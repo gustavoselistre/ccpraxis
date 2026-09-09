@@ -34,6 +34,8 @@
 # AC5  a whitespace span followed by a content span's own leading run sums
 # AC6  a row with no leading indent is unchanged
 # AC7  the non-wrapping fast path is untouched
+# AC8  every cell says whether it is a continuation, so nothing downstream has
+#      to infer it from the shape of the first span
 use strict;
 use warnings;
 use Test::More;
@@ -132,6 +134,29 @@ is($rejoined, $expect, 'AC1 every word survives the wrap, in order');
          'AC7 an unwrapped row is passed through with its indent intact');
     is(length($t->[0]), length($unwrapped->[0]),
        'AC7 fast path is stable across calls');
+}
+
+# AC8 — the continuation flag. Fixing the indent made line 0 carry a leading
+# indent span of its own, which broke the one thing downstream code had to
+# recognise a continuation by (25-dashboard.t's banner counter, inferring it
+# from the first span's role). The wrapper knows the answer, so it records it.
+{
+    my $cells = tui::Frame::wrap_line($LONG, 'text.muted', $W, $CONT);
+    cmp_ok(scalar @$cells, '>', 1, 'AC8 fixture wraps to several cells');
+    is($cells->[0]{continuation}, 0, 'AC8 the first row is not a continuation');
+    for my $i (1 .. $#$cells) {
+        is($cells->[$i]{continuation}, 1, "AC8 row $i is marked a continuation");
+    }
+
+    # The fast path returns one cell without entering the wrap loop, and it must
+    # carry the flag too -- an unwrapped row is the first row of its own line.
+    my $one = tui::Frame::wrap_line($SHORT, 'text.muted', $W, $CONT);
+    is(scalar @$one, 1, 'AC8 the short row does not wrap');
+    is($one->[0]{continuation}, 0, 'AC8 a single-row fast path still states it');
+
+    # make_cell is the single cell constructor; the default belongs there.
+    my $bare = tui::Frame::make_cell('anything', 'text.muted', $W);
+    is($bare->{continuation}, 0, 'AC8 make_cell defaults the flag to 0');
 }
 
 done_testing();
