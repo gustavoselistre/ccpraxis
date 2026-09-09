@@ -410,16 +410,32 @@ sub wrap_line {
     # continuation lines so their own added indent (WRAP_CONTINUATION_INDENT,
     # Screen.pm) reads as genuinely MORE indented than line 0, not merely
     # equal to it (existing 2 + new 2 = 4, per spec S2.4). Recover it by
-    # walking the spans from the front and collecting any purely-whitespace
-    # run before the first span carrying real content.
+    # walking the spans from the front and collecting the leading space run,
+    # WHEREVER IT LIVES.
+    #
+    # THAT LAST PART IS THE FIX FOR almanac 20260909-223849-1870. This loop
+    # used to collect only spans that were ENTIRELY whitespace and `last` on
+    # the first span carrying any content -- which covers the case it was
+    # written for (Screen.pm's own 2-column body indent, its own span) and
+    # misses the one where the indent is simply the first characters of a
+    # content span. LaunchScreens renders a subheader as a SINGLE span,
+    # '  ' . $display, and launcher.pl's stale-sandbox reasons already carry
+    # their own '  - ' prefix inside that display text -- so the row arrives
+    # as one span whose text starts with four spaces, the old loop stopped on
+    # iteration one, and line 0 was built from words alone. It rendered flush
+    # at column 0 while its own continuation lines sat at column 2: two
+    # columns LEFT of the text it continues, and four left of its unwrapped
+    # siblings. Take the leading run off whichever span carries it, then stop
+    # at the first span with real content.
     my $leading_indent_text = '';
     my $leading_indent_role;
     for my $sp (@$spans) {
         my $t = defined $sp->{text} ? $sp->{text} : '';
+        if ($t =~ /^( +)/) {
+            $leading_indent_text .= $1;
+            $leading_indent_role = $sp->{role} if !defined $leading_indent_role;
+        }
         last if $t !~ /^ *$/;
-        next if $t eq '';
-        $leading_indent_text .= $t;
-        $leading_indent_role = $sp->{role} if !defined $leading_indent_role;
     }
     $leading_indent_role = DEFAULT_ROLE() if !defined $leading_indent_role;
     my $leading_indent_w = tui::Layout::display_width($leading_indent_text);
