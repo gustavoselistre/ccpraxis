@@ -177,6 +177,136 @@ sub skill_host_only_status {
     return 'visible';
 }
 
+# plugin_source_dir($key, $install_path) -> the directory that actually holds
+# this plugin's files on the host, or undef.
+#
+# installPath is NOT reliably that directory. Claude Code records a cache path
+# (plugins/cache/<marketplace>/<plugin>/<version>) for every install, but for a
+# `directory`-source marketplace it never populates that cache -- it resolves the
+# plugin from the marketplace's own source.path instead, leaving
+# plugins/marketplaces/<name>/ an empty placeholder and the recorded cache path
+# nonexistent. ccpraxis-local is exactly that case: every ccpraxis plugin's
+# installPath points at plugins/cache/ccpraxis-local/<plugin>/0.1.0, which does
+# not exist on this host.
+#
+# So a census keyed on installPath alone reports zero skills for precisely the
+# plugins whose skills we need to judge. Resolve in two steps: trust installPath
+# when it is really there (cache-copied marketplaces), else follow the
+# directory-source marketplace's source.path plus the plugin's own relative
+# `source` from that marketplace's marketplace.json.
+{
+    my %km_cache;      # marketplace name => source.path (directory-source only)
+    my %mkt_cache;     # marketplace name => { plugin name => relative source }
+    my $km_loaded = 0;
+
+    sub _load_known_marketplaces {
+        return if $km_loaded;
+        $km_loaded = 1;
+        my $file = home() . "/.claude/plugins/known_marketplaces.json";
+        my $data = read_json($file);
+        return unless ref $data eq 'HASH';
+        for my $name (keys %$data) {
+            my $entry = $data->{$name};
+            next unless ref $entry eq 'HASH' && ref $entry->{source} eq 'HASH';
+            next unless ($entry->{source}{source} // '') eq 'directory';
+            my $p = $entry->{source}{path};
+            next unless defined $p && length $p;
+            $km_cache{$name} = normalize_path($p);
+        }
+    }
+
+    sub _marketplace_plugin_sources {
+        my ($name, $root) = @_;
+        return $mkt_cache{$name} if exists $mkt_cache{$name};
+        my %sources;
+        my $data = read_json("$root/.claude-plugin/marketplace.json");
+        if (ref $data eq 'HASH' && ref $data->{plugins} eq 'ARRAY') {
+            for my $entry (@{ $data->{plugins} }) {
+                next unless ref $entry eq 'HASH';
+                my ($pname, $psrc) = ($entry->{name}, $entry->{source});
+                next unless defined $pname && length $pname;
+                next unless defined $psrc && !ref $psrc && length $psrc;
+                # Only repo-relative sources can be resolved against $root.
+                next unless $psrc =~ m{^\./};
+                (my $rel = $psrc) =~ s{^\./}{};
+                $sources{$pname} = $rel;
+            }
+        }
+        $mkt_cache{$name} = \%sources;
+        return \%sources;
+    }
+
+    # plugin_directory_source($key) -> ($marketplace, $rel, $root), or () when
+    # this plugin does not come from a directory-source marketplace. $rel is what
+    # that marketplace's own marketplace.json declares as the plugin's `source`,
+    # with the leading "./" stripped.
+    sub plugin_directory_source {
+        my ($key) = @_;
+        return () unless defined $key && $key =~ /^([^@]+)\@(.+)$/;
+        my ($pname, $mkt) = ($1, $2);
+
+        _load_known_marketplaces();
+        my $root = $km_cache{$mkt};
+        return () unless defined $root && -d $root;
+
+        my $rel = _marketplace_plugin_sources($mkt, $root)->{$pname};
+        return () unless defined $rel && length $rel;
+        return ($mkt, $rel, $root);
+    }
+
+    sub plugin_source_dir {
+        my ($key, $install_path) = @_;
+        return $install_path
+            if defined $install_path && length $install_path && -d $install_path;
+
+        my ($mkt, $rel, $root) = plugin_directory_source($key);
+        return undef unless defined $rel;
+
+        my $dir = "$root/$rel";
+        return -d $dir ? $dir : undef;
+    }
+}
+
+# plugin_skill_census($install_path) -> { total => N, host_only => [names] }
+#
+# THE OTHER HALF OF skill_host_only_status. `host-only: true` was enforced on
+# exactly one of the two paths that put a skill into a container: discover_skills
+# drops a host-only STANDALONE skill, while plugin-shipped skills reach the
+# container through plugin selection, which never opened a SKILL.md and so could
+# not see the marker. Nine skills across three plugins declared themselves
+# host-only and were mounted anyway -- including /sandbox:setup, whose whole body
+# is "exit this session and run claude-sandbox from a terminal", and
+# /sandbox:test, which needs a container runtime the image does not ship.
+#
+# Census, not a verdict: the two callers want different things from it.
+# discover_plugins drops a plugin whose skills are ALL host-only (there is
+# nothing left to offer); cmd_materialize_plugins excludes the individual
+# host-only skill dirs of a MIXED plugin (steward and todo each ship both kinds)
+# from the copy that lands in claude-home.
+#
+# `total` counts skill dirs that actually carry a SKILL.md -- a stray directory
+# is not a skill, and counting it would make an all-host-only plugin look mixed.
+sub plugin_skill_census {
+    my ($install_path) = @_;
+    my %census = (total => 0, host_only => []);
+    return \%census unless defined $install_path && length $install_path;
+
+    my $skills_dir = "$install_path/skills";
+    return \%census unless -d $skills_dir;
+    opendir my $dh, $skills_dir or return \%census;
+    my @entries = sort grep { $_ !~ /^\.\.?$/ } map { from_fs($_) } readdir $dh;
+    closedir $dh;
+
+    for my $entry (@entries) {
+        next unless -d "$skills_dir/$entry";
+        my $status = skill_host_only_status("$skills_dir/$entry/SKILL.md");
+        next if $status eq 'missing';
+        $census{total}++;
+        push @{ $census{host_only} }, $entry if $status eq 'host-only';
+    }
+    return \%census;
+}
+
 sub now_iso {
     return strftime('%Y-%m-%dT%H:%M:%SZ', gmtime);
 }
@@ -398,15 +528,32 @@ sub discover_plugins {
         my ($label) = $key =~ /^([^@]+)/;
         $label //= $key;
 
+        # host-only census. A plugin whose skills are ALL host-only has nothing
+        # to offer a container, so it is dropped here -- the exact analogue of
+        # discover_skills dropping a host-only standalone skill, and the reason
+        # the picker no longer offers `sandbox` inside a sandbox (both its skills
+        # are host-only; one tells you to exit and run claude-sandbox, the other
+        # needs a container runtime the image does not ship).
+        #
+        # A plugin with NO skills at all is NOT dropped: plenty of plugins are
+        # hooks, agents or scripts, and `total == 0` means "nothing to judge",
+        # not "nothing usable". Only a plugin that shipped skills and made every
+        # one of them host-only is filtered.
+        my $census = plugin_skill_census(plugin_source_dir($key, $install_path));
+        my @host_only = @{ $census->{host_only} };
+        next if $census->{total} > 0 && @host_only == $census->{total};
+
         push @plugins, {
-            key          => $key,
-            label        => $label,
-            install_path => $install_path,
-            scope        => $scope,
-            project_path => $entry_project,
-            version      => $best->{version},
-            partition    => $partition,
-            enabled      => $enabled,
+            key              => $key,
+            label            => $label,
+            install_path     => $install_path,
+            scope            => $scope,
+            project_path     => $entry_project,
+            version          => $best->{version},
+            partition        => $partition,
+            enabled          => $enabled,
+            skills_total     => $census->{total},
+            host_only_skills => [sort @host_only],
         };
     }
 
@@ -638,12 +785,25 @@ sub cmd_diff {
         $was_mounted_p{$m->{key}} = $m;
     }
 
-    my (@plugins_added, @plugins_removed, @plugins_path_changed);
+    my (@plugins_added, @plugins_removed, @plugins_path_changed,
+        @plugins_host_only);
     for my $key (sort keys %was_mounted_p) {
         my $prev = $was_mounted_p{$key};
         my $cur  = $avail_p{$key};
         if (!$cur) {
-            push @plugins_removed, $key;
+            # Gone from discovery. Distinguish "uninstalled" from "every one of
+            # its skills is host-only, so discover_plugins now drops it" -- the
+            # same distinction the skill loop above already draws. Reporting a
+            # deliberate policy filter as "removed" would send the operator
+            # looking for an uninstall that never happened.
+            my $census = plugin_skill_census(
+                plugin_source_dir($key, $prev->{install_path}));
+            if ($census->{total} > 0
+                && @{ $census->{host_only} } == $census->{total}) {
+                push @plugins_host_only, $key;
+            } else {
+                push @plugins_removed, $key;
+            }
         } elsif (!$selected_p{$key}) {
             push @plugins_removed, $key;
         } else {
@@ -665,6 +825,7 @@ sub cmd_diff {
         plugins_added          => [sort @plugins_added],
         plugins_removed        => [sort @plugins_removed],
         plugins_path_changed   => [sort @plugins_path_changed],
+        plugins_host_only      => [sort @plugins_host_only],
     });
     return 0;
 }
@@ -1588,6 +1749,74 @@ sub cmd_mounts {
             unlink $mtmp;
             die "rename $mtmp -> $manifest_file: $!\n";
         };
+    }
+    return 0;
+}
+
+# =====================================================================
+# Subcommand: host-only-masks
+# =====================================================================
+#
+# Emits the container paths of every host-only skill belonging to a SELECTED
+# plugin that reaches the container through a LIVE BIND rather than a copy.
+#
+# Two different mechanisms put a plugin's files into the container, and a
+# host-only skill has to be removed from each differently:
+#
+#   * A cache-copied marketplace is COPIED into claude-home, so a host-only
+#     skill can simply be left out of the copy. Nothing for this subcommand.
+#   * A directory-source marketplace (ccpraxis-local) is bind-mounted LIVE and
+#     read-only, so nothing can be "left out" -- the tree in the container IS the
+#     host's tree. The skill dir is MASKED instead: the launcher binds an empty
+#     directory over it, leaving a directory with no SKILL.md, and a directory
+#     with no SKILL.md is not a skill. Measured against podman before being
+#     written: a nested bind over a subtree of a read-only bind mounts fine and
+#     leaves its siblings intact.
+#
+# discover_plugins has already dropped any plugin whose skills are ALL
+# host-only, so what reaches here is the MIXED case -- steward, which ships two
+# container-usable skills alongside four host-only ones.
+sub cmd_host_only_masks {
+    my %opts = @_;
+    my $file   = $opts{selection_file} or die "--selection-file required\n";
+    my $output = $opts{output};
+
+    my $state   = load_state($file);
+    my $plugins = discover_plugins(%opts);
+    my %by_key  = map { $_->{key} => $_ } @$plugins;
+
+    my @masks;
+    for my $key (@{ $state->{selected_plugins} || [] }) {
+        my $p = $by_key{$key} or next;
+        my @host_only = @{ $p->{host_only_skills} || [] };
+        next unless @host_only;
+
+        my ($mkt, $rel) = plugin_directory_source($key);
+        next unless defined $rel;
+
+        for my $skill (@host_only) {
+            push @masks, {
+                key            => $key,
+                skill          => $skill,
+                container_path => "$CONTAINER_PLUGINS_ROOT/marketplaces/$mkt/$rel/skills/$skill",
+            };
+        }
+    }
+
+    my $json = JSON::PP->new->canonical(1)->pretty->utf8->encode(\@masks);
+    if (defined $output && length $output) {
+        my $dir = dirname($output);
+        make_path($dir) unless -d $dir;
+        my $tmp = "$output.tmp.$$";
+        open my $fh, '>:raw', $tmp or die "write $tmp: $!\n";
+        print $fh $json;
+        close $fh or die "close $tmp: $!\n";
+        rename $tmp, $output or do {
+            unlink $tmp;
+            die "rename $tmp -> $output: $!\n";
+        };
+    } else {
+        print $json;
     }
     return 0;
 }
@@ -2794,6 +3023,9 @@ Commands:
                                                     claudeAiOauth + mcpOAuth from previous
                                                     container state only (host token never
                                                     injected; one-time reset marker gates it).
+  host-only-masks     --selection-file F --output FILE
+                                      Container paths of host-only skills in selected
+                                      live-bound plugins; the launcher masks each.
   materialize-known-marketplaces --output FILE      Emit container-shaped known_marketplaces.json:
                                                     rewrites Windows installLocation paths to the
                                                     container mount target; drops directory-source
@@ -2852,6 +3084,7 @@ my %DISPATCH = (
     'record-mount'        => \&cmd_record_mount,
     'manifest'            => \&cmd_manifest,
     'discover-mcp'            => \&cmd_discover_mcp,
+    'host-only-masks'                  => \&cmd_host_only_masks,
     'materialize-plugins'              => \&cmd_materialize_plugins,
     'materialize-credentials'          => \&cmd_materialize_credentials,
     'materialize-known-marketplaces'   => \&cmd_materialize_known_marketplaces,
