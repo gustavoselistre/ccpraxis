@@ -462,6 +462,21 @@ sub assert_baseline_preserved {
                                        # payload, its live mirror, and the
                                        # container blueprint) -- a sandbox must not
                                        # be left without a tool the host has.
+        'enabledPlugins.almanac@ccpraxis-local' => 1,
+                                       # 2026-09-10 (34a84b9) -- almanac shipped
+                                       # complete and unregistered: no entry in
+                                       # plugins/.claude-plugin/marketplace.json,
+                                       # so /almanac:bug-report and
+                                       # /almanac:bug-triage existed nowhere and
+                                       # guard-almanac-write.sh, registered via
+                                       # ${CLAUDE_PLUGIN_ROOT}, never ran. Enabled
+                                       # here (the host payload) alongside the
+                                       # marketplace entry. Host-only by nature:
+                                       # the container blueprint enables no
+                                       # ccpraxis plugin -- those come from the
+                                       # launcher's picker -- so unlike the two
+                                       # env keys above this lands on one surface,
+                                       # not three.
     );
     my @unexpected = grep {
         !exists $baseline_flat->{$_} && !$permitted_additions{$_}
