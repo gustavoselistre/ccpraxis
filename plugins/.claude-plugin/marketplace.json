@@ -35,6 +35,11 @@
       "name": "todo",
       "source": "./todo",
       "description": "Personal todo notes synced to your private vault. Provides /todo:create (save a note), /todo:manage (list/view/edit/delete/done), and /todo:resume (load a note and work on it). Backed by scripts/todo-sync.pl; pushed by /steward:backup."
+    },
+    {
+      "name": "almanac",
+      "source": "./almanac",
+      "description": "Durable project records that outlive a session: ccpraxis bug reports filed by agents working in any project (one file per report, written only through almanac-bug.pl, frozen once picked up), and the guidance notes that replace Claude Code's built-in auto-memory. Provides /almanac:bug-report and /almanac:bug-triage, plus a PreToolUse hook denying direct edits to report files."
     }
   ]
 }
