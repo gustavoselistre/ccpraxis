@@ -22,6 +22,16 @@ use tui::Frame;
 use tui::Screen;
 use tui::DashboardScreen;
 
+# Detail-row geometry for the approval screen. The indent is two columns deeper
+# than an item row's cursor marker so a detail reads as subordinate to the item
+# above it; the gutter is the widest label ('rationale') so install, verify and
+# rationale values start in one column and the commands can be scanned. The
+# separator is DashboardScreen's, deliberately -- a second separator width would
+# make two label conventions in one TUI.
+use constant DETAIL_INDENT => '    ';
+use constant DETAIL_GUTTER => 9;
+use constant GUTTER_SEP    => tui::DashboardScreen::GUTTER_SEP();
+
 # ---------------------------------------------------------------------------
 # Small total helpers. Every one of these survives undef, a ref, a blessed
 # object and a 10 KB string without dying and without emitting a diagnostic.
@@ -1234,8 +1244,32 @@ sub _row_spans {
 
     my $kind = _str($it->{kind});
     my $disp = _str($it->{display});
-    return [ { text => $disp, role => 'accent' } ]            if $kind eq 'header';
-    return [ { text => '  ' . $disp, role => 'text.muted' } ] if $kind eq 'subheader';
+    return [ { text => $disp, role => 'accent' } ] if $kind eq 'header';
+
+    if ($kind eq 'subheader') {
+        # A structured detail row (see _detail_row) renders as three spans:
+        # a pure-whitespace indent, a label padded to a shared gutter, and the
+        # value. Indenting DEEPER than the item row above it is what makes the
+        # detail read as belonging to that item -- the whole block used to sit
+        # at the item's own indent, so nothing said which item the commands
+        # were for.
+        if (exists $it->{detail_label}) {
+            my $label = _str($it->{detail_label});
+            my $value = _str($it->{detail_value});
+            return [ { text => '', role => 'text.faint' } ]
+                unless length($label) || length($value);
+
+            my $vrole = _str($it->{detail_role});
+            $vrole = 'text.primary' unless tui::Frame::is_known_role($vrole);
+            return [
+                { text => DETAIL_INDENT(), role => 'text.faint' },
+                { text => sprintf('%-*s%s', DETAIL_GUTTER(), $label, GUTTER_SEP()),
+                  role => 'text.faint' },
+                { text => $value, role => $vrole },
+            ];
+        }
+        return [ { text => '  ' . $disp, role => 'text.muted' } ];
+    }
 
     my $cur = _is_num($ls->{cursor}) ? int($ls->{cursor}) : -1;
     my $marker = ($i == $cur) ? (_glyph('cursor') . ' ') : '  ';
@@ -1245,7 +1279,11 @@ sub _row_spans {
     if ($mode eq 'triage') {
         my $st = _str($it->{state});
         $st = 'defer' unless length $st;
-        $mark = '[' . $st . ']';
+        # PADDED TO THE WIDEST STATE, so the item names start in one column
+        # instead of stepping left and right as decisions change. '[approve]'
+        # is the widest at 9; the states are a closed set (TRIAGE_STATES), so
+        # this cannot be outgrown by a longer word arriving later.
+        $mark = sprintf('%-*s', 9, '[' . $st . ']');
         $mark_role = $st eq 'approve' ? 'state.ok'
                    : $st eq 'remove'  ? 'state.crit'
                    :                    'text.muted';
@@ -1331,8 +1369,23 @@ sub list_screen {
     # on a screen that has no tally. Single mode keeps the scroll hints, which
     # are still true and still useful, and drops the counter.
     my @summary;
-    push @summary, { text => $nrows . ' item(s), ' . $nsel . ' selected', role => 'text.muted' }
-        unless $mode eq 'single';
+    if ($mode eq 'triage') {
+        # THE SAME REASONING AS 'single', APPLIED WHERE IT ALSO HOLDS. The
+        # approval walk shows ONE item per screen and puts the position in the
+        # label ("backpack approval - item 1 of 1"), so the footer rendered
+        # "1 item(s), 0 selected": a running tally of a set with one member,
+        # restating the header, with a stray "(s)" -- on a screen whose scarce
+        # resource is the rows that show commands. A count earns its row only
+        # once there is more than one thing to count, and then it is phrased as
+        # the decision being accumulated rather than as a selection.
+        push @summary, { text => $nsel . ' of ' . $nrows . ' approved',
+                         role => 'text.muted' }
+            if $nrows > 1;
+    }
+    elsif ($mode ne 'single') {
+        push @summary, { text => $nrows . ' item(s), ' . $nsel . ' selected',
+                         role => 'text.muted' };
+    }
     my @extra;
     push @extra, '+' . $vp->{above} . ' above' if $vp->{above};
     push @extra, '+' . $vp->{below} . ' below' if $vp->{below};
@@ -1353,7 +1406,26 @@ sub list_screen {
         # the one piece of panel chrome the operator cannot switch off, so it
         # should at least name what it is dividing.
         panels      => [ { title => ($mode eq 'single' ? 'options' : 'items'),
-                           lines => \@lines, body => \@lines } ],
+                           lines => \@lines, body => \@lines,
+                           # HANGING INDENT TO THE VALUE COLUMN, for triage only.
+                           # Every detail row is a label padded to a shared
+                           # gutter followed by its value, and `rationale` is
+                           # agent-written and routinely long. Wrapping it back
+                           # to the default two columns put the continuation
+                           # nowhere near the column it continued -- the value
+                           # started at 16 and resumed at 6. Other modes declare
+                           # nothing and keep the default.
+                           #
+                           # This is the distance BEYOND the row's own leading
+                           # indent, not the absolute column: wrap_line adds the
+                           # continuation indent on top of the indent the row
+                           # already carries (DETAIL_INDENT, recovered by its
+                           # step 3a-pre). Gutter + separator is exactly what
+                           # remains, and 4 + 12 lands the continuation under
+                           # the value.
+                           ($mode eq 'triage'
+                              ? (wrap_indent => DETAIL_GUTTER() + length(GUTTER_SEP()))
+                              : ()) } ],
         footer      => LIST_FOOTER_LEGEND($mode),
         footer_role => 'text.faint',
     };
@@ -1513,14 +1585,41 @@ sub AS_ROOT_WARNING {
     return 'these install/verify commands run AS ROOT inside the container - review each one';
 }
 
-# _detail_row($label, $value) -> a non-landable subheader carrying one of the
-# commands being approved. The cursor skips subheaders, so these read as
+# _detail_row($label, $value, $role) -> a non-landable subheader carrying one of
+# the commands being approved. The cursor skips subheaders, so these read as
 # annotation on the row above them rather than as separately-selectable rows.
+#
+# THE MODEL CARRIES CONTENT, THE RENDERER DECIDES LAYOUT. This used to pre-glue
+# "label: value" into one display string, which _row_spans then prepended two
+# more columns to -- so the row reached the wrapper as a single span whose text
+# began with spaces, which was exactly the shape whose leading indent the
+# wrapper dropped (almanac 20260909-223849-1870). Worse, all three rows of an
+# item then rendered at one indent in one role, so `rationale` -- agent-written,
+# unbounded, and by far the longest -- carried the same visual weight as the
+# command about to run as root. Structured label/value lets _row_spans own the
+# indent and the gutter, and lets each half take the role its content deserves.
 sub _detail_row {
-    my ($label, $value) = @_;
+    my ($label, $value, $role) = @_;
     my $v = _str($value);
     $v = '(none given)' unless length $v;
-    return { kind => 'subheader', disabled => 1, display => _str($label) . ': ' . $v };
+    return {
+        kind         => 'subheader',
+        disabled     => 1,
+        detail_label => _str($label),
+        detail_value => $v,
+        detail_role  => _str($role),
+        # display stays populated so anything reading the model as text (a
+        # self-audit, a test, a future plain-text fallback) still sees the row.
+        display      => _str($label) . ': ' . $v,
+    };
+}
+
+# A blank non-landable row. With more than one item on screen the three detail
+# rows of one item ran straight into the next item's identity row, so where an
+# item ENDED was invisible.
+sub _spacer_row {
+    return { kind => 'subheader', disabled => 1, detail_label => '',
+             detail_value => '', display => '' };
 }
 
 sub triage_model {
@@ -1551,9 +1650,18 @@ sub triage_model {
         # make a DISPLAYED command trustworthy. tui::Frame::safe sanitises
         # every span on the way into a cell; this is the second half of that
         # belt and braces, not a replacement for it.
-        push @items, _detail_row('install',   $it->{install});
-        push @items, _detail_row('verify',    $it->{verify});
-        push @items, _detail_row('rationale', $it->{rationale});
+        #
+        # WEIGHTED, BECAUSE THE THREE ARE NOT EQUAL. install and verify are what
+        # runs as root -- the thing actually being approved -- so they take the
+        # primary role. rationale is context for the decision (design
+        # conventions require it be shown, not merely a name), and it is
+        # agent-written and unbounded, so it takes a muted role and comes last.
+        # It is NOT truncated: this gate collects consent, and clamping the
+        # reason someone asked for root is a product call, not a layout one.
+        push @items, _detail_row('install',   $it->{install},   'text.primary');
+        push @items, _detail_row('verify',    $it->{verify},    'text.primary');
+        push @items, _detail_row('rationale', $it->{rationale}, 'text.muted');
+        push @items, _spacer_row() if $i < $#{ ref $pending eq 'ARRAY' ? $pending : [] };
     }
 
     my @ok = grep { ref $_ eq 'HASH' } @{ ref $approved eq 'ARRAY' ? $approved : [] };
