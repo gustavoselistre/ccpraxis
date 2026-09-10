@@ -135,14 +135,24 @@ sub marker_path { my ($reg, $sid) = @_; return "$reg/$sid"; }
 }
 
 # ===========================================================================
-# E. AC-4 (behavior 4): arm with NEITHER --session nor $CLAUDE_SESSION_ID set
+# E. AC-4 (behavior 4): arm with NO session id from ANY source
 #    -> STATUS: error, exit 1, no marker written under ANY name.
+#
+#    The fixture scrubs BOTH env candidates. It used to scrub only
+#    CLAUDE_SESSION_ID, which was enough while that was the only one the script
+#    consulted -- and which was itself the bug: CLAUDE_SESSION_ID is a Claude
+#    Code TEMPLATE SUBSTITUTION, not an environment variable, so that fallback
+#    could never fire. CLAUDE_CODE_SESSION_ID is the one actually present in the
+#    Bash environment, and leaving it set here would hand `arm` a real session id
+#    from the harness running the suite -- the test would then assert "no id
+#    anywhere" against an environment that had one.
 # ===========================================================================
 {
     my $reg = new_registry();
     my ($out, $rc) = run_cli(
         ['arm'],
-        { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $reg, BP_LEDGER => undef, CLAUDE_SESSION_ID => undef },
+        { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $reg, BP_LEDGER => undef,
+          CLAUDE_SESSION_ID => undef, CLAUDE_CODE_SESSION_ID => undef },
     );
     is($rc, 1, 'E1 CANONICAL (-> AC-4/behavior 4): arm with no session id anywhere exits 1 -- '
              . 'this is a direct invocation; silently no-op-ing here would be a command that '
@@ -163,7 +173,8 @@ sub marker_path { my ($reg, $sid) = @_; return "$reg/$sid"; }
     my ($out, $rc) = run_cli(
         ['arm'],
         { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $reg, BP_LEDGER => undef,
-          CLAUDE_SESSION_ID => 'sess-f-envsid' },
+          CLAUDE_SESSION_ID => q{sess-f-envsid},
+          CLAUDE_CODE_SESSION_ID => undef },
     );
     is($rc, 0, 'F1: arm succeeds using only $CLAUDE_SESSION_ID, no --session flag');
     is(kv($out, 'SESSION'), 'sess-f-envsid',
@@ -180,14 +191,31 @@ sub marker_path { my ($reg, $sid) = @_; return "$reg/$sid"; }
     my ($out, $rc) = run_cli(
         ['arm', '--session', 'sess-g-explicit'],
         { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $reg, BP_LEDGER => undef,
-          CLAUDE_SESSION_ID => 'sess-g-env-should-be-ignored' },
+          CLAUDE_SESSION_ID => q{sess-g-env-should-be-ignored},
+          CLAUDE_CODE_SESSION_ID => undef },
     );
     is($rc, 0, 'G1: arm succeeds');
     is(kv($out, 'SESSION'), 'sess-g-explicit',
        'G2 CANONICAL: --session overrides $CLAUDE_SESSION_ID when both are given');
     ok(-f marker_path($reg, 'sess-g-explicit'), 'G3: marker written under the --session id');
-    ok(!-f marker_path($reg, 'sess-g-env-should-be-ignored'),
-       'G4: no marker written under the ignored env id');
+    # G4 AMENDED, and deliberately: it used to assert that the env id was
+    # IGNORED -- no marker under it. That is exactly the behaviour that made a
+    # bad --session fail silently. The gate looks a marker up by the session_id
+    # in its OWN hook payload and exit 0's when there is none, so a single
+    # authoritative source with no cross-check turns any disagreement into
+    # "armed, enforcing nothing" -- reported from a live session that armed,
+    # reported armed, and was never gated.
+    #
+    # --session still WINS in the sense the spec's "explicit override" means:
+    # it is what SESSION: reports and what every other subcommand acts on (G2,
+    # G3, unchanged). It no longer wins by leaving the alternative unarmed.
+    # Both markers are cheap, the TTL sweep reaps whichever is not the live
+    # session, and being right stops depending on which source was stale.
+    ok(-f marker_path($reg, 'sess-g-env-should-be-ignored'),
+       'G4: the env candidate is ALSO armed, so a stale --session cannot leave '
+     . 'the live session unwatched');
+    is(kv($out, 'ALSO_ARMED'), 'sess-g-env-should-be-ignored',
+       'G5: and the disagreement is reported rather than resolved silently');
 }
 
 # ===========================================================================
