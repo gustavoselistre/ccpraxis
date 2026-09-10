@@ -52,6 +52,7 @@ use File::Spec;
 # for every consumer -- see BpSession.pm's header.
 my $SCRIPT_DIR = dirname(File::Spec->rel2abs(__FILE__));
 require "$SCRIPT_DIR/BpSession.pm";
+require "$SCRIPT_DIR/BpResumption.pm";
 
 my $cmd = shift @ARGV // '';
 
@@ -59,9 +60,10 @@ if    ($cmd eq 'arm')    { cmd_arm()    }
 elsif ($cmd eq 'disarm') { cmd_disarm() }
 elsif ($cmd eq 'status') { cmd_status() }
 elsif ($cmd eq 'hold')   { cmd_hold()   }
+elsif ($cmd eq 'await-operator') { cmd_await_operator() }
 else {
     emit('STATUS', 'error');
-    emit('ERROR',  "Unknown command '$cmd' (usage: arm|disarm|status|hold)");
+    emit('ERROR',  "Unknown command '$cmd' (usage: arm|disarm|status|hold|await-operator)");
     exit 1;
 }
 
@@ -492,27 +494,18 @@ sub cmd_hold {
         }
     }
     if ($armed || $arming) {
-        open my $fh, '>', "$mark.wakeup-pending" or do {
+        # ATOMIC, for the same reason the primary marker is. A reader that
+        # catches this file between open() and print() sees a zero-byte marker
+        # and cannot tell it from a malformed one -- and the window is not
+        # theoretical: capturing this process's identity reads /proc first, so
+        # there is real work between creating the file and filling it. A test
+        # polling for the file caught exactly that.
+        write_marker_atomic("$mark.wakeup-pending",
+            BpResumption::marker_line(deadline => $deadline, pid => $$)) or do {
             emit('STATUS', 'error');
             emit('ERROR',  "Cannot write $mark.wakeup-pending: $!");
             exit 1;
         };
-        # Line format: <written_epoch> bounded <deadline_epoch> <pid>.
-        #
-        # THE PID IS THE PROMISE. A deadline in a file is an assertion, not a
-        # guarantee: if this process is killed -- operator interrupt, container
-        # restart, OOM -- nothing returns, and a gate reading only the epoch
-        # cannot tell that from a live wait. It would then permit the stop and
-        # the session would idle forever, which is the precise failure this
-        # whole mechanism exists to prevent, arriving with the gate's blessing.
-        #
-        # $$ is the process that is about to sleep to that deadline, so the gate
-        # can check it with kill -0 and get a fact instead of a claim.
-        #
-        # Field 1 stays the write epoch and fields 2/3 stay as they were, so an
-        # older gate reading only what it knows still behaves exactly as before.
-        print {$fh} "$now bounded $deadline $$\n";
-        close $fh;
     }
 
     emit('STATUS',   ($armed || $arming) ? 'holding' : 'holding_unarmed');
@@ -543,6 +536,71 @@ sub sleep_until {
         $left = 60 if $left > 60;
         sleep $left;
     }
+}
+
+# await-operator --reason "..." : the turn ends because A HUMAN WAS ASKED.
+#
+# THE GAP THIS FILLS. The gate permits a turn to end only if something will
+# resume the session, the arm is lifted, or a one-shot exemption is present. An
+# agent that has FINISHED the watched work and is now asking the operator a
+# question satisfies none of them:
+#
+#   * nothing is pending, and the only way to pretend otherwise is to background
+#     a wait for work that does not exist -- the hollow pause this whole
+#     subsystem exists to prevent;
+#   * lifting an arm the operator set, unasked, is worse than the block;
+#   * the exemption file is reachable only by touching a dotfile whose sole
+#     purpose is to relax a safety gate, which a permission layer may quite
+#     reasonably refuse -- measured on this machine, it does.
+#
+# So an agent could be left with no honest exit. Waiting on a human is not a
+# stall: it is the correct end of a turn, and the operator's next message is
+# what resumes the session. The sibling guard has had a verb for "nothing is
+# pending and that is correct" (bp-runstate.pl's `finish`) since it was written;
+# continuity had none.
+#
+# WHAT KEEPS IT HONEST. It is ONE-SHOT -- the gate consumes the exemption -- so
+# it can never silence the gate, only end the turn in which it was taken. It
+# records a reason, so a chain of them is visible rather than anonymous. And it
+# refuses on an unarmed session, where it would be meaningless. It is NOT a
+# claim that anything will return, which is exactly why it is a separate verb
+# rather than a hold with a lie in it.
+sub cmd_await_operator {
+    my $opts = parse_args(qw(session reason));
+
+    my $reason = $opts->{reason};
+    $reason = 'waiting for the operator' unless defined $reason && length $reason;
+    $reason =~ s/[\r\n]+/ /g;
+
+    my $sid = resolve_session($opts);
+    my $dir = resolve_registry_dir_or_die();
+    my $mark = continuity_marker($sid, $dir);
+    unless (defined $mark) {
+        emit('STATUS', 'error');
+        emit('ERROR',  "invalid session id: $sid");
+        exit 1;
+    }
+
+    unless (-f $mark) {
+        emit('STATUS',  'not_armed');
+        emit('SESSION', $sid);
+        emit('NOTE',    'nothing is gating this session, so no exemption is needed');
+        exit 2;
+    }
+
+    open my $fh, '>', "$mark.stop-ok" or do {
+        emit('STATUS', 'error');
+        emit('ERROR',  "Cannot write $mark.stop-ok: $!");
+        exit 1;
+    };
+    print {$fh} 'awaiting-operator ' . time() . " $reason\n";
+    close $fh;
+
+    emit('STATUS',  'awaiting_operator');
+    emit('SESSION', $sid);
+    emit('REASON',  $reason);
+    emit('NOTE', 'this permits exactly ONE turn to end and is consumed by the gate; '
+               . 'the arm stays in force for every turn after it');
 }
 
 # ── Helpers ────────────────────────────────────────────────

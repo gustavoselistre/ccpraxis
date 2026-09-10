@@ -46,6 +46,17 @@ use warnings;
 use JSON::PP ();
 use File::Basename qw(dirname);
 use Cwd ();
+use File::Spec;
+
+# The resumption contract -- process liveness and process IDENTITY -- is shared
+# with the continuity gate. See BpResumption.pm's header for why these two
+# guards keep separate SCOPES but must not keep separate MECHANISMS: both
+# lessons below were learned here first, and the continuity gate then shipped a
+# liveness check without either, because the knowledge lived in this file rather
+# than anywhere it could be reached from.
+require File::Spec->catfile(
+    dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f }),
+    'BpResumption.pm');
 
 my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
 
@@ -70,81 +81,17 @@ sub state_path {
     return "$base/run-state.$surface.json";
 }
 
-# pid_alive($pid) — see bp-keepawake.pl for why kill(0) is not enough on
-# Windows: perl cannot signal a native process it did not create, and reports a
-# healthy one as dead. A watcher we cannot verify must NOT hold a pause open.
-sub pid_alive {
-    my ($pid) = @_;
-    return 0 unless defined $pid && $pid =~ /^\d+$/ && $pid > 0;
-    return kill(0, $pid) ? 1 : 0 unless $^O =~ /^(MSWin32|msys|cygwin)$/;
-    return 1 if kill(0, $pid);
-    my $out = do { local $ENV{MSYS2_ARG_CONV_EXCL} = '*'; `tasklist /FI "PID eq $pid" /NH` };
-    return 0 unless defined $out;
-    return ($out =~ /\b\Q$pid\E\b/) ? 1 : 0;
-}
-
-# pid_fingerprint($pid) -> string | undef  (fixbatch step7 / HIGH-2)
+# pid_alive / pid_fingerprint now live in BpResumption.pm, shared with the
+# continuity gate. These wrappers keep every call site below reading unchanged.
 #
-# WHY THIS EXISTS. pid_alive() answers "does SOME process exist at this
-# number right now" -- it has no memory of WHICH process was alive when the
-# pause was granted. Once the real watcher exits (its whole purpose --
-# bp-watch.pl "exits and is gone by design"), the OS is free to hand that
-# same number to literally anything, and a bare pid_alive() check cannot
-# tell the difference. The red-team demonstrated this concretely: an
-# unrelated `sleep &` occupying the recorded watcher_pid made `status`
-# report a verified pause with nothing actually watching.
-#
-# This returns a value that identifies THIS SPECIFIC PROCESS INSTANCE, not
-# merely "some process at this number" -- it changes when the OS recycles a
-# pid to a different process, because it is derived from data the OS
-# assigns once, at that process's own creation, and never touches again.
-#
-# TWO PROCESS DOMAINS, NEITHER TOOL SEES BOTH (same split pid_alive already
-# lives with): an MSYS/cygwin-spawned process (what every perl process in
-# this whole family is, including every test's own $$) exposes a virtual
-# /proc/$pid/stat -- readable cross-process, even from a bp-runstate.pl
-# child querying a DIFFERENT, still-live perl process -- whose 20th
-# whitespace-separated field after the ")" is the kernel's own start-time
-# counter for that specific process instance. A genuinely native Windows
-# process (invisible to /proc) is fingerprinted instead via `wmic ... get
-# CreationDate`, which native tooling CAN see.
-#
-# undef means "could not be determined" and callers MUST treat that as
-# UNVERIFIED -- never as a match. An unfingerprintable pid must fail toward
-# NOT-paused, the same direction pid_alive itself already fails when it
-# cannot signal a process it did not create.
-sub pid_fingerprint {
-    my ($pid) = @_;
-    return undef unless defined $pid && $pid =~ /^\d+$/ && $pid > 0;
-
-    if (open my $fh, '<', "/proc/$pid/stat") {
-        local $/;
-        my $raw = <$fh>;
-        close $fh;
-        if (defined $raw && $raw =~ /\)\s*(.*)$/s) {
-            my @f = split ' ', $1;
-            return "proc:$f[19]" if defined $f[19] && $f[19] =~ /^\d+$/;
-        }
-        return undef;
-    }
-
-    if ($^O =~ /^(MSWin32|msys|cygwin)$/) {
-        my $out = do {
-            local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
-            `wmic process where "ProcessId=$pid" get CreationDate 2>/dev/null`;
-        };
-        return undef unless defined $out;
-        $out =~ s/\x00//g;   # wmic's console output is UTF-16LE seen through the pipe
-        return "wmic:$1" if $out =~ /(\d{14}\.\d+[+-]\d+)/;
-        return undef;
-    }
-
-    # macOS/BSD fallback: no /proc, not Windows.
-    my $out = `ps -o lstart= -p $pid 2>/dev/null`;
-    return undef unless defined $out && length $out;
-    $out =~ s/^\s+|\s+$//g;
-    return length($out) ? "ps:$out" : undef;
-}
+# What they encode is worth restating where it is used: kill(0) reports a
+# healthy NATIVE Windows process as dead, and -- the one that actually bit --
+# a live pid is not the SAME pid once a watcher has exited and the OS recycled
+# the number. A red-team demonstrated the second concretely here: an unrelated
+# `sleep &` occupying the recorded watcher_pid made a pause read as verified
+# with nothing watching.
+sub pid_alive       { return BpResumption::pid_alive(@_) }
+sub pid_fingerprint { return BpResumption::pid_fingerprint(@_) }
 
 sub _read {
     my ($root, $surface) = @_;

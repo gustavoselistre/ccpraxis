@@ -172,7 +172,9 @@ sub reg { return tempdir(CLEANUP => 1) }
         skip 'fork unavailable', 3 unless defined $pid && $pid > 0;
         my $wp = "$r/sid-mark.wakeup-pending";
         my $tries = 0;
-        until (-f $wp || $tries++ > 40) { select undef, undef, undef, 0.1 }
+        until ((-s $wp) || $tries++ > 40) { select undef, undef, undef, 0.1 }   # -s, not -f: an
+        # empty file is not a written marker, and polling on existence alone
+        # raced the write it was waiting for.
         ok(-f $wp, 'AC3 hold writes the wake-up marker immediately, not when it finishes');
         open my $fh, '<', $wp or die $!;
         my $line = <$fh> // '';
@@ -208,6 +210,55 @@ sub reg { return tempdir(CLEANUP => 1) }
     like($out, qr/holding_unarmed/, 'AC5 but it says the session is not armed');
     ok(!-f "$r/sid-unarmed.wakeup-pending",
        'AC5 and writes no wake-up marker for a gate that will never look it up');
+}
+
+# ── AC6 — ending a turn to ask the operator something ─────────────────────
+#
+# The gate permits a stop only if something will resume the session, the arm is
+# lifted, or a one-shot exemption exists. An agent that has FINISHED the watched
+# work and is asking the operator a question satisfies none of them: nothing is
+# pending, lifting the operator's own arm is not the agent's call, and the
+# exemption file was reachable only by touching a dotfile that exists to relax a
+# safety gate -- which a permission layer may refuse, and on this machine does.
+#
+# So there was no honest exit, and the only dishonest one was to background a
+# wait for work that does not exist. Waiting on a human is not a stall; it is
+# the correct end of a turn. This verb says so, once.
+{
+    my $r = reg();
+    run_cli(['arm', '--session', 'sid-await'],
+            { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $r, BP_LEDGER => undef,
+              CLAUDE_SESSION_ID => undef, CLAUDE_CODE_SESSION_ID => undef });
+
+    my ($out, $rc) = run_cli(
+        ['await-operator', '--session', 'sid-await', '--reason', 'asked about promotion'],
+        { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $r,
+          CLAUDE_SESSION_ID => undef, CLAUDE_CODE_SESSION_ID => undef });
+    is($rc, 0, 'AC6 await-operator exits 0 on an armed session');
+    is(kv($out, 'STATUS'), 'awaiting_operator', 'AC6 STATUS: awaiting_operator');
+    ok(-f "$r/sid-await.stop-ok",
+       'AC6 CANONICAL: it writes the one-shot exemption the gate already consumes -- '
+     . 'no new gate machinery, and no permission layer standing between an agent '
+     . 'and its only honest exit');
+
+    open my $fh, '<', "$r/sid-await.stop-ok" or die $!;
+    my $line = <$fh>;
+    close $fh;
+    like($line, qr/^awaiting-operator \d+ asked about promotion/,
+         'AC6 recording WHY, so a chain of them is visible rather than anonymous');
+
+    # The arm itself is untouched: this ends one turn, it does not disarm.
+    ok(-f "$r/sid-await", 'AC6 the arm stays in force');
+
+    # And it is meaningless on an unarmed session, so it refuses rather than
+    # leaving a stray exemption lying in the registry.
+    my ($out2, $rc2) = run_cli(
+        ['await-operator', '--session', 'sid-not-armed'],
+        { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $r,
+          CLAUDE_SESSION_ID => undef, CLAUDE_CODE_SESSION_ID => undef });
+    is($rc2, 2, 'AC6 an unarmed session gets exit 2');
+    is(kv($out2, 'STATUS'), 'not_armed', 'AC6 STATUS: not_armed');
+    ok(!-f "$r/sid-not-armed.stop-ok", 'AC6 and no exemption is left behind');
 }
 
 done_testing();

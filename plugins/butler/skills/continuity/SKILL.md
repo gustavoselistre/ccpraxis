@@ -36,6 +36,21 @@ a backgrounded command that exits is what actually re-invokes the session. When 
 whatever you were really waiting on and either finish or hold again. Pick the horizon to match what
 you are waiting for; it may not exceed the wake-up TTL (900s by default).
 
+## Ending a turn to ask the operator something
+
+That is not a stall — it is the correct end of a turn, and the operator's reply
+is what resumes the session. Say so explicitly:
+
+```bash
+perl "<plugin-root>/scripts/bp-continuity.pl" await-operator --reason "<what you asked>"
+```
+
+It permits exactly ONE turn to end and is consumed by the gate, so it can never
+silence it; the arm stays in force afterwards. Do NOT background a wait for work
+that does not exist instead — a wake-up nothing will honour is the failure this
+gate exists to prevent, and taking one out to satisfy the gate is worse than the
+block.
+
 ## `on` does not arm immediately, and that is deliberate
 
 Nothing running as a Bash tool call is told which session Claude Code considers live — including

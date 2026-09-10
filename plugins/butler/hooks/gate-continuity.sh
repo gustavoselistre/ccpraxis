@@ -151,52 +151,33 @@ fi
 # pattern.
 WAKEUP_TTL_S=${CCPRAXIS_CONTINUITY_WAKEUP_TTL_S:-900}
 if [ -f "$MARK.wakeup-pending" ]; then
-  WNOW=$(date +%s 2>/dev/null || echo 0)
-  WAT=$(awk 'NR==1{print $1+0; exit}' "$MARK.wakeup-pending" 2>/dev/null || echo 0)
-  # A marker with no timestamp predates this change; fall back to its mtime so
-  # an in-flight upgrade does not either strand or over-trust it.
-  [ "$WAT" -gt 0 ] 2>/dev/null || WAT=$(stat -c %Y "$MARK.wakeup-pending" 2>/dev/null || echo 0)
-  # BOUNDED, OR IT IS NOT A WAKE-UP. Field 2 is the literal "bounded" and field
-  # 3 a deadline epoch, written by `bp-continuity.pl hold` -- the one command
-  # that both records the promise and keeps it, because it sleeps and exits, and
-  # a backgrounded command that exits is what actually re-invokes this session.
+  # ONE IMPLEMENTATION OF "WILL ANYTHING BRING THIS BACK", AND IT IS NOT HERE.
   #
-  # A marker without that (what mark-wakeup.sh writes on any Task/Agent dispatch
-  # or backgrounded Bash call) records only that something was DISPATCHED. A
-  # dispatch is not a promise to come back: a subagent that runs forever, or a
-  # background command with no timeout, satisfies it and then never returns, and
-  # the session idles with nothing left to wake it. The TTL does not save that
-  # case -- it governs whether a LATER stop is allowed, and there is no later
-  # stop, because nothing wakes the session to have one.
-  WBOUND=$(awk 'NR==1{print $2; exit}' "$MARK.wakeup-pending" 2>/dev/null || echo '')
-  WDEAD=$(awk 'NR==1{print $3+0; exit}' "$MARK.wakeup-pending" 2>/dev/null || echo 0)
-  WPID=$(awk 'NR==1{print $4+0; exit}' "$MARK.wakeup-pending" 2>/dev/null || echo 0)
+  # This used to parse the marker in awk and decide in shell: bounded? deadline
+  # ahead? pid alive? Two of those three were subtly wrong, and both had already
+  # been solved in bp-runstate.pl -- kill -0 reports a healthy native Windows
+  # process as dead, and a live pid is not the SAME pid once the holding process
+  # has exited and the OS recycled the number. `hold` exits at its deadline BY
+  # DESIGN, so pid reuse is the ordinary case here, not an exotic one.
+  #
+  # Shell cannot compute a process fingerprint, so translating the rules here a
+  # second time could only reproduce that gap. bp-resumption.pl answers instead,
+  # over the same module bp-runstate.pl uses. The marker is consumed either way,
+  # so a stale one can never be spent twice.
+  VERIFY_OUT=$(perl "$HOOK_DIR/../scripts/bp-resumption.pl" verify \
+                 --file "$MARK.wakeup-pending" --ttl "$WAKEUP_TTL_S" 2>&1)
+  VERIFY_RC=$?
   rm -f "$MARK.wakeup-pending" 2>/dev/null
 
-  # AND THE PROCESS THAT PROMISED IT MUST STILL BE ALIVE.
-  #
-  # A deadline in a file is an assertion. `hold` sleeps to that deadline in a
-  # real process and exits, and it is the EXIT that re-invokes the session -- so
-  # if that process is gone (operator interrupt, container restart, OOM), the
-  # wake-up it promised is gone with it and nothing distinguishes that from a
-  # live wait except asking the kernel. Permitting a stop on the strength of a
-  # dead process's promise is the original failure with a better alibi.
-  #
-  # A marker with no pid (field 4 absent) predates this and is treated as
-  # unverifiable rather than trusted: same direction as every other unknown here.
-  WALIVE=0
-  if [ "$WPID" -gt 0 ] 2>/dev/null && kill -0 "$WPID" 2>/dev/null; then
-    WALIVE=1
-  fi
-
-  if [ "$WNOW" -gt 0 ] && [ "$WAT" -gt 0 ] && [ $(( WNOW - WAT )) -lt "$WAKEUP_TTL_S" ] \
-     && [ "$WBOUND" = "bounded" ] && [ "$WDEAD" -gt "$WNOW" ] 2>/dev/null \
-     && [ "$WALIVE" -eq 1 ]; then
+  if [ "$VERIFY_RC" -eq 0 ]; then
     rm -f "$MARK.stop-blocks" 2>/dev/null
     exit 0
   fi
-  # Stale: fall through and block. The marker is gone either way, so a stale one
-  # cannot be spent twice.
+  # Refused. Say WHY on the way to blocking -- a gate whose refusals cannot be
+  # explained is one an agent learns to work around rather than satisfy.
+  if [ -n "${VERIFY_OUT:-}" ]; then
+    echo "butler continuity-gate: the pending wake-up was refused: ${VERIFY_OUT#REASON: }" >&2
+  fi
 fi
 
 # --- bounded nagging ---------------------------------------------------------
@@ -251,9 +232,19 @@ Do one of these NOW, in this turn:
     left to wake this session. Take the hold alongside whatever you dispatched,
     then poll it when the hold elapses and hold again if you are still waiting.
 
+  * if you are ENDING THE TURN TO ASK THE OPERATOR SOMETHING, say so -- that is
+    a legitimate end of a turn, not a stall, and the operator's reply is what
+    resumes the session:
+
+      perl $CONT_PL await-operator --reason "<what you asked>"
+
+    One turn only; the arm stays in force afterwards.
+
   * explicitly disarm: perl plugins/butler/scripts/bp-continuity.pl disarm
     (or /butler:continuity off) if the watched work is actually finished, or
-  * touch $MARK.stop-ok to skip just this once.
+  * touch $MARK.stop-ok to skip just this once (await-operator is the same
+    exemption with a reason attached, and does not need a permission layer to
+    let you touch a dotfile).
 
 (This will not block more than $MAX_BLOCKS times in a row.)
 EOF
