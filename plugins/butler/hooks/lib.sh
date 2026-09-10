@@ -472,6 +472,30 @@ bp_find_data_dir() {
 # fixes. A trailing slash, embedded spaces, non-ASCII characters, and even an
 # embedded newline after the leading slash/drive-letter are all accepted
 # verbatim — they are properties of a real path, not evidence of relativity.
+# bp_mtime FILE -- the file's mtime in epoch seconds, or 0 if it cannot be read.
+#
+# `stat -c %Y` is GNU-only. Every caller wrote `stat -c %Y "$f" 2>/dev/null ||
+# echo 0`, which on BSD/macOS takes the `|| echo 0` branch for a file that
+# exists and is perfectly readable -- and every one of those callers is an AGE
+# check. An age of "0 epoch" is either infinitely old or, in the comparisons
+# used here, indistinguishable from "cannot tell", so the effect is that TTL
+# reaping quietly stops happening: stale markers become immortal and the sweeps
+# that are supposed to clear an abandoned arm never fire.
+#
+# Windows and the Linux container both have GNU stat, so this is not a live
+# outage today -- it is a portability claim this repo makes and does not keep.
+# GNU first (no new cost where it works), BSD second, and perl last because
+# perl is the one thing every supported host is guaranteed to have.
+bp_mtime() {
+  local f="$1" mt
+  [ -n "$f" ] || { printf '0'; return 0; }
+  mt=$(stat -c %Y "$f" 2>/dev/null) && [ -n "$mt" ] && { printf '%s' "$mt"; return 0; }
+  mt=$(stat -f %m "$f" 2>/dev/null) && [ -n "$mt" ] && { printf '%s' "$mt"; return 0; }
+  mt=$(perl -e 'print ((stat($ARGV[0]))[9] // 0)' "$f" 2>/dev/null) \
+    && [ -n "$mt" ] && { printf '%s' "$mt"; return 0; }
+  printf '0'
+}
+
 bp_is_absolute_path() {
   case "$1" in
     /*) return 0 ;;
@@ -619,7 +643,7 @@ bp_drive_any_active() {
   for f in "$@"; do
     [ -f "$f" ] || continue
     if [ "$now" -gt 0 ]; then
-      mt=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+      mt=$(bp_mtime "$f")
       if [ "$mt" -gt 0 ] && [ $(( (now - mt) / 3600 )) -ge "$ttl" ]; then
         rm -f "$f" 2>/dev/null
         continue
@@ -758,7 +782,7 @@ bp_continuity_any_active() {
     base=$(basename "$f")
     case "$base" in *.*) continue ;; esac   # companion file, not a primary marker
     if [ "$now" -gt 0 ]; then
-      mt=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+      mt=$(bp_mtime "$f")
       if [ "$mt" -gt 0 ] && [ $(( (now - mt) / 3600 )) -ge "$ttl" ]; then
         rm -f "$f" "$f.wakeup-pending" "$f.stop-blocks" "$f.stop-ok" 2>/dev/null
         continue

@@ -112,7 +112,7 @@ bp_read_payload open
       RTTL_H="${CCPRAXIS_REPORTER_TTL_H:-12}"
       case "$RTTL_H" in ''|*[!0-9]*) RTTL_H=12 ;; esac
       RNOW=$(date +%s 2>/dev/null || echo 0)
-      RMT=$(stat -c %Y "$RMARK" 2>/dev/null || echo 0)
+      RMT=$(bp_mtime "$RMARK")
       if [ "$RNOW" -gt 0 ] && [ "$RMT" -gt 0 ] \
          && [ $(( (RNOW - RMT) / 3600 )) -ge "$RTTL_H" ]; then
         rm -f "$RMARK" 2>/dev/null
@@ -238,7 +238,7 @@ MARK=$(bp_drive_marker "$SID" 2>/dev/null) || exit 0
 TTL_H="${CCPRAXIS_DRIVE_TTL_H:-12}"
 case "$TTL_H" in ''|*[!0-9]*) TTL_H=12 ;; esac
 MNOW=$(date +%s 2>/dev/null || echo 0)
-MMT=$(stat -c %Y "$MARK" 2>/dev/null || echo 0)
+MMT=$(bp_mtime "$MARK")
 if [ "$MNOW" -gt 0 ] && [ "$MMT" -gt 0 ] \
    && [ $(( (MNOW - MMT) / 3600 )) -ge "$TTL_H" ]; then
   rm -f "$MARK" 2>/dev/null

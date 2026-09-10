@@ -96,7 +96,7 @@ if [ -f "$BP_DIR/runs/.paused" ] && [ ! -f "$BP_DIR/runs/.shutdown" ]; then
   fi
   # A paused stop must hand off CURRENT state — a stale ledger means the coordinator
   # didn't refresh before parking. Same freshness limit as the terminal path below.
-  PNOW=$(date +%s); PMT=$(stat -c %Y "$BP_LEDGER" 2>/dev/null || echo 0)
+  PNOW=$(date +%s); PMT=$(bp_mtime "$BP_LEDGER")
   PAGE_MIN=$(( (PNOW - PMT) / 60 )); PFRESH="${BP_LEDGER_FRESH_MIN:-15}"
   if [ "$PAGE_MIN" -gt "$PFRESH" ]; then
     echo "STOP BLOCKED: a fleet pause is active but the ledger is ${PAGE_MIN}m stale (limit ${PFRESH}m). Refresh '## Next action', and set last_updated with iso_now (or: date -u +%Y-%m-%dT%H:%M:%SZ) — never from memory, you have no clock — so the warm resume is clean, then stop." >&2
@@ -126,7 +126,7 @@ case "$STATUS" in
     exit 2 ;;
 esac
 
-NOW=$(date +%s); MT=$(stat -c %Y "$BP_LEDGER" 2>/dev/null || echo 0)
+NOW=$(date +%s); MT=$(bp_mtime "$BP_LEDGER")
 AGE_MIN=$(( (NOW - MT) / 60 ))
 FRESH="${BP_LEDGER_FRESH_MIN:-15}"
 if [ "$AGE_MIN" -gt "$FRESH" ]; then
