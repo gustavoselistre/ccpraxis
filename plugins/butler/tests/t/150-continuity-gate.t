@@ -684,4 +684,47 @@ PROBE_EOF
     ok(!-f $wp2, 'V5: and IS removed -- a dead promise cannot be re-read later');
 }
 
+# ===========================================================================
+# R. THE REMEDY IS RUNNABLE, whatever the hook's PATH happens to be.
+#
+# A hook does not run in the agent's shell. The agent's Bash calls are
+# profile-initialised and re-read the user's PATH; this hook inherits whatever
+# PATH the long-running Claude Code process started with, which can predate a
+# newly added bin directory by an entire session. Observed exactly that: the
+# first block message after adding the shim printed the fallback, while
+# `bp-continuity.sh` resolved in every shell the agent had.
+#
+# So a PATH miss says nothing about whether the short form would work for the
+# READER, and the fallback has to be good rather than merely correct.
+# ===========================================================================
+{
+    my $root = new_project();
+    my $cdir = tempdir(CLEANUP => 1);
+    plant_marker($cdir, 'sess-r');
+
+    # With no shim reachable on PATH, the message must still name something
+    # directly runnable -- and not make the reader assemble it.
+    local $ENV{PATH} = '/usr/bin:/bin';
+    my (undef, $out) = run_gate(stop_payload($root, 'sess-r'), cdir => $cdir);
+
+    like($out, qr/hold --seconds \d+/,
+         'R1: the hold remedy is a complete, runnable invocation');
+    unlike($out, qr{/\.\./},
+         'R2 CANONICAL: no unresolved `/../` reaches the reader');
+    like($out, qr{(?:^|\s)(?:\S*bp-continuity\.sh|bp-continuity|perl \S+bp-continuity\.pl) hold}m,
+         'R3: and it resolves to a shim, a shim path, or perl + the script -- never a bare '
+       . 'verb the reader has to work out how to invoke');
+
+    # Every remedy in the message uses the SAME spelling. A message that named
+    # the command three different ways would teach the reader that the spelling
+    # is guesswork.
+    # Command lines only. The message's prose is indented 5 columns and its
+    # runnable lines 9, and the prose legitimately contains the verbs ("Take the
+    # hold alongside it"), so an indent-blind match reads sentences as commands.
+    my @spellings = ($out =~ /^ {8,}(\S+) (?:hold|await-operator|disarm)\b/mg);
+    my %uniq = map { $_ => 1 } @spellings;
+    cmp_ok(scalar(keys %uniq), '<=', 1,
+       'R4: all three remedies are spelled with one consistent command form');
+}
+
 done_testing();

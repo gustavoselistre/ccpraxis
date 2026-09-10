@@ -572,6 +572,36 @@ sub cmd_await_operator {
     $reason = 'waiting for the operator' unless defined $reason && length $reason;
     $reason =~ s/[\r\n]+/ /g;
 
+    # NOT WHILE A RUN IS IN FLIGHT.
+    #
+    # This verb exists so a turn can end honestly when a human has been asked.
+    # It must not become the way an UNATTENDED run stops dead. The operator's
+    # report is blunt about the pattern: "a whole unattended run halt because of
+    # some blocking user input... 99% of the times it was not actually necessary
+    # and could have progressed while batching the question to the end".
+    #
+    # An active run is exactly the state where nobody is watching, so a question
+    # asked now is answered hours later at best. The question is not discarded --
+    # it is appended to the run's question queue, which is what "batch it to the
+    # end" needs to be more than an instruction -- and the turn is refused, so
+    # the agent carries on with the work it can still do.
+    #
+    # A PAUSED or FINISHED run does not trip this: the first has a watcher and
+    # the second is over. Only `active` means work is underway right now.
+    my $run_state = active_run_state();
+    if (defined $run_state) {
+        record_question($reason);
+        emit('STATUS', 'refused_run_active');
+        emit('RUN_STATE', $run_state);
+        emit('QUESTION_QUEUED', questions_path() // '(could not record)');
+        emit('ERROR', 'a run is ACTIVE, so this would halt unattended work for an answer '
+                    . 'nobody is there to give. The question has been queued; batch it with '
+                    . 'the others and keep going. If it truly blocks everything, finish or '
+                    . 'pause the run first (bp-runstate.pl finish|pause), which is a '
+                    . 'deliberate act rather than a side effect of asking.');
+        exit 3;
+    }
+
     my $sid = resolve_session($opts);
     my $dir = resolve_registry_dir_or_die();
     my $mark = continuity_marker($sid, $dir);
@@ -601,6 +631,47 @@ sub cmd_await_operator {
     emit('REASON',  $reason);
     emit('NOTE', 'this permits exactly ONE turn to end and is consumed by the gate; '
                . 'the arm stays in force for every turn after it');
+}
+
+# active_run_state() -> the run's state when it is ACTIVE, else undef.
+#
+# Read through BpRunState so this agrees with guard-subagent-stall.sh rather
+# than forming a second opinion: `effective` resolves a pause whose watcher died
+# back to active, and that resolution is the whole reason a stale pause cannot
+# keep permitting things.
+sub active_run_state {
+    my $rs = "$SCRIPT_DIR/bp-runstate.pl";
+    return undef unless -f $rs;
+    my $out = `"$^X" "$rs" status 2>/dev/null`;
+    return undef unless defined $out && $out =~ /"state"\s*:\s*"([a-z_]+)"/;
+    my $state = $1;
+    return $state eq 'active' ? $state : undef;
+}
+
+# Where a deferred question goes. Beside the run state it belongs to, not in
+# the continuity registry: the queue is a property of the RUN (it is emptied
+# when the run is reported on), and continuity is per session.
+sub questions_path {
+    my $rs = "$SCRIPT_DIR/bp-runstate.pl";
+    return undef unless -f $rs;
+    my $dir = `"$^X" "$rs" state-dir 2>/dev/null`;
+    return undef unless defined $dir;
+    chomp $dir;
+    return undef unless length $dir;
+    return "$dir/questions.md";
+}
+
+# APPEND, never overwrite. Several questions across a long run are the norm, and
+# the whole point is that none of them is lost.
+sub record_question {
+    my ($text) = @_;
+    my $p = questions_path() or return 0;
+    my $d = dirname($p);
+    make_path($d) unless -d $d;
+    open my $fh, '>>', $p or return 0;
+    print {$fh} '- [' . iso_now() . "] $text\n";
+    close $fh;
+    return 1;
 }
 
 # ── Helpers ────────────────────────────────────────────────

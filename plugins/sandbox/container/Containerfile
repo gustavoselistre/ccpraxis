@@ -172,6 +172,24 @@ RUN curl -sSL --connect-timeout 10 --max-time 180 --retry 2 --retry-delay 3 --re
 # -- a silent failure far harder to diagnose than this loud one.
 ENV PATH="/opt/node24/bin:${PATH}"
 
+# ccpraxis plugin shims, so the verbs a hook tells the agent to run are
+# reachable BY NAME inside a sandbox and not only on the host.
+#
+# WHY THIS IS BAKED RATHER THAN WIRED AT LAUNCH. On the host, plugin bin dirs
+# reach PATH through each plugin's ccpraxis-install.pl. A container never runs
+# that installer -- it bind-mounts the live plugin tree read-only and starts --
+# so without this the in-container agent gets the fallback spelling of every
+# remedy (a fully resolved path) while the host agent gets `bp-continuity.sh`.
+#
+# The mount target is fixed by the launcher (launcher.pl: the directory-source
+# marketplace is bound at /root/.claude/plugins/marketplaces/<name>), and
+# ccpraxis-local is that marketplace. The directory is absent until the bind
+# happens, which costs nothing: a PATH entry that does not resolve is skipped.
+#
+# Verified: a Windows bind mount presents these files as 0777 inside the
+# container, so the shims are executable there without the host's chmod.
+ENV PATH="/root/.claude/plugins/marketplaces/ccpraxis-local/butler/bin:${PATH}"
+
 # pnpm supply-chain hardening -- separate from the npm_config_ignore_scripts
 # key above (that one governs npm; pnpm reads its own PNPM_CONFIG_* env).
 # MINIMUM_RELEASE_AGE is in MINUTES: 10080 = 7 days, matching the >=7-day

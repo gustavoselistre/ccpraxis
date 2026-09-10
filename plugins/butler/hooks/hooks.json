@@ -1,83 +1,177 @@
 {
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
-        "hooks": [
-          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gate-shutdown.sh\"", "timeout": 15 },
-          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-writes.sh\"", "timeout": 15 },
-          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/ledger-guard.sh\"", "timeout": 15 }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-bash.sh\"", "timeout": 15 },
-          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/mark-wakeup.sh\"", "timeout": 15 },
-          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gate-headless-background.sh\"", "timeout": 15 },
-          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-judge-checks.sh\"", "timeout": 15 },
-          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-validation-interlock.sh\"", "timeout": 15 }
-        ]
-      },
-      {
-        "matcher": "Task",
-        "hooks": [
-          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gate-shutdown.sh\"", "timeout": 15 },
-          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/track-dispatch.sh\"", "timeout": 15 },
-          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/mark-wakeup.sh\"", "timeout": 15 }
-        ]
-      },
-      {
-        "hooks": [
-          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/repeat-guard.sh\"", "timeout": 15 }
-        ]
-      },
-      {
-        "hooks": [
-          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/wait-shape-guard.sh\"", "timeout": 15 }
-        ]
-      },
-      {
-        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
-        "hooks": [
-          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-blueprint-write.sh\"", "timeout": 15 }
-        ]
-      },
-      {
-        "matcher": "Agent",
-        "hooks": [
-          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/mark-wakeup.sh\"", "timeout": 15 }
-        ]
-      },
-      {
-        "matcher": "Task|Agent",
-        "hooks": [
-          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/track-worker-solo.sh\"", "timeout": 15 }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Task",
-        "hooks": [
-          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/log-dispatch.sh\"", "timeout": 15 }
-        ]
-      },
-      {
-        "matcher": "Task|Agent",
-        "hooks": [
-          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/untrack-worker-solo.sh\"", "timeout": 15 }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gate-stop.sh\"", "timeout": 15 },
-          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gate-drive-loop.sh\"", "timeout": 30 },
-          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gate-continuity.sh\"", "timeout": 15 }
-        ]
-      }
-    ]
-  }
+   "hooks" : {
+      "PostToolUse" : [
+         {
+            "hooks" : [
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/log-dispatch.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Task"
+         },
+         {
+            "hooks" : [
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/untrack-worker-solo.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Task|Agent"
+         }
+      ],
+      "PreToolUse" : [
+         {
+            "hooks" : [
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gate-shutdown.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               },
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-writes.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               },
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/ledger-guard.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Edit|Write|MultiEdit|NotebookEdit"
+         },
+         {
+            "hooks" : [
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-bash.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               },
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/mark-wakeup.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               },
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gate-headless-background.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               },
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-judge-checks.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               },
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-validation-interlock.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Bash"
+         },
+         {
+            "hooks" : [
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gate-shutdown.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               },
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/track-dispatch.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               },
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/mark-wakeup.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Task"
+         },
+         {
+            "hooks" : [
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/repeat-guard.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ]
+         },
+         {
+            "hooks" : [
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/wait-shape-guard.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ]
+         },
+         {
+            "hooks" : [
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-blueprint-write.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Edit|Write|MultiEdit|NotebookEdit"
+         },
+         {
+            "hooks" : [
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/mark-wakeup.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Agent"
+         },
+         {
+            "hooks" : [
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/track-worker-solo.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Task|Agent"
+         },
+         {
+            "hooks" : [
+               {
+                  "command" : "\"$CLAUDE_PLUGIN_ROOT\"/hooks/guard-ask-operator.sh",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "AskUserQuestion"
+         }
+      ],
+      "Stop" : [
+         {
+            "hooks" : [
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gate-stop.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               },
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gate-drive-loop.sh\"",
+                  "timeout" : 30,
+                  "type" : "command"
+               },
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gate-continuity.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ]
+         }
+      ]
+   }
 }
