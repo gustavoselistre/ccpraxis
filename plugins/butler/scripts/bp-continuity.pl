@@ -12,7 +12,7 @@
 #   disarm [--session <id>]
 #   status [--session <id>]
 #
-# Session resolution: every candidate id, not one — see session_candidates().
+# Session resolution: see resolve_session_full() and BpSession.pm.
 # ERROR (exit 1) when there is none, because this is a direct, non-hook
 # invocation and silently no-op-ing on a missing session id would be exactly
 # the "correct, tested, never invoked" defect this run has hit repeatedly.
@@ -45,6 +45,13 @@ use warnings;
 use POSIX qw(strftime);
 use IO::Handle;
 use File::Path qw(make_path);
+use File::Basename qw(dirname);
+use File::Spec;
+
+# The session-identity resolver. All of "which session am I" lives there, once,
+# for every consumer -- see BpSession.pm's header.
+my $SCRIPT_DIR = dirname(File::Spec->rel2abs(__FILE__));
+require "$SCRIPT_DIR/BpSession.pm";
 
 my $cmd = shift @ARGV // '';
 
@@ -70,7 +77,6 @@ sub cmd_arm {
         exit 1;
     }
 
-    my @sids = session_candidates($opts);         # already emitted+exited if empty
     my $by = $opts->{by} // 'agent';
     unless ($by eq 'operator' || $by eq 'agent') {
         emit('STATUS', 'error');
@@ -79,86 +85,78 @@ sub cmd_arm {
     }
 
     my $dir = resolve_registry_dir_or_die();
-
-    # AN EXPLICITLY-PASSED ID IS VALIDATED BEFORE ANYTHING IS ARMED. Candidates
-    # gathered from the environment may be quietly skipped when malformed --
-    # they are a safety net, and a broken net should not fail the call. But
-    # --session is a direct instruction, and letting an env candidate silently
-    # stand in for a caller's invalid id would arm SOMETHING while reporting
-    # success for a request that was never honoured. That is the same class of
-    # lie this whole change exists to remove.
-    if (defined $opts->{session} && length $opts->{session}
-            && !defined continuity_marker($opts->{session}, $dir)) {
-        emit('STATUS', 'error');
-        emit('ERROR',  "invalid session id: $opts->{session}");
-        exit 1;
-    }
-
     make_path($dir) unless -d $dir;
     my $since = iso_now();
 
-    my @armed;
-    my @bad;
-    my $first = 1;
-    for my $sid (@sids) {
+    # ── explicit id: arm it directly ───────────────────────────────────────
+    # The direct path stays for callers that genuinely know the id -- the gate's
+    # own claim step, tests, and an operator repairing state by hand. It is not
+    # the path /butler:continuity uses, because a skill body cannot know the id.
+    if (defined $opts->{session} && length $opts->{session}) {
+        my $sid = $opts->{session};
         my $mark = continuity_marker($sid, $dir);
         unless (defined $mark) {
-            push @bad, $sid;
-            next;
+            emit('STATUS', 'error');
+            emit('ERROR',  "invalid session id: $sid");
+            exit 1;
         }
-        # SECONDARY CANDIDATES ARE TAGGED, and the reason is concurrency. The
-        # registry is shared: every session on this host (or in this sandbox)
-        # keys its marker into the same directory by session id. That is the
-        # right model -- one marker per session, and the gate looks up its own.
-        # Arming EXTRA candidate ids is what makes a stale id survivable, but it
-        # also means that if a candidate id happens to be some OTHER live
-        # session, that session gets armed without its operator asking.
-        #
-        # It cannot be prevented from here: no non-hook caller can learn which
-        # session Claude Code considers live (see session_candidates). What it
-        # can do is refuse to be silent about it. A tagged marker lets the gate
-        # explain itself when it blocks a session nobody deliberately armed,
-        # which turns a mystery into a one-line fix ("disarm").
-        my $tag = $first ? '' : ' candidate';
         open my $fh, '>', $mark or do {
             emit('STATUS', 'error');
             emit('ERROR',  "Cannot write $mark: $!");
             exit 1;
         };
-        print {$fh} "$by $since$tag\n";
+        print {$fh} "$by $since\n";
         close $fh;
-        $first = 0;
         # Explicit touch: on some filesystems a fresh open+print already sets
         # mtime to now, but idempotent re-arm (behavior 8) requires the mtime to
-        # move forward on every arm call, not just the first — utime() makes that
-        # true unconditionally rather than depending on open() semantics.
+        # move forward on every arm call, not just the first — utime() makes
+        # that true unconditionally rather than depending on open() semantics.
         my $now = time();
         utime($now, $now, $mark);
-        push @armed, $sid;
+
+        emit('STATUS',   'armed');
+        emit('SESSION',  $sid);
+        emit('ARMED_BY', $by);
+        emit('SINCE',    $since);
+        return;
     }
 
-    unless (@armed) {
+    # ── no id: write a ticket and let the gate bind it ─────────────────────
+    #
+    # The nonce reaches this session's transcript by being printed, and the Stop
+    # hook binds the ticket to the session whose transcript carries it AND whose
+    # payload session_id matches. Nothing is armed until then, which is exactly
+    # when it first matters: the gate is a Stop hook, so binding at the first
+    # Stop cannot miss an enforcement point.
+    #
+    # This is the whole fix. The previous version guessed an id from a template
+    # substitution and reported success either way; if the guess was wrong, the
+    # gate looked up a marker that did not exist and exited silently.
+    my $nonce = BpSession::new_nonce();
+    my $pending = "$dir/pending";
+    make_path($pending) unless -d $pending;
+
+    my $ticket = "$pending/$nonce";
+    open my $fh, '>', $ticket or do {
         emit('STATUS', 'error');
-        emit('ERROR',  'invalid session id' . (@bad > 1 ? 's' : '') . ': '
-                      . join(', ', @bad));
+        emit('ERROR',  "Cannot write $ticket: $!");
         exit 1;
-    }
+    };
+    print {$fh} "$by $since\n";
+    close $fh;
 
-    emit('STATUS',   'armed');
-    emit('SESSION',  $armed[0]);
+    # The beacon lets status/disarm resolve THIS session between Stops. Keyed by
+    # a process-scoped value that only has to be stable, never correct: whatever
+    # it says, the nonce it points at resolves through the transcript.
+    write_beacon($dir, $nonce);
+
+    emit('STATUS',  'arming');
+    emit('NONCE',   $nonce);
     emit('ARMED_BY', $by);
-    emit('SINCE',    $since);
-
-    # SAY IT WHEN THE SOURCES DISAGREE. Both markers are live, so the gate will
-    # find whichever session is real -- but the operator should know that the
-    # ambiguity existed rather than discover it from a gate that never fired.
-    if (@armed > 1) {
-        emit('ALSO_ARMED', join(', ', @armed[1 .. $#armed]));
-        emit('NOTE', 'the session-id sources disagreed; every candidate is armed '
-                   . 'so the gate cannot miss the live one. Run `status` after a '
-                   . 'turn or two to see which one the gate is actually using.');
-    }
-    emit('WARN', 'ignored invalid session id: ' . join(', ', @bad)) if @bad;
+    emit('SINCE',   $since);
+    emit('NOTE', 'the arm binds to this session at the next turn boundary, when '
+               . 'the Stop hook can confirm which session actually printed this '
+               . 'nonce. Run `status` after that to see it bound.');
 }
 
 sub cmd_disarm {
@@ -173,7 +171,27 @@ sub cmd_disarm {
         exit 1;
     }
 
+    # An UNBOUND ticket is also an arm, and disarm has to reach it. Otherwise
+    # "off" would report not_armed while a ticket sat waiting to bind at the
+    # next turn boundary -- arming the session the operator had just switched
+    # off. Done before the marker check so it happens on both paths.
+    my $ticket_dropped = 0;
+    if (my $nonce = read_beacon($dir)) {
+        if (-f "$dir/pending/$nonce") {
+            unlink "$dir/pending/$nonce";
+            $ticket_dropped = 1;
+        }
+        my $bp = beacon_path($dir);
+        unlink $bp if defined $bp && -f $bp;
+    }
+
     unless (-f $mark) {
+        if ($ticket_dropped) {
+            emit('STATUS',  'disarmed');
+            emit('SESSION', $sid);
+            emit('NOTE',    'a pending arm was cancelled before it bound');
+            return;
+        }
         emit('STATUS',  'not_armed');
         emit('SESSION', $sid);
         exit 2;
@@ -231,8 +249,7 @@ sub iso_to_epoch {
 
 sub cmd_status {
     my $opts = parse_args(qw(session));
-    my @sids = session_candidates($opts);
-    my $sid  = $sids[0];
+    my ($sid, $confidence) = resolve_session_full($opts);
 
     my $dir = resolve_registry_dir_or_die();
     my $mark = continuity_marker($sid, $dir);
@@ -243,13 +260,26 @@ sub cmd_status {
     }
 
     unless (-f $mark) {
+        # An arm that has not reached a turn boundary yet is not "unarmed" --
+        # it is waiting for the Stop hook to confirm which session printed its
+        # nonce. Saying "unarmed" here would look exactly like the failure this
+        # whole mechanism removes.
+        if (my $nonce = read_beacon($dir)) {
+            if (-f "$dir/pending/$nonce") {
+                emit('STATUS', 'arming');
+                emit('NONCE',  $nonce);
+                emit('NOTE', 'a ticket is waiting to bind at the next turn '
+                           . 'boundary; nothing is enforced until it does');
+                return;
+            }
+        }
         emit('STATUS',  'unarmed');
         emit('SESSION', $sid);
-        report_other_candidates($dir, $sid, @sids);
+        emit('CONFIDENCE', $confidence);
         return;
     }
 
-    my ($by, $since, $tag) = read_marker($mark);
+    my ($by, $since) = read_marker($mark);
     unless (defined $by || defined $since) {
         emit('STATUS',  'unarmed');
         emit('SESSION', $sid);
@@ -258,27 +288,20 @@ sub cmd_status {
 
     emit('STATUS',   'armed');
     emit('SESSION',  $sid);
+    emit('CONFIDENCE', $confidence);
     emit('ARMED_BY', $by // 'unknown');
     emit('SINCE',    $since // '');
-    if (defined $tag && $tag eq 'candidate') {
-        emit('ARMED_AS', 'candidate');
-        emit('NOTE', 'this marker was written as a FALLBACK candidate by an arm '
-                   . 'whose session-id sources disagreed -- possibly by another '
-                   . 'session. If this session was never meant to be watched, '
-                   . 'disarm it.');
-    }
 
     # HAS THE GATE ACTUALLY RUN FOR THIS MARKER?
-    # This is the whole diagnostic,
-    # and it is decisive rather than circumstantial: gate-continuity.sh touches
-    # the marker on every run that gets past its TTL check, so a marker whose
-    # mtime is still its arm time is a marker no gate has ever looked up. That
-    # is exactly what an arm keyed to the wrong session id looks like from the
-    # inside -- "armed", enforcing nothing -- and it is the reason that failure
-    # went unnoticed until an operator counted turn boundaries by hand.
+    # This is the diagnostic, and it is decisive rather than circumstantial:
+    # gate-continuity.sh touches the marker on every run that gets past its TTL
+    # check, so a marker whose mtime is still its arm time is a marker no gate
+    # has ever looked up. With the ticket flow that should no longer be possible
+    # -- the gate is what created the marker -- so if this ever says no, the
+    # binding assumption itself is wrong and that is worth surfacing loudly.
     #
-    # A grace period, because "armed 4 seconds ago" has legitimately not
-    # reached a Stop boundary yet. Past that, silence is the finding.
+    # A grace period, because "armed 4 seconds ago" has legitimately not reached
+    # a Stop boundary yet. Past that, silence is the finding.
     my $armed_at = iso_to_epoch($since);
     my $mtime    = (stat $mark)[9];
     if (defined $armed_at && defined $mtime) {
@@ -289,24 +312,10 @@ sub cmd_status {
         if (!$seen && $age >= 120) {
             emit('WARN', "the Stop gate has not run for this session id in the "
                        . "${age}s since it was armed. Either no turn has ended "
-                       . "yet, or this id is not the session Claude Code thinks "
-                       . "is live -- in which case the arm is enforcing nothing. "
-                       . "Re-run arm (it marks every candidate id) and compare.");
+                       . "yet, or this marker is keyed to a session Claude Code "
+                       . "does not consider live -- in which case it is "
+                       . "enforcing nothing. Disarm and re-arm to rebind.");
         }
-    }
-
-    report_other_candidates($dir, $sid, @sids);
-}
-
-# When the session-id sources disagree, say what the OTHER candidates look
-# like. Reporting only the most-trusted one is how a mismatch stays invisible.
-sub report_other_candidates {
-    my ($dir, $primary, @sids) = @_;
-    for my $sid (@sids) {
-        next if $sid eq $primary;
-        my $mark = continuity_marker($sid, $dir) or next;
-        my $state = (-f $mark) ? 'armed' : 'unarmed';
-        emit('OTHER_CANDIDATE', "$sid ($state)");
     }
 }
 
@@ -427,64 +436,87 @@ sub iso_now {
 }
 
 # resolve_session(\%opts) -> session id, or exits 1 with STATUS: error.
-# session_candidates($opts) -> list of distinct session ids this invocation
-# could plausibly be about, most-trusted first. NEVER empty (it exits first).
+# ── which session am I ─────────────────────────────────────────────────────
 #
-# WHY A LIST AND NOT A VALUE. An arm keys a marker by session id; the gate
-# looks up the marker by the session_id in its OWN hook payload, which is what
-# Claude Code considers live, and exit 0's SILENTLY when there is no marker for
-# it (gate-continuity.sh). So any disagreement about "which session is this"
-# produces the worst possible outcome: arm reports success and watches nothing.
-# It was reported from a live session -- armed, reported armed, and the gate
-# never ran -- after exiting a session, rebuilding the container, and relaunching
-# with the previous conversation resumed.
+# THE ANSWER IS NOT AVAILABLE DIRECTLY, and pretending otherwise is what broke.
+# See BpSession.pm's header for the full account; the short version is that
+# ${CLAUDE_SESSION_ID} is a template substitution baked into a skill body at
+# render time (not an env var, and never verified), while the gate that consumes
+# the marker uses the session_id from its own hook payload and exits silently
+# when the two disagree.
 #
-# TWO THINGS ARE INDEPENDENTLY TRUE, and only the first is verified here:
+# So this script does not guess. `arm` writes a TICKET carrying a nonce and
+# prints the nonce, which lands in the arming session's transcript; the Stop
+# hook -- which IS told the live session id -- binds that ticket to the session
+# whose transcript actually carries the nonce. Two independent facts must agree
+# before anything is armed, which is what makes it safe with any number of
+# concurrent sessions sharing one registry.
 #
-#   1. The documented fallback was already dead. This resolved --session, else
-#      $CLAUDE_SESSION_ID -- and $CLAUDE_SESSION_ID is NOT SET in this harness's
-#      Bash environment at all (measured). $CLAUDE_CODE_SESSION_ID is. So the id
-#      substituted into the /butler:continuity skill body was the ONLY source,
-#      with no cross-check and no second chance.
-#   2. That substituted id is reported to have been a stale, pre-resume session
-#      id. Plausible and consistent with the evidence (the marker's mtime had
-#      not moved across two turn boundaries, and the gate touches it on every
-#      run past the TTL check) but NOT reproduced here, and not something this
-#      script should stake correctness on.
-#
-# So resolution does not pick a winner. It collects every candidate and arm
-# marks ALL of them: if the two sources disagree, one marker is the live session
-# and the other is reaped by the existing TTL sweep. Being right becomes
-# independent of which source was stale -- which is what makes this a workaround
-# for a harness behaviour we do not control rather than a bet on a diagnosis.
-sub session_candidates {
-    my ($opts) = @_;
-    my @raw = (
-        $opts->{session},
-        $ENV{CLAUDE_SESSION_ID},
-        $ENV{CLAUDE_CODE_SESSION_ID},
-    );
-    my (@out, %seen);
-    for my $sid (@raw) {
-        next unless defined $sid && length $sid;
-        next if $seen{$sid}++;
-        push @out, $sid;
-    }
-    unless (@out) {
-        emit('STATUS', 'error');
-        emit('ERROR',  'no session id: pass --session, or set $CLAUDE_SESSION_ID '
-                      . 'or $CLAUDE_CODE_SESSION_ID');
-        exit 1;
-    }
-    return @out;
+# For `status` and `disarm`, which run between Stops and need an answer now, the
+# nonce is remembered in a beacon keyed by $CLAUDE_CODE_SESSION_ID. That key
+# only has to be STABLE within a process, not correct: whatever it says, the
+# nonce it points at resolves through the transcript to the real session id.
+sub beacon_path {
+    my ($dir) = @_;
+    my $key = $ENV{CLAUDE_CODE_SESSION_ID};
+    return undef unless defined $key && length $key;
+    return undef if $key =~ m{[/\*.\x00]};
+    return "$dir/beacons/$key";
 }
 
-# resolve_session($opts) -> the single most-trusted candidate. For disarm and
-# status, which act on one marker; arm uses session_candidates directly.
+sub write_beacon {
+    my ($dir, $nonce) = @_;
+    my $bp = beacon_path($dir) or return 0;
+    make_path(dirname($bp)) unless -d dirname($bp);
+    open my $fh, '>', $bp or return 0;
+    print {$fh} "$nonce\n";
+    close $fh;
+    return 1;
+}
+
+sub read_beacon {
+    my ($dir) = @_;
+    my $bp = beacon_path($dir) or return undef;
+    open my $fh, '<', $bp or return undef;
+    my $n = <$fh>;
+    close $fh;
+    chomp($n //= '');
+    return length($n) ? $n : undef;
+}
+
+# resolve_session($opts) -> ($sid, $confidence). $confidence is:
+#   'explicit'   -- the caller passed --session
+#   'verified'   -- resolved through a beacon nonce to a transcript record
+#   'unverified' -- the process-scoped env value, with nothing to check it
+# Exits 1 when there is nothing at all.
+sub resolve_session_full {
+    my ($opts) = @_;
+
+    my $explicit = $opts->{session};
+    return ($explicit, 'explicit') if defined $explicit && length $explicit;
+
+    my $dir = continuity_active_dir();
+    if (defined $dir) {
+        if (my $nonce = read_beacon($dir)) {
+            if (my $sid = BpSession::session_for_nonce($nonce)) {
+                return ($sid, 'verified');
+            }
+        }
+    }
+
+    my $env = $ENV{CLAUDE_CODE_SESSION_ID};
+    return ($env, 'unverified') if defined $env && length $env;
+
+    emit('STATUS', 'error');
+    emit('ERROR',  'cannot determine this session: pass --session, or run `arm` '
+                  . 'first so a beacon exists to resolve through');
+    exit 1;
+}
+
 sub resolve_session {
     my ($opts) = @_;
-    my @c = session_candidates($opts);
-    return $c[0];
+    my ($sid) = resolve_session_full($opts);
+    return $sid;
 }
 
 # continuity_active_dir() -> the registry dir, or undef if UNRESOLVABLE.

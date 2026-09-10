@@ -57,11 +57,50 @@ MAX_BLOCKS=3
 # overwhelming common case (no one armed anywhere) costs stats only, and this
 # is where a stale marker belonging to ANY session gets reaped, regardless of
 # who is calling right now.
-bp_continuity_any_active || exit 0
+# --- cheap pre-check, now counting UNBOUND arms too --------------------------
+#
+# bp_continuity_any_active exits when no MARKER exists anywhere. A pending
+# TICKET is not a marker -- it is an arm waiting to learn which session it
+# belongs to -- so checking markers alone would exit before the ticket could
+# ever bind, and every arm would silently do nothing. That is precisely the
+# class of failure the ticket flow replaces, so it must not be reintroduced
+# here. Cost when nothing is pending: one directory test.
+CONT_DIR=$(bp_continuity_active_dir 2>/dev/null || true)
+HAVE_PENDING=0
+if [ -n "${CONT_DIR:-}" ] && [ -d "$CONT_DIR/pending" ]; then
+  for _t in "$CONT_DIR"/pending/*; do
+    [ -e "$_t" ] || break
+    HAVE_PENDING=1
+    break
+  done
+fi
 
+if [ "$HAVE_PENDING" -eq 0 ]; then
+  bp_continuity_any_active || exit 0
+fi
+
+# READ THE PAYLOAD EXACTLY ONCE. bp_read_payload consumes stdin (`read -r -d ''`),
+# so a second call finds nothing and, in `open` mode, waits out the timeout and
+# exits 0 -- which would make this gate stand aside on every single stop while
+# looking perfectly healthy. One read, then $SID is reused below.
 bp_read_payload open
 SID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
 [ -n "$SID" ] || exit 0
+
+# --- bind any pending arm to THIS session ------------------------------------
+#
+# `bp-continuity.pl arm` cannot know which session Claude Code considers live: a
+# Bash tool call is never told. THIS hook is told, in its payload. So arming
+# writes a ticket carrying a nonce and prints the nonce into its own session's
+# transcript, and the binding happens here, where the live id is a fact rather
+# than a guess. bp-session.pl binds a ticket only when the transcript record
+# carrying its nonce names the SAME session as this payload -- two independent
+# facts agreeing, which is what makes it safe for any number of concurrent
+# sessions sharing one registry.
+if [ "$HAVE_PENDING" -eq 1 ]; then
+  perl "$HOOK_DIR/../scripts/bp-session.pl" claim --session "$SID" >/dev/null 2>&1 || true
+fi
+
 MARK=$(bp_continuity_marker "$SID" 2>/dev/null) || exit 0
 [ -f "$MARK" ] || exit 0
 

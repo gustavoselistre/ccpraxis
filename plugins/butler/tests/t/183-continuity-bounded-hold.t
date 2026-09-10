@@ -28,17 +28,14 @@
 #    the deadline and delivers it (it sleeps, then exits; a backgrounded command
 #    that exits is what re-invokes the session).
 #
-# AC1  every candidate id is armed, not just the most-trusted one
-# AC2  the disagreement is reported (ALSO_ARMED), never resolved silently
-# AC3  fallback markers are tagged, so a session armed by someone else's arm
-#      can find out why
-# AC4  an explicitly-passed INVALID id is an error, never quietly replaced by
-#      an env candidate
-# AC5  status proves whether the gate has run (GATE_SEEN), and warns when it
+# AC1  an explicitly-passed INVALID id is an error, never quietly replaced
+# AC2  status proves whether the gate has run (GATE_SEEN), and warns when it
 #      has not
-# AC6  hold writes a bounded marker with a future deadline, then returns
-# AC7  hold refuses a wait longer than the marker's own TTL
-# AC8  hold on an unarmed session is a timer and says so, writing no marker
+# AC3  hold writes a bounded marker with a future deadline, then returns
+# AC4  hold refuses a wait longer than the marker's own TTL
+# AC5  hold on an unarmed session is a timer and says so, writing no marker
+#
+# The identity half -- tickets, nonces, and the gate binding them -- is t/184.
 use strict;
 use warnings;
 use Test::More;
@@ -71,56 +68,14 @@ sub kv {
 
 sub reg { return tempdir(CLEANUP => 1) }
 
-# ── AC1/AC2/AC3 — disagreeing sources ─────────────────────────────────────
-{
-    my $r = reg();
-    my ($out, $rc) = run_cli(
-        ['arm', '--session', 'sid-explicit', '--by', 'operator'],
-        { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $r, BP_LEDGER => undef,
-          CLAUDE_SESSION_ID => undef, CLAUDE_CODE_SESSION_ID => 'sid-from-env' },
-    );
-    is($rc, 0, 'AC1 arm succeeds when the sources disagree');
-    is(kv($out, 'SESSION'), 'sid-explicit',
-       'AC1 --session remains the primary, reported id');
-    ok(-f "$r/sid-explicit", 'AC1 the explicit id is armed');
-    ok(-f "$r/sid-from-env",
-       'AC1 the env candidate is ALSO armed -- a stale primary cannot leave the live '
-     . 'session unwatched');
-    is(kv($out, 'ALSO_ARMED'), 'sid-from-env',
-       'AC2 the disagreement is reported rather than resolved silently');
-    ok(defined kv($out, 'NOTE'), 'AC2 with a note explaining why both are armed');
+# The blocks that used to stand here asserted the FIRST attempt at this: arm
+# every candidate session id it could find, tag the fallbacks, and report the
+# disagreement. That was a workaround for not knowing which session was live,
+# and it carried a real cost -- a candidate id could be another LIVE session,
+# which would then be armed without its operator asking. It is superseded by the
+# ticket flow (t/184), which does not guess at all.
 
-    open my $fh, '<', "$r/sid-from-env" or die $!;
-    my $line = <$fh>;
-    close $fh;
-    like($line, qr/\bcandidate\b/,
-         'AC3 the fallback marker is tagged, so the session it armed can find out why');
-
-    open my $fh2, '<', "$r/sid-explicit" or die $!;
-    my $line2 = <$fh2>;
-    close $fh2;
-    unlike($line2, qr/\bcandidate\b/, 'AC3 the primary marker is not tagged');
-
-    my ($sout) = run_cli(['status', '--session', 'sid-from-env'],
-                         { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $r,
-                           CLAUDE_SESSION_ID => undef, CLAUDE_CODE_SESSION_ID => undef });
-    is(kv($sout, 'ARMED_AS'), 'candidate', 'AC3 status surfaces the tag');
-}
-
-# Agreement: one id, one marker, no noise.
-{
-    my $r = reg();
-    my ($out, $rc) = run_cli(
-        ['arm', '--session', 'sid-same'],
-        { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $r, BP_LEDGER => undef,
-          CLAUDE_SESSION_ID => undef, CLAUDE_CODE_SESSION_ID => 'sid-same' },
-    );
-    is($rc, 0, 'AC2 arm succeeds when the sources agree');
-    is(kv($out, 'ALSO_ARMED'), undef,
-       'AC2 no ALSO_ARMED when there is nothing to disagree about');
-}
-
-# ── AC4 — an invalid explicit id is an error, not a silent substitution ────
+# ── AC1 — an invalid explicit id is an error, not a silent substitution ────
 {
     my $r = reg();
     my ($out, $rc) = run_cli(
@@ -128,14 +83,14 @@ sub reg { return tempdir(CLEANUP => 1) }
         { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $r, BP_LEDGER => undef,
           CLAUDE_SESSION_ID => undef, CLAUDE_CODE_SESSION_ID => 'sid-valid-env' },
     );
-    is($rc, 1, 'AC4 an invalid --session exits 1 even when a valid env candidate exists');
-    is(kv($out, 'STATUS'), 'error', 'AC4 STATUS: error');
+    is($rc, 1, 'AC1 an invalid --session exits 1 even when a valid env candidate exists');
+    is(kv($out, 'STATUS'), 'error', 'AC1 STATUS: error');
     ok(!-f "$r/sid-valid-env",
-       'AC4 and nothing was armed -- the env candidate does not stand in for a '
+       'AC1 and nothing was armed -- the env candidate does not stand in for a '
      . 'request that was never honoured');
 }
 
-# ── AC5 — status proves whether the gate has run ──────────────────────────
+# ── AC2 — status proves whether the gate has run ──────────────────────────
 {
     my $r = reg();
     run_cli(['arm', '--session', 'sid-gate'],
@@ -145,9 +100,9 @@ sub reg { return tempdir(CLEANUP => 1) }
     my ($fresh) = run_cli(['status', '--session', 'sid-gate'],
                           { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $r,
                             CLAUDE_SESSION_ID => undef, CLAUDE_CODE_SESSION_ID => undef });
-    is(kv($fresh, 'GATE_SEEN'), 'no', 'AC5 a just-armed marker reports GATE_SEEN: no');
+    is(kv($fresh, 'GATE_SEEN'), 'no', 'AC2 a just-armed marker reports GATE_SEEN: no');
     is(kv($fresh, 'WARN'), undef,
-       'AC5 ...and does NOT warn yet -- "armed two seconds ago" has not reached a Stop');
+       'AC2 ...and does NOT warn yet -- "armed two seconds ago" has not reached a Stop');
 
     # Backdate the arm and its mtime: armed long ago, gate never ran.
     my $old = time() - 600;
@@ -159,9 +114,9 @@ sub reg { return tempdir(CLEANUP => 1) }
     my ($stale) = run_cli(['status', '--session', 'sid-gate'],
                           { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $r,
                             CLAUDE_SESSION_ID => undef, CLAUDE_CODE_SESSION_ID => undef });
-    is(kv($stale, 'GATE_SEEN'), 'no', 'AC5 still no');
+    is(kv($stale, 'GATE_SEEN'), 'no', 'AC2 still no');
     like(kv($stale, 'WARN') // '', qr/has not run/,
-         'AC5 and NOW it warns -- this is the decisive symptom of arming a session '
+         'AC2 and NOW it warns -- this is the decisive symptom of arming a session '
        . 'Claude Code does not consider live');
 
     # The gate touches the marker on every run; that is what GATE_SEEN reads.
@@ -170,11 +125,11 @@ sub reg { return tempdir(CLEANUP => 1) }
     my ($seen) = run_cli(['status', '--session', 'sid-gate'],
                          { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $r,
                            CLAUDE_SESSION_ID => undef, CLAUDE_CODE_SESSION_ID => undef });
-    is(kv($seen, 'GATE_SEEN'), 'yes', 'AC5 a touched marker reports GATE_SEEN: yes');
-    is(kv($seen, 'WARN'), undef, 'AC5 and stops warning');
+    is(kv($seen, 'GATE_SEEN'), 'yes', 'AC2 a touched marker reports GATE_SEEN: yes');
+    is(kv($seen, 'WARN'), undef, 'AC2 and stops warning');
 }
 
-# ── AC6/AC7/AC8 — the bounded hold ────────────────────────────────────────
+# ── AC3/AC4/AC5 — the bounded hold ────────────────────────────────────────
 {
     my $r = reg();
     run_cli(['arm', '--session', 'sid-hold'],
@@ -186,15 +141,15 @@ sub reg { return tempdir(CLEANUP => 1) }
                              { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $r,
                                CLAUDE_SESSION_ID => undef, CLAUDE_CODE_SESSION_ID => undef });
     my $elapsed = time() - $t0;
-    is($rc, 0, 'AC6 hold exits 0');
+    is($rc, 0, 'AC3 hold exits 0');
     # hold emits STATUS twice on purpose: `holding` up front, flushed before the
     # wait so a backgrounded caller can read it immediately, then `hold_elapsed`
     # at the end. kv() returns the first match, so assert on both explicitly.
-    is(kv($out, 'STATUS'), 'holding', 'AC6 it announces the hold before waiting');
+    is(kv($out, 'STATUS'), 'holding', 'AC3 it announces the hold before waiting');
     like($out, qr/^STATUS:\s*hold_elapsed$/m,
-         'AC6 and reports that the wait elapsed when it returns');
-    cmp_ok($elapsed, '>=', 2, 'AC6 it actually waited -- the hold IS the wake-up, not a note about one');
-    cmp_ok($elapsed, '<', 30, 'AC6 and returned promptly after its deadline');
+         'AC3 and reports that the wait elapsed when it returns');
+    cmp_ok($elapsed, '>=', 2, 'AC3 it actually waited -- the hold IS the wake-up, not a note about one');
+    cmp_ok($elapsed, '<', 30, 'AC3 and returned promptly after its deadline');
 }
 
 # The marker it writes is what the gate requires: bounded, with a future deadline.
@@ -218,13 +173,13 @@ sub reg { return tempdir(CLEANUP => 1) }
         my $wp = "$r/sid-mark.wakeup-pending";
         my $tries = 0;
         until (-f $wp || $tries++ > 40) { select undef, undef, undef, 0.1 }
-        ok(-f $wp, 'AC6 hold writes the wake-up marker immediately, not when it finishes');
+        ok(-f $wp, 'AC3 hold writes the wake-up marker immediately, not when it finishes');
         open my $fh, '<', $wp or die $!;
         my $line = <$fh> // '';
         close $fh;
         my ($written, $bounded, $deadline) = split ' ', $line;
-        is($bounded, 'bounded', 'AC6 the marker declares itself bounded');
-        cmp_ok(($deadline // 0), '>', time(), 'AC6 with a deadline in the future');
+        is($bounded, 'bounded', 'AC3 the marker declares itself bounded');
+        cmp_ok(($deadline // 0), '>', time(), 'AC3 with a deadline in the future');
         waitpid($pid, 0);
     }
 }
@@ -238,9 +193,9 @@ sub reg { return tempdir(CLEANUP => 1) }
     my ($out, $rc) = run_cli(['hold', '--session', 'sid-ttl', '--seconds', '99999'],
                              { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $r,
                                CLAUDE_SESSION_ID => undef, CLAUDE_CODE_SESSION_ID => undef });
-    is($rc, 1, 'AC7 a hold longer than the wake-up TTL is refused');
+    is($rc, 1, 'AC4 a hold longer than the wake-up TTL is refused');
     like(kv($out, 'ERROR') // '', qr/TTL/,
-         'AC7 and says why -- the marker would expire before the wait ended');
+         'AC4 and says why -- the marker would expire before the wait ended');
 }
 
 # AC8 — holding an unarmed session.
@@ -249,10 +204,10 @@ sub reg { return tempdir(CLEANUP => 1) }
     my ($out, $rc) = run_cli(['hold', '--session', 'sid-unarmed', '--seconds', '1'],
                              { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $r,
                                CLAUDE_SESSION_ID => undef, CLAUDE_CODE_SESSION_ID => undef });
-    is($rc, 0, 'AC8 holding an unarmed session is not an error');
-    like($out, qr/holding_unarmed/, 'AC8 but it says the session is not armed');
+    is($rc, 0, 'AC5 holding an unarmed session is not an error');
+    like($out, qr/holding_unarmed/, 'AC5 but it says the session is not armed');
     ok(!-f "$r/sid-unarmed.wakeup-pending",
-       'AC8 and writes no wake-up marker for a gate that will never look it up');
+       'AC5 and writes no wake-up marker for a gate that will never look it up');
 }
 
 done_testing();
