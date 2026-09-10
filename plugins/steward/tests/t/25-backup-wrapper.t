@@ -106,8 +106,31 @@ use StewardTest qw(ok is like unlike diag done_testing read_text path_exists);
 
 my $SKILL_MD    = "$Bin/../../skills/backup/SKILL.md";
 my $RUNPM       = "$Bin/../../../../scripts/backup/Run.pm";
-my $SNAPSHOT    = "$Bin/../../../../.ccpraxis-local-data/blueprints/backup-driver/reports/skill-before.md";
-my $PARITY_DIR  = "$Bin/../../../../.ccpraxis-local-data/blueprints/backup-driver/reports/parity";
+# Same archive-follows rule as $PARITY_DIR below: a finished blueprint is
+# relocated to blueprints/_archive/<name>/, and a hardcoded live path turns into
+# "the file does not exist" rather than "the blueprint moved".
+my $SNAPSHOT    = (grep { -e $_ }
+    "$Bin/../../../../.ccpraxis-local-data/blueprints/backup-driver/reports/skill-before.md",
+    "$Bin/../../../../.ccpraxis-local-data/blueprints/_archive/backup-driver/reports/skill-before.md")[0]
+  // "$Bin/../../../../.ccpraxis-local-data/blueprints/backup-driver/reports/skill-before.md";
+# A BLUEPRINT MOVES WHEN IT IS ARCHIVED, and this path did not follow it.
+# /blueprint:manage relocates a finished blueprint from blueprints/<name>/ to
+# blueprints/_archive/<name>/. These assertions hardcoded the live location, so
+# archiving backup-driver turned every parity check in this file red -- not with
+# "the blueprint moved", but with "the file does not exist", which reads like the
+# artefact was never produced.
+#
+# This is the exact class almanac 20260823-210122-433f closed once already
+# ("archiving a blueprint silently breaks tests that hardcode its path"), and
+# butler's t/100 has carried the two-candidate fix since. The steward tests never
+# adopted it. Resolving both locations is what makes the check survive the next
+# archive too.
+my $BP_ROOT_D    = "$Bin/../../../../.ccpraxis-local-data/blueprints";
+my $PARITY_DIR = (grep { -e $_ }
+    "$BP_ROOT_D/backup-driver/reports/parity",
+    "$BP_ROOT_D/_archive/backup-driver/reports/parity")[0]
+  // "$BP_ROOT_D/backup-driver/reports/parity";
+
 my $PARITY_06   = "$PARITY_DIR/06-skill-becomes-wrapper.md";
 my $REPO_ROOT   = abs_path("$Bin/../../../..") // "$Bin/../../../..";
 

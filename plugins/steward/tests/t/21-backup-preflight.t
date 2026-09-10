@@ -58,7 +58,24 @@ use StewardTest qw(ok is like unlike diag done_testing temproot make_machine ini
 my $PREFLIGHT_SRC  = "$Bin/../../../../scripts/backup/Preflight.pm";
 my $RUNPM          = "$Bin/../../../../scripts/backup/Run.pm";
 my $BACKUP_SCRIPT  = "$Bin/../../../../scripts/backup.pl";
-my $PARITY_FILE    = "$Bin/../../../../.ccpraxis-local-data/blueprints/backup-driver/reports/parity/02-preflight-and-config.md";
+# A BLUEPRINT MOVES WHEN IT IS ARCHIVED, and this path did not follow it.
+# /blueprint:manage relocates a finished blueprint from blueprints/<name>/ to
+# blueprints/_archive/<name>/. These assertions hardcoded the live location, so
+# archiving backup-driver turned every parity check in this file red -- not with
+# "the blueprint moved", but with "the file does not exist", which reads like the
+# artefact was never produced.
+#
+# This is the exact class almanac 20260823-210122-433f closed once already
+# ("archiving a blueprint silently breaks tests that hardcode its path"), and
+# butler's t/100 has carried the two-candidate fix since. The steward tests never
+# adopted it. Resolving both locations is what makes the check survive the next
+# archive too.
+my $BP_ROOT_D    = "$Bin/../../../../.ccpraxis-local-data/blueprints";
+my $PARITY_FILE = (grep { -e $_ }
+    "$BP_ROOT_D/backup-driver/reports/parity/02-preflight-and-config.md",
+    "$BP_ROOT_D/_archive/backup-driver/reports/parity/02-preflight-and-config.md")[0]
+  // "$BP_ROOT_D/backup-driver/reports/parity/02-preflight-and-config.md";
+
 
 my $PREFLIGHT_EXISTS = -f $PREFLIGHT_SRC ? 1 : 0;
 ok($PREFLIGHT_EXISTS, 'scripts/backup/Preflight.pm exists on disk')
