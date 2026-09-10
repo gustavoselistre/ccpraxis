@@ -17,6 +17,32 @@ blocks a turn from ending with nothing scheduled to resume this session — unle
 explicitly lifted with `off`. This is independent of `/butler:drive-solo` and the reporter; it exists
 for unattended work that involves neither.
 
+## What counts as "scheduled to resume"
+
+A **bounded** wait, and only that. Dispatching a subagent or backgrounding a Bash call is not
+enough on its own: a dispatch records that something *started*, never that anything will come
+back. A subagent that runs forever, or a background command with no timeout, satisfies a naive
+gate and then never returns — leaving the session idle with nothing left to re-invoke it, which is
+the exact outcome this gate exists to prevent.
+
+So take a bounded wait alongside whatever you dispatched, as a **background** Bash call:
+
+```bash
+perl "<plugin-root>/scripts/bp-continuity.pl" hold --seconds 600
+```
+
+One command both records the promise and keeps it: it writes the deadline, sleeps, and exits — and
+a backgrounded command that exits is what actually re-invokes the session. When it elapses, poll
+whatever you were really waiting on and either finish or hold again. Pick the horizon to match what
+you are waiting for; it may not exceed the wake-up TTL (900s by default).
+
+## If `status` says the gate has never run
+
+`status` reports `GATE_SEEN`. The gate touches the marker on every run, so `GATE_SEEN: no` well
+after arming means no Stop has been gated for this session id — usually because the id armed is not
+the one Claude Code considers live. Re-run `on`: it arms every candidate id it can find and reports
+the disagreement, rather than trusting one source silently.
+
 ## Arguments
 
 - `$ARGUMENTS` — one of `on`, `off`, `status`. Empty defaults to `status`.

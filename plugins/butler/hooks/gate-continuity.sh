@@ -117,8 +117,23 @@ if [ -f "$MARK.wakeup-pending" ]; then
   # A marker with no timestamp predates this change; fall back to its mtime so
   # an in-flight upgrade does not either strand or over-trust it.
   [ "$WAT" -gt 0 ] 2>/dev/null || WAT=$(stat -c %Y "$MARK.wakeup-pending" 2>/dev/null || echo 0)
+  # BOUNDED, OR IT IS NOT A WAKE-UP. Field 2 is the literal "bounded" and field
+  # 3 a deadline epoch, written by `bp-continuity.pl hold` -- the one command
+  # that both records the promise and keeps it, because it sleeps and exits, and
+  # a backgrounded command that exits is what actually re-invokes this session.
+  #
+  # A marker without that (what mark-wakeup.sh writes on any Task/Agent dispatch
+  # or backgrounded Bash call) records only that something was DISPATCHED. A
+  # dispatch is not a promise to come back: a subagent that runs forever, or a
+  # background command with no timeout, satisfies it and then never returns, and
+  # the session idles with nothing left to wake it. The TTL does not save that
+  # case -- it governs whether a LATER stop is allowed, and there is no later
+  # stop, because nothing wakes the session to have one.
+  WBOUND=$(awk 'NR==1{print $2; exit}' "$MARK.wakeup-pending" 2>/dev/null || echo '')
+  WDEAD=$(awk 'NR==1{print $3+0; exit}' "$MARK.wakeup-pending" 2>/dev/null || echo 0)
   rm -f "$MARK.wakeup-pending" 2>/dev/null
-  if [ "$WNOW" -gt 0 ] && [ "$WAT" -gt 0 ] && [ $(( WNOW - WAT )) -lt "$WAKEUP_TTL_S" ]; then
+  if [ "$WNOW" -gt 0 ] && [ "$WAT" -gt 0 ] && [ $(( WNOW - WAT )) -lt "$WAKEUP_TTL_S" ] \
+     && [ "$WBOUND" = "bounded" ] && [ "$WDEAD" -gt "$WNOW" ] 2>/dev/null; then
     rm -f "$MARK.stop-blocks" 2>/dev/null
     exit 0
   fi
@@ -138,15 +153,41 @@ fi
 
 echo $((BLOCKS + 1)) > "$MARK.stop-blocks" 2>/dev/null
 
+CONT_PL="$HOOK_DIR/../scripts/bp-continuity.pl"
+
+# A marker tagged `candidate` was written as a FALLBACK by an arm whose
+# session-id sources disagreed -- possibly by a DIFFERENT session sharing this
+# registry. Blocking a session nobody deliberately armed, without saying why, is
+# how a safety net becomes a mystery.
+CAND=$(awk 'NR==1{print $3; exit}' "$MARK" 2>/dev/null || echo '')
+if [ "$CAND" = "candidate" ]; then
+  cat >&2 <<EOF
+
+NOTE: this session was armed as a FALLBACK CANDIDATE, not directly. Another
+session's /butler:continuity could not tell which session id was live and armed
+every candidate. If this session was never meant to be watched, disarm it.
+EOF
+fi
+
 cat >&2 <<EOF
-BLOCKED (butler continuity-gate): this turn is ending with nothing scheduled
+BLOCKED (butler continuity-gate)
+: this turn is ending with nothing scheduled
 to resume this armed session, and it has not been disarmed.
 
 This session was explicitly armed to be watched. A turn may end only if
 something will wake it, or the arm is explicitly lifted. Neither holds now.
 
 Do one of these NOW, in this turn:
-  * dispatch a subagent or background a Bash call before this turn ends, or
+  * take a BOUNDED wait -- run this as a BACKGROUND Bash call, so its exit
+    re-invokes this session at a time known in advance:
+
+      perl $CONT_PL hold --seconds 600
+
+    Dispatching a subagent or backgrounding a command is NOT enough on its own.
+    A dispatch is not a promise to come back: if it never returns, nothing is
+    left to wake this session. Take the hold alongside whatever you dispatched,
+    then poll it when the hold elapses and hold again if you are still waiting.
+
   * explicitly disarm: perl plugins/butler/scripts/bp-continuity.pl disarm
     (or /butler:continuity off) if the watched work is actually finished, or
   * touch $MARK.stop-ok to skip just this once.
