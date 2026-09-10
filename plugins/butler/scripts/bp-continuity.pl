@@ -27,8 +27,8 @@
 #
 # Registry: ${CCPRAXIS_CONTINUITY_ACTIVE_DIR:-$HOME/.claude/ccpraxis/.continuity-active},
 # duplicated from lib.sh's bp_continuity_active_dir on purpose (this script
-# imports nothing bash-side) — the two resolutions must agree; see
-# scripts/statusline.pl's own duplicate for the third leg of that parity.
+# imports nothing bash-side) — the resolutions must agree. There are FOUR legs,
+# not three: lib.sh, this file, bp-session.pl and scripts/statusline.pl.
 #
 # PATH RESOLUTION — see lib.sh's bp_continuity_active_dir for the single rule
 # all three components follow (fix-batch F1): override, else $HOME, else
@@ -100,13 +100,17 @@ sub cmd_arm {
             emit('ERROR',  "invalid session id: $sid");
             exit 1;
         }
-        open my $fh, '>', $mark or do {
+        # WRITE ATOMICALLY. A crash or ENOSPC between open and print leaves a
+        # ZERO-BYTE marker, and the two readers disagree about what that means:
+        # the gate keys on the file EXISTING (so it blocks), while status keyed
+        # on parseable content (so it said "unarmed"). The operator is then told
+        # they are not armed, cannot end the turn, and has no reason to try
+        # disarm. temp-file + rename makes the marker appear whole or not at all.
+        write_marker_atomic($mark, "$by $since\n") or do {
             emit('STATUS', 'error');
             emit('ERROR',  "Cannot write $mark: $!");
             exit 1;
         };
-        print {$fh} "$by $since\n";
-        close $fh;
         # Explicit touch: on some filesystems a fresh open+print already sets
         # mtime to now, but idempotent re-arm (behavior 8) requires the mtime to
         # move forward on every arm call, not just the first — utime() makes
@@ -148,7 +152,15 @@ sub cmd_arm {
     # The beacon lets status/disarm resolve THIS session between Stops. Keyed by
     # a process-scoped value that only has to be stable, never correct: whatever
     # it says, the nonce it points at resolves through the transcript.
-    write_beacon($dir, $nonce);
+    # A FAILED BEACON IS NOT COSMETIC. status's `arming` branch finds the ticket
+    # THROUGH the beacon, so without one this session reports `unarmed` right up
+    # until the gate arms it -- "not armed" followed by being armed anyway is the
+    # same lie as "armed" followed by nothing, just inverted. Say so instead.
+    unless (write_beacon($dir, $nonce)) {
+        emit('WARN', 'could not record the local beacon, so `status` and `disarm` in this '
+                   . 'session will not see the pending arm. The ticket is live and will '
+                   . 'still bind at the next turn boundary.');
+    }
 
     emit('STATUS',  'arming');
     emit('NONCE',   $nonce);
@@ -161,7 +173,7 @@ sub cmd_arm {
 
 sub cmd_disarm {
     my $opts = parse_args(qw(session));
-    my $sid = resolve_session($opts) or return;
+    my ($sid, $confidence) = resolve_session_full($opts);
 
     my $dir = resolve_registry_dir_or_die();
     my $mark = continuity_marker($sid, $dir);
@@ -189,7 +201,9 @@ sub cmd_disarm {
         if ($ticket_dropped) {
             emit('STATUS',  'disarmed');
             emit('SESSION', $sid);
+            emit('CONFIDENCE', $confidence);
             emit('NOTE',    'a pending arm was cancelled before it bound');
+            disarm_confidence_warning($confidence);
             return;
         }
         emit('STATUS',  'not_armed');
@@ -210,6 +224,7 @@ sub cmd_disarm {
     unlink "$mark.wakeup-pending";
     unlink "$mark.stop-blocks";
     unlink "$mark.stop-ok";
+    unlink "$mark.gave-up";
 
     if (-f $mark) {
         emit('STATUS',  'error');
@@ -222,19 +237,39 @@ sub cmd_disarm {
 
     emit('STATUS',  'disarmed');
     emit('SESSION', $sid);
+    emit('CONFIDENCE', $confidence);
+    disarm_confidence_warning($confidence);
 }
 
-# read_marker($mark) -> ($by, $since, $tag) or () when unreadable. $tag is the
-# optional third field ('candidate' on a fallback marker); undef when absent,
-# which is every marker written before that field existed.
+# A disarm on an UNVERIFIED id may have removed a marker belonging to nothing
+# while the live session's own marker survives -- and the operator would be told
+# "disarmed" either way. It is not refused: with no beacon (arm never ran here,
+# or its nonce was ambiguous) the env id is the only handle there is, and
+# refusing would leave a session unable to switch itself off at all. So it acts,
+# and says how sure it was.
+sub disarm_confidence_warning {
+    my ($confidence) = @_;
+    return unless defined $confidence && $confidence eq 'unverified';
+    emit('WARN', 'this session could not be identified from a transcript, so the id '
+               . 'came from a process-scoped env value with nothing to check it against. '
+               . 'If the gate still blocks, the live session has its own marker: run '
+               . 'status to see which id is actually armed.');
+}
+
+# read_marker($mark) -> ($by, $since) or () when unreadable.
+#
+# There was briefly a third field, `candidate`, tagging markers written by an
+# arm that armed every session id it could guess at. That approach is gone --
+# the gate binds a ticket to the one session whose transcript carries its nonce,
+# so there is nothing to hedge and nothing to tag.
 sub read_marker {
     my ($mark) = @_;
     open my $fh, '<', $mark or return ();
     my $line = <$fh>;
     close $fh;
     chomp($line //= '');
-    my ($by, $since, $tag) = $line =~ /^(\S+)\s+(\S+)(?:\s+(\S+))?/;
-    return ($by, $since, $tag);
+    my ($by, $since) = $line =~ /^(\S+)\s+(\S+)/;
+    return ($by, $since);
 }
 
 # iso_to_epoch($iso) -> epoch seconds, or undef. iso_now() writes UTC with a
@@ -265,11 +300,41 @@ sub cmd_status {
         # nonce. Saying "unarmed" here would look exactly like the failure this
         # whole mechanism removes.
         if (my $nonce = read_beacon($dir)) {
-            if (-f "$dir/pending/$nonce") {
+            my $ticket = "$dir/pending/$nonce";
+            if (-f $ticket) {
                 emit('STATUS', 'arming');
                 emit('NONCE',  $nonce);
                 emit('NOTE', 'a ticket is waiting to bind at the next turn '
                            . 'boundary; nothing is enforced until it does');
+
+                # AN ARM THAT NEVER BINDS MUST NOT LOOK LIKE ONE THAT HAS NOT
+                # BOUND YET. Binding needs the nonce to be findable in a
+                # transcript whose record names the session the Stop hook
+                # reports. Two known ways that never happens:
+                #
+                #   * `arm` ran inside a SUBAGENT. Its transcript is a separate
+                #     file under <session>/subagents/, and its records carry the
+                #     subagent's own id -- which is never the id any Stop hook
+                #     reports, so no gate can ever match it. Arming from a
+                #     subagent is meaningless: it has no Stop of its own that
+                #     gates the parent.
+                #   * the nonce turned out to be AMBIGUOUS (present in more than
+                #     one transcript), which resolves to nothing by design.
+                #
+                # Detecting the subagent case from an env var was considered and
+                # rejected: CLAUDE_CODE_CHILD_SESSION is set in ordinary
+                # top-level sessions on this machine (measured), so refusing on
+                # it would break arming exactly where it should work. Reporting
+                # the observable fact -- "this ticket has aged and still does not
+                # resolve" -- needs no such guess.
+                my $age = time() - ((stat $ticket)[9] // time());
+                if ($age >= 120 && !BpSession::session_for_nonce($nonce)) {
+                    emit('WARN', "this ticket has been pending ${age}s and its nonce still "
+                               . "resolves to no session, so it may never bind. Arming from "
+                               . "inside a subagent cannot bind (its transcript is its own, "
+                               . "and no Stop hook reports its id); an ambiguous nonce cannot "
+                               . "either. Disarm and re-arm from the main session.");
+                }
                 return;
             }
         }
@@ -281,8 +346,16 @@ sub cmd_status {
 
     my ($by, $since) = read_marker($mark);
     unless (defined $by || defined $since) {
-        emit('STATUS',  'unarmed');
+        # THE GATE READS EXISTENCE, SO SO DOES THIS. An empty or corrupt marker
+        # still blocks every stop; reporting "unarmed" here made status the only
+        # component that disagreed, and sent the operator looking for a problem
+        # they had no way to name. Report armed, and say the content is bad.
+        emit('STATUS',  'armed');
         emit('SESSION', $sid);
+        emit('ARMED_BY', 'unknown');
+        emit('SINCE',    '');
+        emit('WARN', 'the marker exists but its content is unreadable. The gate keys on '
+                   . 'the file existing, so this session IS gated; disarm works normally.');
         return;
     }
 
@@ -302,6 +375,25 @@ sub cmd_status {
     #
     # A grace period, because "armed 4 seconds ago" has legitimately not reached
     # a Stop boundary yet. Past that, silence is the finding.
+    # DID THE GATE EVER STAND ASIDE? gate-continuity.sh yields after N
+    # consecutive blocks rather than wedge the session, and leaves this record
+    # so the yield is discoverable. Without it the session reads as armed and
+    # watched while continuity has, at least once, let a turn end with nothing
+    # scheduled -- which is the state an operator most needs to know about.
+    if (-f "$mark.gave-up") {
+        open my $gh, '<', "$mark.gave-up";
+        my $when = $gh ? <$gh> : undef;
+        close $gh if $gh;
+        chomp($when //= '');
+        my $ago = ($when =~ /^\d+$/) ? (time() - $when) : undef;
+        emit('GAVE_UP', defined $ago
+            ? strftime('%Y-%m-%dT%H:%M:%SZ', gmtime($when)) . " (${ago}s ago)"
+            : 'yes');
+        emit('WARN', 'continuity stood aside at least once rather than block again. '
+                   . 'The arm still stands, but a turn has ended with nothing scheduled; '
+                   . 'if that work mattered, nothing woke it.');
+    }
+
     my $armed_at = iso_to_epoch($since);
     my $mtime    = (stat $mark)[9];
     if (defined $armed_at && defined $mtime) {
@@ -378,29 +470,58 @@ sub cmd_hold {
     my $now      = time();
     my $deadline = $now + $secs;
 
-    # Write the pending marker ONLY for a session that is actually armed. A hold
-    # on an unarmed session is a harmless timer, and saying so is better than
-    # leaving a marker for a gate that will never look it up.
+    # Write the pending marker for a session that is armed OR ARMING.
+    #
+    # "Arming" matters because of an ordering the first version got wrong. The
+    # primary marker does not exist until the gate BINDS the ticket, and that
+    # happens at a Stop -- so on the very first turn after `arm`, a hold taken
+    # in that same turn found no marker, declined to write anything, and the
+    # Stop blocked. The correct first-use sequence (arm, dispatch, hold, end
+    # turn) was therefore guaranteed to be refused once, and the explanation
+    # went to a BACKGROUND process's stdout that nobody reads.
+    #
+    # A pending ticket for this same session is the arm, just not yet bound; the
+    # gate claims tickets BEFORE it looks for the wake-up marker, so a file
+    # written here is found in that same run. The ticket is this session's by
+    # construction: resolve_session reached $sid by way of this beacon's nonce.
     my $armed = (-f $mark) ? 1 : 0;
-    if ($armed) {
+    my $arming = 0;
+    if (!$armed) {
+        if (my $nonce = read_beacon($dir)) {
+            $arming = 1 if -f "$dir/pending/$nonce";
+        }
+    }
+    if ($armed || $arming) {
         open my $fh, '>', "$mark.wakeup-pending" or do {
             emit('STATUS', 'error');
             emit('ERROR',  "Cannot write $mark.wakeup-pending: $!");
             exit 1;
         };
-        # Line format: <written_epoch> bounded <deadline_epoch>. The gate reads
-        # field 1 for the existing TTL check and fields 2/3 for boundedness, so
-        # an older gate reading only field 1 still behaves exactly as before.
-        print {$fh} "$now bounded $deadline\n";
+        # Line format: <written_epoch> bounded <deadline_epoch> <pid>.
+        #
+        # THE PID IS THE PROMISE. A deadline in a file is an assertion, not a
+        # guarantee: if this process is killed -- operator interrupt, container
+        # restart, OOM -- nothing returns, and a gate reading only the epoch
+        # cannot tell that from a live wait. It would then permit the stop and
+        # the session would idle forever, which is the precise failure this
+        # whole mechanism exists to prevent, arriving with the gate's blessing.
+        #
+        # $$ is the process that is about to sleep to that deadline, so the gate
+        # can check it with kill -0 and get a fact instead of a claim.
+        #
+        # Field 1 stays the write epoch and fields 2/3 stay as they were, so an
+        # older gate reading only what it knows still behaves exactly as before.
+        print {$fh} "$now bounded $deadline $$\n";
         close $fh;
     }
 
-    emit('STATUS',   $armed ? 'holding' : 'holding_unarmed');
+    emit('STATUS',   ($armed || $arming) ? 'holding' : 'holding_unarmed');
+    emit('BINDS_AT', 'next turn boundary') if $arming && !$armed;
     emit('SESSION',  $sid);
     emit('SECONDS',  $secs);
     emit('DEADLINE', strftime('%Y-%m-%dT%H:%M:%SZ', gmtime($deadline)));
     emit('NOTE', 'not armed, so no wake-up marker was written; this is only a timer')
-        unless $armed;
+        unless $armed || $arming;
     # Flush before sleeping: a backgrounded caller should be able to read this
     # immediately rather than when the wait ends.
     STDOUT->flush() if STDOUT->can('flush');
@@ -425,6 +546,22 @@ sub sleep_until {
 }
 
 # ── Helpers ────────────────────────────────────────────────
+
+# write_marker_atomic($path, $content) -> 1 on success, 0 on failure.
+# temp-file + rename, so a reader never sees a half-written marker. See the
+# call sites for why a zero-byte marker was worse than no marker at all.
+sub write_marker_atomic {
+    my ($path, $content) = @_;
+    my $tmp = "$path.tmp.$$";
+    open my $fh, '>', $tmp or return 0;
+    print {$fh} $content or do { close $fh; unlink $tmp; return 0 };
+    close $fh or do { unlink $tmp; return 0 };
+    unless (rename $tmp, $path) {
+        unlink $tmp;
+        return 0;
+    }
+    return 1;
+}
 
 sub emit {
     my ($key, $val) = @_;
@@ -460,7 +597,11 @@ sub beacon_path {
     my ($dir) = @_;
     my $key = $ENV{CLAUDE_CODE_SESSION_ID};
     return undef unless defined $key && length $key;
-    return undef if $key =~ m{[/\*.\x00]};
+    # Same character rules as continuity_marker, INCLUDING the backslash: on
+    # this host a backslash nests one directory level, so omitting it here (as
+    # this did) let an env value place a beacon outside the beacons dir.
+    return undef if $key =~ m{[/*.\x00]};
+    return undef if index($key, chr(92)) >= 0;
     return "$dir/beacons/$key";
 }
 
@@ -526,13 +667,37 @@ sub resolve_session {
 # override, else $HOME, else $USERPROFILE, else undef. Does NOT guess $PWD
 # or '.' -- see resolve_registry_dir_or_die(), the only caller, which is
 # where the "fail loudly" half of F1's rule actually lives.
+# ABSOLUTE, OR UNRESOLVED. lib.sh's bp_is_absolute_path is the rule of record:
+# a value beginning '/' or a Windows drive letter, and nothing else. The perl
+# copies used to accept ANY non-empty string, so bash and perl disagreed about
+# the same environment -- a relative CCPRAXIS_CONTINUITY_ACTIVE_DIR let `arm`
+# write a marker under the caller's cwd and report success while the gate,
+# which rejects it, enforced nothing. That is precisely the "armed, enforcing
+# nothing" failure this subsystem exists to remove, reached through the parity
+# these copies are supposed to guarantee.
+sub _bp_is_absolute_path {
+    my ($v) = @_;
+    return 0 unless defined $v && length $v;
+    return 1 if $v =~ m{^/};
+    return 0 unless $v =~ m{^[A-Za-z]:};
+    # The drive-letter form may be bare ("C:"), slashed, or backslashed. The
+    # backslash is matched via chr(92) rather than written into a character
+    # class: this repo edits perl through shell heredocs, which collapse a
+    # doubled backslash and silently produce an unterminated class.
+    my $rest = substr($v, 2);
+    return 1 if $rest eq q{} || $rest =~ m{^/} || substr($rest, 0, 1) eq chr(92);
+    return 0;
+}
+
 sub continuity_active_dir {
-    return $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR}
-        if defined $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR} && length $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR};
-    my $home = $ENV{HOME};
-    $home = $ENV{USERPROFILE} unless defined $home && length $home;
-    return undef unless defined $home && length $home;
-    return "$home/.claude/ccpraxis/.continuity-active";
+    my $override = $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR};
+    return $override if _bp_is_absolute_path($override);
+    return undef if defined $override && length $override;   # set but relative
+    for my $home ($ENV{HOME}, $ENV{USERPROFILE}) {
+        next unless _bp_is_absolute_path($home);
+        return "$home/.claude/ccpraxis/.continuity-active";
+    }
+    return undef;
 }
 
 # resolve_registry_dir_or_die() -> the registry dir, or exits 1 with
@@ -545,9 +710,15 @@ sub resolve_registry_dir_or_die {
     my $dir = continuity_active_dir();
     unless (defined $dir) {
         emit('STATUS', 'error');
-        emit('ERROR',  'cannot resolve continuity registry directory: neither $HOME nor '
-                      . '$USERPROFILE is set, and CCPRAXIS_CONTINUITY_ACTIVE_DIR is not set '
-                      . 'either -- refusing to guess a location (e.g. $PWD or \'.\') that the '
+        # Name the ACTUAL cause. A relative override is now rejected as well as
+        # an unset one, and telling someone a variable "is not set" when it is
+        # set but relative sends them looking in the wrong place.
+        my $ov = $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR};
+        my $why = (defined $ov && length $ov)
+            ? "CCPRAXIS_CONTINUITY_ACTIVE_DIR is set to '$ov', which is not an absolute path"
+            : 'neither $HOME nor $USERPROFILE is set, and CCPRAXIS_CONTINUITY_ACTIVE_DIR is not set either';
+        emit('ERROR',  "cannot resolve continuity registry directory: $why"
+                      . ' -- refusing to guess a location (e.g. $PWD or \'.\') that the '
                       . 'gate and the statusline badge would not agree with');
         exit 1;
     }
@@ -572,7 +743,7 @@ sub parse_args {
     my @known = @_;
     my %known = map { $_ => 1 } @known;
     my %opts;
-    while (my $arg = shift @ARGV) {
+    while (defined(my $arg = shift @ARGV)) {
         unless ($arg =~ /^--([\w-]+)$/ && $known{$1}) {
             emit('STATUS', 'error');
             emit('ERROR',  "Unknown or unexpected argument: $arg");

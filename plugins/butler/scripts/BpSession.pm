@@ -116,9 +116,17 @@ sub find_transcript {
 # hold the one we are looking for. Newest-first plus that bound is what keeps
 # this cheap on a machine with hundreds of transcripts. Pass max_age => 0 to
 # disable the bound.
+# `max_files` (default 50) bounds how many candidates are opened, newest first.
+# This runs inside a Stop hook with a 15s budget, and the scan is O(bytes of
+# every recently-touched transcript) with no early exit -- uniqueness requires
+# seeing them all. Cheap today (~0.1s), but it grows with the number of
+# concurrent live sessions, which is exactly the unattended-fleet condition this
+# exists for. A killed hook does not block, so a timeout here would make the
+# gate stand aside leaving no trace: the one outcome worth engineering against.
 sub transcript_files {
     my (%opts) = @_;
-    my $max_age = exists $opts{max_age} ? $opts{max_age} : 3600;
+    my $max_age   = exists $opts{max_age}   ? $opts{max_age}   : 3600;
+    my $max_files = exists $opts{max_files} ? $opts{max_files} : 50;
     my $now = time();
 
     my @found;
@@ -141,7 +149,10 @@ sub transcript_files {
             }
         }
     }
-    return map { $_->[0] } sort { $b->[1] <=> $a->[1] } @found;
+    my @sorted = map { $_->[0] } sort { $b->[1] <=> $a->[1] } @found;
+    return @sorted if $max_files <= 0 || @sorted <= $max_files;
+    return @sorted[0 .. $max_files - 1];
+
 }
 
 # ── nonces ─────────────────────────────────────────────────────────────────
@@ -170,8 +181,7 @@ sub valid_nonce {
 # transcript is tens of thousands of lines and only one can match.
 #
 # `sessionId` is preferred over the filename DELIBERATELY -- that is the whole
-# point (see the header). `session_id` is accepted as a fallback because records
-# carry both spellings, and the filename is used only as a last resort.
+# point (see the header). The filename is used only as a last resort.
 #
 # UNIQUENESS IS REQUIRED, and this is not a theoretical nicety. A tool call's
 # COMMAND TEXT is recorded in the transcript too, not just its output -- so a
@@ -198,10 +208,19 @@ sub _resolve {
     return (undef, undef) unless defined $nonce && length $nonce;
 
     my (%ids, %routes);
+    my $max_bytes = exists $opts{max_bytes} ? $opts{max_bytes} : 64 * 1024 * 1024;
     for my $path (transcript_files(%opts)) {
         open my $fh, '<:raw', $path or next;
         my $hit;
+        my $read = 0;
         while (my $line = <$fh>) {
+            $read += length $line;
+            # A per-file byte cap, for the same reason as max_files: this runs
+            # under a hook timeout, and a single pathological transcript should
+            # not be able to consume the whole budget. A nonce is planted at the
+            # END of a transcript in the ordinary case, but the scan is
+            # front-to-back, so the cap is generous rather than tight.
+            last if $max_bytes > 0 && $read > $max_bytes;
             next if index($line, $nonce) < 0;
             $hit = $line;
             last;
@@ -213,10 +232,17 @@ sub _resolve {
         my $route = 'filename';
         my $rec = eval { JSON::PP->new->utf8->decode($hit) };
         if (ref $rec eq 'HASH') {
-            for my $key (qw(sessionId session_id)) {
-                my $v = $rec->{$key};
-                if (defined $v && !ref $v && length $v) { $id = $v; $route = 'record'; last }
-            }
+            # `sessionId` ONLY. Records carry `session_id` as well, and the two
+            # are NOT synonyms: measured across every transcript in this project,
+            # every record carrying both has them DIFFERENT -- `session_id` is
+            # the PREDECESSOR session in a resume chain. Accepting it as a
+            # fallback would bind a ticket to a session that has already ended,
+            # which is the failure this module exists to prevent, reached by a
+            # subtler route. A record without `sessionId` is skipped, not guessed
+            # at.
+            my $v = $rec->{sessionId};
+            if (defined $v && !ref $v && length $v) { $id = $v; $route = 'record' }
+
         }
         if (!defined $id) {
             my ($vol, $dir, $file) = File::Spec->splitpath($path);

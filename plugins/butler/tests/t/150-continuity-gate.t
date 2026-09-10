@@ -226,10 +226,13 @@ sub plant_marker {
     my $cdir = tempdir(CLEANUP => 1);
     plant_marker($cdir, 'sess-b2');
 
-    # A live bounded hold, as `bp-continuity.pl hold` writes it.
+    # A live bounded hold, as `bp-continuity.pl hold` writes it. Field 4 is the
+    # PID of the process promising to return; $$ is this test, which is alive,
+    # so the gate's liveness check passes and B2 stays a test of the CLOBBER
+    # rather than an accidental test of liveness.
     my $wp = marker_path($cdir, 'sess-b2') . '.wakeup-pending';
     open my $fh, '>', $wp or die "fixture: $!";
-    print {$fh} time . ' bounded ' . (time + 600) . "\n";
+    print {$fh} time . ' bounded ' . (time + 600) . " $$\n";
     close $fh;
 
     # ...then a dispatch, which is what used to overwrite it.
@@ -504,7 +507,7 @@ PROBE_EOF
     plant_marker($cdir2, 'sess-z2');
     my $wp2 = marker_path($cdir2, 'sess-z2') . '.wakeup-pending';
     open my $fh2, '>', $wp2 or die "fixture: $!";
-    print {$fh2} time . ' bounded ' . (time + 300) . "\n";
+    print {$fh2} time . ' bounded ' . (time + 300) . " $$\n";
     close $fh2;
     my ($rc2) = run_gate(stop_payload($root2, 'sess-z2'), cdir => $cdir2);
     is($rc2, 0, 'Z3 non-vacuity: a fresh BOUNDED wake-up marker permits the stop');
@@ -548,6 +551,64 @@ PROBE_EOF
     my ($rc3) = run_gate(stop_payload($root3, 'sess-z3'), cdir => $cdir3);
     isnt($rc3, 0, 'Z6 upgrade path AMENDED: an unstamped legacy marker is treated as UNBOUNDED '
                 . 'and does not permit the stop -- freshness alone stopped being sufficient');
+}
+
+# ===========================================================================
+# W. THE PROMISE MUST BE ALIVE (H4a).
+#
+# A deadline in a file is an assertion, not a guarantee. `hold` sleeps to that
+# deadline in a real process and it is that process EXITING that re-invokes the
+# session -- so if it has been killed (operator interrupt, container restart,
+# OOM), the wake-up died with it and nothing distinguishes that from a live wait
+# except asking the kernel. Permitting a stop on a dead process's promise is the
+# original failure with a better alibi.
+# ===========================================================================
+{
+    # A pid that is certainly not running: fork a child and reap it, so the id
+    # existed and is now gone. Far more honest than picking a large integer.
+    my $dead = fork();
+    if (defined $dead && $dead == 0) { exit 0 }
+    waitpid($dead, 0) if defined $dead && $dead > 0;
+
+    SKIP: {
+        skip 'fork unavailable', 3 unless defined $dead && $dead > 0;
+
+        my $root = new_project();
+        my $cdir = tempdir(CLEANUP => 1);
+        plant_marker($cdir, 'sess-w');
+        my $wp = marker_path($cdir, 'sess-w') . '.wakeup-pending';
+        open my $fh, '>', $wp or die "fixture: $!";
+        print {$fh} time . ' bounded ' . (time + 600) . " $dead\n";
+        close $fh;
+
+        my ($rc) = run_gate(stop_payload($root, 'sess-w'), cdir => $cdir);
+        isnt($rc, 0, 'W1 CANONICAL: a bounded marker whose PROCESS is dead does not permit '
+                   . 'the stop -- nothing is going to return');
+
+        # Counter-check: identical marker, live pid, permitted. Without this W1
+        # would pass just as well if the gate had started refusing everything.
+        my $root2 = new_project();
+        my $cdir2 = tempdir(CLEANUP => 1);
+        plant_marker($cdir2, 'sess-w2');
+        my $wp2 = marker_path($cdir2, 'sess-w2') . '.wakeup-pending';
+        open my $fh2, '>', $wp2 or die "fixture: $!";
+        print {$fh2} time . ' bounded ' . (time + 600) . " $$\n";
+        close $fh2;
+        my ($rc2) = run_gate(stop_payload($root2, 'sess-w2'), cdir => $cdir2);
+        is($rc2, 0, 'W2: the same marker with a LIVE pid does permit it');
+
+        # A marker predating the pid field is unverifiable, so it is refused --
+        # the same direction every other unknown takes here.
+        my $root3 = new_project();
+        my $cdir3 = tempdir(CLEANUP => 1);
+        plant_marker($cdir3, 'sess-w3');
+        my $wp3 = marker_path($cdir3, 'sess-w3') . '.wakeup-pending';
+        open my $fh3, '>', $wp3 or die "fixture: $!";
+        print {$fh3} time . ' bounded ' . (time + 600) . "\n";
+        close $fh3;
+        my ($rc3) = run_gate(stop_payload($root3, 'sess-w3'), cdir => $cdir3);
+        isnt($rc3, 0, 'W3: a bounded marker with NO pid is treated as unverifiable, not trusted');
+    }
 }
 
 done_testing();

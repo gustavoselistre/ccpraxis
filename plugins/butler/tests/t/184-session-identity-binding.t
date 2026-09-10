@@ -17,10 +17,14 @@
 # independent facts to agree: the transcript record says which session printed
 # the nonce, the hook payload says which session is stopping.
 #
-# WHY THE RECORD AND NOT THE FILENAME. A resumed conversation can append to a
-# transcript named for the session it resumed, so the filename is the id of the
-# wrong session in precisely the case that was reported. Each record carries its
-# own `sessionId`, which is right either way. AC3 pins that.
+#
+# WHY THE RECORD AND NOT THE FILENAME. Each record carries its own `sessionId`,
+# and that is what is read -- never the .jsonl's name. Measured: `--resume`
+# creates a NEW transcript with a NEW id, and separately, every record carrying
+# both `sessionId` and `session_id` has them DIFFERENT (`session_id` is the
+# predecessor in a resume chain, not a synonym). So a name-or-second-field
+# shortcut would bind a ticket to a session that has already ended. AC3 pins the
+# general case: filename and record disagreeing, record wins.
 #
 # WHY UNIQUENESS IS REQUIRED. A tool call's COMMAND TEXT is recorded in the
 # transcript, not just its output -- so a nonce merely NAMED on a command line
@@ -51,10 +55,16 @@ ok(-f $CONT_PL,    'bp-continuity.pl exists') or BAIL_OUT('script missing');
 
 require "$Bin/../../scripts/BpSession.pm";
 
-# A world of its own: HOME *and* USERPROFILE are redirected, so no test ever
-# reads the real machine's transcripts. That matters more than usual here --
-# the resolver's whole job is to search transcripts, and the suite runs inside a
-# live session whose own transcript is full of nonces this file mentions.
+# A world of its own. Redirecting HOME and USERPROFILE is NOT sufficient, and
+# an earlier version of this comment claimed it was: transcript_roots also walks
+# UP FROM THE CWD looking for .ccpraxis-local-data/claude-home/projects, and
+# this repo has one, so every test was still reading the real machine's
+# transcripts. AC4 (ambiguity) is the assertion whose outcome depends on
+# unrelated on-disk state, so that was a live flake, not a cosmetic slip.
+#
+# Every child therefore runs with its cwd inside the temp world (see run_cli),
+# where that walk finds nothing. Isolation is now a property of the fixture
+# rather than a claim in a comment.
 sub new_world {
     my $root = tempdir(CLEANUP => 1);
     make_path("$root/home/.claude/projects/proj");
@@ -85,7 +95,11 @@ sub run_cli {
         else                    { delete $ENV{$k} }
     }
     my $argstr = join ' ', map { my $a = $_; $a =~ s/'/'\\''/g; "'$a'" } @$args;
-    my $out = `perl "$script" $argstr 2>&1`;
+    # Run INSIDE the temp world, so transcript_roots' walk up from the cwd finds
+    # no .ccpraxis-local-data and the child cannot see this repo's transcripts.
+    my $home = $env->{HOME};
+    my $prefix = (defined $home && -d $home) ? "cd '$home' && " : '';
+    my $out = `$prefix perl "$script" $argstr 2>&1`;
     return (defined($out) ? $out : '', $? >> 8);
 }
 
@@ -158,9 +172,17 @@ sub fresh_nonce { return BpSession::new_nonce() }
     my $live     = '44444444-4444-4444-4444-444444444444';   # the record's id
     my $nonce    = fresh_nonce();
 
-    # A resumed session appending to the transcript it resumed: the filename is
-    # the OLD session, the record carries the NEW one. Reading the filename here
-    # would arm a session that no longer exists -- the reported failure exactly.
+    # A file whose NAME is one session and whose RECORD is another.
+    #
+    # The scenario originally written here was wrong and is worth correcting
+    # rather than deleting: it claimed a resumed session appends to the
+    # transcript it resumed. Measured on real transcripts, `--resume` produces a
+    # NEW file with a NEW id, so that particular shape does not arise that way.
+    # What DOES arise is the general case this pins -- filename and record
+    # disagreeing -- which the resolver must survive however it is produced,
+    # because reading the filename would arm a session that is not the one whose
+    # tool output this is. The rule (record over filename) is right; only the
+    # story justifying it was.
     plant($root, $resumed, $live, $nonce);
     make_ticket($root, $nonce);
 
@@ -252,6 +274,60 @@ sub fresh_nonce { return BpSession::new_nonce() }
     ok(!-f "$root/reg/pending/$nonce",
        'AC7 CANONICAL: the ticket is cancelled -- otherwise "off" would report success '
      . 'and then arm the session at the next turn boundary anyway');
+}
+
+# ===========================================================================
+# X. THE SEAM: the GATE must actually bind a ticket (M6).
+#
+# Everything else here tests bp-session.pl's claim directly, and t/150 tests the
+# gate directly -- so the LINE THAT JOINS THEM was covered by nothing. It is
+# `perl "$HOOK_DIR/../scripts/bp-session.pl" claim ... >/dev/null 2>&1 || true`:
+# silenced and failure-tolerant by design, so if that relative path broke, or
+# perl went missing, every arm in existence would quietly never bind and every
+# test in this repo would still pass. That is the precise shape of the defect
+# this whole subsystem was written to remove, so leaving it untested was the one
+# gap that mattered most.
+#
+# This drives the real hook, with a real Stop payload, and requires the marker
+# to exist afterwards.
+# ===========================================================================
+{
+    my $GATE = "$Bin/../../hooks/gate-continuity.sh";
+    SKIP: {
+        skip 'gate-continuity.sh not present', 4 unless -f $GATE;
+
+        my $root  = new_world();
+        my $sid   = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+        my $env   = world_env($root);
+
+        # Arm the way the skill does: no --session, so a ticket is written.
+        my ($aout, $arc) = run_cli($CONT_PL, ['arm', '--by', 'operator'], $env);
+        is($arc, 0, 'X1 fixture: arm wrote a ticket');
+        my $nonce = kv($aout, 'NONCE');
+        ok(-f "$root/reg/pending/$nonce", 'X2 fixture: the ticket is on disk');
+
+        # The session's transcript carries the nonce, as it would after the arm
+        # call returned.
+        plant($root, $sid, $sid, $nonce);
+
+        # Now drive the GATE itself, exactly as Claude Code would.
+        my $payload = JSON::PP->new->canonical->encode({
+            session_id => $sid, cwd => "$root/proj",
+        });
+        my %e = %$env;
+        my $envstr = join ' ', map {
+            defined $e{$_} ? "$_='$e{$_}'" : ()
+        } sort keys %e;
+        my $out = `$envstr bash "$GATE" <<'PAYLOAD_EOF' 2>&1
+$payload
+PAYLOAD_EOF`;
+
+        ok(-f "$root/reg/$sid",
+           'X3 CANONICAL: the GATE bound the ticket -- the seam between the hook and '
+         . 'bp-session.pl is wired, not merely each side of it');
+        ok(!-f "$root/reg/pending/$nonce",
+           'X4: and consumed the ticket, so it cannot bind twice');
+    }
 }
 
 done_testing();

@@ -51,6 +51,14 @@ that shows `STATUS: armed` with the real id.
 `status` also reports `GATE_SEEN`. The gate touches the marker on every run, so `GATE_SEEN: no`
 well after binding means no Stop has been gated for this id — disarm and re-arm to rebind.
 
+## After a `--resume`, re-arm
+
+Resuming a conversation starts a NEW session with a NEW id (measured, not
+assumed). The previous session's marker stays in the registry until its TTL
+expires, so the statusline badge may still show "watched" for an id that no
+longer exists — while the resumed session is not gated at all. `status` reports
+this honestly (`unarmed`), and `on` fixes it.
+
 ## Arguments
 
 - `$ARGUMENTS` — one of `on`, `off`, `status`. Empty defaults to `status`.

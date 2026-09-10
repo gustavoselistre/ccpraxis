@@ -170,9 +170,28 @@ if [ -f "$MARK.wakeup-pending" ]; then
   # stop, because nothing wakes the session to have one.
   WBOUND=$(awk 'NR==1{print $2; exit}' "$MARK.wakeup-pending" 2>/dev/null || echo '')
   WDEAD=$(awk 'NR==1{print $3+0; exit}' "$MARK.wakeup-pending" 2>/dev/null || echo 0)
+  WPID=$(awk 'NR==1{print $4+0; exit}' "$MARK.wakeup-pending" 2>/dev/null || echo 0)
   rm -f "$MARK.wakeup-pending" 2>/dev/null
+
+  # AND THE PROCESS THAT PROMISED IT MUST STILL BE ALIVE.
+  #
+  # A deadline in a file is an assertion. `hold` sleeps to that deadline in a
+  # real process and exits, and it is the EXIT that re-invokes the session -- so
+  # if that process is gone (operator interrupt, container restart, OOM), the
+  # wake-up it promised is gone with it and nothing distinguishes that from a
+  # live wait except asking the kernel. Permitting a stop on the strength of a
+  # dead process's promise is the original failure with a better alibi.
+  #
+  # A marker with no pid (field 4 absent) predates this and is treated as
+  # unverifiable rather than trusted: same direction as every other unknown here.
+  WALIVE=0
+  if [ "$WPID" -gt 0 ] 2>/dev/null && kill -0 "$WPID" 2>/dev/null; then
+    WALIVE=1
+  fi
+
   if [ "$WNOW" -gt 0 ] && [ "$WAT" -gt 0 ] && [ $(( WNOW - WAT )) -lt "$WAKEUP_TTL_S" ] \
-     && [ "$WBOUND" = "bounded" ] && [ "$WDEAD" -gt "$WNOW" ] 2>/dev/null; then
+     && [ "$WBOUND" = "bounded" ] && [ "$WDEAD" -gt "$WNOW" ] 2>/dev/null \
+     && [ "$WALIVE" -eq 1 ]; then
     rm -f "$MARK.stop-blocks" 2>/dev/null
     exit 0
   fi
@@ -185,28 +204,33 @@ BLOCKS=0
 [ -f "$MARK.stop-blocks" ] && BLOCKS=$(cat "$MARK.stop-blocks" 2>/dev/null || echo 0)
 case "$BLOCKS" in ''|*[!0-9]*) BLOCKS=0 ;; esac
 if [ "$BLOCKS" -ge "$MAX_BLOCKS" ]; then
+  # GIVING UP IS RECORDED, NOT SILENT -- and it stays a BOUNDED escape.
+  #
+  # Yielding after N refusals is right: a gate that will not yield is worse than
+  # a stalled run. What was wrong is that it left no trace. The marker stayed, so
+  # the session still read as "armed" and the statusline kept its watched glyph,
+  # while nothing anywhere said continuity had just stood aside -- the same
+  # "reports armed, enforces nothing" shape this subsystem exists to remove,
+  # arriving at the one moment nobody is looking for it.
+  #
+  # DISARMING HERE WAS CONSIDERED AND REJECTED. A review argued this state is
+  # terminal because no later stop exists to gate. That holds for an UNATTENDED
+  # session; in an interactive one the operator speaks again and there are more
+  # stops, which is exactly what t/150's D6 pins ("a bounded escape, not a
+  # permanent disarm"). Disarming would silently discard an arm the operator
+  # asked for, on the strength of an assumption that is only sometimes true. So
+  # the counter still resets and the arm still stands; what changes is that the
+  # give-up leaves a durable record `status` can surface.
   rm -f "$MARK.stop-blocks" 2>/dev/null
+  date +%s > "$MARK.gave-up" 2>/dev/null || true
   echo "butler continuity-gate: allowing this stop after $BLOCKS consecutive blocks — a gate that will not yield is worse than a stalled run." >&2
+  echo "butler continuity-gate: this session is STILL ARMED but continuity just stood aside. If nothing is actually scheduled, it will not be woken. Run /butler:continuity status to see it, or 'off' if the work is finished." >&2
   exit 0
 fi
 
 echo $((BLOCKS + 1)) > "$MARK.stop-blocks" 2>/dev/null
 
 CONT_PL="$HOOK_DIR/../scripts/bp-continuity.pl"
-
-# A marker tagged `candidate` was written as a FALLBACK by an arm whose
-# session-id sources disagreed -- possibly by a DIFFERENT session sharing this
-# registry. Blocking a session nobody deliberately armed, without saying why, is
-# how a safety net becomes a mystery.
-CAND=$(awk 'NR==1{print $3; exit}' "$MARK" 2>/dev/null || echo '')
-if [ "$CAND" = "candidate" ]; then
-  cat >&2 <<EOF
-
-NOTE: this session was armed as a FALLBACK CANDIDATE, not directly. Another
-session's /butler:continuity could not tell which session id was live and armed
-every candidate. If this session was never meant to be watched, disarm it.
-EOF
-fi
 
 cat >&2 <<EOF
 BLOCKED (butler continuity-gate)

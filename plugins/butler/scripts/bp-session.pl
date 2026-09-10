@@ -152,14 +152,37 @@ sub cmd_claim {
 
 # The registry directory, resolved by the SAME rule as lib.sh's
 # bp_continuity_active_dir and bp-continuity.pl's own copy: override, else HOME,
-# else USERPROFILE, else unresolvable. A fourth divergent guess here would be a
-# fourth way for the three components to disagree about where markers live.
+# else USERPROFILE, else unresolvable -- and ABSOLUTE, which the perl copies
+# used to skip while bash enforced it. Four legs share this rule: lib.sh, this
+# file, bp-continuity.pl and scripts/statusline.pl.
+# ABSOLUTE, OR UNRESOLVED. lib.sh's bp_is_absolute_path is the rule of record:
+# a value beginning '/' or a Windows drive letter, and nothing else. The perl
+# copies used to accept ANY non-empty string, so bash and perl disagreed about
+# the same environment -- a relative CCPRAXIS_CONTINUITY_ACTIVE_DIR let `arm`
+# write a marker under the caller's cwd and report success while the gate,
+# which rejects it, enforced nothing. That is precisely the "armed, enforcing
+# nothing" failure this subsystem exists to remove, reached through the parity
+# these copies are supposed to guarantee.
+sub _bp_is_absolute_path {
+    my ($v) = @_;
+    return 0 unless defined $v && length $v;
+    return 1 if $v =~ m{^/};
+    return 0 unless $v =~ m{^[A-Za-z]:};
+    # The drive-letter form may be bare ("C:"), slashed, or backslashed. The
+    # backslash is matched via chr(92) rather than written into a character
+    # class: this repo edits perl through shell heredocs, which collapse a
+    # doubled backslash and silently produce an unterminated class.
+    my $rest = substr($v, 2);
+    return 1 if $rest eq q{} || $rest =~ m{^/} || substr($rest, 0, 1) eq chr(92);
+    return 0;
+}
+
 sub continuity_dir {
-    return $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR}
-        if defined $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR}
-        && length $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR};
+    my $override = $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR};
+    return $override if _bp_is_absolute_path($override);
+    return undef if defined $override && length $override;   # set but relative
     for my $home ($ENV{HOME}, $ENV{USERPROFILE}) {
-        next unless defined $home && length $home;
+        next unless _bp_is_absolute_path($home);
         return "$home/.claude/ccpraxis/.continuity-active";
     }
     return undef;
@@ -168,7 +191,7 @@ sub continuity_dir {
 sub parse_args {
     my %known = map { $_ => 1 } @_;
     my %opts;
-    while (my $arg = shift @ARGV) {
+    while (defined(my $arg = shift @ARGV)) {
         unless ($arg =~ /^--([\w-]+)$/ && $known{$1}) {
             print "STATUS: error\nERROR: unknown or unexpected argument: $arg\n";
             exit 1;

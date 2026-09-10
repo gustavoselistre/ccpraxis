@@ -460,14 +460,34 @@ my $word = $MARKER{$env};
 # registry on every Stop event, owner-independently). A read path that
 # second-guessed the reaper would disagree with the gate, which is the one thing
 # this badge must never do.
+# ABSOLUTE, OR UNRESOLVED -- the same rule lib.sh's bp_is_absolute_path applies.
+# This copy used to accept any non-empty value, so a relative override lit the
+# badge off a marker the gate would never read: the badge would claim a watch
+# that was not happening, which is the one thing it must never do.
+sub _bp_is_absolute_path {
+    my ($v) = @_;
+    return 0 unless defined $v && length $v;
+    return 1 if $v =~ m{^/};
+    return 0 unless $v =~ m{^[A-Za-z]:};
+    # The drive-letter form may be bare ("C:"), slashed, or backslashed. The
+    # backslash is matched via chr(92) rather than written into a character
+    # class: this repo edits perl through shell heredocs, which collapse a
+    # doubled backslash and silently produce an unterminated class.
+    my $rest = substr($v, 2);
+    return 1 if $rest eq q{} || $rest =~ m{^/} || substr($rest, 0, 1) eq chr(92);
+    return 0;
+}
+
 sub _registry_dir {
     my ($override, $leaf) = @_;
     my $v = $ENV{$override};
-    return $v if defined $v && length $v;
-    my $home = $ENV{HOME};
-    $home = $ENV{USERPROFILE} unless defined $home && length $home;
-    return undef unless defined $home && length $home;
-    return "$home/.claude/ccpraxis/$leaf";
+    return $v if _bp_is_absolute_path($v);
+    return undef if defined $v && length $v;   # set but relative
+    for my $home ($ENV{HOME}, $ENV{USERPROFILE}) {
+        next unless _bp_is_absolute_path($home);
+        return "$home/.claude/ccpraxis/$leaf";
+    }
+    return undef;
 }
 
 my $sid = $data->{session_id};
