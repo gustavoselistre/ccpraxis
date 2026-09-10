@@ -237,15 +237,27 @@ fi
 #
 # .stop-blocks is still counted, because the count is useful evidence in the
 # message; it no longer decides anything.
-# How to spell the remedy. A shim on PATH if there is one, else the resolved
-# absolute path -- RESOLVED, so the message never prints a `/../` at its reader.
-# Never a guess: naming a command that does not exist here would be worse than
-# a long path.
+# How to spell the remedy, best form first.
+#
+# WHY THIS IS NOT JUST `command -v`. A hook does not run in the agent's shell.
+# The agent's Bash calls are profile-initialised and re-read the user's PATH, so
+# they see a bin directory added to it at any time; THIS hook inherits whatever
+# PATH the long-running Claude Code process started with, which can predate that
+# entry by an entire session. The first message after adding the shim proved it:
+# `bp-continuity.sh` resolved in every shell the agent had, and not here.
+#
+# So a PATH miss says nothing about whether the SHORT form would work for the
+# reader, and the fallback has to be good rather than merely correct. The shim's
+# own absolute path is one token and needs no interpreter; `perl <the .pl>` is
+# the last resort, for a tree where the shim is missing entirely.
 CONT_PL=$(cd "$HOOK_DIR/../scripts" 2>/dev/null && pwd)/bp-continuity.pl
+CONT_SH=$(cd "$HOOK_DIR/../bin" 2>/dev/null && pwd)/bp-continuity.sh
 if command -v bp-continuity >/dev/null 2>&1; then
   CONT="bp-continuity"
 elif command -v bp-continuity.sh >/dev/null 2>&1; then
   CONT="bp-continuity.sh"
+elif [ -f "$CONT_SH" ]; then
+  CONT="$CONT_SH"
 else
   CONT="perl $CONT_PL"
 fi

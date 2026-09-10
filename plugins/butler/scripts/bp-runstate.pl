@@ -298,6 +298,17 @@ unless (caller) {
     }
     my $surface = $o{surface};
 
+    # state-dir: print where this surface's state lives, for callers that need
+    # to put something BESIDE it (the deferred-question queue). Exposed as a
+    # verb rather than letting each caller rebuild the path -- that rule is
+    # already duplicated more than it should be, and a queue written to a
+    # different directory than the one the run is read from is a queue nobody
+    # finds.
+    if ($cmd eq 'state-dir') {
+        print BpRunState::state_dir($root), "\n";
+        exit 0;
+    }
+
     if ($cmd eq 'status') {
         my ($st, $rec) = BpRunState::effective($root, $surface);
         # ORDER MATTERS: the record's own `state` is what was WRITTEN; $st is
