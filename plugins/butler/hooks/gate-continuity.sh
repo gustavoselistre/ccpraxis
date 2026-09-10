@@ -61,7 +61,6 @@ HOOK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib.sh
 source "$HOOK_DIR/lib.sh" 2>/dev/null || exit 0
 
-MAX_BLOCKS=3
 
 # Coordinators are gate-stop.sh's business, and arm itself already refuses
 # BP_LEDGER at the source (spec SS2.2). This is defense in depth, independent
@@ -219,72 +218,60 @@ if [ -f "$MARK.wakeup-pending" ]; then
   fi
 fi
 
-# --- bounded nagging ---------------------------------------------------------
-BLOCKS=0
-[ -f "$MARK.stop-blocks" ] && BLOCKS=$(cat "$MARK.stop-blocks" 2>/dev/null || echo 0)
-case "$BLOCKS" in ''|*[!0-9]*) BLOCKS=0 ;; esac
-if [ "$BLOCKS" -ge "$MAX_BLOCKS" ]; then
-  # GIVING UP IS RECORDED, NOT SILENT -- and it stays a BOUNDED escape.
-  #
-  # Yielding after N refusals is right: a gate that will not yield is worse than
-  # a stalled run. What was wrong is that it left no trace. The marker stayed, so
-  # the session still read as "armed" and the statusline kept its watched glyph,
-  # while nothing anywhere said continuity had just stood aside -- the same
-  # "reports armed, enforces nothing" shape this subsystem exists to remove,
-  # arriving at the one moment nobody is looking for it.
-  #
-  # DISARMING HERE WAS CONSIDERED AND REJECTED. A review argued this state is
-  # terminal because no later stop exists to gate. That holds for an UNATTENDED
-  # session; in an interactive one the operator speaks again and there are more
-  # stops, which is exactly what t/150's D6 pins ("a bounded escape, not a
-  # permanent disarm"). Disarming would silently discard an arm the operator
-  # asked for, on the strength of an assumption that is only sometimes true. So
-  # the counter still resets and the arm still stands; what changes is that the
-  # give-up leaves a durable record `status` can surface.
-  rm -f "$MARK.stop-blocks" 2>/dev/null
-  date +%s > "$MARK.gave-up" 2>/dev/null || true
-  echo "butler continuity-gate: allowing this stop after $BLOCKS consecutive blocks — a gate that will not yield is worse than a stalled run." >&2
-  echo "butler continuity-gate: this session is STILL ARMED but continuity just stood aside. If nothing is actually scheduled, it will not be woken. Run /butler:continuity status to see it, or 'off' if the work is finished." >&2
-  exit 0
+# --- it blocks until something is done ---------------------------------------
+#
+# There used to be a bound here: after N consecutive refusals the gate yielded,
+# on the reasoning that a gate which will not yield is worse than a stalled run.
+# That was true when the only honest way to satisfy it was to have real work in
+# flight -- an agent with nothing to schedule and no way to say so could be
+# wedged, and yielding was the escape.
+#
+# It is not true any more. There are now three remedies, one of which is always
+# available: hold (something will return), await-operator (a human was asked),
+# disarm (the work is finished). Each is a single command. An agent that cannot
+# satisfy any of them is an agent that has not read the message, and yielding
+# for it converts a loud refusal into a silent one -- the session ends armed,
+# unwatched, with nothing scheduled, which is exactly the outcome this gate
+# exists to prevent. The bound was protecting against a gap that has since been
+# closed.
+#
+# .stop-blocks is still counted, because the count is useful evidence in the
+# message; it no longer decides anything.
+# How to spell the remedy. A shim on PATH if there is one, else the resolved
+# absolute path -- RESOLVED, so the message never prints a `/../` at its reader.
+# Never a guess: naming a command that does not exist here would be worse than
+# a long path.
+CONT_PL=$(cd "$HOOK_DIR/../scripts" 2>/dev/null && pwd)/bp-continuity.pl
+if command -v bp-continuity >/dev/null 2>&1; then
+  CONT="bp-continuity"
+elif command -v bp-continuity.sh >/dev/null 2>&1; then
+  CONT="bp-continuity.sh"
+else
+  CONT="perl $CONT_PL"
 fi
 
-echo $((BLOCKS + 1)) > "$MARK.stop-blocks" 2>/dev/null
-
-CONT_PL="$HOOK_DIR/../scripts/bp-continuity.pl"
-
 cat >&2 <<EOF
-BLOCKED (butler continuity-gate)
-: this turn is ending with nothing scheduled
-to resume this armed session, and it has not been disarmed.
+BLOCKED (butler continuity-gate): this turn is ending with nothing scheduled to
+resume this armed session, and it has not been disarmed.
 
-This session was explicitly armed to be watched. A turn may end only if
-something will wake it, or the arm is explicitly lifted. Neither holds now.
+Pick one and run it NOW, in this turn:
 
-Do one of these NOW, in this turn:
-  * take a BOUNDED wait -- run this as a BACKGROUND Bash call, so its exit
-    re-invokes this session at a time known in advance:
+  1. Something will bring me back -- take a BOUNDED wait, as a BACKGROUND Bash
+     call, so its exit re-invokes this session:
+         $CONT hold --seconds 600
+     Dispatching a subagent or backgrounding a command is NOT enough on its own:
+     a dispatch is not a promise to come back. Take the hold alongside it, then
+     poll when the hold elapses and hold again if still waiting.
 
-      perl $CONT_PL hold --seconds 600
+  2. I am asking the operator something -- that is a legitimate end of a turn,
+     and their reply is what resumes the session:
+         $CONT await-operator --reason "<what you asked>"
+     One turn only; the arm stays in force afterwards.
 
-    Dispatching a subagent or backgrounding a command is NOT enough on its own.
-    A dispatch is not a promise to come back: if it never returns, nothing is
-    left to wake this session. Take the hold alongside whatever you dispatched,
-    then poll it when the hold elapses and hold again if you are still waiting.
+  3. The watched work is genuinely finished:
+         $CONT disarm      (or /butler:continuity off)
 
-  * if you are ENDING THE TURN TO ASK THE OPERATOR SOMETHING, say so -- that is
-    a legitimate end of a turn, not a stall, and the operator's reply is what
-    resumes the session:
-
-      perl $CONT_PL await-operator --reason "<what you asked>"
-
-    One turn only; the arm stays in force afterwards.
-
-  * explicitly disarm: perl plugins/butler/scripts/bp-continuity.pl disarm
-    (or /butler:continuity off) if the watched work is actually finished, or
-  * touch $MARK.stop-ok to skip just this once (await-operator is the same
-    exemption with a reason attached, and does not need a permission layer to
-    let you touch a dotfile).
-
-(This will not block more than $MAX_BLOCKS times in a row.)
+This gate does not yield on its own. It will keep blocking until one of the
+above is done -- each is one command, and one of them is always true.
 EOF
 exit 2

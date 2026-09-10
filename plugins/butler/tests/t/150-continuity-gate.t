@@ -256,11 +256,21 @@ sub plant_marker {
 }
 
 # ===========================================================================
-# D. AC-6 (criterion 3): armed session's Stop with NO wake-up recorded is
-#    BLOCKED, up to 3 consecutive times, then auto-allowed on the 4th with
-#    .stop-blocks reset (behavior 13 / AC-10). No fixture in this section
-#    stubs bp-drive-next.pl or reads BP_LEDGER as a branching signal for
-#    behavior (only as the top-of-file coordinator short-circuit, section G).
+# D. AC-6/AC-10 AMENDED: an armed Stop with no wake-up is blocked, and STAYS
+#    blocked. The gate no longer yields after N refusals.
+#
+#    THE BOUND WAS PROTECTING AGAINST A GAP THAT IS NOW CLOSED. It existed
+#    because the only honest way to satisfy this gate was to have real work in
+#    flight: an agent with nothing to schedule, and no way to say so, could be
+#    wedged -- and a gate that will not yield is worse than a stalled run. There
+#    are now three remedies and one of them is always true: `hold` (something
+#    will return), `await-operator` (a human was asked), `disarm` (the work is
+#    finished). Each is one command.
+#
+#    Yielding now costs more than it saves: it converts a loud refusal into a
+#    silent one, ending the session armed, unwatched, with nothing scheduled --
+#    the exact outcome this gate exists to prevent, arriving at the one moment
+#    nobody is looking for it. Operator's call, 2026-09-10.
 # ===========================================================================
 {
     my $root = new_project();
@@ -270,25 +280,33 @@ sub plant_marker {
     my ($rc1, $out1) = run_gate(stop_payload($root, 'sess-d'), cdir => $cdir);
     is($rc1, 2, 'D1 CANONICAL (-> behavior 9/AC-6): 1st Stop with no wake-up pending is '
               . 'BLOCKED -- exit 2');
-    like($out1, qr/(?:dispatch|background)/i,
-       'D1a: the block text names a remedy verb (dispatch/background)');
-    like($out1, qr/disarm/i, 'D1b: the block text names disarm as a remedy');
-    like($out1, qr/stop-ok/, 'D1c: the block text names the one-shot .stop-ok escape hatch');
+
+    # The message must name every remedy it has, because an agent that cannot
+    # find one is the case the removed bound used to rescue.
+    like($out1, qr/\bhold\b/,           'D1a: the block text offers hold');
+    like($out1, qr/await-operator/,     'D1b: ...and await-operator');
+    like($out1, qr/disarm/i,            'D1c: ...and disarm');
+    like($out1, qr/--seconds/,          'D1d: with a runnable hold invocation, not just a verb name');
+
+    # No `/../` in anything it tells the reader to run. The path used to be
+    # printed unresolved, twice, in one message.
+    unlike($out1, qr{/\.\./},
+       'D1e: no unresolved `/../` in the remedies -- the path is resolved before printing');
 
     my ($rc2) = run_gate(stop_payload($root, 'sess-d'), cdir => $cdir);
     is($rc2, 2, 'D2: 2nd consecutive Stop also blocked');
     my ($rc3) = run_gate(stop_payload($root, 'sess-d'), cdir => $cdir);
     is($rc3, 2, 'D3: 3rd consecutive Stop also blocked');
-    my ($rc4, $out4) = run_gate(stop_payload($root, 'sess-d'), cdir => $cdir);
-    is($rc4, 0, 'D4 CANONICAL (-> AC-10/behavior 13): the 4th consecutive Stop is ALLOWED -- '
-              . 'the block is bounded, never a trap');
-    ok(!-f marker_path($cdir, 'sess-d') . '.stop-blocks',
-       'D5 CANONICAL: .stop-blocks is RESET (removed) once the bound is hit');
-
+    my ($rc4) = run_gate(stop_payload($root, 'sess-d'), cdir => $cdir);
+    is($rc4, 2, 'D4 AMENDED (was AC-10/behavior 13): the 4th is blocked TOO -- the gate '
+              . 'does not yield on its own any more');
     my ($rc5) = run_gate(stop_payload($root, 'sess-d'), cdir => $cdir);
-    is($rc5, 2, 'D6 CANONICAL: after the reset, the counter starts over -- the 5th call '
-              . '(1st after reset) is blocked again, proving D4 was a bounded escape, not a '
-              . 'permanent disarm');
+    is($rc5, 2, 'D5: and the 5th, and so on. It blocks until a remedy is actually run');
+
+    # Non-vacuity: it is not simply refusing everything. A remedy still works.
+    my ($rc6) = run_gate(stop_payload($root, 'sess-d'), cdir => $cdir, stop_ok => 1);
+    is($rc6, 0, 'D6 CANONICAL: and a session that RUNS one of the remedies is permitted -- '
+              . 'the gate is unyielding, not immovable');
 }
 
 # ===========================================================================

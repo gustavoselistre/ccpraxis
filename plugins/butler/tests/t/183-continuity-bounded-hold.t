@@ -261,4 +261,66 @@ sub reg { return tempdir(CLEANUP => 1) }
     ok(!-f "$r/sid-not-armed.stop-ok", 'AC6 and no exemption is left behind');
 }
 
+# ── AC7 — the PATH shim, and the one thing that could break it ────────────
+#
+# The gate's block message used to carry ~80 characters of resolved path to
+# bp-continuity.pl, twice, complete with a `/../`. A remedy that unwieldy
+# invites being retyped wrongly. plugins/butler/bin/ is already a PATH entry,
+# so a shim there is reachable as a bare command.
+#
+# THE RISK IS WHERE IT LOOKS FOR THE SCRIPT. claude-sandbox.sh, the shim this
+# one is modelled on, hardcodes $HOME/.claude/ccpraxis/... because it only ever
+# runs on the host. This one is also read INSIDE A SANDBOX, where the plugin
+# tree is bind-mounted at /root/.claude/plugins/marketplaces/ccpraxis-local/ and
+# a $HOME assumption points at nothing. So it must resolve from its own
+# location, and that is what this proves: a copy of the tree at an arbitrary
+# path still finds its own script.
+{
+    my $shim = "$Bin/../../bin/bp-continuity.sh";
+    ok(-f $shim, 'AC7 the shim exists at plugins/butler/bin/bp-continuity.sh');
+
+    SKIP: {
+        skip 'shim missing', 4 unless -f $shim;
+
+        open my $fh, '<', $shim or die $!;
+        local $/;
+        my $src = <$fh>;
+        close $fh;
+        # Comments stripped first: this file's own header EXPLAINS why it does
+        # not use $HOME, and matching prose would fail on the explanation while
+        # passing on the mistake.
+        my $code = join "\n", grep { !/^\s*#/ } split /\n/, $src;
+        unlike($code, qr/\$\{?HOME\}?/,
+               'AC7 CANONICAL: no $HOME anywhere in the CODE -- that assumption is exactly '
+             . 'what would break it inside a sandbox');
+        like($src, qr/BASH_SOURCE/,
+             'AC7 it locates itself instead');
+
+        # Relocate the whole plugin tree and run the shim from there. If it
+        # resolved through $HOME or a fixed path, this fails.
+        my $tmp = tempdir(CLEANUP => 1);
+        mkdir "$tmp/bin"; mkdir "$tmp/scripts";
+        for my $f (qw(bp-continuity.pl BpSession.pm BpResumption.pm)) {
+            my $src_f = "$Bin/../../scripts/$f";
+            next unless -f $src_f;
+            open my $r, '<:raw', $src_f or next;
+            my $data = <$r>; close $r;
+            open my $w, '>:raw', "$tmp/scripts/$f" or next;
+            print {$w} $data; close $w;
+        }
+        open my $r2, '<:raw', $shim or die $!;
+        my $shim_src = <$r2>; close $r2;
+        open my $w2, '>:raw', "$tmp/bin/bp-continuity.sh" or die $!;
+        print {$w2} $shim_src; close $w2;
+        chmod 0755, "$tmp/bin/bp-continuity.sh";
+
+        my $reg = reg();
+        my $out = `CCPRAXIS_CONTINUITY_ACTIVE_DIR='$reg' bash '$tmp/bin/bp-continuity.sh' arm --session shim-relocated 2>&1`;
+        like($out, qr/STATUS:\s*armed/,
+             'AC7 CANONICAL: a relocated copy still finds its own script -- the shim works '
+           . 'wherever the plugin tree is mounted');
+        ok(-f "$reg/shim-relocated", 'AC7 and actually did the work');
+    }
+}
+
 done_testing();
