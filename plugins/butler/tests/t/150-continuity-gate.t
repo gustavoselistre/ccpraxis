@@ -40,6 +40,11 @@ use File::Temp qw(tempdir tempfile);
 use File::Path qw(make_path);
 use JSON::PP;
 
+# Fixtures build wake-up markers through the SAME module the gate verifies with.
+# They used to hand-roll the line, and when the contract gained a process
+# identity they silently became "unverifiable" markers testing the wrong thing.
+require "$Bin/../../scripts/BpResumption.pm";
+
 my $HOOKS = "$Bin/../../hooks";
 my $MARK  = "$HOOKS/mark-wakeup.sh";
 my $GATE  = "$HOOKS/gate-continuity.sh";
@@ -232,7 +237,7 @@ sub plant_marker {
     # rather than an accidental test of liveness.
     my $wp = marker_path($cdir, 'sess-b2') . '.wakeup-pending';
     open my $fh, '>', $wp or die "fixture: $!";
-    print {$fh} time . ' bounded ' . (time + 600) . " $$\n";
+    print {$fh} BpResumption::marker_line(deadline => time() + 600, pid => $$);
     close $fh;
 
     # ...then a dispatch, which is what used to overwrite it.
@@ -507,7 +512,7 @@ PROBE_EOF
     plant_marker($cdir2, 'sess-z2');
     my $wp2 = marker_path($cdir2, 'sess-z2') . '.wakeup-pending';
     open my $fh2, '>', $wp2 or die "fixture: $!";
-    print {$fh2} time . ' bounded ' . (time + 300) . " $$\n";
+    print {$fh2} BpResumption::marker_line(deadline => time() + 300, pid => $$);
     close $fh2;
     my ($rc2) = run_gate(stop_payload($root2, 'sess-z2'), cdir => $cdir2);
     is($rc2, 0, 'Z3 non-vacuity: a fresh BOUNDED wake-up marker permits the stop');
@@ -532,7 +537,7 @@ PROBE_EOF
     plant_marker($cdir_ex, 'sess-expired');
     my $wp_ex = marker_path($cdir_ex, 'sess-expired') . '.wakeup-pending';
     open my $fh_ex, '>', $wp_ex or die "fixture: $!";
-    print {$fh_ex} time . ' bounded ' . (time - 5) . "\n";
+    print {$fh_ex} BpResumption::marker_line(deadline => time() - 5, pid => $$);
     close $fh_ex;
     my ($rc_ex) = run_gate(stop_payload($root_ex, 'sess-expired'), cdir => $cdir_ex);
     isnt($rc_ex, 0, 'Z5: a bounded marker whose deadline has passed does not permit the stop');
@@ -578,7 +583,8 @@ PROBE_EOF
         plant_marker($cdir, 'sess-w');
         my $wp = marker_path($cdir, 'sess-w') . '.wakeup-pending';
         open my $fh, '>', $wp or die "fixture: $!";
-        print {$fh} time . ' bounded ' . (time + 600) . " $dead\n";
+        print {$fh} BpResumption::marker_line(deadline => time() + 600, pid => $dead,
+                                              fingerprint => 'proc:1');
         close $fh;
 
         my ($rc) = run_gate(stop_payload($root, 'sess-w'), cdir => $cdir);
@@ -592,7 +598,7 @@ PROBE_EOF
         plant_marker($cdir2, 'sess-w2');
         my $wp2 = marker_path($cdir2, 'sess-w2') . '.wakeup-pending';
         open my $fh2, '>', $wp2 or die "fixture: $!";
-        print {$fh2} time . ' bounded ' . (time + 600) . " $$\n";
+        print {$fh2} BpResumption::marker_line(deadline => time() + 600, pid => $$);
         close $fh2;
         my ($rc2) = run_gate(stop_payload($root2, 'sess-w2'), cdir => $cdir2);
         is($rc2, 0, 'W2: the same marker with a LIVE pid does permit it');
