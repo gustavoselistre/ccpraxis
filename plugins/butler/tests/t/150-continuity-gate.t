@@ -132,15 +132,37 @@ sub plant_marker {
 
     my ($mrc, $mout) = run_mark(task_dispatch_payload($root, 'sess-b'), cdir => $cdir);
     is($mrc, 0, 'B0 setup: mark-wakeup.sh never blocks on a Task dispatch');
-    ok(-f marker_path($cdir, 'sess-b') . '.wakeup-pending',
-       'B1 CANONICAL (-> SS2.4): a Task dispatch writes the continuity wake-up-pending file, '
-     . 'INDEPENDENT of any .drive-solo directory existing -- this session has none');
+    # B1 INVERTED. It used to assert that a dispatch WRITES the continuity
+    # wake-up marker. Once the gate began requiring a `bounded` deadline, a
+    # marker written here could never permit a stop again -- so the assertion
+    # was pinning a no-op, and the write had become actively harmful: it was
+    # truncating, so a dispatch made after taking a bounded hold destroyed that
+    # hold's deadline. The documented workflow is exactly that order. The write
+    # is gone and this now guards its return.
+    ok(!-f marker_path($cdir, 'sess-b') . '.wakeup-pending',
+       'B1 CANONICAL: a Task dispatch writes NO continuity wake-up marker -- a dispatch '
+     . 'records that something started, never that anything will come back');
 
     my ($rc, $out) = run_gate(stop_payload($root, 'sess-b'), cdir => $cdir);
-    is($rc, 0, 'B2 CANONICAL (-> AC-9/behavior 10): the armed session'."'".'s Stop, right after '
-             . 'a Task dispatch, is ALLOWED');
+    # B2 AMENDED (operator request, 2026-09-10): a bare dispatch marker no
+    # longer permits the stop on its own. AC-9 read "a dispatch happened, so a
+    # wake-up is scheduled", and that inference is unsound in one specific way:
+    # a dispatch is not a promise to come back. A subagent that runs forever, or
+    # a background command with no timeout, writes exactly this marker and then
+    # never returns -- leaving the session idle with nothing left to re-invoke
+    # it, which is the very outcome the gate exists to prevent. The marker's TTL
+    # cannot rescue it either: the TTL only decides whether a LATER stop is
+    # allowed, and there is no later stop.
+    #
+    # A wake-up now has to be BOUNDED -- see the D block for the shape that
+    # permits it, and `bp-continuity.pl hold`, which writes it and then delivers
+    # it from the same process.
+    isnt($rc, 0, 'B2 AMENDED (was AC-9/behavior 10): a Stop after a bare Task dispatch is '
+               . 'BLOCKED -- a dispatch records that something STARTED, never that anything '
+               . 'will come back');
     ok(!-f marker_path($cdir, 'sess-b') . '.wakeup-pending',
-       'B3 CANONICAL: the wake-up-pending file is CONSUMED (removed) by the allowing Stop');
+       'B3 CANONICAL: the wake-up-pending file is CONSUMED (removed) either way, so a stale '
+     . 'marker can never be spent twice');
 }
 
 # ===========================================================================
@@ -153,13 +175,19 @@ sub plant_marker {
 
     my ($mrc) = run_mark(backgrounded_bash_payload($root, 'sess-c'), cdir => $cdir);
     is($mrc, 0, 'C0 setup: mark-wakeup.sh never blocks on a backgrounded Bash call');
-    ok(-f marker_path($cdir, 'sess-c') . '.wakeup-pending',
-       'C1 CANONICAL: a run_in_background:true Bash call ALSO writes the continuity '
-     . 'wake-up-pending file, independent of .drive-solo');
+    ok(!-f marker_path($cdir, 'sess-c') . '.wakeup-pending',
+       'C1 CANONICAL: nor does a backgrounded Bash call -- backgrounding a command with '
+     . 'no timeout is the unbounded case, not a scheduled wake-up');
 
     my ($rc, $out) = run_gate(stop_payload($root, 'sess-c'), cdir => $cdir);
-    is($rc, 0, 'C2 CANONICAL (-> AC-9): armed session'."'".'s Stop after a backgrounded Bash '
-             . 'call is ALLOWED');
+    # C2 AMENDED alongside B2: backgrounding a Bash call is the case that makes
+    # the old rule's unsoundness concrete. `run_in_background` on a command with
+    # no timeout -- a tail -f, a server, a poll loop -- writes this marker and
+    # may never exit. The gate cannot read the command, so it cannot tell that
+    # one from a ten-second build; the only sound rule is to require a wait that
+    # states its own deadline.
+    isnt($rc, 0, 'C2 AMENDED (was AC-9): a Stop after a bare backgrounded Bash call is BLOCKED '
+               . '-- backgrounding a command with no timeout is exactly the unbounded case');
 }
 
 # ===========================================================================
@@ -181,6 +209,45 @@ sub plant_marker {
        'C2b CANONICAL: a FOREGROUND Bash call (run_in_background:false) does NOT write the '
      . 'continuity wake-up-pending file -- proves the trigger is the boolean, not merely '
      . '"any Bash call"');
+}
+
+# ===========================================================================
+# B2. THE CLOBBER, in the order the docs actually prescribe.
+#
+# SKILL.md says to take a bounded wait "alongside whatever you dispatched", and
+# the gate's own block text says the same. Both orders must therefore work. They
+# did not: mark-wakeup.sh wrote `<epoch> <ToolName>` over the SAME file with a
+# truncating `>`, so taking a hold and then dispatching destroyed the hold's
+# deadline and the next Stop blocked -- while dispatch-then-hold survived by
+# luck of ordering, with nothing anywhere stating the dependency.
+# ===========================================================================
+{
+    my $root = new_project();
+    my $cdir = tempdir(CLEANUP => 1);
+    plant_marker($cdir, 'sess-b2');
+
+    # A live bounded hold, as `bp-continuity.pl hold` writes it. Field 4 is the
+    # PID of the process promising to return; $$ is this test, which is alive,
+    # so the gate's liveness check passes and B2 stays a test of the CLOBBER
+    # rather than an accidental test of liveness.
+    my $wp = marker_path($cdir, 'sess-b2') . '.wakeup-pending';
+    open my $fh, '>', $wp or die "fixture: $!";
+    print {$fh} time . ' bounded ' . (time + 600) . " $$\n";
+    close $fh;
+
+    # ...then a dispatch, which is what used to overwrite it.
+    my ($mrc) = run_mark(task_dispatch_payload($root, 'sess-b2'), cdir => $cdir);
+    is($mrc, 0, 'B2-0 setup: the dispatch hook still exits 0');
+
+    ok(-f $wp, 'B2-1: the bounded marker still exists after a dispatch');
+    open my $rh, '<', $wp or die $!;
+    my $line = <$rh>;
+    close $rh;
+    like($line, qr/\bbounded\b/,
+         'B2-2 CANONICAL: and is still BOUNDED -- a dispatch no longer truncates a live hold');
+
+    my ($rc) = run_gate(stop_payload($root, 'sess-b2'), cdir => $cdir);
+    is($rc, 0, 'B2-3 CANONICAL: so the stop is permitted, in the order the docs prescribe');
 }
 
 # ===========================================================================
@@ -431,26 +498,117 @@ PROBE_EOF
     isnt($rc, 0, 'Z1: a STALE wake-up marker does NOT permit the stop -- the gate still blocks');
     ok(!-f $wp, 'Z2: ...and the stale marker is removed, so it cannot be spent twice');
 
-    # And the fresh case still works, so Z1 is not just "the gate always blocks".
+    # And the permitting case still works, so Z1 is not just "the gate always
+    # blocks". It has to be a BOUNDED marker now -- fresh is necessary and no
+    # longer sufficient. Field 2/3 are what `bp-continuity.pl hold` writes:
+    # the literal "bounded" and the epoch it guarantees a return by.
     my $root2 = new_project();
     my $cdir2 = tempdir(CLEANUP => 1);
     plant_marker($cdir2, 'sess-z2');
     my $wp2 = marker_path($cdir2, 'sess-z2') . '.wakeup-pending';
     open my $fh2, '>', $wp2 or die "fixture: $!";
-    print {$fh2} time . " Bash\n";
+    print {$fh2} time . ' bounded ' . (time + 300) . " $$\n";
     close $fh2;
     my ($rc2) = run_gate(stop_payload($root2, 'sess-z2'), cdir => $cdir2);
-    is($rc2, 0, 'Z3 non-vacuity: a FRESH wake-up marker still permits the stop');
+    is($rc2, 0, 'Z3 non-vacuity: a fresh BOUNDED wake-up marker permits the stop');
 
-    # An unstamped marker (written before this change) falls back to mtime
-    # rather than being stranded or blindly trusted.
+    # ...and the counter-check that boundedness is what did it: same freshness,
+    # no deadline, blocked.
+    my $root_ub = new_project();
+    my $cdir_ub = tempdir(CLEANUP => 1);
+    plant_marker($cdir_ub, 'sess-unbounded');
+    my $wp_ub = marker_path($cdir_ub, 'sess-unbounded') . '.wakeup-pending';
+    open my $fh_ub, '>', $wp_ub or die "fixture: $!";
+    print {$fh_ub} time . " Bash\n";
+    close $fh_ub;
+    my ($rc_ub) = run_gate(stop_payload($root_ub, 'sess-unbounded'), cdir => $cdir_ub);
+    isnt($rc_ub, 0, 'Z4: an equally fresh UNBOUNDED marker does not permit it -- boundedness '
+                  . 'is doing the work, not recency');
+
+    # A bounded marker whose deadline has already passed is not a wake-up
+    # either: nothing is going to return.
+    my $root_ex = new_project();
+    my $cdir_ex = tempdir(CLEANUP => 1);
+    plant_marker($cdir_ex, 'sess-expired');
+    my $wp_ex = marker_path($cdir_ex, 'sess-expired') . '.wakeup-pending';
+    open my $fh_ex, '>', $wp_ex or die "fixture: $!";
+    print {$fh_ex} time . ' bounded ' . (time - 5) . "\n";
+    close $fh_ex;
+    my ($rc_ex) = run_gate(stop_payload($root_ex, 'sess-expired'), cdir => $cdir_ex);
+    isnt($rc_ex, 0, 'Z5: a bounded marker whose deadline has passed does not permit the stop');
+
+    # An unstamped marker (written before the timestamp field existed) still
+    # falls back to mtime for the FRESHNESS half of the check -- but freshness
+    # is no longer sufficient, so it is now blocked as unbounded. That is the
+    # safe direction for a legacy marker: the gate cannot know what wrote it or
+    # whether anything will return, and blocking costs one bounded hold while
+    # allowing costs a session that never wakes.
     my $root3 = new_project();
     my $cdir3 = tempdir(CLEANUP => 1);
     plant_marker($cdir3, 'sess-z3');
     my $wp3 = marker_path($cdir3, 'sess-z3') . '.wakeup-pending';
     open my $fh3, '>', $wp3 or die "fixture: $!"; close $fh3;   # empty, no stamp
     my ($rc3) = run_gate(stop_payload($root3, 'sess-z3'), cdir => $cdir3);
-    is($rc3, 0, 'Z4 upgrade path: an unstamped marker written just now is honoured via its mtime');
+    isnt($rc3, 0, 'Z6 upgrade path AMENDED: an unstamped legacy marker is treated as UNBOUNDED '
+                . 'and does not permit the stop -- freshness alone stopped being sufficient');
+}
+
+# ===========================================================================
+# W. THE PROMISE MUST BE ALIVE (H4a).
+#
+# A deadline in a file is an assertion, not a guarantee. `hold` sleeps to that
+# deadline in a real process and it is that process EXITING that re-invokes the
+# session -- so if it has been killed (operator interrupt, container restart,
+# OOM), the wake-up died with it and nothing distinguishes that from a live wait
+# except asking the kernel. Permitting a stop on a dead process's promise is the
+# original failure with a better alibi.
+# ===========================================================================
+{
+    # A pid that is certainly not running: fork a child and reap it, so the id
+    # existed and is now gone. Far more honest than picking a large integer.
+    my $dead = fork();
+    if (defined $dead && $dead == 0) { exit 0 }
+    waitpid($dead, 0) if defined $dead && $dead > 0;
+
+    SKIP: {
+        skip 'fork unavailable', 3 unless defined $dead && $dead > 0;
+
+        my $root = new_project();
+        my $cdir = tempdir(CLEANUP => 1);
+        plant_marker($cdir, 'sess-w');
+        my $wp = marker_path($cdir, 'sess-w') . '.wakeup-pending';
+        open my $fh, '>', $wp or die "fixture: $!";
+        print {$fh} time . ' bounded ' . (time + 600) . " $dead\n";
+        close $fh;
+
+        my ($rc) = run_gate(stop_payload($root, 'sess-w'), cdir => $cdir);
+        isnt($rc, 0, 'W1 CANONICAL: a bounded marker whose PROCESS is dead does not permit '
+                   . 'the stop -- nothing is going to return');
+
+        # Counter-check: identical marker, live pid, permitted. Without this W1
+        # would pass just as well if the gate had started refusing everything.
+        my $root2 = new_project();
+        my $cdir2 = tempdir(CLEANUP => 1);
+        plant_marker($cdir2, 'sess-w2');
+        my $wp2 = marker_path($cdir2, 'sess-w2') . '.wakeup-pending';
+        open my $fh2, '>', $wp2 or die "fixture: $!";
+        print {$fh2} time . ' bounded ' . (time + 600) . " $$\n";
+        close $fh2;
+        my ($rc2) = run_gate(stop_payload($root2, 'sess-w2'), cdir => $cdir2);
+        is($rc2, 0, 'W2: the same marker with a LIVE pid does permit it');
+
+        # A marker predating the pid field is unverifiable, so it is refused --
+        # the same direction every other unknown takes here.
+        my $root3 = new_project();
+        my $cdir3 = tempdir(CLEANUP => 1);
+        plant_marker($cdir3, 'sess-w3');
+        my $wp3 = marker_path($cdir3, 'sess-w3') . '.wakeup-pending';
+        open my $fh3, '>', $wp3 or die "fixture: $!";
+        print {$fh3} time . ' bounded ' . (time + 600) . "\n";
+        close $fh3;
+        my ($rc3) = run_gate(stop_payload($root3, 'sess-w3'), cdir => $cdir3);
+        isnt($rc3, 0, 'W3: a bounded marker with NO pid is treated as unverifiable, not trusted');
+    }
 }
 
 done_testing();

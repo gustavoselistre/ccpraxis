@@ -104,15 +104,19 @@ my $RULE_FILL_RE      = quotemeta(Theme::glyph('rule.h'));
 # tui::DashboardScreen::compose directly.
 #
 # STRUCTURAL discriminator (primary, authoritative): every cell wrap_line/
-# make_cell emits carries a `spans` arrayref (Frame.pm's single cell
-# constructor). A banner-START row's FIRST span carries the banner's own
-# role (Screen.pm's $banner_role, e.g. 'state.crit'/'state.warn'); a
-# CONTINUATION row's FIRST span carries the continuation-indent role
-# CONTINUATION_ROLE below ('text.primary' -- the plain 2-space indent
-# wrap_line prepends to every line after the first, Screen.pm
-# WRAP_CONTINUATION_INDENT). This distinguishes start-vs-continuation by
-# STRUCTURE, not by scanning rendered text for a marker that a banner's own
-# (dynamic, tool-surfaced) content could coincidentally contain anywhere.
+# make_cell emits carries a `continuation` flag -- 0 on the first row of a
+# wrapped line (and on every single-row fast path), 1 on the rest. So a
+# banner-START row is exactly a row with a falsy `continuation`. This
+# distinguishes start-vs-continuation by STRUCTURE, not by scanning rendered
+# text for a marker that a banner's own (dynamic, tool-surfaced) content could
+# coincidentally contain anywhere.
+#
+# WAS an inference from the first span's ROLE: a start carried the banner's own
+# role, a continuation carried the indent role (CONTINUATION_ROLE below). That
+# held only while line 0 never had a leading indent of its own, which stopped
+# being true when wrap_line was fixed to keep the one-column inset
+# overlay_warnings deliberately adds (almanac 20260909-223849-1870). The flag
+# exists because appearance turned out to be the wrong thing to read.
 #
 # TEXT discriminator (secondary, belt-and-braces): `/^\s*!! /` matches BOTH
 # accepted first-row shapes above (wrapped "!! ..." and unwrapped
@@ -149,21 +153,31 @@ my $RULE_FILL_RE      = quotemeta(Theme::glyph('rule.h'));
 # Per the ruling above: structural is authoritative; the width 1/2/3 pinned
 # block below asserts cols==3 gets a real count (via structural alone) and
 # cols==1/2 do not.
-my $CONTINUATION_ROLE = 'text.primary';   # Screen.pm's wrap-continuation indent role
+my $CONTINUATION_ROLE = q{text.primary};   # kept for the historical note above; the
+                                        # discriminator now reads the continuation flag
 sub count_banner_starts {
     my ($rows) = @_;
     $rows = [] if ref($rows) ne 'ARRAY';
     my $count = 0;
     for my $row (@$rows) {
         next if ref($row) ne 'HASH';
-        my $spans = (ref($row->{spans}) eq 'ARRAY') ? $row->{spans} : undef;
-        # A row with no spans array (or an empty one) cannot be identified
-        # as a continuation -- there is no indent span to find -- so it
-        # counts as a start. Documented, not silently swallowed: every cell
-        # this codebase actually emits carries spans (make_cell/wrap_line),
-        # so this branch is a defensive default, not an expected path.
-        my $first_role = ($spans && @$spans) ? $spans->[0]{role} : undef;
-        $count++ if !defined($first_role) || $first_role ne $CONTINUATION_ROLE;
+        # READ THE FLAG THE WRAPPER SETS. This used to infer "continuation"
+        # from the first span's role being $CONTINUATION_ROLE -- an indent span
+        # in the default role. That inference was wrong twice. It over-counted
+        # when a continuation row's own text contained the banner marker (the
+        # amendment noted below), and it under-counted the moment line 0
+        # legitimately kept a leading indent of its own: overlay_warnings insets
+        # its text by one column deliberately, wrap_line used to drop that inset
+        # on the first row only, and once that was fixed every banner's first
+        # row started with an indent span and read as a continuation.
+        #
+        # tui::Frame::make_cell now defaults `continuation` to 0 and wrap_line
+        # sets it to 1 for every row after the first, so the wrapper states the
+        # answer instead of leaving it to be guessed from appearance. A row
+        # missing the key entirely counts as a start -- documented, not silently
+        # swallowed: every cell this codebase emits comes from make_cell or
+        # wrap_line, so that is a defensive default, not an expected path.
+        $count++ unless $row->{continuation};
     }
     return $count;
 }

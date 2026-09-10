@@ -135,59 +135,101 @@ sub marker_path { my ($reg, $sid) = @_; return "$reg/$sid"; }
 }
 
 # ===========================================================================
-# E. AC-4 (behavior 4): arm with NEITHER --session nor $CLAUDE_SESSION_ID set
-#    -> STATUS: error, exit 1, no marker written under ANY name.
-# ===========================================================================
-{
-    my $reg = new_registry();
-    my ($out, $rc) = run_cli(
-        ['arm'],
-        { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $reg, BP_LEDGER => undef, CLAUDE_SESSION_ID => undef },
-    );
-    is($rc, 1, 'E1 CANONICAL (-> AC-4/behavior 4): arm with no session id anywhere exits 1 -- '
-             . 'this is a direct invocation; silently no-op-ing here would be a command that '
-             . 'is "correct, tested and never invoked" for the input class it exists to handle');
-    is(kv($out, 'STATUS'), 'error', 'E2: STATUS: error');
-    opendir(my $dh, $reg) or die $!;
-    my @entries = grep { !/^\.\.?$/ } readdir $dh;
-    closedir $dh;
-    is(scalar(@entries), 0, 'E3 CANONICAL: no marker file exists under ANY name in the registry');
-}
-
-# ===========================================================================
-# F. behavior 4 corollary: $CLAUDE_SESSION_ID (env), no --session, DOES arm --
-#    proves --session is an override, not the only source.
+# E/F/G REPLACED (2026-09-10). All three pinned the same premise -- that `arm`
+# RESOLVES a session id from --session or the environment -- and that premise is
+# what failed in the field. A Bash tool call is never told which session Claude
+# Code considers live: ${CLAUDE_SESSION_ID} is a template substitution baked
+# into a skill body at render time (not an env var; the old
+# $ENV{CLAUDE_SESSION_ID} fallback these blocks tested could never fire), while
+# the gate consuming the marker uses the session_id from its own hook payload
+# and exits SILENTLY when the two disagree. An operator armed, was told
+# "armed", and was never gated.
+#
+# So `arm` no longer resolves anything. It writes a TICKET carrying a nonce and
+# prints the nonce, which lands in the arming session's transcript; the Stop
+# hook -- which IS handed the live id -- binds the ticket to the session whose
+# transcript actually carries that nonce. See t/184 for the binding itself.
+# What survives here is the direct `--session` path, which is what the gate's
+# own claim step and manual repair use.
+#
+# E. no --session: a TICKET is written and NOTHING is armed yet.
 # ===========================================================================
 {
     my $reg = new_registry();
     my ($out, $rc) = run_cli(
         ['arm'],
         { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $reg, BP_LEDGER => undef,
-          CLAUDE_SESSION_ID => 'sess-f-envsid' },
+          CLAUDE_SESSION_ID => undef, CLAUDE_CODE_SESSION_ID => undef },
     );
-    is($rc, 0, 'F1: arm succeeds using only $CLAUDE_SESSION_ID, no --session flag');
-    is(kv($out, 'SESSION'), 'sess-f-envsid',
-       'F2 CANONICAL: the session id resolved from the env var appears in SESSION:');
-    ok(-f marker_path($reg, 'sess-f-envsid'), 'F3: marker written under the env-resolved id');
+    is($rc, 0, 'E1 (was AC-4/behavior 4): arm with no id is the NORMAL path now, not an error');
+    is(kv($out, 'STATUS'), 'arming', 'E2: STATUS: arming -- not yet bound to a session');
+    like(kv($out, 'NONCE') // '', qr/\Accpx-sess-/,
+         'E3: it prints a nonce, which is how the session that ran it is identified later');
+    ok(-d "$reg/pending", 'E4: a pending ticket directory exists');
+    opendir(my $ph, "$reg/pending") or die $!;
+    my @tickets = grep { !/^\.\.?$/ } readdir $ph;
+    closedir $ph;
+    is(scalar(@tickets), 1, 'E5: exactly one ticket was written');
+    is($tickets[0], kv($out, 'NONCE'), 'E6: named by the nonce it printed');
+
+    opendir(my $dh, $reg) or die $!;
+    my @markers = grep { !/^\.\.?$/ && $_ ne 'pending' && $_ ne 'beacons' } readdir $dh;
+    closedir $dh;
+    is(scalar(@markers), 0,
+       'E7 CANONICAL: NO marker exists under any name -- arming a guessed id is exactly '
+     . 'what produced "armed, enforcing nothing", so nothing is armed until the gate '
+     . 'confirms which session this is');
 }
 
 # ===========================================================================
-# G. AC-4 continued (spec SS2.2's "explicit override"): --session wins over
-#    $CLAUDE_SESSION_ID when BOTH are present.
+# F. an env session id is NOT a source of identity any more. It may key a
+#    beacon (a stable process-scoped handle for status/disarm to resolve
+#    through), but it can never by itself decide what gets armed.
+# ===========================================================================
+{
+    my $reg = new_registry();
+    my ($out, $rc) = run_cli(
+        ['arm'],
+        { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $reg, BP_LEDGER => undef,
+          CLAUDE_SESSION_ID => q{sess-f-envsid},
+          CLAUDE_CODE_SESSION_ID => q{sess-f-code-envsid} },
+    );
+    is($rc, 0, 'F1: arm still succeeds with env ids present');
+    is(kv($out, 'STATUS'), 'arming', 'F2: and still only ARMS NOTHING YET');
+    ok(!-f marker_path($reg, 'sess-f-envsid'),
+       'F3 CANONICAL: no marker under $CLAUDE_SESSION_ID -- it is a template token, '
+     . 'not an identity');
+    ok(!-f marker_path($reg, 'sess-f-code-envsid'),
+       'F4 CANONICAL: nor under $CLAUDE_CODE_SESSION_ID -- one unverified process value '
+     . 'is not evidence of which session is live either');
+}
+
+# ===========================================================================
+# G. --session is the DIRECT path: it arms exactly that id, immediately, and
+#    touches nothing else. This is what the gate's claim step and hand repair
+#    use, and it is the only way to arm without a turn boundary.
 # ===========================================================================
 {
     my $reg = new_registry();
     my ($out, $rc) = run_cli(
         ['arm', '--session', 'sess-g-explicit'],
         { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $reg, BP_LEDGER => undef,
-          CLAUDE_SESSION_ID => 'sess-g-env-should-be-ignored' },
+          CLAUDE_SESSION_ID => q{sess-g-env-should-be-ignored},
+          CLAUDE_CODE_SESSION_ID => q{sess-g-code-env} },
     );
-    is($rc, 0, 'G1: arm succeeds');
-    is(kv($out, 'SESSION'), 'sess-g-explicit',
-       'G2 CANONICAL: --session overrides $CLAUDE_SESSION_ID when both are given');
-    ok(-f marker_path($reg, 'sess-g-explicit'), 'G3: marker written under the --session id');
+    is($rc, 0, 'G1: arm --session succeeds');
+    is(kv($out, 'STATUS'), 'armed', 'G2: and arms immediately, no ticket, no waiting');
+    is(kv($out, 'SESSION'), 'sess-g-explicit', 'G3: reporting the id it was given');
+    ok(-f marker_path($reg, 'sess-g-explicit'), 'G4: marker written under the --session id');
     ok(!-f marker_path($reg, 'sess-g-env-should-be-ignored'),
-       'G4: no marker written under the ignored env id');
+       'G5: and nothing under either env id -- an explicit instruction is not a hint');
+    ok(!-f marker_path($reg, 'sess-g-code-env'), 'G6: neither of them');
+    ok(!-d "$reg/pending" || do {
+           opendir(my $p, "$reg/pending") or die $!;
+           my @t = grep { !/^\.\.?$/ } readdir $p;
+           closedir $p;
+           !@t;
+       }, 'G7: the direct path writes no ticket');
 }
 
 # ===========================================================================

@@ -1205,11 +1205,11 @@ sub _indent {
 # == child_indent), a hierarchy inversion: a continuation of a package row
 # reads as its own coordinator, a continuation of a coordinator reads as its
 # own worker. tui::Screen DOES let a panel override the continuation indent
-# via `wrap_indent`, but only on its character-break wrap path
-# (tui/Screen.pm:315-339); the word-wrap path this panel actually uses
-# hardcodes tui::Screen's constant and ignores the override. Both
-# tui/Screen.pm and tui/Frame.pm are outside this package's write set, so
-# that plumbing gap cannot be closed there (verified: switching the whole
+# via `wrap_indent`, but AT THE TIME THIS WAS WRITTEN only on its
+# character-break wrap path; the word-wrap path this panel actually uses
+# hardcoded tui::Screen's constant and ignored the override. Both
+# tui/Screen.pm and tui/Frame.pm were outside that package's write set, so
+# the plumbing gap could not be closed there (verified: switching the whole
 # Blueprints panel to the char-break path instead was tried and reverted --
 # it breaks t/182 AC14's "every word survives a wrap" guarantee, because
 # character breaking is not word-safe for the "cur"/"paused" free-text
@@ -1221,6 +1221,16 @@ sub _indent {
 # level's own indent (2, 4, 6). A row that already fits the panel's content
 # width hits tui::Frame::wrap_line's own unmodified fast path -- byte-
 # identical passthrough -- so a row that never wraps is unaffected.
+#
+# THAT PLUMBING GAP IS NOW CLOSED. tui::Screen's word-wrap path honours
+# `wrap_indent` too (needed by the approval screen's label/value rows, whose
+# values wrapped back to column 2 from a gutter at 16). So this panel COULD
+# now declare wrap_indent instead of pre-wrapping its own rows. It is left
+# as-is deliberately: the pre-wrap is correct, tested, and per-ROW, while
+# wrap_indent is per-PANEL and this panel mixes tree rows with free-text
+# "cur"/"paused" lines that want the ordinary indent. Adopting it would be a
+# behaviour change across t/182 and t/187, which is its own piece of work and
+# not a side effect of closing the gap.
 use constant TREE_WRAP_CONTINUATION_INDENT => 1;
 
 # _wrap_tree_row($row, $width) -> \@rows. Pre-wraps one tree row (an

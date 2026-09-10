@@ -57,11 +57,50 @@ MAX_BLOCKS=3
 # overwhelming common case (no one armed anywhere) costs stats only, and this
 # is where a stale marker belonging to ANY session gets reaped, regardless of
 # who is calling right now.
-bp_continuity_any_active || exit 0
+# --- cheap pre-check, now counting UNBOUND arms too --------------------------
+#
+# bp_continuity_any_active exits when no MARKER exists anywhere. A pending
+# TICKET is not a marker -- it is an arm waiting to learn which session it
+# belongs to -- so checking markers alone would exit before the ticket could
+# ever bind, and every arm would silently do nothing. That is precisely the
+# class of failure the ticket flow replaces, so it must not be reintroduced
+# here. Cost when nothing is pending: one directory test.
+CONT_DIR=$(bp_continuity_active_dir 2>/dev/null || true)
+HAVE_PENDING=0
+if [ -n "${CONT_DIR:-}" ] && [ -d "$CONT_DIR/pending" ]; then
+  for _t in "$CONT_DIR"/pending/*; do
+    [ -e "$_t" ] || break
+    HAVE_PENDING=1
+    break
+  done
+fi
 
+if [ "$HAVE_PENDING" -eq 0 ]; then
+  bp_continuity_any_active || exit 0
+fi
+
+# READ THE PAYLOAD EXACTLY ONCE. bp_read_payload consumes stdin (`read -r -d ''`),
+# so a second call finds nothing and, in `open` mode, waits out the timeout and
+# exits 0 -- which would make this gate stand aside on every single stop while
+# looking perfectly healthy. One read, then $SID is reused below.
 bp_read_payload open
 SID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
 [ -n "$SID" ] || exit 0
+
+# --- bind any pending arm to THIS session ------------------------------------
+#
+# `bp-continuity.pl arm` cannot know which session Claude Code considers live: a
+# Bash tool call is never told. THIS hook is told, in its payload. So arming
+# writes a ticket carrying a nonce and prints the nonce into its own session's
+# transcript, and the binding happens here, where the live id is a fact rather
+# than a guess. bp-session.pl binds a ticket only when the transcript record
+# carrying its nonce names the SAME session as this payload -- two independent
+# facts agreeing, which is what makes it safe for any number of concurrent
+# sessions sharing one registry.
+if [ "$HAVE_PENDING" -eq 1 ]; then
+  perl "$HOOK_DIR/../scripts/bp-session.pl" claim --session "$SID" >/dev/null 2>&1 || true
+fi
+
 MARK=$(bp_continuity_marker "$SID" 2>/dev/null) || exit 0
 [ -f "$MARK" ] || exit 0
 
@@ -117,8 +156,42 @@ if [ -f "$MARK.wakeup-pending" ]; then
   # A marker with no timestamp predates this change; fall back to its mtime so
   # an in-flight upgrade does not either strand or over-trust it.
   [ "$WAT" -gt 0 ] 2>/dev/null || WAT=$(stat -c %Y "$MARK.wakeup-pending" 2>/dev/null || echo 0)
+  # BOUNDED, OR IT IS NOT A WAKE-UP. Field 2 is the literal "bounded" and field
+  # 3 a deadline epoch, written by `bp-continuity.pl hold` -- the one command
+  # that both records the promise and keeps it, because it sleeps and exits, and
+  # a backgrounded command that exits is what actually re-invokes this session.
+  #
+  # A marker without that (what mark-wakeup.sh writes on any Task/Agent dispatch
+  # or backgrounded Bash call) records only that something was DISPATCHED. A
+  # dispatch is not a promise to come back: a subagent that runs forever, or a
+  # background command with no timeout, satisfies it and then never returns, and
+  # the session idles with nothing left to wake it. The TTL does not save that
+  # case -- it governs whether a LATER stop is allowed, and there is no later
+  # stop, because nothing wakes the session to have one.
+  WBOUND=$(awk 'NR==1{print $2; exit}' "$MARK.wakeup-pending" 2>/dev/null || echo '')
+  WDEAD=$(awk 'NR==1{print $3+0; exit}' "$MARK.wakeup-pending" 2>/dev/null || echo 0)
+  WPID=$(awk 'NR==1{print $4+0; exit}' "$MARK.wakeup-pending" 2>/dev/null || echo 0)
   rm -f "$MARK.wakeup-pending" 2>/dev/null
-  if [ "$WNOW" -gt 0 ] && [ "$WAT" -gt 0 ] && [ $(( WNOW - WAT )) -lt "$WAKEUP_TTL_S" ]; then
+
+  # AND THE PROCESS THAT PROMISED IT MUST STILL BE ALIVE.
+  #
+  # A deadline in a file is an assertion. `hold` sleeps to that deadline in a
+  # real process and exits, and it is the EXIT that re-invokes the session -- so
+  # if that process is gone (operator interrupt, container restart, OOM), the
+  # wake-up it promised is gone with it and nothing distinguishes that from a
+  # live wait except asking the kernel. Permitting a stop on the strength of a
+  # dead process's promise is the original failure with a better alibi.
+  #
+  # A marker with no pid (field 4 absent) predates this and is treated as
+  # unverifiable rather than trusted: same direction as every other unknown here.
+  WALIVE=0
+  if [ "$WPID" -gt 0 ] 2>/dev/null && kill -0 "$WPID" 2>/dev/null; then
+    WALIVE=1
+  fi
+
+  if [ "$WNOW" -gt 0 ] && [ "$WAT" -gt 0 ] && [ $(( WNOW - WAT )) -lt "$WAKEUP_TTL_S" ] \
+     && [ "$WBOUND" = "bounded" ] && [ "$WDEAD" -gt "$WNOW" ] 2>/dev/null \
+     && [ "$WALIVE" -eq 1 ]; then
     rm -f "$MARK.stop-blocks" 2>/dev/null
     exit 0
   fi
@@ -131,22 +204,53 @@ BLOCKS=0
 [ -f "$MARK.stop-blocks" ] && BLOCKS=$(cat "$MARK.stop-blocks" 2>/dev/null || echo 0)
 case "$BLOCKS" in ''|*[!0-9]*) BLOCKS=0 ;; esac
 if [ "$BLOCKS" -ge "$MAX_BLOCKS" ]; then
+  # GIVING UP IS RECORDED, NOT SILENT -- and it stays a BOUNDED escape.
+  #
+  # Yielding after N refusals is right: a gate that will not yield is worse than
+  # a stalled run. What was wrong is that it left no trace. The marker stayed, so
+  # the session still read as "armed" and the statusline kept its watched glyph,
+  # while nothing anywhere said continuity had just stood aside -- the same
+  # "reports armed, enforces nothing" shape this subsystem exists to remove,
+  # arriving at the one moment nobody is looking for it.
+  #
+  # DISARMING HERE WAS CONSIDERED AND REJECTED. A review argued this state is
+  # terminal because no later stop exists to gate. That holds for an UNATTENDED
+  # session; in an interactive one the operator speaks again and there are more
+  # stops, which is exactly what t/150's D6 pins ("a bounded escape, not a
+  # permanent disarm"). Disarming would silently discard an arm the operator
+  # asked for, on the strength of an assumption that is only sometimes true. So
+  # the counter still resets and the arm still stands; what changes is that the
+  # give-up leaves a durable record `status` can surface.
   rm -f "$MARK.stop-blocks" 2>/dev/null
+  date +%s > "$MARK.gave-up" 2>/dev/null || true
   echo "butler continuity-gate: allowing this stop after $BLOCKS consecutive blocks — a gate that will not yield is worse than a stalled run." >&2
+  echo "butler continuity-gate: this session is STILL ARMED but continuity just stood aside. If nothing is actually scheduled, it will not be woken. Run /butler:continuity status to see it, or 'off' if the work is finished." >&2
   exit 0
 fi
 
 echo $((BLOCKS + 1)) > "$MARK.stop-blocks" 2>/dev/null
 
+CONT_PL="$HOOK_DIR/../scripts/bp-continuity.pl"
+
 cat >&2 <<EOF
-BLOCKED (butler continuity-gate): this turn is ending with nothing scheduled
+BLOCKED (butler continuity-gate)
+: this turn is ending with nothing scheduled
 to resume this armed session, and it has not been disarmed.
 
 This session was explicitly armed to be watched. A turn may end only if
 something will wake it, or the arm is explicitly lifted. Neither holds now.
 
 Do one of these NOW, in this turn:
-  * dispatch a subagent or background a Bash call before this turn ends, or
+  * take a BOUNDED wait -- run this as a BACKGROUND Bash call, so its exit
+    re-invokes this session at a time known in advance:
+
+      perl $CONT_PL hold --seconds 600
+
+    Dispatching a subagent or backgrounding a command is NOT enough on its own.
+    A dispatch is not a promise to come back: if it never returns, nothing is
+    left to wake this session. Take the hold alongside whatever you dispatched,
+    then poll it when the hold elapses and hold again if you are still waiting.
+
   * explicitly disarm: perl plugins/butler/scripts/bp-continuity.pl disarm
     (or /butler:continuity off) if the watched work is actually finished, or
   * touch $MARK.stop-ok to skip just this once.

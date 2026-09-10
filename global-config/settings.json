@@ -11,6 +11,7 @@
    "editorMode" : "vim",
    "effortLevel" : "high",
    "enabledPlugins" : {
+      "almanac@ccpraxis-local" : true,
       "backpack@ccpraxis-local" : true,
       "blueprint@ccpraxis-local" : true,
       "butler@ccpraxis-local" : true,

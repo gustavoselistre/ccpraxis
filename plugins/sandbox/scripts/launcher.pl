@@ -991,6 +991,11 @@ my $MATERIALIZED_MARKETPLACES_FILE = "$CLAUDE_DATA/plugins/known_marketplaces.js
 # no zombies) and the NEW one to copy the current set; materialize reads the
 # plugins manifest back as merge provenance (sandbox-installed vs deselected).
 my $PLUGINS_COPY_MANIFEST      = "$LAUNCHER_DIR/.host-tier-plugins.json";
+# Host-only skill masks. skills.pl emits the container paths of host-only skills
+# belonging to a selected, LIVE-BOUND plugin; the launcher binds $EMPTY_SKILL_DIR
+# over each one so the container sees a skill directory with no SKILL.md.
+my $HOST_ONLY_MASKS_FILE       = "$LAUNCHER_DIR/.host-only-masks.json";
+my $EMPTY_SKILL_DIR            = "$LAUNCHER_DIR/empty-skill";
 my $MARKETPLACES_COPY_MANIFEST = "$LAUNCHER_DIR/.host-tier-marketplaces.json";
 my $SKILLS_COPY_MANIFEST       = "$LAUNCHER_DIR/.host-tier-skills.json";
 # Container CLAUDE.md and settings.json: per-project copies (blueprint
@@ -3035,6 +3040,7 @@ sub _skill_divergence_msg {
     $fmt->('plugin-path drift', $d->{plugin_path_changed});
     $fmt->('plugin added',      $d->{plugins_added});
     $fmt->('plugin removed',    $d->{plugins_removed});
+    $fmt->('plugin now host-only', $d->{plugins_host_only});
     $fmt->('plugin path drift', $d->{plugins_path_changed});
     return join('; ', @parts);
 }
@@ -3764,6 +3770,62 @@ if (-f "$HOST_PLUGINS_DIR/known_marketplaces.json") {
                 unless -d "$CLAUDE_DATA/plugins/marketplaces/$name";
             my $container_path = "/root/.claude/plugins/marketplaces/$name";
             push @PLUGIN_MOUNTS, '-v', "${host_path}:${container_path}:ro";
+        }
+    }
+}
+
+# Mask the host-only skills of any selected plugin that is served by one of the
+# live binds above.
+#
+# `host-only: true` was enforced on only one of the two paths into a container.
+# discover_skills drops a host-only STANDALONE skill; plugin-shipped skills came
+# in through plugin selection, which never opened a SKILL.md. discover_plugins
+# now drops a plugin whose skills are ALL host-only (sandbox, todo), but that
+# cannot help a MIXED plugin -- steward ships /steward:setup-project and
+# /steward:audit, which belong in a container, next to four skills that do not.
+#
+# A directory-source marketplace is bind-mounted LIVE and read-only, so there is
+# no copy to leave a skill out of. Bind an empty directory over the skill dir
+# instead: what remains is a directory with no SKILL.md, which is not a skill.
+# Measured against podman first -- a nested bind over a subtree of a read-only
+# bind mounts fine and leaves its siblings intact.
+#
+# Ordering matters: every mask must come AFTER the marketplace bind it nests
+# inside, which is why this block sits below the loop above rather than beside it.
+if (@PLUGIN_MOUNTS && -f $SELECTION_FILE) {
+    run_perl_to_file('host-only mask discovery', $HOST_ONLY_MASKS_FILE,
+        'host-only-masks',
+        '--selection-file', $SELECTION_FILE,
+        '--project-path',   $PROJECT_PATH,
+        '--plugins-snapshot', $PLUGINS_SNAPSHOT_FILE);
+
+    my $masks;
+    {
+        local $/;
+        if (open my $fh, '<:raw', $HOST_ONLY_MASKS_FILE) {
+            my $raw = <$fh>;
+            close $fh;
+            $masks = eval { require JSON::PP; JSON::PP::decode_json($raw) };
+        }
+    }
+    if (ref $masks eq 'ARRAY' && @$masks) {
+        # One shared empty directory serves every mask: it is mounted read-only
+        # and never written, so there is nothing to keep separate per skill.
+        make_path($EMPTY_SKILL_DIR) unless -d $EMPTY_SKILL_DIR;
+        my $empty_src = winify_path($EMPTY_SKILL_DIR);
+        if (-d $EMPTY_SKILL_DIR) {
+            for my $m (@$masks) {
+                next unless ref $m eq 'HASH';
+                my $target = $m->{container_path};
+                next unless defined $target && $target =~ m{^/root/\.claude/plugins/};
+                push @PLUGIN_MOUNTS, '-v', "${empty_src}:${target}:ro";
+            }
+        } else {
+            # Fail SOFT. A mask that cannot be created is a host-only skill left
+            # visible in the container -- the bug this closes, no worse than
+            # before it was closed. Refusing to launch the sandbox over it would
+            # be a far bigger regression than the defect.
+            _emit_err("Warning: could not create $EMPTY_SKILL_DIR; host-only plugin skills will be visible in the container.\n");
         }
     }
 }

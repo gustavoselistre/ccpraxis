@@ -504,27 +504,31 @@ if [ -n "$DATA" ] && [ -d "$DATA/.drive-solo" ]; then
       > "$DATA/.drive-solo/.wakeup-pending" 2>/dev/null || true
 fi
 
-# --- NEW path -- independent of .drive-solo, keyed by THIS session's own ---
-# continuity marker. Written ONLY if that session is already armed (the
-# marker file exists) -- this hook never arms continuity itself.
-CSID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
-if [ -n "$CSID" ]; then
-  if CMARK=$(bp_continuity_marker "$CSID" 2>/dev/null); then
-    # STAMPED, not just touched (bug report 20260829-225523-88e7).
-    #
-    # This used to be an empty file: a bare "something was dispatched" flag with
-    # no notion of WHEN. The gate consumes it at the next stop, so a marker
-    # written for work that had already finished several turns earlier was still
-    # honoured -- and an armed session ended a turn with the work plainly
-    # unfinished, which is the exact failure the gate exists to prevent.
-    #
-    # The epoch lets the gate expire it: a wake-up that was scheduled long ago
-    # has, by then, either fired or died. Which of those it was is not knowable
-    # from a shell hook, and both mean the same thing here -- it is no longer
-    # pending.
-    [ -f "$CMARK" ] && printf '%s %s\n' "$(date +%s 2>/dev/null || echo 0)" "$TOOL" \
-      > "$CMARK.wakeup-pending" 2>/dev/null || true
-  fi
-fi
+# --- continuity: NOTHING IS WRITTEN HERE ANY MORE ----------------------------
+#
+# This hook used to stamp `<epoch> <ToolName>` into
+# <continuity-marker>.wakeup-pending on every Task dispatch or backgrounded Bash
+# call, so that an armed session could end its turn on the strength of having
+# dispatched something. gate-continuity.sh no longer accepts that, and the
+# reason is the whole point of the change: a dispatch records that something
+# STARTED, never that anything will come back. A subagent that runs forever, or
+# a background command with no timeout, wrote exactly this marker and then never
+# returned, leaving the session idle with nothing left to re-invoke it.
+#
+# Since the gate now requires field 2 to be the literal `bounded` (written only
+# by `bp-continuity.pl hold`, which sleeps to its own deadline and exits), a
+# marker written here could never permit a stop again. It had two effects left,
+# both harmful:
+#
+#   * it CLOBBERED a live bounded hold. The write was truncating (`>`), so a
+#     dispatch made after taking a hold destroyed the hold's deadline and left
+#     `<epoch> <ToolName>` in its place -- and the documented workflow is
+#     exactly that order ("take a bounded wait alongside whatever you
+#     dispatched"). Verified: hold, then dispatch, then Stop => BLOCKED.
+#   * it made the gate delete a file this hook had just created, once per turn,
+#     for nothing.
+#
+# So `hold` is the sole writer of that file now. The .drive-solo path above is
+# untouched -- it has its own consumer with its own contract.
 
 exit 0

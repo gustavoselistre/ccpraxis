@@ -357,7 +357,12 @@ sub make_cell {
     my ($line, $role, $w) = @_;
     $role = DEFAULT_ROLE() if !defined $role;
     my $spans = fit_spans(spanify($line, $role), $w, $role);
-    return { text => spans_text($spans), role => $role, spans => $spans };
+    # `continuation` defaults to 0 here so EVERY cell carries it, including the
+    # single-row fast paths wrap_line returns without going near its wrap loop.
+    # wrap_line overwrites it for rows after the first; see the note at the end
+    # of that sub for why a cell states this rather than leaving it inferred.
+    return { text => spans_text($spans), role => $role, spans => $spans,
+             continuation => 0 };
 }
 
 # wrap_line($line, $role, $w, $continuation_indent) -> \@cells, a NON-EMPTY
@@ -410,16 +415,36 @@ sub wrap_line {
     # continuation lines so their own added indent (WRAP_CONTINUATION_INDENT,
     # Screen.pm) reads as genuinely MORE indented than line 0, not merely
     # equal to it (existing 2 + new 2 = 4, per spec S2.4). Recover it by
-    # walking the spans from the front and collecting any purely-whitespace
-    # run before the first span carrying real content.
+    # walking the spans from the front and collecting the leading space run,
+    # WHEREVER IT LIVES.
+    #
+    # THAT LAST PART IS THE FIX FOR almanac 20260909-223849-1870. This loop
+    # used to collect only spans that were ENTIRELY whitespace and `last` on
+    # the first span carrying any content -- which covers the case it was
+    # written for (Screen.pm's own 2-column body indent, its own span) and
+    # misses the one where the indent is simply the first characters of a
+    # content span. LaunchScreens renders a subheader as a SINGLE span,
+    # '  ' . $display, and launcher.pl's stale-sandbox reasons already carry
+    # their own '  - ' prefix inside that display text -- so the row arrives
+    # as one span whose text starts with four spaces, the old loop stopped on
+    # iteration one, and line 0 was built from words alone. It rendered flush
+    # at column 0 while its own continuation lines sat at column 2: two
+    # columns LEFT of the text it continues, and four left of its unwrapped
+    # siblings. Take the leading run off whichever span carries it, then stop
+    # at the first span with real content.
+    # THE INDENT KEEPS THE ROLE OF THE SPAN IT CAME FROM, and that matters
+    # because a role is not only a foreground colour: 'overlay.warn' paints a
+    # background, so an indent left in DEFAULT_ROLE renders as an unpainted
+    # notch at the left edge of the warning bar rather than as part of it.
     my $leading_indent_text = '';
     my $leading_indent_role;
     for my $sp (@$spans) {
         my $t = defined $sp->{text} ? $sp->{text} : '';
+        if ($t =~ /^( +)/) {
+            $leading_indent_text .= $1;
+            $leading_indent_role = $sp->{role} if !defined $leading_indent_role;
+        }
         last if $t !~ /^ *$/;
-        next if $t eq '';
-        $leading_indent_text .= $t;
-        $leading_indent_role = $sp->{role} if !defined $leading_indent_role;
     }
     $leading_indent_role = DEFAULT_ROLE() if !defined $leading_indent_role;
     my $leading_indent_w = tui::Layout::display_width($leading_indent_text);
@@ -627,7 +652,14 @@ sub wrap_line {
                 my @indent_spans;
                 push @indent_spans, { text => $leading_indent_text, role => $leading_indent_role }
                     if $effective_leading > 0;
-                push @indent_spans, { text => (' ' x $effective_indent), role => DEFAULT_ROLE() }
+                # The continuation indent takes the LINE's role, not
+                # DEFAULT_ROLE. Same reason as the leading indent just above: on
+                # a role that paints a background ('overlay.warn'), a default-
+                # role indent left an unpainted notch down the left edge of
+                # every continuation row of the warning bar.
+                push @indent_spans, { text => (' ' x $effective_indent),
+                                      role => (defined $leading_indent_role
+                                               ? $leading_indent_role : $role) }
                     if $effective_indent > 0;
                 $line_spans = [ @indent_spans, @$line_words ];
             } else {
@@ -662,6 +694,24 @@ sub wrap_line {
             push @cells, make_cell($line_spans, $role, $w);
         }
     }
+
+    # SAY WHICH ROWS ARE CONTINUATIONS, rather than leaving callers to infer it.
+    #
+    # Code downstream needs to tell a wrapped row's first line from its
+    # continuations -- counting how many distinct banners are on screen, for
+    # one. With nothing structural to read, that was inferred from the shape of
+    # the first span: an indent span in DEFAULT_ROLE meant "continuation". The
+    # inference has now been wrong twice. It over-counted when a continuation's
+    # own text contained the banner marker, and it under-counted once line 0
+    # correctly kept a leading indent of its own -- the overlay insets its text
+    # by one column deliberately (tui::Screen::overlay_warnings), and once that
+    # inset survived wrapping, every banner's first row looked like a
+    # continuation.
+    #
+    # The wrapper knows the answer for free. Recording it ends the guessing:
+    # `continuation` is 0 on the first row of a wrapped line and 1 on the rest,
+    # including the single row every fast path returns.
+    $cells[$_]{continuation} = ($_ == 0 ? 0 : 1) for 0 .. $#cells;
     return \@cells;
 }
 
@@ -986,7 +1036,11 @@ sub wrap_capped {
         }
         push @spans, { text => ELLIPSIS(), role => $role };
         my $fitted = fit_spans(\@spans, $w_num, $role);
-        $kept[-1] = { text => spans_text($fitted), role => $last->{role}, spans => $fitted };
+        # Appending an ellipsis does not change whether this row was the first
+        # of its wrapped line, so `continuation` is carried, not recomputed.
+        $kept[-1] = { text => spans_text($fitted), role => $last->{role},
+                      spans => $fitted,
+                      continuation => ($last->{continuation} ? 1 : 0) };
     }
     else {
         # $w is one column or less -- there is no room for content AND an
