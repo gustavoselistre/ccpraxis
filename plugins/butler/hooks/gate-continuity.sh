@@ -237,6 +237,21 @@ fi
 #
 # .stop-blocks is still counted, because the count is useful evidence in the
 # message; it no longer decides anything.
+# ONE-SHOT DIAGNOSTIC (remove once read). Three times now I have explained why
+# the shim is not on this hook's PATH without measuring it. A hook cannot be
+# handed an env var by the agent, so this keys on a file instead: it writes once
+# and never again.
+_PROBE="${CONT_DIR:-}/.path-probe"
+if [ -n "${CONT_DIR:-}" ] && [ ! -e "$_PROBE" ]; then
+  {
+    echo "PATH=$PATH"
+    echo "bp-continuity:    $(command -v bp-continuity 2>&1 || echo MISS)"
+    echo "bp-continuity.sh: $(command -v bp-continuity.sh 2>&1 || echo MISS)"
+    echo "perl:             $(command -v perl 2>&1 || echo MISS)"
+    echo "SHELL=${SHELL:-unset}"
+  } > "$_PROBE" 2>/dev/null || true
+fi
+
 # How to spell the remedy, best form first.
 #
 # WHY THIS IS NOT JUST `command -v`. A hook does not run in the agent's shell.
@@ -263,27 +278,18 @@ else
 fi
 
 cat >&2 <<EOF
-BLOCKED (butler continuity-gate): this turn is ending with nothing scheduled to
-resume this armed session, and it has not been disarmed.
+BLOCKED (butler continuity-gate): nothing is scheduled to resume this armed session, and it is not disarmed.
 
-Pick one and run it NOW, in this turn:
+Run ONE of these now:
 
-  1. Something will bring me back -- take a BOUNDED wait, as a BACKGROUND Bash
-     call, so its exit re-invokes this session:
-         $CONT hold --seconds 600
-     Dispatching a subagent or backgrounding a command is NOT enough on its own:
-     a dispatch is not a promise to come back. Take the hold alongside it, then
-     poll when the hold elapses and hold again if still waiting.
+  $CONT hold --seconds 600
+      A bounded wait. Run it as a BACKGROUND Bash call -- its exit wakes this session. Take it alongside any subagent or background command you dispatched: a dispatch may never return, so it is not a wake-up on its own.
 
-  2. I am asking the operator something -- that is a legitimate end of a turn,
-     and their reply is what resumes the session:
-         $CONT await-operator --reason "<what you asked>"
-     One turn only; the arm stays in force afterwards.
+  $CONT disarm
+      The watched work is finished. (Or /butler:continuity off.)
 
-  3. The watched work is genuinely finished:
-         $CONT disarm      (or /butler:continuity off)
+Got a question for the operator? It does NOT end the turn -- an armed session is unattended work, so nobody is there to answer. Queue it and carry on: $CONT ask --text "<question>". The statusline shows the count; they are answered when the work stops for a reason that is about the work.
 
-This gate does not yield on its own. It will keep blocking until one of the
-above is done -- each is one command, and one of them is always true.
+This gate does not yield on its own -- it blocks until one of the above runs.
 EOF
 exit 2

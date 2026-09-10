@@ -284,7 +284,13 @@ sub plant_marker {
     # The message must name every remedy it has, because an agent that cannot
     # find one is the case the removed bound used to rescue.
     like($out1, qr/\bhold\b/,           'D1a: the block text offers hold');
-    like($out1, qr/await-operator/,     'D1b: ...and await-operator');
+    # D1b AMENDED: the message no longer offers a way to end the turn for a
+    # question. An armed session IS unattended work, so "I asked a human" is not
+    # an exit -- it is a reason to queue and keep going. What the message must
+    # still do is say where the question goes.
+    like($out1, qr/\bask\b/,            'D1b: ...and points questions at the queue');
+    unlike($out1, qr/await-operator/,   'D1b: and no longer offers halting-to-ask as an exit');
+
     like($out1, qr/disarm/i,            'D1c: ...and disarm');
     like($out1, qr/--seconds/,          'D1d: with a runnable hold invocation, not just a verb name');
 

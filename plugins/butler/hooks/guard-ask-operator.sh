@@ -34,12 +34,37 @@ source "$HOOK_DIR/lib.sh" 2>/dev/null || exit 0
 RUNSTATE="$HOOK_DIR/../scripts/bp-runstate.pl"
 [ -f "$RUNSTATE" ] || exit 0
 
-# Only `active`. `effective` resolves a pause whose watcher died back to active,
-# so a stale pause cannot be used to slip a question through.
-STATE=$(perl "$RUNSTATE" status 2>/dev/null | perl -ne 'print $1 if /"state"\s*:\s*"([a-z_]+)"/')
-[ "${STATE:-}" = "active" ] || exit 0
+# UNATTENDED means either of two things, and both must trip this.
+#
+#   * a RUN is active -- `effective` resolves a pause whose watcher died back to
+#     active, so a stale pause cannot be used to slip a question through;
+#   * CONTINUITY IS ARMED for this session. Arming is the operator saying "watch
+#     this, I am not here", so an armed session is unattended by definition. The
+#     first version of this guard checked only the run, which meant a plain
+#     armed overnight session -- the exact case the operator described -- sailed
+#     straight past it.
+UNATTENDED=0
+WHY="unattended work is in flight"
 
-bp_read_payload open
+STATE=$(perl "$RUNSTATE" status 2>/dev/null | perl -ne 'print $1 if /"state"\s*:\s*"([a-z_]+)"/')
+[ "${STATE:-}" = "active" ] && { UNATTENDED=1; WHY="a run is ACTIVE"; }
+
+if [ "$UNATTENDED" -eq 0 ]; then
+  bp_read_payload open
+  _SID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
+  if [ -n "${_SID:-}" ]; then
+    _CDIR=$(bp_continuity_active_dir 2>/dev/null || true)
+    [ -n "${_CDIR:-}" ] && [ -f "$_CDIR/$_SID" ] && { UNATTENDED=1; WHY="continuity is ARMED for this session"; }
+  fi
+  _PAYLOAD_READ=1
+fi
+
+[ "$UNATTENDED" -eq 1 ] || exit 0
+
+# Read the payload only if the armed-check above did not already do it --
+# bp_read_payload consumes stdin, and a second call would block until its
+# timeout and then stand aside, silently letting every question through.
+[ -n "${_PAYLOAD_READ:-}" ] || bp_read_payload open
 
 # bp_json_get resolves dot-separated paths to SCALARS and has no array
 # indexing, and AskUserQuestion's payload nests the text inside
@@ -67,8 +92,7 @@ if [ -n "${QDIR:-}" ]; then
 fi
 
 cat >&2 <<EOF
-BLOCKED (butler ask-operator guard): a run is ACTIVE, so asking the operator now
-would stop unattended work for an answer nobody is there to give.
+BLOCKED (butler ask-operator guard): $WHY, so asking the operator now would stop unattended work for an answer nobody is there to give.
 
 The question has been queued and will not be lost:
     ${QDIR:-<queue unavailable>}/questions.md
