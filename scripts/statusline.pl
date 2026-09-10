@@ -512,6 +512,34 @@ if (length $sid) {
     }
 }
 
+# ── Pending questions ────────────────────────────────────────
+#
+# A COUNT, BECAUSE THE ALTERNATIVE WAS STOPPING. Unattended work used to halt
+# the moment an agent wanted to ask something -- hours of idle for an answer
+# nobody was there to give, and usually for a question the agent could have
+# settled itself. Questions are queued now instead, and the thing that makes
+# queueing acceptable rather than a way of losing them is that the operator can
+# SEE there are some waiting without going to look.
+#
+# Read straight from the file bp-continuity.pl's `ask` appends to, counted the
+# same way (a leading "- " is one question). No verb is shelled out to: the
+# statusline runs on every render and must stay cheap.
+#
+# Project-scoped like the queue itself, and silent when there are none -- a zero
+# would spend a column saying nothing.
+my $pending_questions = 0;
+{
+    my $qdir = $ENV{CLAUDE_PROJECT_DIR};
+    $qdir = $cwd if !defined $qdir || !length $qdir;
+    if (defined $qdir && length $qdir) {
+        my $qf = "$qdir/.ccpraxis-local-data/.subagent-guard/questions.md";
+        if (open my $qfh, '<', $qf) {
+            while (my $l = <$qfh>) { $pending_questions++ if $l =~ /^\s*-\s/ }
+            close $qfh;
+        }
+    }
+}
+
 # ── ...and where it goes ─────────────────────────────────────
 #
 # IT IS THE LEAD GLYPH NOW (operator, 2026-08-26). It was a word: first an
@@ -533,6 +561,13 @@ my $watched = length($badge_word) ? 1 : 0;
 my $marker  = ($watched ? $OK : $FAINT)
             . ($watched ? $GLYPH_WATCHED : $GLYPH_UNWATCHED)
             . "${R}$WORD_COLOR{$env} ${word}${R}";
+
+# Pending questions ride immediately after the continuity glyph, because they
+# are the same subject: this session is watched, and N things are waiting to be
+# asked when it stops. "?3" is three columns for a fact that otherwise costs a
+# halted run to discover. Silent at zero -- a "?0" would spend a column saying
+# nothing, which is the mistake the badge itself was reduced from a word to fix.
+$marker .= "${R} ${WARN}?${pending_questions}${R}" if $pending_questions > 0;
 
 # ── Git (with background fetch every 30 min) ────────────────
 my $git_str = '';

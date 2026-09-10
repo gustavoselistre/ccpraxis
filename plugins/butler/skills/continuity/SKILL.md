@@ -36,20 +36,24 @@ a backgrounded command that exits is what actually re-invokes the session. When 
 whatever you were really waiting on and either finish or hold again. Pick the horizon to match what
 you are waiting for; it may not exceed the wake-up TTL (900s by default).
 
-## Ending a turn to ask the operator something
+## If you have a question for the operator
 
-That is not a stall — it is the correct end of a turn, and the operator's reply
-is what resumes the session. Say so explicitly:
+Queue it. Do NOT end the turn for it:
 
 ```bash
-perl "<plugin-root>/scripts/bp-continuity.pl" await-operator --reason "<what you asked>"
+bp-continuity.sh ask --text "<your question>"
 ```
 
-It permits exactly ONE turn to end and is consumed by the gate, so it can never
-silence it; the arm stays in force afterwards. Do NOT background a wait for work
-that does not exist instead — a wake-up nothing will honour is the failure this
-gate exists to prevent, and taking one out to satisfy the gate is worse than the
-block.
+An armed session IS unattended work — that is what arming means — so a turn that
+ends to ask something stops the work for an answer nobody is there to give. The
+question is recorded, the statusline shows how many are waiting, and they are
+answered when the work stops for a reason that is actually about the work.
+
+Meanwhile: decide it yourself if it is not a product call
+(`.ccpraxis-local-data/guidance/escalate-product-decisions-only.md`), and carry
+on with everything that does not depend on the answer. If nothing can proceed,
+the honest report is that the work is finished pending an answer — `disarm` and
+say so.
 
 ## `on` does not arm immediately, and that is deliberate
 

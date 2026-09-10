@@ -212,54 +212,45 @@ sub reg { return tempdir(CLEANUP => 1) }
        'AC5 and writes no wake-up marker for a gate that will never look it up');
 }
 
-# ── AC6 — ending a turn to ask the operator something ─────────────────────
+# ── AC6 — a question is QUEUED, and does not end the turn ─────────────────
 #
-# The gate permits a stop only if something will resume the session, the arm is
-# lifted, or a one-shot exemption exists. An agent that has FINISHED the watched
-# work and is asking the operator a question satisfies none of them: nothing is
-# pending, lifting the operator's own arm is not the agent's call, and the
-# exemption file was reachable only by touching a dotfile that exists to relax a
-# safety gate -- which a permission layer may refuse, and on this machine does.
+# There was a verb here that ended the turn because a human had been asked
+# (await-operator). It was wrong, and the operator named why: an armed session
+# IS unattended work -- that is what arming means -- so a turn that ends to ask
+# something halts the work for an answer nobody is there to give. Offering it as
+# one of three equal choices in the block message invited exactly that.
 #
-# So there was no honest exit, and the only dishonest one was to background a
-# wait for work that does not exist. Waiting on a human is not a stall; it is
-# the correct end of a turn. This verb says so, once.
+# `ask` replaces it. It records the question, reports the running count, and
+# does NOT permit a stop.
 {
     my $r = reg();
-    run_cli(['arm', '--session', 'sid-await'],
-            { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $r, BP_LEDGER => undef,
-              CLAUDE_SESSION_ID => undef, CLAUDE_CODE_SESSION_ID => undef });
+    my $proj = tempdir(CLEANUP => 1);
+    mkdir "$proj/.ccpraxis-local-data";
+    local $ENV{CLAUDE_PROJECT_DIR} = $proj;
 
-    my ($out, $rc) = run_cli(
-        ['await-operator', '--session', 'sid-await', '--reason', 'asked about promotion'],
-        { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $r,
+    my ($out, $rc) = run_cli(['ask', '--text', 'Approach A or B?'],
+        { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $r, CLAUDE_PROJECT_DIR => $proj,
           CLAUDE_SESSION_ID => undef, CLAUDE_CODE_SESSION_ID => undef });
-    is($rc, 0, 'AC6 await-operator exits 0 on an armed session');
-    is(kv($out, 'STATUS'), 'awaiting_operator', 'AC6 STATUS: awaiting_operator');
-    ok(-f "$r/sid-await.stop-ok",
-       'AC6 CANONICAL: it writes the one-shot exemption the gate already consumes -- '
-     . 'no new gate machinery, and no permission layer standing between an agent '
-     . 'and its only honest exit');
+    is($rc, 0, 'AC6 ask exits 0');
+    is(kv($out, 'STATUS'), 'queued', 'AC6 STATUS: queued');
+    is(kv($out, 'QUEUED'), '1', 'AC6 and reports the running count');
 
-    open my $fh, '<', "$r/sid-await.stop-ok" or die $!;
-    my $line = <$fh>;
-    close $fh;
-    like($line, qr/^awaiting-operator \d+ asked about promotion/,
-         'AC6 recording WHY, so a chain of them is visible rather than anonymous');
-
-    # The arm itself is untouched: this ends one turn, it does not disarm.
-    ok(-f "$r/sid-await", 'AC6 the arm stays in force');
-
-    # And it is meaningless on an unarmed session, so it refuses rather than
-    # leaving a stray exemption lying in the registry.
-    my ($out2, $rc2) = run_cli(
-        ['await-operator', '--session', 'sid-not-armed'],
-        { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $r,
+    my ($out2) = run_cli(['ask', '--text', 'And another?'],
+        { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $r, CLAUDE_PROJECT_DIR => $proj,
           CLAUDE_SESSION_ID => undef, CLAUDE_CODE_SESSION_ID => undef });
-    is($rc2, 2, 'AC6 an unarmed session gets exit 2');
-    is(kv($out2, 'STATUS'), 'not_armed', 'AC6 STATUS: not_armed');
-    ok(!-f "$r/sid-not-armed.stop-ok", 'AC6 and no exemption is left behind');
+    is(kv($out2, 'QUEUED'), '2', 'AC6 CANONICAL: the queue accumulates across calls');
+
+    my $qf = "$proj/.ccpraxis-local-data/.subagent-guard/questions.md";
+    ok(-f $qf, 'AC6 the queue is a real file that outlives the process');
+
+    # The verb it replaced is gone, not merely undocumented.
+    my ($gone, $grc) = run_cli(['await-operator', '--reason', 'x'],
+        { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $r, CLAUDE_PROJECT_DIR => $proj,
+          CLAUDE_SESSION_ID => undef, CLAUDE_CODE_SESSION_ID => undef });
+    isnt($grc, 0, 'AC6 await-operator is REMOVED -- a retired escape hatch that still works '
+                . 'is not retired');
 }
+
 
 # ── AC7 — the PATH shim, and the one thing that could break it ────────────
 #

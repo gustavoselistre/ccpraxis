@@ -14,21 +14,21 @@
 # which is this repo's recurring lesson: a written instruction is not an
 # enforcement mechanism.
 #
-# TWO WAYS A RUN COULD STOP TO ASK, so two guards:
-#   * the AskUserQuestion tool          -> guard-ask-operator.sh (PreToolUse)
-#   * bp-continuity.pl await-operator   -> refuses while a run is active
+# UNATTENDED MEANS EITHER OF TWO THINGS, and both trip the guard: a RUN is
+# active, or CONTINUITY IS ARMED for the session. The first version checked only
+# the run, which missed the case actually described -- a plain armed overnight
+# session sets no run state at all.
 #
-# WHAT MUST NOT HAPPEN IS OVER-BLOCKING. An interactive session asking its
-# operator something is normal and good. Only `active` -- unattended work in
-# flight right now -- trips either guard, and AC3/AC6 are the counter-checks
-# that keep them from becoming a blanket ban on talking to the operator.
+# WHAT MUST NOT HAPPEN IS OVER-BLOCKING. A session that is neither armed nor
+# driving a run is free to ask; AC3 and AC4 are the counter-checks that keep
+# this from becoming a blanket ban on talking to the operator.
 #
 # AC1  AskUserQuestion is denied while a run is ACTIVE
 # AC2  ...and the question text is queued, not lost
 # AC3  ...and it is ALLOWED when the run is inert / paused / finished
-# AC4  await-operator is refused while a run is ACTIVE
-# AC5  ...and queues its reason too
-# AC6  ...and works normally when no run is active
+# AC4  an ARMED session is unattended too, and an unarmed one may still ask
+# AC5  ...with the question queued either way
+# AC6  the turn-ending verb (await-operator) is GONE; `ask` replaces it
 # AC7  the queue APPENDS -- several questions over a long run all survive
 use strict;
 use warnings;
@@ -126,31 +126,74 @@ sub queue_contents {
     }
 }
 
-# ── AC4/AC5/AC6 — the same rule for await-operator ────────────────────────
+# ── AC4/AC5 — ARMED counts as unattended, and `ask` is the way through ────
+#
+# The first version of this guard keyed only on a RUN being active. That missed
+# the case the operator actually described: a plain armed overnight session,
+# which sets no run state at all and so sailed straight past the guard.
+#
+# Arming IS the operator saying "watch this, I am not here", so it is unattended
+# by definition. And the verb that used to end a turn for a question
+# (await-operator) is gone -- an armed session ending its turn to ask something
+# is the halt, not the remedy.
 {
     my $root = new_project();
     my $reg  = "$root/reg";
-    set_run_state($root, 'activate', '--reason', 'unattended work');
+    make_path($reg);
 
-    system("CLAUDE_PROJECT_DIR='$root' CCPRAXIS_CONTINUITY_ACTIVE_DIR='$reg' "
-         . "$^X '$CONT' arm --session sess-a >/dev/null 2>&1");
+    # No run at all. Only the arm.
+    open my $fh, '>', "$reg/sess-armed" or die $!;
+    print {$fh} "operator 2026-09-10T00:00:00Z\n";
+    close $fh;
 
-    my $out = `CLAUDE_PROJECT_DIR='$root' CCPRAXIS_CONTINUITY_ACTIVE_DIR='$reg' $^X '$CONT' await-operator --session sess-a --reason 'A or B?' 2>&1`;
+    my $payload = JSON::PP->new->canonical->encode({
+        session_id => 'sess-armed', cwd => $root, tool_name => 'AskUserQuestion',
+        tool_input => { questions => [ { question => 'Should I rename it?' } ] },
+    });
+    my $out = `CLAUDE_PROJECT_DIR='$root' CCPRAXIS_CONTINUITY_ACTIVE_DIR='$reg' bash "$GUARD" <<'PAYLOAD_EOF' 2>&1
+$payload
+PAYLOAD_EOF`;
     my $rc = $? >> 8;
-    is($rc, 3, 'AC4 CANONICAL: await-operator is refused while a run is active -- the honest '
-             . 'exit for "a human was asked" must not become the way a run stops dead');
-    like($out, qr/refused_run_active/, 'AC4 and says why');
-    like(queue_contents($root), qr/A or B\?/, 'AC5 the reason is queued too');
 
-    # ...and with no run, it behaves exactly as before.
+    is($rc, 2, 'AC4 CANONICAL: an ARMED session is unattended -- the question is denied even '
+             . 'with no run active, which is the overnight case the run-only check missed');
+    like($out, qr/ARMED/, 'AC4 and the refusal names the real reason rather than claiming a run');
+    like(queue_contents($root), qr/Should I rename it\?/, 'AC5 the question is queued');
+
+    # An UNARMED session with no run is free to ask. Over-blocking is the real
+    # risk with a guard like this.
     my $root2 = new_project();
     my $reg2  = "$root2/reg";
-    system("CLAUDE_PROJECT_DIR='$root2' CCPRAXIS_CONTINUITY_ACTIVE_DIR='$reg2' "
-         . "$^X '$CONT' arm --session sess-b >/dev/null 2>&1");
-    my $out2 = `CLAUDE_PROJECT_DIR='$root2' CCPRAXIS_CONTINUITY_ACTIVE_DIR='$reg2' $^X '$CONT' await-operator --session sess-b --reason 'ok?' 2>&1`;
-    is($? >> 8, 0, 'AC6 CANONICAL: with no active run it still permits the turn -- the guard '
-                 . 'is scoped to unattended work, not to talking to the operator');
-    like($out2, qr/awaiting_operator/, 'AC6 with the normal status');
+    make_path($reg2);
+    my $p2 = JSON::PP->new->canonical->encode({
+        session_id => 'sess-free', cwd => $root2, tool_name => 'AskUserQuestion',
+        tool_input => { questions => [ { question => 'Fine?' } ] },
+    });
+    `CLAUDE_PROJECT_DIR='$root2' CCPRAXIS_CONTINUITY_ACTIVE_DIR='$reg2' bash "$GUARD" <<'PAYLOAD_EOF' 2>&1
+$p2
+PAYLOAD_EOF`;
+    is($? >> 8, 0, 'AC4 CANONICAL: an unarmed session with no run may still ask -- talking to '
+                 . 'the operator is normal when nothing unattended is in flight');
+}
+
+# ── AC6 — the halting verb is gone ────────────────────────────────────────
+{
+    my $root = new_project();
+    my $reg  = "$root/reg";
+    my $cont = "$Bin/../../scripts/bp-continuity.pl";
+    system("CLAUDE_PROJECT_DIR='$root' CCPRAXIS_CONTINUITY_ACTIVE_DIR='$reg' "
+         . "$^X '$cont' arm --session s1 >/dev/null 2>&1");
+    my $out = `CLAUDE_PROJECT_DIR='$root' CCPRAXIS_CONTINUITY_ACTIVE_DIR='$reg' $^X '$cont' await-operator --reason 'x' 2>&1`;
+    isnt($? >> 8, 0,
+         'AC6 CANONICAL: await-operator is REMOVED. A retired escape hatch that still works '
+       . 'is not retired, and this one ended turns for questions -- the exact halt being '
+       . 'designed out');
+
+    # ...and `ask` is what replaced it: it records and returns, never permitting a stop.
+    my $q = `CLAUDE_PROJECT_DIR='$root' CCPRAXIS_CONTINUITY_ACTIVE_DIR='$reg' $^X '$cont' ask --text 'A or B?' 2>&1`;
+    is($? >> 8, 0, 'AC6 ask succeeds');
+    like($q, qr/STATUS:\s*queued/, 'AC6 and reports the question queued');
+    like($q, qr/QUEUED:\s*\d+/,    'AC6 with a count the statusline also shows');
 }
 
 # ── AC7 — the queue accumulates ───────────────────────────────────────────

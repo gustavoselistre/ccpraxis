@@ -60,10 +60,10 @@ if    ($cmd eq 'arm')    { cmd_arm()    }
 elsif ($cmd eq 'disarm') { cmd_disarm() }
 elsif ($cmd eq 'status') { cmd_status() }
 elsif ($cmd eq 'hold')   { cmd_hold()   }
-elsif ($cmd eq 'await-operator') { cmd_await_operator() }
+elsif ($cmd eq 'ask')    { cmd_ask()    }
 else {
     emit('STATUS', 'error');
-    emit('ERROR',  "Unknown command '$cmd' (usage: arm|disarm|status|hold|await-operator)");
+    emit('ERROR',  "Unknown command '$cmd' (usage: arm|disarm|status|hold|ask)");
     exit 1;
 }
 
@@ -538,119 +538,64 @@ sub sleep_until {
     }
 }
 
-# await-operator --reason "..." : the turn ends because A HUMAN WAS ASKED.
+# ask --text "..." : QUEUE a question and CARRY ON. It does not end the turn.
 #
-# THE GAP THIS FILLS. The gate permits a turn to end only if something will
-# resume the session, the arm is lifted, or a one-shot exemption is present. An
-# agent that has FINISHED the watched work and is now asking the operator a
-# question satisfies none of them:
+# THIS REPLACES await-operator, which was a mistake. That verb let a turn end
+# because a human had been asked, and the reasoning was that waiting on a person
+# is a legitimate way for a turn to finish. It is -- but not here. An armed
+# session IS unattended work; that is what arming means. So a verb that ends the
+# turn to ask something is, in this context, precisely the halt the gate exists
+# to prevent, wearing the gate's own approval. Worse, the block message
+# advertised it as one of three equal choices, which invites an agent to reach
+# for it the moment it feels unsure.
 #
-#   * nothing is pending, and the only way to pretend otherwise is to background
-#     a wait for work that does not exist -- the hollow pause this whole
-#     subsystem exists to prevent;
-#   * lifting an arm the operator set, unasked, is worse than the block;
-#   * the exemption file is reachable only by touching a dotfile whose sole
-#     purpose is to relax a safety gate, which a permission layer may quite
-#     reasonably refuse -- measured on this machine, it does.
+# The operator's account of the pattern: "a whole unattended run halt because of
+# some blocking user input. 99% of the times it was not actually necessary and
+# could have progressed while batching the question to the end."
 #
-# So an agent could be left with no honest exit. Waiting on a human is not a
-# stall: it is the correct end of a turn, and the operator's next message is
-# what resumes the session. The sibling guard has had a verb for "nothing is
-# pending and that is correct" (bp-runstate.pl's `finish`) since it was written;
-# continuity had none.
-#
-# WHAT KEEPS IT HONEST. It is ONE-SHOT -- the gate consumes the exemption -- so
-# it can never silence the gate, only end the turn in which it was taken. It
-# records a reason, so a chain of them is visible rather than anonymous. And it
-# refuses on an unarmed session, where it would be meaningless. It is NOT a
-# claim that anything will return, which is exactly why it is a separate verb
-# rather than a hold with a lie in it.
-sub cmd_await_operator {
-    my $opts = parse_args(qw(session reason));
+# So: no verb ends a turn for a question any more. Questions accumulate, the
+# statusline shows how many are waiting, and they are answered when the work
+# stops for a reason that is actually about the work -- `disarm` when it is
+# finished, or the operator returning. If a question genuinely blocks
+# everything, the honest report is that the work is finished pending an answer,
+# which is `disarm` plus saying so.
+sub cmd_ask {
+    my $opts = parse_args(qw(text session));
 
-    my $reason = $opts->{reason};
-    $reason = 'waiting for the operator' unless defined $reason && length $reason;
-    $reason =~ s/[\r\n]+/ /g;
-
-    # NOT WHILE A RUN IS IN FLIGHT.
-    #
-    # This verb exists so a turn can end honestly when a human has been asked.
-    # It must not become the way an UNATTENDED run stops dead. The operator's
-    # report is blunt about the pattern: "a whole unattended run halt because of
-    # some blocking user input... 99% of the times it was not actually necessary
-    # and could have progressed while batching the question to the end".
-    #
-    # An active run is exactly the state where nobody is watching, so a question
-    # asked now is answered hours later at best. The question is not discarded --
-    # it is appended to the run's question queue, which is what "batch it to the
-    # end" needs to be more than an instruction -- and the turn is refused, so
-    # the agent carries on with the work it can still do.
-    #
-    # A PAUSED or FINISHED run does not trip this: the first has a watcher and
-    # the second is over. Only `active` means work is underway right now.
-    my $run_state = active_run_state();
-    if (defined $run_state) {
-        record_question($reason);
-        emit('STATUS', 'refused_run_active');
-        emit('RUN_STATE', $run_state);
-        emit('QUESTION_QUEUED', questions_path() // '(could not record)');
-        emit('ERROR', 'a run is ACTIVE, so this would halt unattended work for an answer '
-                    . 'nobody is there to give. The question has been queued; batch it with '
-                    . 'the others and keep going. If it truly blocks everything, finish or '
-                    . 'pause the run first (bp-runstate.pl finish|pause), which is a '
-                    . 'deliberate act rather than a side effect of asking.');
-        exit 3;
-    }
-
-    my $sid = resolve_session($opts);
-    my $dir = resolve_registry_dir_or_die();
-    my $mark = continuity_marker($sid, $dir);
-    unless (defined $mark) {
+    my $text = $opts->{text};
+    unless (defined $text && length $text) {
         emit('STATUS', 'error');
-        emit('ERROR',  "invalid session id: $sid");
+        emit('ERROR',  '--text required: the question to queue');
         exit 1;
     }
+    $text =~ s/[\r\n]+/ /g;
 
-    unless (-f $mark) {
-        emit('STATUS',  'not_armed');
-        emit('SESSION', $sid);
-        emit('NOTE',    'nothing is gating this session, so no exemption is needed');
-        exit 2;
-    }
-
-    open my $fh, '>', "$mark.stop-ok" or do {
+    my $p = questions_path();
+    unless (defined $p) {
         emit('STATUS', 'error');
-        emit('ERROR',  "Cannot write $mark.stop-ok: $!");
+        emit('ERROR',  'cannot resolve a questions queue for this project');
+        exit 1;
+    }
+    record_question($text) or do {
+        emit('STATUS', 'error');
+        emit('ERROR',  "cannot write $p");
         exit 1;
     };
-    print {$fh} 'awaiting-operator ' . time() . " $reason\n";
-    close $fh;
 
-    emit('STATUS',  'awaiting_operator');
-    emit('SESSION', $sid);
-    emit('REASON',  $reason);
-    emit('NOTE', 'this permits exactly ONE turn to end and is consumed by the gate; '
-               . 'the arm stays in force for every turn after it');
+    my $n = count_questions();
+    emit('STATUS',   'queued');
+    emit('QUEUED',   $n);
+    emit('QUEUE',    $p);
+    emit('NOTE', 'the question is recorded and the statusline now shows the count. '
+               . 'This does NOT end the turn -- carry on with whatever does not '
+               . 'depend on the answer, and decide it yourself if it is not a '
+               . 'product call.');
 }
 
-# active_run_state() -> the run's state when it is ACTIVE, else undef.
-#
-# Read through BpRunState so this agrees with guard-subagent-stall.sh rather
-# than forming a second opinion: `effective` resolves a pause whose watcher died
-# back to active, and that resolution is the whole reason a stale pause cannot
-# keep permitting things.
-sub active_run_state {
-    my $rs = "$SCRIPT_DIR/bp-runstate.pl";
-    return undef unless -f $rs;
-    my $out = `"$^X" "$rs" status 2>/dev/null`;
-    return undef unless defined $out && $out =~ /"state"\s*:\s*"([a-z_]+)"/;
-    my $state = $1;
-    return $state eq 'active' ? $state : undef;
-}
-
-# Where a deferred question goes. Beside the run state it belongs to, not in
-# the continuity registry: the queue is a property of the RUN (it is emptied
-# when the run is reported on), and continuity is per session.
+# Where a deferred question goes: beside the run state, through the verb that
+# owns that path. Not in the continuity registry -- the queue is a property of
+# the PROJECT's work, and it is read by the statusline and by whatever reports
+# at the end, neither of which is session-scoped.
 sub questions_path {
     my $rs = "$SCRIPT_DIR/bp-runstate.pl";
     return undef unless -f $rs;
@@ -661,8 +606,8 @@ sub questions_path {
     return "$dir/questions.md";
 }
 
-# APPEND, never overwrite. Several questions across a long run are the norm, and
-# the whole point is that none of them is lost.
+# APPEND, never overwrite. Several questions across a long run are the norm and
+# the entire point is that none of them is lost.
 sub record_question {
     my ($text) = @_;
     my $p = questions_path() or return 0;
@@ -673,6 +618,17 @@ sub record_question {
     close $fh;
     return 1;
 }
+
+# count_questions() -> how many are waiting. The statusline reads the same file.
+sub count_questions {
+    my $p = questions_path() or return 0;
+    open my $fh, '<', $p or return 0;
+    my $n = 0;
+    while (my $l = <$fh>) { $n++ if $l =~ /^\s*-\s/ }
+    close $fh;
+    return $n;
+}
+
 
 # ── Helpers ────────────────────────────────────────────────
 
