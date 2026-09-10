@@ -132,9 +132,16 @@ sub plant_marker {
 
     my ($mrc, $mout) = run_mark(task_dispatch_payload($root, 'sess-b'), cdir => $cdir);
     is($mrc, 0, 'B0 setup: mark-wakeup.sh never blocks on a Task dispatch');
-    ok(-f marker_path($cdir, 'sess-b') . '.wakeup-pending',
-       'B1 CANONICAL (-> SS2.4): a Task dispatch writes the continuity wake-up-pending file, '
-     . 'INDEPENDENT of any .drive-solo directory existing -- this session has none');
+    # B1 INVERTED. It used to assert that a dispatch WRITES the continuity
+    # wake-up marker. Once the gate began requiring a `bounded` deadline, a
+    # marker written here could never permit a stop again -- so the assertion
+    # was pinning a no-op, and the write had become actively harmful: it was
+    # truncating, so a dispatch made after taking a bounded hold destroyed that
+    # hold's deadline. The documented workflow is exactly that order. The write
+    # is gone and this now guards its return.
+    ok(!-f marker_path($cdir, 'sess-b') . '.wakeup-pending',
+       'B1 CANONICAL: a Task dispatch writes NO continuity wake-up marker -- a dispatch '
+     . 'records that something started, never that anything will come back');
 
     my ($rc, $out) = run_gate(stop_payload($root, 'sess-b'), cdir => $cdir);
     # B2 AMENDED (operator request, 2026-09-10): a bare dispatch marker no
@@ -168,9 +175,9 @@ sub plant_marker {
 
     my ($mrc) = run_mark(backgrounded_bash_payload($root, 'sess-c'), cdir => $cdir);
     is($mrc, 0, 'C0 setup: mark-wakeup.sh never blocks on a backgrounded Bash call');
-    ok(-f marker_path($cdir, 'sess-c') . '.wakeup-pending',
-       'C1 CANONICAL: a run_in_background:true Bash call ALSO writes the continuity '
-     . 'wake-up-pending file, independent of .drive-solo');
+    ok(!-f marker_path($cdir, 'sess-c') . '.wakeup-pending',
+       'C1 CANONICAL: nor does a backgrounded Bash call -- backgrounding a command with '
+     . 'no timeout is the unbounded case, not a scheduled wake-up');
 
     my ($rc, $out) = run_gate(stop_payload($root, 'sess-c'), cdir => $cdir);
     # C2 AMENDED alongside B2: backgrounding a Bash call is the case that makes
@@ -202,6 +209,42 @@ sub plant_marker {
        'C2b CANONICAL: a FOREGROUND Bash call (run_in_background:false) does NOT write the '
      . 'continuity wake-up-pending file -- proves the trigger is the boolean, not merely '
      . '"any Bash call"');
+}
+
+# ===========================================================================
+# B2. THE CLOBBER, in the order the docs actually prescribe.
+#
+# SKILL.md says to take a bounded wait "alongside whatever you dispatched", and
+# the gate's own block text says the same. Both orders must therefore work. They
+# did not: mark-wakeup.sh wrote `<epoch> <ToolName>` over the SAME file with a
+# truncating `>`, so taking a hold and then dispatching destroyed the hold's
+# deadline and the next Stop blocked -- while dispatch-then-hold survived by
+# luck of ordering, with nothing anywhere stating the dependency.
+# ===========================================================================
+{
+    my $root = new_project();
+    my $cdir = tempdir(CLEANUP => 1);
+    plant_marker($cdir, 'sess-b2');
+
+    # A live bounded hold, as `bp-continuity.pl hold` writes it.
+    my $wp = marker_path($cdir, 'sess-b2') . '.wakeup-pending';
+    open my $fh, '>', $wp or die "fixture: $!";
+    print {$fh} time . ' bounded ' . (time + 600) . "\n";
+    close $fh;
+
+    # ...then a dispatch, which is what used to overwrite it.
+    my ($mrc) = run_mark(task_dispatch_payload($root, 'sess-b2'), cdir => $cdir);
+    is($mrc, 0, 'B2-0 setup: the dispatch hook still exits 0');
+
+    ok(-f $wp, 'B2-1: the bounded marker still exists after a dispatch');
+    open my $rh, '<', $wp or die $!;
+    my $line = <$rh>;
+    close $rh;
+    like($line, qr/\bbounded\b/,
+         'B2-2 CANONICAL: and is still BOUNDED -- a dispatch no longer truncates a live hold');
+
+    my ($rc) = run_gate(stop_payload($root, 'sess-b2'), cdir => $cdir);
+    is($rc, 0, 'B2-3 CANONICAL: so the stop is permitted, in the order the docs prescribe');
 }
 
 # ===========================================================================
