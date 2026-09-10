@@ -617,4 +617,53 @@ PROBE_EOF
     }
 }
 
+# ===========================================================================
+# V. A LIVE HOLD SURVIVES BEING WOKEN EARLY.
+#
+# The marker used to be consumed on every stop, which was right when it was a
+# bare "something was dispatched" flag: there was no way to tell whether it was
+# still pending, so spending it once was the only safe reading.
+#
+# A bounded marker is different -- it names a deadline and a live process, so
+# its validity is re-derived on every check. Consuming it broke a CONTINUING
+# promise: a hold sleeps for minutes, and if the session wakes for any other
+# reason in the meantime (a background task finishing, a notification), that
+# turn's stop spends the marker and the NEXT stop is blocked while the hold is
+# still alive and still going to fire.
+#
+# Observed live: blocked while an 890s hold was sleeping, having been woken
+# early by an unrelated task completing.
+# ===========================================================================
+{
+    my $root = new_project();
+    my $cdir = tempdir(CLEANUP => 1);
+    plant_marker($cdir, 'sess-v');
+    my $wp = marker_path($cdir, 'sess-v') . '.wakeup-pending';
+    open my $fh, '>', $wp or die "fixture: $!";
+    print {$fh} BpResumption::marker_line(deadline => time() + 600, pid => $$);
+    close $fh;
+
+    my ($rc1) = run_gate(stop_payload($root, 'sess-v'), cdir => $cdir);
+    is($rc1, 0, 'V1: the first stop is permitted by the live hold');
+    ok(-f $wp, 'V2 CANONICAL: and the marker SURVIVES -- the promise has not been spent, '
+             . 'the process is still sleeping toward the same deadline');
+
+    my ($rc2) = run_gate(stop_payload($root, 'sess-v'), cdir => $cdir);
+    is($rc2, 0, 'V3 CANONICAL: so a second stop is permitted too. Waking early for an '
+              . 'unrelated reason must not invalidate a hold that is still running');
+
+    # ...and the "cannot be spent twice" property still holds where it matters:
+    # a marker that CANNOT justify a stop is removed, so it cannot be re-read.
+    my $root2 = new_project();
+    my $cdir2 = tempdir(CLEANUP => 1);
+    plant_marker($cdir2, 'sess-v2');
+    my $wp2 = marker_path($cdir2, 'sess-v2') . '.wakeup-pending';
+    open my $fh2, '>', $wp2 or die "fixture: $!";
+    print {$fh2} BpResumption::marker_line(deadline => time() - 5, pid => $$);
+    close $fh2;
+    my ($rc3) = run_gate(stop_payload($root2, 'sess-v2'), cdir => $cdir2);
+    isnt($rc3, 0, 'V4: an expired hold does not permit the stop');
+    ok(!-f $wp2, 'V5: and IS removed -- a dead promise cannot be re-read later');
+}
+
 done_testing();

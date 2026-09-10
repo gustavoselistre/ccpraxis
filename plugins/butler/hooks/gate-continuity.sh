@@ -185,12 +185,33 @@ if [ -f "$MARK.wakeup-pending" ]; then
   VERIFY_OUT=$(perl "$HOOK_DIR/../scripts/bp-resumption.pl" verify \
                  --file "$MARK.wakeup-pending" --ttl "$WAKEUP_TTL_S" 2>&1)
   VERIFY_RC=$?
-  rm -f "$MARK.wakeup-pending" 2>/dev/null
 
   if [ "$VERIFY_RC" -eq 0 ]; then
+    # A VALID MARKER IS NOT CONSUMED. It used to be removed on every stop,
+    # because the old marker was a bare "something was dispatched" flag with no
+    # way to tell whether it was still pending -- spending it once was the only
+    # safe reading. That is no longer true: a bounded marker names a deadline
+    # and a live process, so its validity is RE-DERIVED on every check rather
+    # than inferred from the file still being there.
+    #
+    # Consuming it broke a continuing promise. A `hold` sleeps for minutes and
+    # exits; if the session wakes for any OTHER reason in the meantime -- a
+    # background task finishing, a notification -- that turn's stop spends the
+    # marker, and the NEXT stop is blocked even though the hold is still alive
+    # and will still fire. Observed exactly that: blocked while a 890s hold was
+    # sleeping, having been woken early by an unrelated task completing.
+    #
+    # A stale or refused marker is still removed below, so the "cannot be spent
+    # twice" property that mattered is unchanged -- it just applies to markers
+    # that are actually spent, rather than to every marker on sight.
     rm -f "$MARK.stop-blocks" 2>/dev/null
     exit 0
   fi
+
+  # Refused: remove it. A marker that cannot justify a stop now will never be
+  # able to, and leaving it would let a later check re-read the same dead
+  # promise.
+  rm -f "$MARK.wakeup-pending" 2>/dev/null
   # Refused. Say WHY on the way to blocking -- a gate whose refusals cannot be
   # explained is one an agent learns to work around rather than satisfy.
   if [ -n "${VERIFY_OUT:-}" ]; then
