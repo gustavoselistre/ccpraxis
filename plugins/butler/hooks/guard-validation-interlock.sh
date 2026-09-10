@@ -117,7 +117,7 @@ case "$STALE_MIN" in ''|*[!0-9]*) STALE_MIN=180 ;; esac
 [ "$STALE_MIN" -gt 0 ] 2>/dev/null || STALE_MIN=180
 
 NOW=$(date +%s 2>/dev/null || echo 0)
-MTIME=$(stat -c %Y "$MARKER" 2>/dev/null || echo 0)
+MTIME=$(bp_mtime "$MARKER")
 if [ "$NOW" -gt 0 ] && [ "$MTIME" -gt 0 ]; then
   AGE_MIN=$(( (NOW - MTIME) / 60 ))
   [ "$AGE_MIN" -lt "$STALE_MIN" ] || exit 0

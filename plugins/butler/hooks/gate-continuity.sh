@@ -38,6 +38,24 @@
 # ESCAPE HATCHES
 #   * touch <marker>.stop-ok              — one-shot; consumed on use
 #   * export CCPRAXIS_CONTINUITY_STOP_OK=1 — session-wide
+# WHAT THIS DEFENDS AGAINST, stated plainly because the rest of this file argues
+# about soundness at length and never says.
+#
+# ACCIDENT, NOT ADVERSARY. Every check here answers "did the agent END A TURN
+# WITH NOTHING SCHEDULED, without meaning to?" -- an agent that announces its
+# next step and stops, or dispatches something unbounded and treats that as a
+# plan. It is NOT a security boundary and cannot be one: anything that can run a
+# Bash tool call can write a bounded marker by hand, or touch the exemption
+# file, and the block message hands over the latter deliberately.
+#
+# That is the right trade for this problem, but it decides what "sound" means
+# here. The rules exist so an agent cannot satisfy the gate BY ACCIDENT while
+# believing it has scheduled something -- which is why a dispatch no longer
+# counts, why a deadline must be accompanied by a live process, and why that
+# process's IDENTITY is checked rather than just its pid. Each of those closed a
+# way to be wrong sincerely. None of them would stop anyone determined, and
+# adding checks that only stop the determined would cost clarity for nothing.
+
 set -u
 HOOK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib.sh
@@ -110,7 +128,7 @@ MARK=$(bp_continuity_marker "$SID" 2>/dev/null) || exit 0
 # crossed the TTL between the sweep and this read.
 TTL_H=$(bp_continuity_ttl_hours)
 MNOW=$(date +%s 2>/dev/null || echo 0)
-MMT=$(stat -c %Y "$MARK" 2>/dev/null || echo 0)
+MMT=$(bp_mtime "$MARK")
 if [ "$MNOW" -gt 0 ] && [ "$MMT" -gt 0 ] \
    && [ $(( (MNOW - MMT) / 3600 )) -ge "$TTL_H" ]; then
   rm -f "$MARK" "$MARK.wakeup-pending" "$MARK.stop-blocks" "$MARK.stop-ok" 2>/dev/null
