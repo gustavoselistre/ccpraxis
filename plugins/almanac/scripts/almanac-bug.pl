@@ -105,11 +105,22 @@ sub registry_path {
 }
 
 # known_projects() -> list of absolute project roots on THIS machine.
+#
+# FIX (defect 2, 20260911-225720-4c57): the file is read via `<:raw>` (raw,
+# UN-decoded bytes), so it MUST be decoded with `->utf8` -- that tells
+# JSON::PP the input is UTF-8-encoded bytes rather than already-decoded
+# characters. Without it, a registry path containing a real multi-byte
+# character (job-search: "/c/Users/André/Personal Files/Job search")
+# decodes to MOJIBAKE: the two raw bytes of 'é' (0xC3 0xA9) each become their
+# own bogus codepoint (U+00C3, U+00A9) instead of collapsing to one (U+00E9).
+# opendir() on that corrupted string then fails, silently, and a project's
+# entire bug-report store vanishes from `collect` with no diagnostic --
+# verified: job-search's 6 reports (all open) were invisible before this fix.
 sub known_projects {
     my $p = registry_path();
     open my $fh, '<:raw', $p or return ();
     local $/;
-    my $j = eval { JSON::PP->new->decode(<$fh>) };
+    my $j = eval { JSON::PP->new->utf8->decode(<$fh>) };
     close $fh;
     return () unless ref $j eq 'HASH' && ref $j->{projects} eq 'HASH';
     my @out;
@@ -121,6 +132,42 @@ sub known_projects {
     return @out;
 }
 sub reports_dir { my ($root) = @_; return "$root/.ccpraxis-local-data/bug-reports" }
+
+# canonical_root(path) -> a value two SPELLINGS of one directory converge on,
+# so a dedupe keyed on it treats them as the same root.
+#
+# FIX (defect 1, 20260911-225720-4c57): the caller's own root arrives as
+# `C:/Development/ccpraxis` (from $CLAUDE_PROJECT_DIR / Cwd::abs_path), while
+# the steward registry stores the POSIX spelling `/c/Development/ccpraxis`.
+# `all_report_paths` used to dedupe on the RAW string, so both spellings
+# survived into @roots, both got walked, and every report under that one
+# directory was yielded twice -- measured: 88 reports where the project held
+# 43 (43*2 + 2 from another project).
+#
+# Cwd::abs_path is the real answer whenever the directory exists: it
+# resolves case, "..", backslashes and symlinks to one canonical form, which
+# is exactly why both `C:/Development/ccpraxis` and `/c/Development/ccpraxis`
+# collapse to `/c/Development/ccpraxis` on this host (verified). It returns
+# undef for a path that does not currently resolve -- a registered project
+# whose directory has moved or been deleted -- so this falls back to a
+# lightweight textual normalisation for exactly that case (backslashes to
+# forward slashes, `/x/` <-> `X:/` drive form, uppercased drive letter, no
+# trailing slash). The fallback cannot resolve symlinks or on-disk case, but
+# a root that fails even abs_path is already unreadable to list_reports_in,
+# so it contributes nothing either way -- this only stops it being walked
+# under BOTH of its spellings.
+sub canonical_root {
+    my ($p) = @_;
+    return '' unless defined $p && length $p;
+    my $abs = Cwd::abs_path($p);
+    return $abs if defined $abs;
+    my $norm = $p;
+    $norm =~ s{\\}{/}g;
+    $norm =~ s{^/([a-zA-Z])(?=/|\z)}{uc($1) . ':'}e;
+    $norm =~ s{^([a-zA-Z]):}{uc($1) . ':'}e;
+    $norm =~ s{/+\z}{};
+    return $norm;
+}
 
 sub _mkpath {
     my ($d) = @_;
@@ -401,15 +448,28 @@ sub verify {
     return (0, "TAMPERED: body digest $now != recorded $f->{content_sha256}");
 }
 
-# all_report_paths(\@extra_roots) -> sorted absolute paths of every report on
-# this machine. Disk is the truth; there is nothing to keep in sync.
+# all_report_paths(\@extra_roots, $warn) -> sorted absolute paths of every
+# report on this machine. Disk is the truth; there is nothing to keep in
+# sync. $warn, if given, is a coderef called with one string for every root
+# that could not be read at all (see list_reports_in) -- optional so
+# internal callers (the cross-project `$find` in `main`, `verify`) that do
+# not want CLI noise can omit it; `collect` passes one that prints to STDERR.
+#
+# Roots are deduped on canonical_root(), NOT the raw string -- see that sub's
+# header for why the raw-string dedupe this replaced double-counted every
+# report in a project reachable under two spellings.
 sub all_report_paths {
-    my ($extra) = @_;
+    my ($extra, $warn) = @_;
     my %seen;
-    my @roots = grep { !$seen{$_}++ } (@{ $extra // [] }, known_projects());
+    my @roots;
+    for my $r (@{ $extra // [] }, known_projects()) {
+        my $c = canonical_root($r);
+        next if $seen{$c}++;
+        push @roots, $r;
+    }
     my @paths;
     for my $r (@roots) {
-        push @paths, list_reports_in($r);
+        push @paths, list_reports_in($r, $warn);
     }
     my %u; return sort grep { !$u{$_}++ } @paths;
 }
@@ -419,13 +479,28 @@ sub all_report_paths {
 # and the real directory was never read — silently missing every report in any
 # project whose path contains a space. Two of this machine's registered
 # projects do. opendir has no quoting semantics at all.
+#
+# $warn (optional coderef) is called with one message when the ROOT ITSELF is
+# not a readable directory (registered, but gone/inaccessible on this
+# machine) -- NOT when the root exists but simply has no bug-reports/ yet,
+# which is the overwhelmingly common and entirely normal case for a project
+# that has never filed a ccpraxis bug. FIX (defect 2, 20260911-225720-4c57):
+# a root that failed to open its reports dir used to vanish with no
+# diagnostic at all -- that is what hid job-search's 6 open reports (a
+# SEPARATE cause, since fixed: see known_projects()'s header).
 sub list_reports_in {
-    my ($root) = @_;
+    my ($root, $warn) = @_;
     my $dir = reports_dir($root);
-    opendir(my $dh, $dir) or return ();
-    my @f = sort grep { /\.md\z/ && -f "$dir/$_" } readdir($dh);
-    closedir $dh;
-    return map { "$dir/$_" } @f;
+    if (opendir(my $dh, $dir)) {
+        my @f = sort grep { /\.md\z/ && -f "$dir/$_" } readdir($dh);
+        closedir $dh;
+        return map { "$dir/$_" } @f;
+    }
+    if ($warn && !-d $root) {
+        $warn->("project root '$root' does not exist or is not a readable "
+              . "directory on this machine -- skipped");
+    }
+    return ();
 }
 
 sub new_id {
@@ -851,7 +926,11 @@ unless (caller) {
         if ($cmd eq 'list') {
             @paths = AlmanacBug::list_reports_in($root);   # opendir, not glob — see list_reports_in
         } else {
-            @paths = AlmanacBug::all_report_paths([$root]);
+            # A skipped root must be LOUD (defect 2) -- silence is what hid six
+            # open job-search reports with no clue anything had gone wrong.
+            @paths = AlmanacBug::all_report_paths([$root], sub {
+                print STDERR "almanac-bug collect: $_[0]\n";
+            });
         }
         my @out;
         for my $p (@paths) {
@@ -874,7 +953,18 @@ unless (caller) {
                          created_at=>$f->{created_at}, path=>$p,
                          (defined $integrity ? (integrity=>$integrity) : ()) };
         }
-        if ($o{json}) { print JSON::PP->new->canonical->pretty->encode(\@out) }
+        # ->utf8 ON THE ENCODE SIDE TOO, and it is not optional. known_projects
+        # decodes the registry with ->utf8 (see :123), so project paths arrive
+        # here as CHARACTER strings. Encoding without ->utf8 emits those
+        # characters raw, and a path containing `André` goes out as a lone 0xE9
+        # byte -- malformed UTF-8 that every JSON consumer rejects. Measured on
+        # this machine: `collect --json` died with "malformed UTF-8 character in
+        # JSON string ... before \x{e9}/.claude/ccpra...".
+        #
+        # Decode and encode must be symmetric. This is the same hazard the
+        # user-global CLAUDE.md records for registry values ("never re-encode
+        # something already decoded"), arriving from the opposite direction.
+        if ($o{json}) { print JSON::PP->new->utf8->canonical->pretty->encode(\@out) }
         else {
             printf "%-22s %-10s %-9s %s\n", 'ID', 'STATUS', 'SEVERITY', 'TITLE';
             for my $r (@out) {
@@ -883,7 +973,23 @@ unless (caller) {
                 print  "  !! $r->{integrity}\n" if $r->{integrity};
                 print  "  $r->{project}\n" if $cmd eq 'collect';
             }
-            print "\n" . scalar(@out) . " report(s)\n";
+            # FIX (defect 4, 20260911-225720-4c57): `list` used to print a
+            # bare "N report(s)" with no hint the answer was scoped to one
+            # project. Asked to "fetch all bug reports", an agent reached for
+            # `list`, got a confident total, and reported a number that was
+            # never the whole picture -- and `collect` itself never said its
+            # own project set comes from steward's backup registry, so an
+            # unregistered project (filing a bug is unrelated to registering
+            # for backup) was excluded with no indication that had happened.
+            if ($cmd eq 'list') {
+                print "\n" . scalar(@out) . " report(s) IN THIS PROJECT ($root) only -- "
+                    . "run 'almanac-bug.pl collect' for every project on this machine.\n";
+            } else {
+                print "\n" . scalar(@out) . " report(s) across every project REGISTERED in "
+                    . "steward's backup registry -- a project that files ccpraxis bugs but is "
+                    . "not registered for backup is excluded from this count (see any "
+                    . "'skipped' warnings above for a registered root that could not be read).\n";
+            }
         }
         exit 0;
     }
@@ -933,8 +1039,12 @@ almanac-bug.pl — ccpraxis bug reports, one file per report.
         (hand-written, or from before this machine existed). It cannot skip a
         legal transition between valid states. Put it last on the line.
         Leaving `open` FREEZES the body and records its sha256.
-  list [--status S] [--json]        reports in this project
-  collect [--status S] [--json]     reports across every project (via the index)
+  list [--status S] [--json]        reports in THIS PROJECT only
+  collect [--status S] [--json]     reports across every project REGISTERED in
+                                     steward's backup registry -- filing a bug
+                                     and registering for backup are unrelated
+                                     decisions, so an unregistered project is
+                                     excluded, not scanned for
   verify                            re-check every frozen body against its digest
 
 One report per file. Write only through this script — a PreToolUse hook denies
