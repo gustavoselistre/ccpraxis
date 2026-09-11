@@ -77,7 +77,7 @@ perl plugins/sandbox/tests/t/refuse-in-place.t
 ```
 
 **For a sweep, use the runner — never a serial `for` loop.** A full sweep is ~70 minutes of CPU
-across 322 files; run one at a time that is exactly what it costs, and a suite nobody wants to run
+across 325 files; run one at a time that is exactly what it costs, and a suite nobody wants to run
 is a suite that stops getting run.
 
 ```bash
