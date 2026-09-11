@@ -409,7 +409,7 @@ esac
 # on its own). This adds NO new liveness logic — it only reads that already-
 # verified answer, immediately before the unconditional BLOCK below.
 #
-# PROVABLY INERT against t/94-drive-loop-gate.t section H's own fixture: that
+# PROVABLY INERT against t/drive-loop-gate.t section H's own fixture: that
 # fixture has no .subagent-guard/run-state.json at all, so bp-runstate.pl
 # status returns "inert", never "paused" — the case arm below matches
 # nothing and execution falls through to the unchanged BLOCK.

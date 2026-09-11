@@ -292,8 +292,8 @@ rejected with `root-home-rejected`, since either would refuse every project you 
 No flag, no environment variable, no interactive prompt bypasses this guard. If a refusal is wrong,
 the fix is to correct the detector
 (`plugins/sandbox/scripts/ProtectedPaths.pm`) and its oracles
-(`plugins/sandbox/tests/t/51-protected-paths.t`,
-`plugins/sandbox/tests/t/53-refuse-protected-paths.t`) — never to teach the launcher a bypass.
+(`plugins/sandbox/tests/t/protected-paths.t`,
+`plugins/sandbox/tests/t/refuse-protected-paths.t`) — never to teach the launcher a bypass.
 
 ## 9. Relationship to the in-place refusal
 

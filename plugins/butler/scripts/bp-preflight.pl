@@ -259,7 +259,7 @@ my %CHECK = (
 
 # main::dag_project_root() -> ($root, $source). Duplicates repo.usable's
 # three-rung ladder (:197-248) rather than refactoring it -- repo.usable must
-# stay byte-identical (t/27-preflight-repo-check.t asserts on its wording).
+# stay byte-identical (t/preflight-repo-check.t asserts on its wording).
 sub dag_project_root {
     if (defined $ENV{BP_PROJECT_ROOT} && length $ENV{BP_PROJECT_ROOT}) {
         return ($ENV{BP_PROJECT_ROOT}, 'BP_PROJECT_ROOT');

@@ -220,7 +220,7 @@ sub chroot_bin {
 #
 # The chroot isolates the FILESYSTEM. That is how b33 keeps the Claude credential away
 # from a jailed worker: `claude-home/.credentials.json` is simply unreachable on disk
-# (t/156-worker-jail-isolation.t C1 asserts exactly that). It does NOT isolate
+# (t/worker-jail-isolation.t C1 asserts exactly that). It does NOT isolate
 # the ENVIRONMENT — exec() inherits the parent's %ENV wholesale, and nothing in
 # this file has ever touched %ENV except to READ BP_PROJECT_ROOT/BP_WRITE_SET.
 #
@@ -306,7 +306,7 @@ our @JAIL_ENV_DENYLIST = qw(
 #
 # So the threat model is BIDIRECTIONAL: secrets must not leak IN, and controls
 # must not fall OUT. An allowlist defends only the first and actively breaks the
-# second. The denylist defends the first, and t/156-worker-jail-isolation.t's
+# second. The denylist defends the first, and t/worker-jail-isolation.t's
 # C13 asserts the second by checking the protective variables are still
 # PRESENT inside the jail.
 #
@@ -351,7 +351,7 @@ our @JAIL_ENV_ALLOW_EXACT = qw(
 # exact secret the denylist exists to stop.
 #
 # There is no BP_ prefix either, and that is not obvious. It was here, and
-# t/156-worker-jail-isolation.t's canary — BP_JAIL_CANARY, an arbitrary name —
+# t/worker-jail-isolation.t's canary — BP_JAIL_CANARY, an arbitrary name —
 # SURVIVED the boundary because of it. A prefix readmits every future variable
 # someone names with it, which is
 # the denylist's own failure mode reintroduced from the other side. The five
@@ -437,7 +437,7 @@ sub populate_os_skeleton {
     # preserves it as a device, so a jailed worker gets a functional /dev/null
     # and /dev/urandom. The empty-file path below is a LAST-RESORT fallback for a
     # container built before this skeleton existed: it satisfies
-    # t/156-worker-jail-isolation.t (nothing there depends on device
+    # t/worker-jail-isolation.t (nothing there depends on device
     # semantics) but is NOT functional for a real worker, which will
     # misbehave redirecting to an empty regular file or reading it for
     # entropy. If you are debugging odd worker behaviour and see empty files here,

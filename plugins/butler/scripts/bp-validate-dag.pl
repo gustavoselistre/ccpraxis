@@ -7,7 +7,7 @@
 # (fixed_dag + normalized records), never written to the author's file.
 #
 # See specs/b08-dag-integrity-and-deadlock-spec.md sec2.8-2.12 for the
-# contract this file implements, and t/60-dag-integrity.t for the oracle.
+# contract this file implements, and t/dag-integrity.t for the oracle.
 
 use strict;
 use warnings;

@@ -14,7 +14,7 @@
 #
 # This module is split into a PURE core (layout / frame composition / render
 # diff / key dispatch / spawn-argv / signal-path derivation — all unit-tested in
-# tests/t/25-dashboard.t with no terminal) and a thin seam-injected loop
+# tests/t/dashboard-framework.t with no terminal) and a thin seam-injected loop
 # (`run`). Every side effect the loop performs — heartbeat touch, container
 # inspect, state gather, key read, terminal size, spawn, signal write, raw-mode
 # enter/leave, output — is an injected coderef, so the loop itself is driven by
@@ -1543,8 +1543,8 @@ sub _alert_msgs {
 # take. $rows is now an OPTIONAL third parameter -- callers that supply it
 # (activity_capacity, below) get the capped/reserve-aware total that agrees
 # with compose_frame at realistic terminal sizes (verified:
-# t/77-wrap-width-regressions.t, rows=30 cols=90/120). Callers that omit it
-# (t/25, t/40, t/41's direct 2-arg AC16 calls -- pre-existing, untouched
+# t/wrap-width-regressions.t, rows=30 cols=90/120). Callers that omit it
+# (t/dashboard-framework.t, t/layout-responsive.t, t/panel-semantics.t's direct 2-arg AC16 calls -- pre-existing, untouched
 # tests) fall back to the OLD natural/uncapped total, exactly as before this
 # fix-batch: not because the cap doesn't apply to them, but because without
 # $rows there is no $body_height to cap against, and guessing one would risk
@@ -2847,7 +2847,7 @@ sub run {
     # $INSTALL_WARNING assignment in launcher.pl executes before this loop is
     # ever entered (_launch_stage_begin('dashboard')) -- so no NEW/different
     # warning can ever arise while this flag is live to swallow it. That
-    # invariant is enforced by plugins/sandbox/tests/t/87-banner-dismiss.t
+    # invariant is enforced by plugins/sandbox/tests/t/banner-dismiss.t
     # PART 7 (a source-structure scan of launcher.pl); if a future change adds
     # or moves an $INSTALL_WARNING assignment to after the dashboard stage
     # begins, that test goes red -- read it before "fixing" this flag to be

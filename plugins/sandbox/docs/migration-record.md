@@ -197,8 +197,8 @@ a remote-tracking ref.
 **GATE — expected literally:**
 - `git -C "$NEW" branch -a` lists `remotes/origin/ccpraxis-sandbox-workcopy`;
 - `git -C "$NEW" log --oneline -1` shows the Phase A commit;
-- a known fleet-changed file is present: `grep -c CLEAN_ENV "$NEW/plugins/butler/tests/t/09-gate.t"` → **4**;
-- p01 landed: `test -f "$NEW/plugins/sandbox/tests/t/42-refuse-in-place.t"` succeeds **and**
+- a known fleet-changed file is present: `grep -c CLEAN_ENV "$NEW/plugins/butler/tests/t/graceful-stop-gate.t"` → **4**;
+- p01 landed: `test -f "$NEW/plugins/sandbox/tests/t/refuse-in-place.t"` succeeds **and**
   `test -e "$NEW/plugins/sandbox/scripts/ccpraxis-mergeback.pl"` **fails** (it must be gone).
 
 **STOP if the branch did not arrive** — without it the clone has none of this work.

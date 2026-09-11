@@ -535,7 +535,7 @@ sub _resolve_clone_dir {
     eval {
         # Normalise separators BEFORE deriving the directory: abs_path can return
         # a backslashed path on Windows and dirname does not split on backslashes.
-        # Enforced by plugins/butler/tests/t/93-turn-cap-consistency.t (C9).
+        # Enforced by plugins/butler/tests/t/turn-cap-consistency.t (C9).
         (my $self = __FILE__) =~ s{\\}{/}g;
         my $abs = abs_path($self) // $self;
         $abs =~ s{\\}{/}g;

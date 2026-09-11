@@ -17,7 +17,7 @@ package SpendPanel;
 # See specs/b37-spend-surfaces-spec.md S0/S0.1/S1 for the binding contract.
 #
 # CONTRACT (invented here, minimal and TokenInfo.pm-shaped, per
-# t/54-spend-panel.t's own header):
+# t/spend-panel.t's own header):
 #
 #   SpendPanel::status(\%spend, $now) -> \%info
 #

@@ -416,7 +416,7 @@ sub _reject_untrimmed {
 # deterministically land a concurrent write inside the load-modify-write
 # window instead of racing real threads against real wall-clock timing.
 # Nothing in normal operation ever sets this env var; only
-# plugins/almanac/tests/t/04-*.t does, and the hook script it points at
+# plugins/almanac/tests/t/load-modify-write-race.t does, and the hook script it points at
 # never sets it itself (so there is no recursive self-invocation).
 sub _race_test_hook {
     return unless defined $ENV{ALMANAC_RACE_TEST_HOOK} && length $ENV{ALMANAC_RACE_TEST_HOOK};

@@ -148,7 +148,7 @@ sub spawn {
     # powershell.exe, 53 of them keep-awake.ps1 helpers whose -PidFile pointed
     # into TEST fixture directories (bp/, bp2/, bp-orphan/, bp-done/ under a
     # File::Temp root). bp-orchestrator.pl:2250 calls apply() with only a `log`
-    # seam -- no `spawn` seam -- so the REAL spawn runs, and t/06-orchestrator.t
+    # seam -- no `spawn` seam -- so the REAL spawn runs, and t/orchestrator-decision-core.t
     # drives that path. Every run of the butler suite leaked several helpers that
     # then slept forever. Running the suite repeatedly is what filled the machine.
     #

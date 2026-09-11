@@ -1084,7 +1084,7 @@ sub _one_run_summary_cells {
 # THE CURRENT PACKAGE IS DELIBERATELY NOT A TABLE COLUMN, and the reason is a
 # rule this project already paid for. Package d02 of the predecessor initiative
 # closed bug report 20260814-093052-312a with a standing requirement, asserted
-# by plugins/sandbox/tests/t/75-wrap-on-overflow.t AC1: an overflowing row must
+# by plugins/sandbox/tests/t/wrap-on-overflow.t AC1: an overflowing row must
 # WRAP, and no word may be silently dropped. A table column that is given up
 # when the panel is narrow drops content -- which is exactly what that rule
 # forbids, and the first draft of this package did it. t/75 caught it.

@@ -2055,8 +2055,8 @@ sub cmd_materialize_plugins {
         #
         # p01-sandbox-plugin-provisioning, defect A ("not cached" errors on a
         # fresh container) -- ROOT CAUSE, NOT FIXED HERE, deliberately.
-        # This copy mechanism is already correct and complete (t/31-plugin-merge.t,
-        # t/32-plugin-sync.t, and a live .host-tier-plugins.json artifact from the
+        # This copy mechanism is already correct and complete (t/plugin-merge.t,
+        # t/plugin-sync.t, and a live .host-tier-plugins.json artifact from the
         # affected launch all confirm the copied tree is byte-identical to the
         # host's). The actual defect is one layer deeper, inside Claude Code's own
         # runtime: it resolves and caches installed plugin code under a
@@ -2072,7 +2072,7 @@ sub cmd_materialize_plugins {
         # here would be validated ONLY by "the symptom stopped" on a live launch,
         # which this package's done-criterion 2 explicitly forbids as evidence.
         # Done-criterion 1 (zero manual repair needed) is therefore EXPLICITLY
-        # UNMET by this package. t/84-plugin-unknown-version-dest-rel.t is a
+        # UNMET by this package. t/plugin-unknown-version-dest-rel.t is a
         # regression LOCK on today's dest_rel naming (cache/<marketplace>/<plugin>/
         # unknown) -- changing that naming without solving the hash problem above
         # would not fix anything and must be a deliberate, reviewed decision, not
