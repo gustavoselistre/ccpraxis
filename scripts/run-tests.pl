@@ -27,32 +27,117 @@
 #   perl scripts/run-tests.pl --fast             # skip the container tests
 #   perl scripts/run-tests.pl --jobs 8           # override parallelism
 #   perl scripts/run-tests.pl plugins/sandbox    # limit to a plugin or a glob
+#   perl scripts/run-tests.pl --state=failed     # re-run only last run's red files
 use strict;
 use warnings;
 use FindBin qw($Bin);
 use File::Basename qw(basename);
+use File::Spec;
+use File::Path qw(make_path);
+use Cwd qw(abs_path);
 use POSIX qw(:sys_wait_h);
 
-my $ROOT = "$Bin/..";
+my $ROOT     = "$Bin/..";
+my $ROOT_ABS = abs_path($ROOT) // $ROOT;
 
-my ($fast, $jobs, @targets) = (0, 0);
+my ($fast, $jobs, $state_mode, @targets) = (0, 0, 0);
 while (@ARGV) {
     my $a = shift @ARGV;
     if    ($a eq '--fast')            { $fast = 1 }
     elsif ($a eq '--jobs')            { $jobs = shift(@ARGV) || 0 }
     elsif ($a =~ /^--jobs=(\d+)$/)    { $jobs = $1 }
+    elsif ($a eq '--state=failed')    { $state_mode = 1 }
+    elsif ($a =~ /^--state=/)         {
+        print STDERR "error: unsupported value for $a (only --state=failed is recognized)\n";
+        exit 2;
+    }
     elsif ($a eq '--help' || $a eq '-h') { print _usage(); exit 0 }
     else                              { push @targets, $a }
 }
+if ($state_mode && @targets) {
+    print STDERR "error: --state=failed cannot be combined with a path/glob target\n";
+    exit 2;
+}
 sub _usage { return <<'USAGE' }
-usage: perl scripts/run-tests.pl [--fast] [--jobs N] [PATH-OR-GLOB ...]
-  --fast    skip tests that start real containers
-  --jobs N  parallelism for non-container tests (default: cores - 2)
+usage: perl scripts/run-tests.pl [--fast] [--jobs N] [--state=failed] [PATH-OR-GLOB ...]
+  --fast          skip tests that start real containers
+  --jobs N        parallelism for non-container tests (default: cores - 2)
+  --state=failed  re-run only the files recorded failing by the previous run
 USAGE
+
+# --- state file (--state=failed) --------------------------------------------
+# Path: .ccpraxis-local-data/test-state/last-failures.txt, relative to $ROOT.
+# CCPRAXIS_TEST_STATE_DIR, if set and non-empty, replaces just the directory
+# component -- test-isolation hook only, not a documented user flag.
+sub _state_dir {
+    return $ENV{CCPRAXIS_TEST_STATE_DIR}
+        if defined $ENV{CCPRAXIS_TEST_STATE_DIR} && length $ENV{CCPRAXIS_TEST_STATE_DIR};
+    return File::Spec->catdir($ROOT, '.ccpraxis-local-data', 'test-state');
+}
+sub _state_file_path { return File::Spec->catfile(_state_dir(), 'last-failures.txt') }
+
+sub _read_state_file {
+    my $path = _state_file_path();
+    return () unless -f $path;
+    open my $fh, '<:raw', $path or return ();
+    local $/;
+    my $raw = <$fh>;
+    close $fh;
+    return () unless defined $raw && length $raw;
+    return split /\n/, $raw;
+}
+
+# _to_abs($relpath) -- reconstructs a real path from a relpath recorded in the
+# state file, anchored on $ROOT_ABS so it works whether the recorded entry is
+# a real repo file (plugins/foo/tests/t/bar.t) or a fixture path outside the
+# repo tree entirely (../../../tmp/xxx/tests/t/bar.t, in the test suite).
+sub _to_abs { my ($rel) = @_; return File::Spec->rel2abs($rel, $ROOT_ABS) }
+
+# _relpath($abs) -- the inverse: a forward-slash path relative to $ROOT_ABS,
+# used both to write the state file and to decide what "this invocation
+# actually ran" (%ran) means for the merge in the report phase below.
+# Deliberately does NOT re-resolve $abs through abs_path(): on this host's
+# perl, /tmp is a mount point whose realpath differs from its own name, and
+# resolving it here would disagree with how fixture paths are constructed
+# and compared elsewhere (RunnerStateHarness::relpath_from_root does the
+# same plain abs2rel, no realpath, for exactly this reason).
+sub _relpath {
+    my ($abs) = @_;
+    my $rel = File::Spec->abs2rel($abs, $ROOT_ABS);
+    $rel =~ s{\\}{/}g;
+    return $rel;
+}
+
+sub _write_state_atomic {
+    my ($lines) = @_;
+    my $dir = _state_dir();
+    make_path($dir) unless -d $dir;
+    my $final_path = _state_file_path();
+    my $tmp_path   = "$final_path.tmp.$$";
+    open my $fh, '>:raw', $tmp_path or die "cannot write $tmp_path: $!";
+    print {$fh} "$_\n" for @$lines;
+    close $fh;
+    unless (rename($tmp_path, $final_path)) {
+        unlink $final_path;
+        rename($tmp_path, $final_path)
+            or warn "run-tests.pl: cannot rename $tmp_path to $final_path: $!";
+    }
+}
 
 # --- collect ---------------------------------------------------------------
 my @files;
-if (@targets) {
+if ($state_mode) {
+    my @recorded = _read_state_file();
+    my @live     = grep { -f _to_abs($_) } @recorded;
+    for my $gone (grep { !-f _to_abs($_) } @recorded) {
+        print STDERR "state: $gone no longer exists, skipping\n";
+    }
+    unless (@live) {
+        print "no recorded failures -- nothing to run\n";
+        exit 0;
+    }
+    @files = map { _to_abs($_) } @live;
+} elsif (@targets) {
     for my $t (@targets) {
         my @m = glob($t);
         @m = glob("$t/tests/t/*.t")  if !@m || -d $t;
@@ -181,5 +266,27 @@ if (@red) {
 my @slow = (sort { $b->{secs} <=> $a->{secs} } @results)[0 .. ($#results < 4 ? $#results : 4)];
 print "\nslowest:\n";
 printf "  %5ds  %s\n", $_->{secs}, basename($_->{file}) for grep { defined } @slow;
+
+# --- state write (merge, never replace) -------------------------------------
+# %ran is the boundary: "did this invocation actually execute it" -- true
+# whether a file was excluded by --fast, by a path/glob target, or
+# (transitively) never reached because of --state=failed scope. Anything not
+# in %ran is carried forward from the prior state file, provided it still
+# exists on disk; a vanished old entry is dropped unconditionally.
+my %ran = map { _relpath($_->{file}) => 1 } @results;
+my %red = map { _relpath($_->{file}) => 1 } @red;
+
+my @old     = _read_state_file();
+my @carried = grep { !$ran{$_} && -f _to_abs($_) } @old;
+my %seen;
+my @final = sort grep { !$seen{$_}++ } (@carried, keys %red);
+
+_write_state_atomic(\@final);
+
+if (@final) {
+    print "\nstate: " . scalar(@final) . " failing recorded to .ccpraxis-local-data/test-state/last-failures.txt\n";
+} else {
+    print "\nstate: all green, .ccpraxis-local-data/test-state/last-failures.txt cleared\n";
+}
 
 exit scalar(@red);
