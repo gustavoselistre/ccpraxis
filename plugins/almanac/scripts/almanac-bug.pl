@@ -41,6 +41,27 @@ use Digest::SHA qw(sha256_hex);
 use File::Basename qw(dirname);
 use Cwd ();
 
+# Almanac::Lock sits beside this script, and it is found from THIS FILE's own
+# path rather than from $0 or FindBin. Both of those are the invoking program,
+# which is not the same thing: the tests load this script in-process with
+# `do $A`, where $0 is the .t file and FindBin would resolve to the tests
+# directory. __FILE__ is this file wherever it was loaded from, so `perl -c`
+# from the repo root, `perl -c` from plugins/almanac/tests/, a CLI run and a
+# `do` all resolve the same module.
+BEGIN {
+    my $dir = __FILE__;
+    $dir =~ s{\\}{/}g;
+    $dir =~ s{/[^/]+\z}{};
+    $dir = '.' unless length $dir;
+    unshift @INC, $dir;
+}
+use Almanac::Lock ();
+
+# Set by _write_atomic on every failure, cleared at its entry. cas_write
+# reports it rather than a bare "write failed", so a rename that exhausted its
+# retry deadline is named as that.
+our $LAST_ERROR = '';
+
 our @STATES = qw(open reviewing taken resolved declined);
 
 # Closed vocabulary for `severity`. `unknown` is IN it — it is the script's own
@@ -160,14 +181,51 @@ sub _render {
     return "---\n" . join("\n", @lines) . "\n---\n" . $body;
 }
 sub _read_file { my ($p)=@_; open my $fh,'<:raw',$p or return undef; local $/; my $c=<$fh>; close $fh; return $c }
+# Returns 1/0 in scalar context, as three call sites depend on, and sets
+# $LAST_ERROR to a specific reason on failure.
+#
+# THE rename IS RETRIED, against a bounded deadline. On Windows a rename over a
+# path another process holds open FAILS — an on-access virus scanner, an
+# editor, or Claude Code's own node process reading the file is enough — and
+# reporting that as "write failed" turns a transient sharing violation into a
+# lost write. Almanac::Lock::rename_with_retry polls for up to 2s against an
+# allowlist of transient errnos and fails fast on anything else.
+#
+# The temp file stays this function's own business (Almanac::Lock removes
+# nothing, ever — see its header), so the only removal in this script is of
+# $tmp, and never of a lock file.
 sub _write_atomic {
     my ($p, $bytes) = @_;
-    _mkpath(dirname($p)) or return 0;
+    $LAST_ERROR = '';
+    unless (_mkpath(dirname($p))) {
+        $LAST_ERROR = "could not create the directory for $p";
+        return 0;
+    }
     my $tmp = "$p.tmp.$$";
-    open my $fh, '>:raw', $tmp or return 0;
-    print {$fh} $bytes or do { close $fh; unlink $tmp; return 0 };
-    close $fh or do { unlink $tmp; return 0 };
-    rename($tmp, $p) or do { unlink $tmp; return 0 };
+    my $fh;
+    unless (open $fh, '>:raw', $tmp) {
+        $LAST_ERROR = "could not open $tmp for writing: $!";
+        return 0;
+    }
+    unless (print {$fh} $bytes) {
+        my $why = "$!";
+        close $fh;
+        unlink $tmp;
+        $LAST_ERROR = "could not write $tmp: $why";
+        return 0;
+    }
+    unless (close $fh) {
+        my $why = "$!";
+        unlink $tmp;
+        $LAST_ERROR = "could not close $tmp: $why";
+        return 0;
+    }
+    my ($renamed, $err) = Almanac::Lock::rename_with_retry($tmp, $p);
+    unless ($renamed) {
+        $LAST_ERROR = $err->{message};
+        unlink $tmp;
+        return 0;
+    }
     return 1;
 }
 
@@ -190,26 +248,42 @@ sub load {
 # refusal message two lines above it promises. `verify` would then say "not
 # frozen" rather than TAMPERED, so nothing would even report the problem.
 #
-# There is no portable, trustworthy OS-level lock to reach for here. This
-# repo runs on Git-for-Windows, where flock() semantics on Windows perl
-# builds are not something else in this codebase relies on (see this
-# script's own header on Windows landmines, and CLAUDE.md), and mtime
-# granularity is too coarse to reliably distinguish two writes inside the
-# same second. So this re-reads the file's actual on-disk BYTES immediately
-# before the write and compares them to the bytes `load()` captured — a
-# compare-and-swap over the load-modify-write window. It cannot close the
-# window entirely (there is a residual gap between this read and the
-# following rename, same as any userspace CAS without a kernel-level lock),
-# but it narrows "anywhere between load and write" down to "between this
-# read and the next few instructions", and it turns the race from silent
-# data loss into a loud, specific refusal instead of ever writing.
+# THIS IS LAYER TWO, AND THE COMMENT THAT USED TO BE HERE WAS WRONG.
+#
+# It claimed there was no portable OS-level lock worth reaching for on this
+# platform, and built the whole design on that claim. The claim was false.
+# bp-blueprint.pl:425 has taken flock(LOCK_EX) on a sidecar lock file for
+# every blueprint mutation in this repo since it was written, and a direct
+# measurement on 2026-09-11 — two concurrent processes, one sidecar lock
+# file, both host perls — showed the waiter blocking for the holder's full
+# remaining hold and then acquiring. flock works here.
+#
+# So the three read-modify-write verbs now take a real exclusive lock across
+# the WHOLE load-modify-write (Almanac::Lock, on `<report>.md.lock`), and two
+# concurrent writers QUEUE rather than collide. A refusal is not
+# serialization: the requirement is that two agents editing one record both
+# get their change, in some order, not that one of them is told to retry.
+#
+# cas_write is not deleted and not weakened — it is DEMOTED. Three layers,
+# each catching what the one above it cannot:
+#
+#   1. the lock            — two sanctioned writers racing
+#   2. this byte CAS       — a writer that BYPASSED the lock entirely
+#   3. content_sha256      — an out-of-band write that routed around 1 and 2
+#
+# LAYER TWO is therefore about a writer that took no lock at all: it re-reads
+# the file's actual on-disk BYTES immediately before the write and compares
+# them to the bytes `load()` captured. It refuses instead of ever writing, so
+# an unsanctioned concurrent write becomes a loud, specific refusal rather
+# than silent data loss. It takes no lock and releases none — its caller
+# holds one.
 sub cas_write {
     my ($rep, $bytes) = @_;
     my $current = _read_file($rep->{path});
     return (0, 'the report no longer exists on disk') unless defined $current;
     return (0, 'the report changed on disk since it was loaded (a concurrent '
              . 'set-status or update landed in between)') unless $current eq $rep->{raw};
-    return (0, 'write failed') unless _write_atomic($rep->{path}, $bytes);
+    return (0, "write failed: $LAST_ERROR") unless _write_atomic($rep->{path}, $bytes);
     return (1, '');
 }
 
@@ -418,9 +492,45 @@ sub _reject_untrimmed {
 # Nothing in normal operation ever sets this env var; only
 # plugins/almanac/tests/t/load-modify-write-race.t does, and the hook script it points at
 # never sets it itself (so there is no recursive self-invocation).
+#
+# THE SEAM MUST NOW SUSPEND THE LOCK, and that is the correct semantics rather
+# than a dodge. Once the lock wraps load->write, the window this hook lands in
+# is closed to any writer that RESPECTS the lock — the hook's child would block
+# on its own deadline and never land its write. With serialization in place the
+# only writer that can still land there is one that BYPASSED the lock, and
+# catching exactly that is what layer two now exists for. So the seam simulates
+# such a writer: the lock is dropped for the hook's duration and re-acquired
+# afterwards. This is the ONLY sanctioned caller of suspend/resume in this
+# script, and a test asserts that by grep.
 sub _race_test_hook {
+    my ($lock) = @_;                # undef for any caller that holds no lock
     return unless defined $ENV{ALMANAC_RACE_TEST_HOOK} && length $ENV{ALMANAC_RACE_TEST_HOOK};
+    $lock->suspend if $lock;
     system($^X, $ENV{ALMANAC_RACE_TEST_HOOK});
+    if ($lock) {
+        my ($ok, $err) = $lock->resume;
+        unless ($ok) {
+            print STDERR "almanac-bug: could not re-acquire the lock after the test hook: "
+                       . "$err->{message}";
+            exit 2;
+        }
+    }
+    return;
+}
+
+# The three read-modify-write verbs take the lock BEFORE they load, and hold it
+# across the mutation and the cas_write. This is what turns two concurrent
+# writers into a queue instead of a collision. `file` deliberately does NOT
+# lock: its path carries a UTC timestamp to the second plus the low 16 bits of
+# the pid (new_id), so no other process is writing that path, and there is no
+# read-modify-write to serialize.
+sub _refuse_unlocked {
+    my ($verb, $id, $err) = @_;
+    print STDERR "almanac-bug $verb: refused — could not take the write lock on '$id' "
+               . "within $err->{timeout_ms}ms.\n"
+               . $err->{message}
+               . "Retry the command; nothing was written.\n";
+    exit 2;
 }
 
 sub _slurp_arg {
@@ -513,19 +623,33 @@ unless (caller) {
         return undef;
     };
 
+    # The read-only verbs (`list`, `collect`, `verify`) load through this one
+    # reference, and take NO lock. They only read, and a reader that queued
+    # behind a writer would make `list` stall on whatever record some other
+    # agent happens to be holding. Keeping their loader visibly distinct from
+    # the acquire-then-load path the three mutating verbs use is the point.
+    my $read_only_load = \&AlmanacBug::load;
+
     if ($cmd eq 'update') {
         my $id = $pos[0] or die "almanac-bug update: <id> required\n";
         my $path = $find->($id) or die "almanac-bug update: no report '$id'\n";
+        # LAYER ONE, and it must be taken BEFORE the load: the window this
+        # closes is load-to-write, so a lock taken after the load would leave
+        # exactly the gap it exists to remove. Released on every exit below,
+        # refusals included.
+        my ($lock, $lock_err) = Almanac::Lock->acquire($path, verb => 'update');
+        _refuse_unlocked('update', $id, $lock_err) unless $lock;
         my $rep  = AlmanacBug::load($path) or die "almanac-bug update: $path is unreadable or malformed\n";
         die "almanac-bug update: '$id' has MALFORMED: duplicate frontmatter key "
           . "'$rep->{duplicate_key}' — refusing to operate on a possibly-forged report\n"
             if $rep->{duplicate_key};
-        _race_test_hook();
+        _race_test_hook($lock);
         my $st   = $rep->{fields}{status} // 'open';
         unless ($AlmanacBug::MUTABLE{$st}) {
             print STDERR "almanac-bug update: refused — '$id' is $st, and content is frozen from "
                        . "'reviewing' onward so a reviewer cannot have the report rewritten "
                        . "underneath them. Add a follow-up report instead.\n";
+            $lock->release;
             exit 2;
         }
         my $body = _slurp_arg(%o);
@@ -573,6 +697,7 @@ unless (caller) {
               . "($ol lines replaced by $nl), and there is no undo: reports are gitignored.\n"
               . "  To add to the report:      almanac-bug.pl append $id --body-file <file>\n"
               . "  To genuinely rewrite it:   almanac-bug.pl update $id --body-file <file> --replace\n";
+            $lock->release;
             exit 2;
         }
 
@@ -584,9 +709,11 @@ unless (caller) {
         unless ($cas_ok) {
             print STDERR "almanac-bug update: refused — '$id' $cas_why. "
                        . "Retry the command; do not assume it partially applied.\n";
+            $lock->release;
             exit 2;
         }
 
+        $lock->release;
         print "$path\n";
         exit 0;
     }
@@ -604,15 +731,19 @@ unless (caller) {
     if ($cmd eq 'append') {
         my $id = $pos[0] or die "almanac-bug append: <id> required\n";
         my $path = $find->($id) or die "almanac-bug append: no report '$id'\n";
+        # Before the load, for the same reason as `update` above.
+        my ($lock, $lock_err) = Almanac::Lock->acquire($path, verb => 'append');
+        _refuse_unlocked('append', $id, $lock_err) unless $lock;
         my $rep  = AlmanacBug::load($path) or die "almanac-bug append: $path is unreadable or malformed\n";
         die "almanac-bug append: '$id' has MALFORMED: duplicate frontmatter key "
           . "'$rep->{duplicate_key}' — refusing to operate on a possibly-forged report\n"
             if $rep->{duplicate_key};
-        _race_test_hook();
+        _race_test_hook($lock);
         my $st = $rep->{fields}{status} // 'open';
         unless ($AlmanacBug::MUTABLE{$st}) {
             print STDERR "almanac-bug append: refused — '$id' is $st, and content is frozen from "
                        . "'reviewing' onward. Add a follow-up report instead.\n";
+            $lock->release;
             exit 2;
         }
         my $add = _slurp_arg(%o);
@@ -629,8 +760,10 @@ unless (caller) {
         unless ($cas_ok) {
             print STDERR "almanac-bug append: refused — '$id' $cas_why. "
                        . "Retry the command; do not assume it partially applied.\n";
+            $lock->release;
             exit 2;
         }
+        $lock->release;
         print "$path\n";
         exit 0;
     }
@@ -639,11 +772,14 @@ unless (caller) {
         my $id = $pos[0] or die "almanac-bug set-status: <id> required\n";
         my $to = $o{to} or die "almanac-bug set-status: --to <state> required\n";
         my $path = $find->($id) or die "almanac-bug set-status: no report '$id'\n";
+        # Before the load, for the same reason as `update` above.
+        my ($lock, $lock_err) = Almanac::Lock->acquire($path, verb => 'set-status');
+        _refuse_unlocked('set-status', $id, $lock_err) unless $lock;
         my $rep  = AlmanacBug::load($path) or die "almanac-bug set-status: $path unreadable\n";
         die "almanac-bug set-status: '$id' has MALFORMED: duplicate frontmatter key "
           . "'$rep->{duplicate_key}' — refusing to operate on a possibly-forged report\n"
             if $rep->{duplicate_key};
-        _race_test_hook();
+        _race_test_hook($lock);
         _reject_multiline('set-status', 'note', $o{note}) if defined $o{note} && !ref $o{note};
         _reject_untrimmed('set-status', 'note', $o{note}) if defined $o{note} && !ref $o{note};
         my $from = $rep->{fields}{status} // 'open';
@@ -681,7 +817,7 @@ unless (caller) {
                   . "reach it. Re-run with --repair to place it in a valid state."
                 if !$ok && !$from_known;
         }
-        unless ($ok) { print STDERR "almanac-bug set-status: $why\n"; exit 2 }
+        unless ($ok) { print STDERR "almanac-bug set-status: $why\n"; $lock->release; exit 2 }
 
         my %f = %{ $rep->{fields} };
         my $now = AlmanacBug::_iso(time);
@@ -699,9 +835,11 @@ unless (caller) {
         unless ($cas_ok) {
             print STDERR "almanac-bug set-status: refused — '$id' $cas_why. "
                        . "Retry the command; do not assume it partially applied.\n";
+            $lock->release;
             exit 2;
         }
 
+        $lock->release;
         print "$id: $from -> $to" . (($from_known ? '' : '  (repaired: previous status was outside the state machine)')) . "\n";
         exit 0;
     }
@@ -718,7 +856,7 @@ unless (caller) {
         my @out;
         for my $p (@paths) {
             next unless -f $p;
-            my $rep = AlmanacBug::load($p) or next;
+            my $rep = $read_only_load->($p) or next;
             my $f = $rep->{fields};
             next if defined $o{status} && !ref $o{status} && ($f->{status}//'') ne $o{status};
             my $integrity;
@@ -755,7 +893,7 @@ unless (caller) {
         my $n = 0;
         my @skipped;
         for my $p (AlmanacBug::all_report_paths([$root])) {
-            my $rep = AlmanacBug::load($p);
+            my $rep = $read_only_load->($p);
             # A .md in this directory that has no almanac frontmatter is not a
             # report — typically a hand-written file that predates the state
             # machine, or one imported from it. Calling that "malformed" buries
