@@ -45,6 +45,8 @@ ccpraxis/
 │   │   │   ├── guard-almanac-write.sh                        # PreToolUse guard: denies Edit/Write on bug-reports/*.md so the state machine cannot be bypassed
 │   │   │   └── hooks.json                                    # Registers the bug-report write guard for any project with almanac enabled
 │   │   ├── scripts/                                          # Implementation scripts
+│   │   │   ├── Almanac/
+│   │   │   │   └── Lock.pm                                   # Almanac::Lock — a bounded, blocking exclusive lock over a sidecar…
 │   │   │   └── almanac-bug.pl                                # Bug-report state machine: file/update/set-status/list/collect/verify. The only sanctioned writer of bug-reports/*.md
 │   │   ├── skills/                                           # Slash-command skills this plugin provides
 │   │   │   ├── bug-report/
@@ -53,6 +55,9 @@ ccpraxis/
 │   │   │       └── SKILL.md                                  # Collect and triage ccpraxis bug reports filed from every project on this…
 │   │   └── tests/                                            # Test suite -- run via scripts/run-tests.pl
 │   │       └── t/                                            # Test files, one concern each
+│   │           ├── almanac-lock-bounded-acquire.t            # Bounded exclusive-lock acquisition: the deadline is LOCK_NB polling, never…
+│   │           ├── almanac-lock-rename-retry.t               # A rename() that fails because another process holds the destination open is…
+│   │           ├── almanac-lock-serialization.t              # Genuine OS-process serialization over one shared record: two independent…
 │   │           ├── bug-state-machine.t                       # t/01 — bug reports are frozen once ccpraxis picks them up.
 │   │           ├── frontmatter-injection.t                   # t/03 — a report cannot be born forged.
 │   │           ├── load-modify-write-race.t                  # t/04 — a load-modify-write race cannot defeat the freeze guarantee.
