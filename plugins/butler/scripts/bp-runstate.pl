@@ -247,6 +247,37 @@ sub pause {
         unless defined $until && $until =~ /^\d+$/;
     return (0, "--until $until is in the past")
         unless $until > time;
+
+    # --- MAX_PAUSE_SECONDS: a pause may not outlive the prompt cache ---------
+    #
+    # An interactive driver's whole conversation is held in the provider's
+    # prompt cache, whose TTL for these sessions is ONE HOUR. A pause longer
+    # than that wakes a session whose context has gone cold: every turn of the
+    # run has to be re-read before the first useful thing happens, which is the
+    # single most expensive way a long run can resume. Operator's call,
+    # 2026-09-11, after a driver armed a 58-minute pause -- inside the hour, but
+    # with no margin for the wake-up itself to be late.
+    #
+    # 50 minutes leaves ~10 minutes of headroom against that TTL.
+    #
+    # WHY CLAMP RATHER THAN REFUSE. Refusing is the more usual discipline in
+    # this file, and every other check above refuses -- but those checks all
+    # reject a pause that would be WRONG (a dead watcher, a past deadline, an
+    # unverifiable pid), where granting it is the unsafe direction. This one is
+    # different: the pause is well-formed, it is merely too long, and clamping
+    # can only ever make the gate MORE conservative. A shorter pause cannot hold
+    # the gate open for a stalled run; it just wakes the driver sooner, which
+    # costs one cheap re-check. Refusing, by contrast, risks a retry loop
+    # against a gate whose entire purpose is to keep a run moving -- paying a
+    # wedge to prevent something harmless.
+    #
+    # It is not a SILENT clamp: the returned message states the deadline
+    # actually recorded and says it was shortened, so a caller that reads its
+    # own output cannot come away believing it has longer than it does.
+    my $max_pause  = 50 * 60;
+    my $cap_until  = time + $max_pause;
+    my $asked      = $until;
+    $until = $cap_until if $until > $cap_until;
     # --- t10-run-continuity-gaps: the HOLLOW PAUSE ---------------------------
     #
     # Closes almanac report 20260819-123218-45c3, which the operator noticed
@@ -299,6 +330,12 @@ sub pause {
                     until => $until + 0, updated_at => time }, $surface)
         or return (0, 'could not write the run state');
     my $msg = "paused until $until, watched by pid $pid";
+    $msg .= "\nNOTE: --until was shortened from $asked to $until ("
+          . int($max_pause / 60) . "-minute cap). A pause may not outlive this"
+          . "\n  session's prompt cache, or the run resumes with a cold context and has to"
+          . "\n  re-read every turn before doing anything useful. Re-pause when this expires"
+          . "\n  if the work is still in flight."
+        if $asked > $until;
     $msg .= "\nWARNING: this pause names nothing it is waiting FOR"
           . (defined $watching ? " (--watching '$watching' describes a timer, not work)" : ' (no --watching given)')
           . ".\n  A live pid is not evidence that anything is in flight. If every dispatched"
