@@ -28,8 +28,6 @@
 #
 # Section A pins the resolution itself, B pins the round-trip that actually
 # failed, C pins that the explicit and hook-supplied roots still win.
-#
-# Runs standalone: perl plugins/butler/tests/t/runstate-root-resolution.t
 use strict;
 use warnings;
 use Test::More;
