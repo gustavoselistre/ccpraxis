@@ -80,8 +80,36 @@ bp_hook_require_jq() { bp_hook_require_json_parser; }
 # The timeout is deliberately far longer than any real payload needs -- a Write
 # tool_input can be hundreds of KB, and this must never fire on a slow-but-live
 # producer. If it fires at all, the alternative was hanging forever.
+#
+# IDEMPOTENCE (BP_PAYLOAD_READ_DONE). A second bare call in the same process
+# must NOT re-enter `read` at all -- not "make it fast," but "never attempt
+# it." A second `read -t` against an already-exhausted stdin behaves
+# differently across platforms -- this repo has measured a multi-second hang
+# on Windows/cygwin (the ledger's own "runs out its timeout" symptom); on some
+# other bash it can instead return immediately with PAYLOAD silently clobbered
+# back to "". It does not matter, and this file makes no claim about, WHICH of
+# those a given host does -- both are silent-permit failures (the caller's
+# remaining logic runs against an empty-or-hung payload and looks healthy
+# while having enforced nothing), so the fix is "never attempt it," not "make
+# it fast." BP_PAYLOAD_READ_DONE is a plain (non-exported) global, exactly
+# like PAYLOAD itself, set only after a read actually completes -- so it
+# inherits PAYLOAD's own subshell semantics: a call inside $(...) can only
+# ever set the flag in that subshell's own copy, never the parent's
+# (lib.sh:43).
+#
+# THE FLAG ALONE IS NOT TRUSTED -- PAYLOAD must also be set (lib.sh
+# fix-batch FIX 3). An ordinary shell variable does not distinguish "this
+# process's own bp_read_payload set this" from "this process inherited
+# BP_PAYLOAD_READ_DONE=1 from its environment at exec time" -- a stray export
+# left on from a debugging session, or any future orchestration that copies
+# %ENV wholesale, would otherwise skip the real read entirely and leave every
+# downstream bp_json_get silently returning empty (several guards treat that
+# as "no match" and ALLOW). A flag of 1 with PAYLOAD unset is self-evidently
+# not a completed read in THIS process -- the real read always sets PAYLOAD
+# (even to "") before setting the flag -- so it must not short-circuit.
 bp_read_payload() {
   local mode="${1:-closed}"
+  [ "${BP_PAYLOAD_READ_DONE:-0}" = 1 ] && [ "${PAYLOAD+set}" = set ] && return 0
   local rc=0
   PAYLOAD=""
   IFS= read -r -d '' -t "${BP_PAYLOAD_READ_TIMEOUT:-30}" PAYLOAD || rc=$?
@@ -94,6 +122,7 @@ bp_read_payload() {
     echo "butler hook: the tool payload did not arrive within ${BP_PAYLOAD_READ_TIMEOUT:-30}s (stdin never closed) -- blocking, because an unread payload cannot be checked." >&2
     exit 2
   fi
+  BP_PAYLOAD_READ_DONE=1
   return 0
 }
 
@@ -115,28 +144,111 @@ bp_read_payload() {
 #
 # The payload reaches perl on stdin, never argv: a Write tool_input can be
 # megabytes and would blow ARG_MAX.
+#
+# PATH GRAMMAR (both branches implement exactly this -- spec 02-hook-lib-fixes
+# SS2.1). A KEY is split on '.'. A segment matching ^[0-9]+$ is ALWAYS a
+# zero-based array index into the CURRENT node (leading zeros read as decimal,
+# e.g. "007" -> index 7) -- never an object key, even against an object that
+# happens to have a digit-spelled key. Indexing a non-array (object, scalar,
+# null), or an out-of-range index, yields nothing -- same "nothing" as a
+# missing key (SS2.3): zero stdout bytes, exit 0, never an error.
+#
+# BP_JSON_GET_FORCE (unset | perl | jq) -- TEST-ONLY branch selector, read at
+# the very top. Unset: unchanged default (prefer jq if on PATH, else perl,
+# else return 2). perl: skip the jq branch even if jq is on PATH. jq: require
+# the jq branch -- if jq is not on PATH, return 2 immediately (the same
+# no-parser signal), never a silent fallback to perl.
+#
+# THIS IS A TEST-ONLY SEAM, not a runtime tuning knob. Pre-setting
+# BP_JSON_GET_FORCE=jq in a real hook's environment on a jq-less host (this
+# repo's own stated primary platform) forces `return 2` on every single
+# bp_json_get call for the process's lifetime -- several callers don't check
+# the return code and just treat the resulting empty value as "no match",
+# which several guards (guard-bash.sh, guard-git-mutations.sh, ledger-guard.sh)
+# turn into a silent ALLOW; guard-subagent-stall.sh's own
+# `EVENT=$(...) || exit 0` idiom makes that conversion explicit. Do NOT "fix"
+# this by making the jq branch silently fall back to perl when forced and jq
+# is absent -- json-get-array-index.t's own MECHANISM assertion deliberately
+# pins exit 2 here precisely so this differential seam stays trustworthy: a
+# seam that quietly degrades to "whichever parser happens to be present"
+# would make every jq-vs-perl comparison in that file meaningless. Nothing in
+# shipped hook code sets this variable; only the test harness does, scoped
+# per-subprocess.
 bp_json_get() {
   local payload="$1"; shift
   [ "$#" -gt 0 ] || return 2
 
-  if command -v jq >/dev/null 2>&1; then
-    local expr="" k
+  local __force="${BP_JSON_GET_FORCE:-}" __use_jq=0
+  case "$__force" in
+    jq)   command -v jq >/dev/null 2>&1 || return 2
+          __use_jq=1 ;;
+    perl) __use_jq=0 ;;
+    *)    command -v jq >/dev/null 2>&1 && __use_jq=1 ;;
+  esac
+
+  if [ "$__use_jq" -eq 1 ]; then
+    local expr="" k seg segexpr has_digit
     for k in "$@"; do
       [ -z "$expr" ] || expr="$expr // "
-      expr="$expr.$k"
+      segexpr=""
+      has_digit=0
+      local -a __segs=()
+      IFS='.' read -r -a __segs <<<"$k"
+      # bash < 4.4 (stock macOS /bin/bash 3.2) raises "unbound variable" under
+      # set -u when expanding "${arr[@]}" on a genuinely zero-element array --
+      # fixed in 4.4, but this file is sourced under set -u by every caller and
+      # macOS is a first-class host here. `${#arr[@]}` is safe on every bash
+      # version (only [@]/[*] EXPANSION is the trap), so gate on that instead
+      # of ever expanding an empty __segs. Not live today (no caller passes an
+      # empty KEY), but cheap to close.
+      if [ "${#__segs[@]}" -gt 0 ]; then
+        for seg in "${__segs[@]}"; do
+          case "$seg" in
+            ''|*[!0-9]*) segexpr="$segexpr.$seg" ;;      # literal object key
+            *)           segexpr="$segexpr[$seg]?"; has_digit=1 ;;  # array index, error-suppressed
+          esac
+        done
+      fi
+      # A candidate that walked through at least one array index must yield
+      # "nothing" for an object/array RESULT too, not just an out-of-range or
+      # wrong-type STEP -- spec SS2.1: "resolving to an object, array, or null
+      # counts as 'not a match' for that candidate", matching the perl branch's
+      # `ref $v` check a few lines down. `[N]?` only suppresses a runtime error
+      # from indexing a non-array; it does nothing to a successful index whose
+      # element is itself an object/array, and jq's `//` only substitutes on
+      # null/false, so a truthy object/array result would otherwise print
+      # verbatim AND wrongly foreclose a later // candidate. `scalars` (jq
+      # builtin: select(type != "array" and type != "object")) filters exactly
+      # that. The parens are required here because `|` binds looser than `//`
+      # in jq -- `.a[0]? | scalars // .b` parses as `.a[0]? | (scalars // .b)`,
+      # which is wrong; `(.a[0]? | scalars) // .b` is what's needed.
+      # Non-digit candidates are left bare -- AC-7's byte-identical contract
+      # only covers KEYs with no digit segment anywhere, and a plain dotted
+      # path can never resolve to something that needs this filter differently
+      # than the pre-existing scalar-only contract already handled.
+      if [ "$has_digit" -eq 1 ]; then
+        segexpr="($segexpr | scalars)"
+      fi
+      expr="$expr$segexpr"
     done
     # rc deliberately UNCHECKED, matching the pre-existing `jq ... 2>/dev/null`
     # callers: malformed JSON yielded empty (allow) before and still does, so
-    # this refactor cannot change what the container decides.
+    # this refactor cannot change what the container decides. A [N]? whose
+    # runtime node is not an array degrades to "no output" for that step the
+    # same way, chained into the rest of the // fallback.
     #
-    # NO WRAPPING PARENS. `//` is left-associative, so `.a // .b // empty` and
-    # `(.a // .b) // empty` are the same query to jq -- but they are NOT the same
-    # STRING, and several tests stand in for jq with a small perl script that
-    # parses the expression. Those shims split on `//` and treat each term as a
-    # dotted path; a leading `(` makes the first term unparseable, so the shim
-    # returns nothing, the hook sees an empty value and ALLOWS what it should
-    # have denied. Emitting the shape the hooks have always used keeps every
-    # such stand-in working, and costs nothing with a real jq.
+    # NO WRAPPING PARENS around the OUTER // chain. `//` is left-associative,
+    # so `.a // .b // empty` and `(.a // .b) // empty` are the same query to
+    # jq -- but they are NOT the same STRING, and several tests stand in for
+    # jq with a small perl script that parses the expression. Those shims
+    # split on `//` and treat each term as a dotted path; a leading `(` on the
+    # WHOLE expression makes the first term unparseable, so the shim returns
+    # nothing, the hook sees an empty value and ALLOWS what it should have
+    # denied. Emitting the shape the hooks have always used keeps every such
+    # stand-in working, and costs nothing with a real jq. A KEY with no digit
+    # segment compiles to EXACTLY today's dot-concatenation string -- unchanged,
+    # byte for byte (the per-candidate `(... | scalars)` wrapping above only
+    # ever applies to a candidate that used a digit segment).
     jq -r "$expr // empty" <<<"$payload" 2>/dev/null
     return 0
   fi
@@ -150,8 +262,22 @@ bp_json_get() {
       exit 0 unless ref $doc eq "HASH";          # malformed -> empty, as jq
       for my $path (@ARGV) {
         my $v = $doc;
-        for my $k (split /\./, $path) {
-          $v = (ref $v eq "HASH") ? $v->{$k} : undef;
+        for my $seg (split /\./, $path) {
+          if ($seg =~ /^[0-9]+$/) {
+            # Bound-check numerically before subscripting -- a digit string
+            # that overflows the interpreter integer range (e.g.
+            # "99999999999999999999") converts to a huge double, and
+            # $v->[$huge_double] behaves like a NEGATIVE index (wraps to the
+            # LAST element) rather than "out of range". $seg <= $#$v compares
+            # against a small int on the RHS, so the same huge-double
+            # conversion happens but correctly evaluates false -- no
+            # wraparound, matching the documented contract just above (an
+            # out-of-range index yields nothing) and the jq branch, which
+            # never wraps.
+            $v = (ref $v eq "ARRAY" && $seg <= $#$v) ? $v->[$seg] : undef;   # never an object key
+          } else {
+            $v = (ref $v eq "HASH") ? $v->{$seg} : undef;
+          }
           last unless defined $v;
         }
         next if !defined $v || ref $v || $v eq "";
