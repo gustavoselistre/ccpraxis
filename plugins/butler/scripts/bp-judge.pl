@@ -15,7 +15,7 @@
 #     (re-scope, corrected relaunch, drop an *optional* criterion) → relaunch | park.
 #
 # DESIGN: every decision here is a PURE function — no I/O, no globals, no clock —
-# so t/10-judges.t can exhaust the matrix without a real `claude`. Verdict parsing
+# so t/judge-decision-core.t can exhaust the matrix without a real `claude`. Verdict parsing
 # is fail-CLOSED (an unrecognized judge verdict never reads as "all good": a bad
 # harvest verdict escalates, a bad resolve verdict parks — Decision #29's spirit
 # applied to the judges' own output).
@@ -161,7 +161,7 @@ sub normalize_harvest {
 # independent work running. corrective_cap default 1 (a single corrective cycle).
 # defer_cap defaults to 2 when the key is absent; deferrable defaults to 0, so every
 # pre-existing call shape (no deferrable/defer_attempts/defer_cap keys) is
-# byte-for-byte unchanged (t/10-judges.t:91-95).
+# byte-for-byte unchanged (t/judge-decision-core.t:91-95).
 sub audit_outcome {
     my ($c) = @_;
     return 'accept' if defined $c->{verdict} && $c->{verdict} eq 'pass';

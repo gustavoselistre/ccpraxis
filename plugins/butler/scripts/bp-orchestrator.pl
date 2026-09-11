@@ -109,7 +109,7 @@ our $PID_ALIVE_FN;
 # the stale value the tick captured (fixbatch step7 / red-team MAJOR). Gating
 # on `['done','dropped']` here would still be wrong, unconditionally refusing
 # the ORDINARY case (status genuinely still 'done' while the harvest audit is
-# unresolved, which is what the MUST-STAY-GREEN t/99-write-guard-sites.t S4/
+# unresolved, which is what the MUST-STAY-GREEN t/write-guard-sites.t S4/
 # AC14 control pins) -- the table row was never the right tool for a
 # freshness problem. Instead, `_judge_outcome_still_applies` (below) now ALSO
 # re-reads the ledger's live `status:` immediately before either branch
@@ -317,7 +317,7 @@ sub _require_category {
 our $COORDINATOR_MAX_RUNTIME_SECS = $ENV{BP_COORDINATOR_MAX_RUNTIME_SECS} || (24 * 3600);
 
 # ===========================================================================
-# PURE DECISIONS  (no I/O, no globals — unit-tested in t/06-orchestrator.t)
+# PURE DECISIONS  (no I/O, no globals — unit-tested in t/orchestrator-decision-core.t)
 # ===========================================================================
 
 sub _is_terminal { my $s = shift // ''; $s =~ /^(done|dropped|blocked|parked)$/ ? 1 : 0 }
@@ -1983,8 +1983,8 @@ sub archive_judge_verdict {
 # narrowed (whole-tick -> gate-return-to-act) but not eliminated. Closing it fully
 # would mean folding every one of those side effects into this gate's own `mutate`
 # (the `queue_needs_you` S2 pattern), which is a substantially larger, riskier change
-# than this fix-batch's budget allows without jeopardizing the pinned t/98-100
-# oracle. Left open, and named here rather than only in the fix-batch report, per
+# than this fix-batch's budget allows without jeopardizing the pinned write-guard-primitive /
+# write-guard-sites / write-guard-audit oracle. Left open, and named here rather than only in the fix-batch report, per
 # the same "never leave the current shape while comments claim the window is
 # closed" instruction that flagged it. Also: this lock excludes nothing else in the
 # tree (grepped -- no other writer takes `runs/<kind>/<pkg>.lock`); its value is the
@@ -2644,7 +2644,7 @@ sub run {
     my %ckpt_warned;
     # r01: pkg => epoch of the last watchdog-issued relaunch THIS process. LOOP-SCOPE
     # and deliberately NOT persisted to registry.json — see spec §5: persisting this
-    # would silently break t/68-exit-reason-classification.t's C4 oracle, which drives
+    # would silently break t/exit-reason-classification.t's C4 oracle, which drives
     # four SEPARATE go() calls at a fixed $now to simulate four restarts. Same
     # convention/rationale as %seen/%ckpt above.
     my %last_relaunch_at;
@@ -4882,7 +4882,7 @@ sub remediation_step {
 
 sub _block_and_queue {
     # fixbatch step7 / reviewer SHOULD-FIX 2: NOT converted to a hashref -- see
-    # fixbatch-step7.md. t/115-escalation-categories.t (immutable, MUST STAY
+    # fixbatch-step7.md. t/escalation-categories.t (immutable, MUST STAY
     # GREEN) calls this sub directly with the current 9/10-positional-arg
     # signature at 4 sites (D1/D2/D3/E3), including deliberately testing the
     # "old 9-arg call" (no category) refusal shape by arity. A hashref-only

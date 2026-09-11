@@ -28,7 +28,7 @@ binmode STDIN,  ':raw';
 binmode STDOUT, ':raw';
 
 # Loaded by full path (not `use lib` + bareword `use`), exactly as the
-# t/54-spend-panel.t oracle itself loads these two modules -- SpendPanel.pm
+# t/spend-panel.t oracle itself loads these two modules -- SpendPanel.pm
 # and Dashboard.pm live in the SANDBOX plugin's scripts/, this script lives
 # in the BUTLER plugin's scripts/, so there is no shared @INC entry to rely
 # on.

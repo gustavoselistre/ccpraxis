@@ -9,7 +9,7 @@ Appendix A).
 
 Before this inventory, the code only ever *saw* `{accessToken, refreshToken,
 expiresAt(ms), scopes}` — that's the fixture shape used by
-`t/33-credentials-degrade.t`, not a confirmed real-world schema. The spike
+`t/credentials-degrade.t`, not a confirmed real-world schema. The spike
 gate closed this gap: André logged in inside a live sandbox container and the
 resulting `$SANDBOX_CREDENTIALS_FILE` (`claudeAiOauth` key) was inspected
 directly, values masked. **Confirmed fields present:**
@@ -73,4 +73,4 @@ a placeholder that could be mistaken for real data).
 - Existing precedent for "read but never return token material":
   `_gather_oauth_expiry`, `plugins/sandbox/scripts/launcher.pl`.
 - Fixture shape used by tests today (pre-dates this inventory, kept for
-  contrast): `plugins/sandbox/tests/t/33-credentials-degrade.t`.
+  contrast): `plugins/sandbox/tests/t/credentials-degrade.t`.

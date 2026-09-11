@@ -78,7 +78,7 @@ ledger write. So it is no longer prose:
 `plugins/butler/hooks/gate-drive-loop.sh` (Stop) blocks the turn from ending when
 nothing is scheduled and `bp-drive-next.pl next` still returns actionable work;
 `mark-wakeup.sh` (PreToolUse) records the dispatch that earns a legitimate turn end.
-Proven by `plugins/butler/tests/t/94-drive-loop-gate.t`.
+Proven by `plugins/butler/tests/t/drive-loop-gate.t`.
 
 - **Do the next thing in the same turn, rather than announcing it.** "Moving on to X"
   followed by a turn end is precisely the shape the gate exists to catch.

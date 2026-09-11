@@ -64,22 +64,24 @@ needs a toolchain, it belongs in the sandbox container.
 
 ## Tests
 
-Layout: `plugins/<plugin>/tests/t/NN-name.t`, plain `Test::More`, no harness config.
+Layout: `plugins/<plugin>/tests/t/name.t` (lowercase kebab-case, at least two hyphen-separated
+words, no numeric prefix — enforced by `plugins/butler/tests/t/test-naming-hygiene.t`), plain
+`Test::More`, no harness config.
 
 **`prove` does not exist on the Git-for-Windows host** — that perl ships no `TAP::Harness`
 (`Can't locate TAP/Harness/Env.pm`). Run one file directly and judge by exit code plus `not ok`
 count:
 
 ```bash
-perl plugins/sandbox/tests/t/42-refuse-in-place.t
+perl plugins/sandbox/tests/t/refuse-in-place.t
 ```
 
 **For a sweep, use the runner — never a serial `for` loop.** A full sweep is ~70 minutes of CPU
-across 243 files; run one at a time that is exactly what it costs, and a suite nobody wants to run
+across 312 files; run one at a time that is exactly what it costs, and a suite nobody wants to run
 is a suite that stops getting run.
 
 ```bash
-perl scripts/run-tests.pl --fast            # ~85s: everything except the container tests
+perl scripts/run-tests.pl --fast            # ~17min (1019s wall, 300 of 312 files; the 12 container tests are excluded)
 perl scripts/run-tests.pl                   # everything
 perl scripts/run-tests.pl plugins/sandbox   # one plugin
 ```
@@ -124,7 +126,7 @@ These have each cost real debugging time. Details in the user-global `CLAUDE.md`
     above. Disabling conversion while still passing bare `/c/...` is its own bug with the opposite
     symptom: Windows resolves the leading `/` against the current drive, so the path is silently
     created at the **drive root** as `C:\c\...`. That cost 576 stray entries on 2026-06-12; see
-    `plugins/steward/tests/t/09-no-drive-root-strays.t`. Never set the variable shell-wide.
+    `plugins/steward/tests/t/no-drive-root-strays.t`. Never set the variable shell-wide.
 - **Paths contain non-ASCII** (`André`). Nothing may assume ASCII paths. Round-trip registry values
   as UTF-8 bytes; never re-encode something already decoded.
 - **`podman machine set --disk-size` fails on WSL machines** (exit 125). Grow via WSL instead:
@@ -197,8 +199,8 @@ fix-batch (`ef272c3`) — its thesis is that a written instruction is not an enf
 the file is untracked, a fresh clone gets the guard script and never runs it, and the registration
 survives only as prose in a commit message: the same mistake, one level up.
 Two tests fail if the registration goes missing:
-`plugins/sandbox/tests/t/61-settings-scope-split.t` and
-`plugins/butler/tests/t/112-subagent-stall-guard.t`.
+`plugins/sandbox/tests/t/settings-scope-split.t` and
+`plugins/butler/tests/t/subagent-stall-guard.t`.
 
 **Path-qualify test citations** — `t/NN` collides across plugins, and a bare number has already
 produced a confident "no such file exists" about a file that was there.

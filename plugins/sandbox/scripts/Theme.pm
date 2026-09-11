@@ -109,7 +109,7 @@ use Encode ();   # core; used only for UTF-8 encoding of declared glyphs
 #     load. All token DATA tables (roles, glyphs) live inside memoized
 #     builder functions rather than as top-level literals. NOTE (reviewer
 #     S3, package 02-design-tokens): this shape is NOT forced by any
-#     t/64-theme-tokens.t source scan -- B-A2 scans the whole file (not
+#     t/theme-tokens.t source scan -- B-A2 scans the whole file (not
 #     scoped to top-level-only) for spawn/I/O constructs and use/require
 #     targets, none of which a plain top-level hash literal would trip;
 #     B-A3's top-level-only scan forbids just a reference to the process
@@ -464,7 +464,7 @@ sub accent_lightness_band {
 # the block comment beside them for why that number is what it is.
 #
 # NO EMOJI: every codepoint below was checked against the emoji-range test
-# in t/64-theme-tokens.t's own detector (mirroring spec §2.6.1) and none
+# in t/theme-tokens.t's own detector (mirroring spec §2.6.1) and none
 # match. The Miscellaneous Symbols and Dingbats blocks in particular are
 # off-limits to this design system.
 # =============================================================================
@@ -604,7 +604,7 @@ sub _glyphs_data {
         # t03-activity-column: the truncation marker for a row that wrapped
         # past its cap. Declared HERE rather than written into tui/Frame.pm
         # because that module is held to an ASCII-only source rule
-        # (t/65-tui-render-library.t AC-T2: no byte >= 0x80 and no \x{...}
+        # (t/tui-render-library.t AC-T2: no byte >= 0x80 and no \x{...}
         # escape >= 0x80), and this table's chr($cp) construction is the
         # mechanism that rule exists to funnel every glyph through.
         'ellipsis'    => { cp => 0x2026, desc => 'horizontal ellipsis -- a row was truncated past its wrap cap' },
@@ -1096,7 +1096,7 @@ sub _reset_capability_memo {
 # THE GENERATED BLOCK (spec §2.7) -- the statusline drift guard's canonical
 # output. Package 10 embeds generated_block()'s exact text, between the two
 # marker lines generated_markers() returns, into scripts/statusline.pl; the
-# guard in t/64-theme-tokens.t regenerates this payload in memory and
+# guard in t/theme-tokens.t regenerates this payload in memory and
 # compares it byte-for-byte against what is on disk.
 # =============================================================================
 

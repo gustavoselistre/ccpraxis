@@ -81,7 +81,7 @@ my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
 # set). This is deliberately narrow — the other eight functions this file
 # mirrors from BpOrch (see the `# Mirrored from BpOrch::...` comments below)
 # are left as faithful copies on purpose (spec b44-execution-priority §3.1);
-# t/17-drive-next.t asserts BpDrive's own write_sets_overlap behaviour
+# t/drive-next.t asserts BpDrive's own write_sets_overlap behaviour
 # (including its deliberate empty-prefix landmine), so collapsing those
 # mirrors into requires would churn an immutable oracle for no gain here.
 # Measured safe to require: bp-orchestrator.pl is `package BpOrch;` ending

@@ -130,7 +130,7 @@ either side of it.
 
 ## Enforcement
 
-`plugins/sandbox/tests/t/62-tui-adapter-contract.t` is the automated guard for the **fork/spawn half**
+`plugins/sandbox/tests/t/tui-adapter-contract.t` is the automated guard for the **fork/spawn half**
 of Rule 1. Rule 1's "or block" clause — a `sleep`, a blocking `waitpid`, a blocking `flock`, a socket
 read with a long timeout — is **not** mechanically detected by anything in this guard (it is not a
 decidable static property of source text the way a subprocess construct is), and remains doctrine
@@ -181,7 +181,7 @@ current violation is already caught by the same-file closure.
 
 The guard is allowed to keep the suite green in the face of a **known, already-scheduled-to-be-fixed**
 violation, via an explicit `%WAIVED` hash that lives at the top of
-`plugins/sandbox/tests/t/62-tui-adapter-contract.t` itself — not in this document, and not in a
+`plugins/sandbox/tests/t/tui-adapter-contract.t` itself — not in this document, and not in a
 separate data file, because this package's write set is exactly this doc and that test, and the
 package that removes the one current entry (package `03-resources-reader-model`, "package `03`" for
 short) has that test in its own write set too. A waiver is not a pardon and it is not silent: each

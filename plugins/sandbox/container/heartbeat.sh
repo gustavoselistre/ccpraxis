@@ -33,7 +33,7 @@ POST_WAKE_GRACE="${POST_WAKE_GRACE:-600}"     # after a detected resume, give th
 REAP_RECORD="${REAP_RECORD:-$DATA/claude-home/.launcher/last-reap.txt}"   # host-visible: WHY this container stopped
 
 # =============================================================================
-# PURE DECISION (unit-tested in plugins/butler/tests/t/14-reap.t via a sourced
+# PURE DECISION (unit-tested in plugins/sandbox/tests/t/reap-decision.t via a sourced
 # bash harness — no container, no real clock)
 # =============================================================================
 # reap_decision HB_STALE RUN_ACTIVE GRACE_STARTED GRACE_EXPIRED -> one of:

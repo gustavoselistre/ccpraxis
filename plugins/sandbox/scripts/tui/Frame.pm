@@ -739,7 +739,7 @@ sub wrap_line {
 # Overshooting by one more retained character (when one exists) keeps the
 # bounded text's own spans_width > $w whenever $max_rows==1, so wrap_line
 # takes the SAME code path it would for the full text; found via
-# t/88-banner-wrap-every-surface.t's pre-existing AC-4d ($max_banner_rows==1),
+# t/banner-wrap-every-surface.t's pre-existing AC-4d ($max_banner_rows==1),
 # a foreign package's regression guard this fix must not break.
 sub bound_for_wrap {
     my ($text, $max_rows, $w) = @_;
@@ -1055,7 +1055,7 @@ sub wrap_capped {
 # The truncation marker, and its display width.
 #
 # TAKEN FROM Theme, NOT WRITTEN HERE. This module is held to an ASCII-only
-# source rule (t/65-tui-render-library.t AC-T2: no byte at or above 0x80, and
+# source rule (t/tui-render-library.t AC-T2: no byte at or above 0x80, and
 # no hex character escape naming a codepoint at or above 0x80), and Theme's
 # glyph table -- which builds each character with chr($cp) from a hex integer
 # -- is precisely the mechanism that rule exists to funnel every glyph

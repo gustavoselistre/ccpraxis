@@ -9,7 +9,7 @@ package Resources;
 # Resources::gather, which INVOKES caller-supplied coderefs -- every side
 # effect there is the caller's, never this module's.
 #
-# Loaded by launcher.pl and by t/44-resources.t. Dashboard.pm does NOT load
+# Loaded by launcher.pl and by t/resources-panel.t. Dashboard.pm does NOT load
 # it: the launcher computes, Dashboard renders (same split as s08/TokenInfo).
 #
 # See specs/s09-resources-panel-spec.md S2.0-S2.4 for the binding contract.

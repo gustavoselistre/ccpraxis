@@ -14,7 +14,7 @@
 # artifact_changed() close the same gap correctly, scoped to exactly the
 # paths a caller configures, and additionally poll on a real condition
 # rather than a fixed --sleep. This file's CODE below is intentionally
-# UNCHANGED (this is a header-only edit) and t/95-watchdog.t stays green,
+# UNCHANGED (this is a header-only edit) and t/drive-loop-watchdog.t stays green,
 # byte-for-byte, because nothing it exercises changed -- superseding in
 # doctrine is the chosen fix, not a rewrite of internals nothing calls
 # again. See .ccpraxis-local-data/blueprints/butler-and-dashboard-overhaul/

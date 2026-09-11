@@ -14,8 +14,8 @@
 #   • CLI    — `perl bp-checkpoint.pl --pkg <p> --write-set <colon-string> ...`,
 #     guarded by `unless (caller)`; exit 0/1/2/3 (see the CLI block at the end).
 #
-# INVARIANTS (each one is an AC in t/21-durable-checkpoint-commits.t and
-# t/22-checkpoint-hardening.t):
+# INVARIANTS (each one is an AC in t/durable-checkpoint-commits.t and
+# t/checkpoint-hardening.t):
 #   • NEVER dies. Every failure — no repo, no git binary, a locked index, a
 #     rejecting hook, a hung or signal-killed child — is a structured hashref
 #     with a closed `reason` enum.

@@ -509,7 +509,7 @@ sub sweep_settled {
         # never-fatal error handling -- the same contract bp-resolve.pl's
         # archive path relies on. Hand-rolling an equivalent here would have
         # duplicated that logic AND tripped a standing census in
-        # t/69-answer-decision-completeness.t and t/70-decision-delivery.t,
+        # t/answer-decision-completeness.t and t/decision-delivery.t,
         # which pin this file to exactly ONE raw '>:raw' writer so that a new
         # feature cannot quietly grow a second independent ledger writer.
         #

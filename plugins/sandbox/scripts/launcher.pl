@@ -53,7 +53,7 @@ use TokenInfo ();   # s08: pure access/refresh token status struct for the dashb
 use SpendPanel ();  # b37: pure Claude/Go/Zen spend status struct for the dashboard
                     # (the LAUNCHER loads it and computes; Dashboard.pm renders the
                     # already-computed struct and must never load it — same split
-                    # TokenInfo has, and t/54-spend-panel asserts both halves)
+                    # TokenInfo has, and t/spend-panel asserts both halves)
 use Resources ();   # s09: pure resource-probe parsers + the injectable probe seam
 use RunState ();    # s10: pure orchestrator/run-state summarizer for the dashboard
 
