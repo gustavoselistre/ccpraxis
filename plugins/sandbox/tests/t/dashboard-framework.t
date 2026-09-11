@@ -882,7 +882,7 @@ my %st = (
     my $c = Dashboard::compose_frame(\%st2, 10, 60);
     my $diff = Dashboard::render_frame($a, $c, { color => 0 });
     unlike($diff, qr/\e\[2J/, 'render: single-field change is a diff, not a clear');
-    my @moves = ($diff =~ /\e\[(\d+);1H/g);
+    my @moves = ($diff =~ /\e\[(\d+);\d+H/g);
     is(scalar(@moves), 1, 'render: exactly one row repainted for a one-row change');
 
     # resize (row count changes) -> full redraw
@@ -894,7 +894,7 @@ my %st = (
     my $wider = Dashboard::compose_frame(\%st, 10, 80);   # $a was 10x60
     my $wdiff = Dashboard::render_frame($a, $wider, { color => 0 });
     unlike($wdiff, qr/\e\[2J/, 'render: width-only resize is a diff, not a clear');
-    my @wmoves = ($wdiff =~ /\e\[(\d+);1H/g);
+    my @wmoves = ($wdiff =~ /\e\[(\d+);\d+H/g);
     is(scalar(@wmoves), 10, 'render: width-only resize repaints all rows (all text changed)');
 
     # color mode emits SGR for the title row -- RE-DERIVED (spec S2.1): the
@@ -1788,7 +1788,7 @@ sub drive_per_tick {
     # 0-row update: the title row repaints because the spinner index advanced.
     # So exactly ONE row move is expected -- and it must be row 1 (the title
     # row).  A repaint of any OTHER row would still mean a stale $prev baseline.
-    my @row_moves = ($post_scroll_render =~ /\e\[(\d+);1H/g);
+    my @row_moves = ($post_scroll_render =~ /\e\[(\d+);\d+H/g);
     is(scalar(@row_moves), 1,
         'E: post-scroll quiet-tick render repaints EXACTLY ONE row (prev baseline is current, not stale)');
     is_deeply(\@row_moves, ['1'],

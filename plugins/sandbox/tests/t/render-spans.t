@@ -284,7 +284,7 @@ is(Dashboard::display_width("a\tb"), 2,
     my $frameB = [ $footer3, $cellB ];
     my $rdiff = Dashboard::render_frame($frameA, $frameB, { color => 0 });
     unlike($rdiff, qr/\e\[2J/, 'AC-11 role-only: same row count -> diff path, not a clear');
-    my @moves = ($rdiff =~ /\e\[(\d+);1H/g);
+    my @moves = ($rdiff =~ /\e\[(\d+);\d+H/g);
     is(scalar(@moves), 1,
         'AC-11 role-only: a row-level-role-only change repaints exactly one row');
 

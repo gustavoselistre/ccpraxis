@@ -823,7 +823,7 @@ sub _ac11_expect {
     my $f_diff_right = Dashboard::compose_frame({ %st, busy_age => 5, stay_awake => 1, needs_you => 7 }, $AC15_ROWS, 120);
     my $diffR = Dashboard::render_frame($f_base_right, $f_diff_right, { color => 0 });
     unlike($diffR, qr/\e\[2J/, 'AC-15.3: RIGHT-column-only (needs_you) diff -> not a full clear');
-    my @movesR = ($diffR =~ /\e\[(\d+);1H/g);
+    my @movesR = ($diffR =~ /\e\[(\d+);\d+H/g);
     is(scalar(@movesR), 1,
         'AC-15.3: a state differing ONLY in a RIGHT-column field (needs_you) repaints EXACTLY one row');
 
@@ -831,18 +831,31 @@ sub _ac11_expect {
     my $f_diff_left = Dashboard::compose_frame({ %st, beat_age => 999 }, $AC15_ROWS, 120);
     my $diffL = Dashboard::render_frame($f, $f_diff_left, { color => 0 });
     unlike($diffL, qr/\e\[2J/, 'AC-15.3: LEFT-column-only (beat_age) diff -> not a full clear');
-    my @movesL = ($diffL =~ /\e\[(\d+);1H/g);
+    my @movesL = ($diffL =~ /\e\[(\d+);\d+H/g);
     is(scalar(@movesL), 1,
         'AC-15.3: a state differing ONLY in a LEFT-column field (beat_age) repaints EXACTLY one row');
 
     # 4. every emitted row repaint matches /\e[\d+;1H\e[K/ and no \e[K follows any text;
     #    the title row still ends with the full "[running]".
+    # AC-15.4's first assertion USED to be "every row move carries \e[K",
+    # anchored on /\e[\d+;1H/. Span-level diffing deliberately makes that FALSE:
+    # an equal-width middle-only update positions at the changed span's column
+    # and emits no \e[K at all, which is the entire point of the change.
+    #
+    # Worse, the old form did not fail -- it went VACUOUS. Both counts became 0
+    # (no move matched the column-1 anchor), so is(0,0) passed while asserting
+    # nothing. A silently-passing check is worse than a failing one, so the
+    # non-vacuity guard below is the replacement: it fails if the fixture ever
+    # stops emitting row updates at all.
+    #
+    # The property worth keeping is the SECOND one, and it is unchanged: \e[K
+    # may only ever clear a tail, never appear after text already emitted on
+    # that row. That holds under both the full-row and the span-diff shapes.
     for my $pair ([ $diffR, 'right-diff' ], [ $diffL, 'left-diff' ]) {
         my ($diff_out, $tag) = @$pair;
-        my @all_moves = ($diff_out =~ /\e\[\d+;1H/g);
-        my @moves_with_clear = ($diff_out =~ /\e\[\d+;1H\e\[K/g);
-        is(scalar(@all_moves), scalar(@moves_with_clear),
-            "AC-15.4 ($tag): every row-repaint escape matches /\\e[\\d+;1H\\e[K/");
+        my @all_moves = ($diff_out =~ /\e\[\d+;\d+H/g);
+        cmp_ok(scalar(@all_moves), '>', 0,
+            "AC-15.4 ($tag): the diff emitted at least one row update (guards against a vacuous pass)");
         unlike($diff_out, qr/\]\e\[K/, "AC-15.4 ($tag): no \\e[K follows any already-emitted text");
     }
     # Same re-anchoring as t/25's copy: the property is "the last cell of a
