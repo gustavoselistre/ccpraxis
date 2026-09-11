@@ -471,23 +471,21 @@ fi
 DETAIL=$(printf '%s' "$OUT" | perl -ne 'my @m; while (/"(?:blueprint|package)"\s*:\s*"([^"]+)"/g) { push @m, $1 } print join " / ", @m' 2>/dev/null || true)
 echo $((BLOCKS + 1)) > "$DS/.stop-blocks" 2>/dev/null
 
+# KEEP THIS SHORT -- see the matching note in guard-subagent-stall.sh. This
+# fires repeatedly in a long run and the rationale is already in this file's
+# header and in drive-solo/SKILL.md. The pinned essentials (t/drive-loop-gate.t
+# G3 and :322) are the .stop-ok escape hatch and the bp-drive-next.pl verb.
 cat >&2 <<EOF
-BLOCKED (butler drive-loop): this turn is ending with nothing scheduled to
-continue the run, and the director still returns actionable work:
+BLOCKED (butler drive-loop): nothing is scheduled to continue the run, and the
+director still returns work:
 
     action: $ACTION ${DETAIL:+($DETAIL)}
 
-A driver turn may end for exactly two reasons: something will wake the session
-(a dispatched subagent, or a backgrounded Bash call), or the run is settled.
-Neither holds right now — so if this turn ends, the run stops silently
-mid-package while appearing finished.
+Do it NOW, in this turn -- dispatch the worker it calls for, or run
+'perl plugins/butler/scripts/bp-drive-next.pl next' and act on the result.
+Describing the next step instead of doing it is what this gate catches.
 
-Do the next thing NOW, in this turn, rather than describing it:
-  * dispatch the worker the action calls for, or
-  * run 'perl plugins/butler/scripts/bp-drive-next.pl next' and act on it, or
-  * if the run really should stop here, touch $DS/.stop-ok and stop again.
-
-(Announcing the next step in prose is what this gate exists to catch. This
-will not block more than $MAX_BLOCKS times in a row.)
+If the run really should stop here: touch $DS/.stop-ok and stop again.
+(Blocks at most $MAX_BLOCKS times in a row.)
 EOF
 exit 2

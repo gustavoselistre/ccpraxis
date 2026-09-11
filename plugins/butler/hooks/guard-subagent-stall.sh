@@ -255,38 +255,28 @@ case "$EVENT" in
         ;;
     esac
 
+    # KEEP THIS SHORT. It fires repeatedly in a long run, and an operator who
+    # has read the rationale once does not need it again on every denial. The
+    # argument for the gate lives in this file's header and in
+    # drive-solo/SKILL.md; what a reader needs HERE is the verb. Four facts are
+    # load-bearing and pinned by t/subagent-stall-guard.t:155-158 -- the word
+    # BLOCKED, the unresolved worker's name, and both verbs. Everything else is
+    # a pointer.
     cat >&2 <<EOF
-BLOCKED: a run is ACTIVE and this turn did not resolve it.$STALE
-${PENDING:+Unguarded background dispatch(es) since the last resolved turn: $PENDING
+BLOCKED: run is ACTIVE and this turn did not resolve it.$STALE
+${PENDING:+Unresolved since the last resolved turn: $PENDING
 }
-A turn that ends mid-run without resolving it is how an unattended run dies:
-nothing is scheduled, nothing wakes the session, and the work simply stops.
-Silence is not a resolution. There are exactly two, and you must pick one:
+Pick one, then stop:
 
-  1. The run is FINISHED -- nothing is pending:
+  perl $RS finish --reason "<why>"          # nothing is pending
 
-       perl plugins/butler/scripts/bp-runstate.pl finish --reason "<why>"
+  perl $RS pause --watcher-pid <pid> --until \$(( \$(date +%s) + 1800 )) \\
+       --watching "<work in flight>" --reason "<what wakes us>"
 
-  2. The run CONTINUES but something live will wake it. Arm a watcher first
-     (Bash, run_in_background: true), then declare the pause. The pid must be
-     RUNNING and the deadline in the FUTURE -- this is verified, not trusted:
-
-       perl plugins/butler/scripts/bp-runstate.pl pause \
-            --watcher-pid <pid> --until \$(( \$(date +%s) + 1800 )) \
-            --watching "<the work in flight -- an agent, a task id, a command>" \
-            --reason "<what will wake us>"
-
-     ARM THE WATCHER AROUND REAL WORK, not the other way round. A live pid is
-     verified; it is not evidence that anything is running. A pause with every
-     dispatched worker already finished and nothing new dispatched satisfies
-     every check here and still leaves nothing to wake the session -- it just
-     fails later, when the deadline expires. --watching is not enforced and
-     never refuses a pause; it exists so the emptiness is visible while you can
-     still fix it.
-
-If instead you are about to do the work, DO IT NOW in this turn.
-A pause whose watcher dies reverts to active by itself, so a stale pause cannot
-hold the gate open. touch $STATE_DIR/force-stop to override entirely.
+The pause needs a watcher that is RUNNING and OUTLIVES the work -- arm
+bp-watch.pl around the dispatch; never pass the work's own pid.
+Doing the work now, in this turn, also resolves it.
+Why: this file's header. Override: touch $STATE_DIR/force-stop
 EOF
     exit 2
     ;;
