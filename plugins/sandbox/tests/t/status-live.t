@@ -116,10 +116,16 @@ ok(-f $dashboard_pm, 'Dashboard.pm present') or BAIL_OUT;
 ok(-f $launcher_pl,  'launcher.pl present')  or BAIL_OUT;
 my $dash_src = _slurp($dashboard_pm);
 
-# Isolate row 1's rendered segment out of a render_frame() ANSI string: every
-# row (full paint or diff) is emitted as "\e[<n>;1H\e[K<text>", so row 1's
-# text runs from its own "\e[1;1H\e[K" up to the next row-move escape or the
-# synchronized-output end.
+# Isolate row 1's rendered segment out of a render_frame() ANSI string.
+# RE-POINTED (span-level row diffing, tui-span-diff): a DIFF frame no longer
+# carries a row's full text -- an unchanged span is not re-emitted, so a
+# spinner-only tick's diff is just the new glyph's bytes at whatever column
+# follows the unchanged leading span(s), with no \e[1;1H\e[K anchor at all.
+# No regex over a diff frame can recover "row 1's full text" because the
+# information was never emitted. Call sites now pass this helper a FULL
+# PAINT (render_frame(undef, $frame, ...), the existing documented idiom),
+# which still emits every row as "\e[<n>;1H\e[K<text>" -- so the isolation
+# below is unchanged; only what callers hand it changed.
 sub _row1_segment {
     my ($frame) = @_;
     return $1 if $frame =~ /\e\[1;1H\e\[K(.*?)(?:\e\[\d+;1H|\e\[\?2026l)/s;
@@ -472,7 +478,7 @@ sub _run_live {
     ok(scalar(@renders) >= 3, 'AC-6a: at least 3 primary renders captured (clock-advancing run)');
     for my $i (1 .. $#renders) {
         unlike($renders[$i], qr/\e\[2J/, "AC-6a: render $i (post-first, idle) has no full repaint");
-        my @moves = ($renders[$i] =~ /\e\[(\d+);1H/g);
+        my @moves = ($renders[$i] =~ /\e\[(\d+);\d+H/g);
         is(scalar(@moves), 1, "AC-6a: render $i (post-first, idle) repaints exactly one row");
         is($moves[0], 1, "AC-6a: render $i (post-first, idle) row repaint is the title row (row 1)");
     }
@@ -480,7 +486,23 @@ sub _run_live {
     for my $i (0 .. $#renders) {
         my $expected_idx   = int($t_at_render[$i] / $tick_int) % $SPINNER_N;
         my $expected_bytes = $SPINNER_BYTES[$expected_idx];
-        my $seg = _row1_segment($renders[$i]);
+        # RE-POINTED (span-level row diffing): $renders[$i] is a real DIFF
+        # frame (AC-6a already proved exactly one row move, no full clear),
+        # and a diff no longer carries row 1's full text to regex out of --
+        # only the changed span (see the helper's comment above). The state
+        # driving this block never changes tick-to-tick except spinner_idx
+        # (same gather() every tick, same formula the run loop itself uses
+        # for spinner_idx -- Dashboard.pm's $state{spinner_idx} = int($ht /
+        # $spin_div) -- already independently reproduced as $expected_idx
+        # above), so a FULL PAINT of that exact state reconstructs row 1's
+        # text byte-for-byte as the real loop would have painted it, without
+        # relying on anything the diff frame does or doesn't re-emit.
+        my $frame_i = Dashboard::compose_frame(
+            { project_name => 'demo', container => 'ctr1', status => 'running',
+              spinner_idx   => $expected_idx },
+            20, 80);
+        my $full_i = Dashboard::render_frame(undef, $frame_i, { color => 0 });
+        my $seg = _row1_segment($full_i);
         ok(defined $seg, "AC-6b: render $i -- row 1 segment isolated from the ANSI stream");
         SKIP: {
             skip 'row 1 segment not isolated', 1 unless defined $seg;
@@ -539,7 +561,7 @@ sub _run_live {
     my @renders = grep { /\A\e\[\?2026h/ } @calls;              # frames only; OSC calls excluded
     for my $i (1 .. $#renders) {                                # skip [0]: first frame is a full paint
         unlike($renders[$i], qr/\e\[2J/,  "AC-7: idle tick $i: no full repaint");
-        my @moves = ($renders[$i] =~ /\e\[(\d+);1H/g);
+        my @moves = ($renders[$i] =~ /\e\[(\d+);\d+H/g);
         is(scalar(@moves), 1, "AC-7: idle tick $i: exactly one row repainted");
         is($moves[0], 1,      "AC-7: idle tick $i: and it is the title row");
     }

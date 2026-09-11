@@ -20,10 +20,18 @@
 # enter/leave, output — is an injected coderef, so the loop itself is driven by
 # the test harness with a fake clock and a scripted key queue.
 #
-# RENDER MODEL (the B0 carry-forward / flicker fix, extended by s04): never
-# `\e[2J` per frame. Clear once on a full redraw (first frame or a resize), then
-# update only the rows whose text changed via `\e[<row>;1H` + text + `\e[K`, with
-# the whole burst wrapped in synchronized-output `\e[?2026h` … `\e[?2026l`.
+# RENDER MODEL (the B0 carry-forward / flicker fix, extended by s04, then by
+# the span-diff change): never `\e[2J` per frame. Clear once on a full redraw
+# (first frame or a resize), then update only the rows whose SIGNATURE
+# changed (`_cell_sig`). A changed row is no longer always re-emitted whole:
+# `_row_diff_ansi` diffs the row's spans against the previous frame's (common
+# prefix / common suffix by role+text) and, when the changed middle is the
+# same DISPLAY WIDTH on both sides (so nothing after it would shift), emits
+# ONLY that middle at its column -- no `\e[K`. This is what stops the
+# top-row spinner from visibly blanking-then-refilling every tick. Anything
+# that changes the middle's width falls back to the old whole-tail repaint
+# (`\e[<row>;<col>H` + text-to-end-of-row + `\e[K`). The whole burst is
+# wrapped in synchronized-output `\e[?2026h` … `\e[?2026l`.
 #
 # Composed rows are a STYLED-SPAN model (s04): a row is an ordered list of
 # `{ text, role }` spans; a composed cell carries both the spans and their plain
@@ -1118,20 +1126,18 @@ sub _cell_sig {
     return join('', map { length($_) . ':' . $_ } @fields);
 }
 
-# _row_ansi($row, \%cell, $color) -> the ANSI to (re)draw one 1-based row.
-# The line is cleared (\e[K) BEFORE the text, never after: every composed row is
-# exactly $cols display columns wide, so writing it parks the cursor in the last
-# cell (deferred auto-wrap). A trailing \e[K would then erase that last cell —
-# invisibly on a dash separator, but visibly chopping the title's closing "]"
-# (the "[running" bug). Clearing first wipes any stale tail (a width-shrink
-# diff) and leaves the final character intact. With color, each span is
+# _spans_ansi(\@spans, $color) -> the ANSI text for a list of spans, with NO
+# cursor-position/clear prefix and no trailing reset. With color, each span is
 # SELF-CLOSING (SGR . text . \e[0m; a ''-role span emits bare text) -- no
 # row-level trailing reset, so style never bleeds within a row or across rows.
-# PRIVATE, extended (F9: s04 fix-batch doc-tag pass).
-sub _row_ansi {
-    my ($row, $cell, $color) = @_;
-    my $s = "\e[${row};1H\e[K";
-    for my $raw_sp (@{ _cell_spans($cell) }) {
+# Guards a non-hashref span element via _span_hash (F1: never die). Factored
+# out of _row_ansi (span-diff change) so the partial-row emit path
+# (_row_diff_ansi) can reuse the exact same span-to-ANSI mapping instead of a
+# second, silently divergent copy. PRIVATE.
+sub _spans_ansi {
+    my ($spans, $color) = @_;
+    my $s = '';
+    for my $raw_sp (@$spans) {
         my $sp   = _span_hash($raw_sp);   # F1: never die on a malformed span element
         my $text = defined $sp->{text} ? $sp->{text} : '';
         if (!$color) {
@@ -1142,6 +1148,97 @@ sub _row_ansi {
         $s .= $sgr eq '' ? $text : ($sgr . $text . "\e[0m");
     }
     return $s;
+}
+
+# _row_ansi($row, \%cell, $color) -> the ANSI to (re)draw one 1-based row IN
+# FULL (full repaint / resize / first frame). The line is cleared (\e[K)
+# BEFORE the text, never after: every composed row is exactly $cols display
+# columns wide, so writing it parks the cursor in the last cell (deferred
+# auto-wrap). A trailing \e[K would then erase that last cell — invisibly on
+# a dash separator, but visibly chopping the title's closing "]" (the
+# "[running" bug). Clearing first wipes any stale tail (a width-shrink diff)
+# and leaves the final character intact. PRIVATE, extended (F9: s04
+# fix-batch doc-tag pass).
+sub _row_ansi {
+    my ($row, $cell, $color) = @_;
+    return "\e[${row};1H\e[K" . _spans_ansi(_cell_spans($cell), $color);
+}
+
+# _span_eq($a, $b) -> true iff two spans (any shape accepted by _span_hash)
+# have the SAME role and the SAME text. Used by _row_diff_ansi's prefix/
+# suffix scan; comparing role+text (not just text) means a role-only change
+# (e.g. a status glyph recoloring with identical text) still counts as a
+# difference, matching _cell_sig's own role-sensitivity. PRIVATE.
+sub _span_eq {
+    my ($a, $b) = @_;
+    my $sa = _span_hash($a);
+    my $sb = _span_hash($b);
+    my $ra = defined $sa->{role} ? $sa->{role} : '';
+    my $rb = defined $sb->{role} ? $sb->{role} : '';
+    my $ta = defined $sa->{text} ? $sa->{text} : '';
+    my $tb = defined $sb->{text} ? $sb->{text} : '';
+    return $ra eq $rb && $ta eq $tb;
+}
+
+# _row_diff_ansi($row, \%prev_cell, \%new_cell, $color) -> the ANSI to bring
+# row $row from $prev_cell's painted state to $new_cell's, WITHOUT
+# re-emitting the whole row when only a middle span (or two) actually
+# changed (the top-row spinner-flash fix). Caller guarantees the two cells'
+# _cell_sig differ (a no-op diff is filtered out by render_frame before this
+# is called).
+#
+# Algorithm: find the longest common PREFIX of spans (role+text equal,
+# scanned left to right) and the longest common SUFFIX (scanned right to
+# left, never overlapping the prefix). The spans strictly between them on
+# each side are the "middle". If the middle's DISPLAY WIDTH is unchanged,
+# nothing to the right of it shifts on screen, so only the middle needs to
+# be repainted: position the cursor at column `spans_width(prefix)+1` and
+# emit ONLY the new middle spans -- no \e[K, because nothing after the
+# middle needs erasing (it's already correct on screen and untouched).
+# Otherwise the suffix (and everything after the middle) would visually
+# shift, so fall back to repainting from the start of the middle through
+# end-of-row (middle + suffix), ending in \e[K to clear any stale tail left
+# by a row that got narrower in aggregate.
+#
+# Column arithmetic uses spans_width (-> display_width), never length/byte
+# count: a status dot / spinner / gauge glyph can be 1-2 display columns
+# across several UTF-8 bytes, so byte length would misposition the cursor
+# whenever the unchanged prefix contains one. PRIVATE.
+sub _row_diff_ansi {
+    my ($row, $prev_cell, $new_cell, $color) = @_;
+    my $prev_spans = _cell_spans($prev_cell);
+    my $new_spans  = _cell_spans($new_cell);
+    my $pn = scalar @$prev_spans;
+    my $nn = scalar @$new_spans;
+
+    my $prefix = 0;
+    while ($prefix < $pn && $prefix < $nn
+           && _span_eq($prev_spans->[$prefix], $new_spans->[$prefix])) {
+        $prefix++;
+    }
+
+    my $suffix = 0;
+    while ($suffix < ($pn - $prefix) && $suffix < ($nn - $prefix)
+           && _span_eq($prev_spans->[$pn - 1 - $suffix], $new_spans->[$nn - 1 - $suffix])) {
+        $suffix++;
+    }
+
+    my @prefix_spans = @{$new_spans}[0 .. $prefix - 1];
+    my @mid_old      = @{$prev_spans}[$prefix .. $pn - 1 - $suffix];
+    my @mid_new      = @{$new_spans}[$prefix .. $nn - 1 - $suffix];
+    my @suffix_spans = @{$new_spans}[$nn - $suffix .. $nn - 1];
+
+    my $col = spans_width(\@prefix_spans) + 1;
+
+    if (spans_width(\@mid_old) == spans_width(\@mid_new)) {
+        # Equal-width middle: nothing after it shifts. No \e[K -- the spinner case.
+        return "\e[${row};${col}H" . _spans_ansi(\@mid_new, $color);
+    }
+
+    # Width changed: the suffix (and anything past the middle) would shift on
+    # screen, so repaint from the middle through end-of-row and clear any tail.
+    return "\e[${row};${col}H" . _spans_ansi(\@mid_new, $color)
+         . _spans_ansi(\@suffix_spans, $color) . "\e[K";
 }
 
 # render_frame($prev_frame, $new_frame, \%opts) -> the ANSI string to apply.
@@ -1175,10 +1272,15 @@ sub render_frame {
     my $out = "\e[?2026h";   # begin synchronized output
     $out .= "\e[2J\e[H" if $full;
     for my $i (0 .. $#$new) {
-        unless ($repaint) {
-            next if _cell_sig($prev->[$i]) eq _cell_sig($new->[$i]);
+        if ($repaint) {
+            $out .= _row_ansi($i + 1, $new->[$i], $color);
+            next;
         }
-        $out .= _row_ansi($i + 1, $new->[$i], $color);
+        next if _cell_sig($prev->[$i]) eq _cell_sig($new->[$i]);
+        # Span-level diff (the flicker fix): emit only the changed middle of
+        # the row when it's safe to (see _row_diff_ansi), instead of always
+        # re-emitting the whole row via _row_ansi's \e[K + full text.
+        $out .= _row_diff_ansi($i + 1, $prev->[$i], $new->[$i], $color);
     }
     $out .= "\e[?2026l";     # end synchronized output
     return $out;
