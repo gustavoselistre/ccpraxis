@@ -329,6 +329,57 @@ sub pause {
                     hollow_pause => $hollow,
                     until => $until + 0, updated_at => time }, $surface)
         or return (0, 'could not write the run state');
+
+    # --- HOLD THE WAKE-LOCK. A paused run is a run that must survive the wait.
+    #
+    # The lease was going unheld for most of a live drive-solo run, and the
+    # cause is a chicken-and-egg between two mechanisms that each assumed the
+    # other:
+    #
+    #   * bp-keepawake.pl's helper self-expires after 900s unless something
+    #     refreshes its pid file.
+    #   * Only the DIRECTOR (bp-drive-next.pl) ever creates the first lease.
+    #     bp-watch.pl's --keepawake deliberately refuses to spawn one
+    #     (bp-watch.pl:549) so it can never become a second, independent
+    #     lock-holder -- it refreshes an existing lease and is otherwise a
+    #     no-op.
+    #   * But the director only runs when the DRIVER calls it, and a driver
+    #     deep inside one long package does not call it for hours.
+    #
+    # So the moment the lease lapses, the only thing that could restore it is
+    # the one thing that is not running. Measured 2026-09-11: ~80 minutes of a
+    # live run with no wake-lock at all, on a host that sleeps.
+    #
+    # `pause` is the right place to close it because `pause` is the one call a
+    # driver CANNOT skip: guard-subagent-stall.sh denies the turn end without
+    # it. Tying the lease to it makes the lease exactly as reliable as the gate
+    # that is already enforced, rather than depending on a loop the driver may
+    # legitimately not be in.
+    #
+    # Safe by construction in the two places that would otherwise be hazards.
+    # bp-keepawake.pl's own spawn() returns undef when $0 ends in ".t", so a
+    # test calling pause() can never leak an immortal OS wake-lock (that guard
+    # exists because 53 leaked helpers once filled this machine). And apply()
+    # is idempotent: a live lease is refreshed, never duplicated.
+    #
+    # Driver surface only. The reporter pauses on its own surface and does not
+    # own the run's machine-level lifetime.
+    if (!defined $surface || $surface eq 'driver') {
+        eval {
+            my $scriptdir = dirname(do {
+                (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f
+            });
+            require File::Spec->catfile($scriptdir, 'bp-keepawake.pl');
+            my $r = $root // $ENV{CLAUDE_PROJECT_DIR};
+            $r = _resolve_project_root() unless defined $r && length $r;
+            BpKeepAwake::apply('active', "$r/.ccpraxis-local-data/.drive-solo", {});
+            1;
+        };
+        # Never fatal: failing to hold a wake-lock must not refuse a pause that
+        # is otherwise valid. The run continuing matters more than the machine
+        # staying awake.
+    }
+
     my $msg = "paused until $until, watched by pid $pid";
     $msg .= "\nNOTE: --until was shortened from $asked to $until ("
           . int($max_pause / 60) . "-minute cap). A pause may not outlive this"
