@@ -156,6 +156,7 @@ when the trigger applies:
 
 | note | read it when |
 |---|---|
+| `.ccpraxis-local-data/RESUME.md` | **IF IT EXISTS, AT THE START OF EVERY SESSION, BEFORE ANYTHING ELSE.** A previous session paused mid-initiative and wrote down what is in flight, what must not be restarted, and which baselines are stale. Its absence means no session is mid-flight — the normal state. Delete it when its work is genuinely finished; a stale one is worse than none |
 | `.ccpraxis-local-data/guidance/push-straight-to-main.md` | pushing, or about to flag a "Bypassed rule violations" warning |
 | `.ccpraxis-local-data/guidance/escalate-product-decisions-only.md` | about to ask the operator anything mid-run |
 | `.ccpraxis-local-data/guidance/fix-ccpraxis-defects-in-place.md` | a real defect surfaces outside the current package's write set |
