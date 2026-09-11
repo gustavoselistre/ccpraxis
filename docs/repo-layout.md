@@ -371,6 +371,7 @@ ccpraxis/
 │   │   │       ├── resumption-contract.t                     # 186 — ONE answer to "will anything bring this back?"
 │   │   │       ├── run-continuity-gaps.t                     # t10 -- the oracle for blueprint tui-operator-feedback.
 │   │   │       ├── runstate-pause-cap.t                      # A pause may not outlive this session's prompt cache.
+│   │   │       ├── runstate-pause-holds-lease.t              # A paused run must keep holding the machine awake.
 │   │   │       ├── runstate-root-resolution.t                # bp-runstate.pl must anchor its state to the PROJECT, never to its own install…
 │   │   │       ├── runstate-surface-separation.t             # 144 — g03-reporter-stop-gate, PILLAR 3: the --surface separation on…
 │   │   │       ├── session-identity-binding.t                # 184 — WHICH SESSION AM I, and who is allowed to say.

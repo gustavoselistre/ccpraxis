@@ -16,9 +16,12 @@
 # not an enforcement mechanism.
 #
 # WHAT IT DOES. While a run is ACTIVE, AskUserQuestion is denied and the question
-# is APPENDED to the run's question queue. Nothing is lost -- it is batched for
-# the end of the run, which is what "batch it" needs in order to be more than a
-# hope -- and the agent is told to carry on with the work it can still do.
+# is APPENDED to the run's question queue. Nothing is lost within the 16-item
+# safety cap below -- it is batched for the end of the run, which is what
+# "batch it" needs in order to be more than a hope -- and the agent is told to
+# carry on with the work it can still do. The deny decision itself never
+# depends on the cap: every question in a call is refused regardless of how
+# many there are or where the logging loop below stops.
 #
 # WHAT IT DELIBERATELY DOES NOT DO. It does not fire when a run is inert, paused
 # or finished. An interactive session asking its operator something is normal and
@@ -56,32 +59,51 @@ if [ "$UNATTENDED" -eq 0 ]; then
     _CDIR=$(bp_continuity_active_dir 2>/dev/null || true)
     [ -n "${_CDIR:-}" ] && [ -f "$_CDIR/$_SID" ] && { UNATTENDED=1; WHY="continuity is ARMED for this session"; }
   fi
-  _PAYLOAD_READ=1
 fi
 
 [ "$UNATTENDED" -eq 1 ] || exit 0
 
-# Read the payload only if the armed-check above did not already do it --
-# bp_read_payload consumes stdin, and a second call would block until its
-# timeout and then stand aside, silently letting every question through.
-[ -n "${_PAYLOAD_READ:-}" ] || bp_read_payload open
+# bp_read_payload (lib.sh) is now safe to call more than once per process --
+# whichever of this call and the one in the armed-check branch above runs
+# first performs the real read; the other is a no-op that leaves PAYLOAD
+# exactly as the first call left it. No caller-side bookkeeping needed any
+# more; the guard against a hung-or-clobbered second read now lives in
+# lib.sh itself, once, for every caller.
+bp_read_payload open
 
-# bp_json_get resolves dot-separated paths to SCALARS and has no array
-# indexing, and AskUserQuestion's payload nests the text inside
-# tool_input.questions[] -- so asking it for the question yields nothing, and a
-# queued question with no text is barely better than no queue at all. Pull every
-# question out with perl instead, which also handles the multi-question case
-# bp_json_get could not have expressed at all.
-QTEXT=$(printf '%s' "$PAYLOAD" | perl -MJSON::PP -0777 -ne '
-    my $j = eval { decode_json($_) } or exit 0;
-    my $q = $j->{tool_input}{questions};
-    exit 0 unless ref $q eq "ARRAY";
-    my @out = grep { defined && length } map {
-        ref $_ eq "HASH" ? $_->{question} : undef
-    } @$q;
-    print join(" | ", @out);
-' 2>/dev/null || true)
+# AskUserQuestion's payload nests the text inside tool_input.questions[] --
+# bp_json_get (lib.sh) now indexes arrays, so pull each question out with a
+# bounded loop rather than a standalone perl parse. 16 is a safety upper
+# bound, not an assumed exact count -- the real fixture this must keep green
+# (no-halt-for-questions.t AC7) exercises 4 questions in one call. Stop at the
+# first gap: AskUserQuestion never produces a sparse array, so this is a
+# deliberate, documented narrowing relative to the retired parse, not a bug.
+# Do NOT raise or remove the cap -- it costs nothing to the deny decision
+# above (that has already committed, unconditionally, by the time this loop
+# runs); the cap only bounds how much LOGGED text this loop can build.
+QTEXT=""
+_QI=0
+while [ "$_QI" -lt 16 ]; do
+  _Q=$(bp_json_get "$PAYLOAD" "tool_input.questions.${_QI}.question" 2>/dev/null || true)
+  [ -n "$_Q" ] || break
+  if [ -n "$QTEXT" ]; then
+    QTEXT="$QTEXT | $_Q"
+  else
+    QTEXT="$_Q"
+  fi
+  _QI=$((_QI + 1))
+done
 [ -n "${QTEXT:-}" ] || QTEXT="(question text not recoverable from the payload)"
+
+# If the loop stopped because it hit the cap (not because of a real gap),
+# check one index past it: a non-empty result there means the payload
+# genuinely had more than 16 questions, and the logged text would otherwise
+# claim completeness it doesn't have. One extra bp_json_get call, only on
+# this already-rare path.
+if [ "$_QI" -eq 16 ]; then
+  _QMORE=$(bp_json_get "$PAYLOAD" "tool_input.questions.16.question" 2>/dev/null || true)
+  [ -n "$_QMORE" ] && QTEXT="$QTEXT | (+more, truncated at 16)"
+fi
 
 # Queue it beside the run state, through the verb that owns that path.
 QDIR=$(perl "$RUNSTATE" state-dir 2>/dev/null || true)
