@@ -58,11 +58,63 @@ require File::Spec->catfile(
     dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f }),
     'BpResumption.pm');
 
-my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
+# PROJECT-ANCHORED ROOT RESOLUTION — never script-relative.
+#
+# This file used to fall back to Cwd::abs_path("$DIR/../../.."), i.e. three
+# levels up from its OWN location. That is the guess bp-drive-next.pl:1105
+# already documents as wrong, and for the same reason: butler normally runs
+# from an INSTALL outside the project (~/.claude/ccpraxis, or a marketplace
+# dir), so the guess resolves the install root, not the project.
+#
+# It failed silently and expensively. guard-subagent-stall.sh reads this state
+# with --root "$CLAUDE_PROJECT_DIR" — hooks always have that variable — while a
+# driver following drive-solo/SKILL.md's own documented `pause` invocation
+# passes no --root at all. The Bash tool's environment does NOT carry
+# CLAUDE_PROJECT_DIR, so the driver's pause landed under the install root and
+# the gate went on reading the project's, where the state was still `active`.
+# The pause was well-formed, verified, and invisible: the gate denied every
+# Stop, and the run could not advance past its first dispatch.
+#
+# So resolve the way every other butler entry point does. Priority mirrors
+# bp-drive-next.pl's _resolve_project_root and bp-lib.sh's bp_project_root:
+#
+#   explicit --root > $CLAUDE_PROJECT_DIR > $BP_PROJECT_ROOT > git toplevel
+#     > walk up from cwd for a dir holding .ccpraxis-local-data > cwd
+#
+# CLAUDE_PROJECT_DIR stays first because in a hook it is authoritative and is
+# exactly what the reader uses. The chain now ENDS at cwd rather than at the
+# install dir: a wrong answer anchored to the project is recoverable, one
+# anchored to the install is a different repo's state file.
+sub _resolve_project_root {
+    return $ENV{BP_PROJECT_ROOT}
+        if defined $ENV{BP_PROJECT_ROOT} && length $ENV{BP_PROJECT_ROOT};
+
+    # git toplevel — trust only a clean exit and a real directory.
+    my $top = `git rev-parse --show-toplevel 2>/dev/null`;
+    if ($? == 0 && defined $top) {
+        chomp $top;
+        return $top if length $top && -d $top;
+    }
+
+    # Walk up from cwd for the first ancestor that already holds .ccpraxis-local-data.
+    my $d = Cwd::getcwd();
+    if (defined $d && length $d) {
+        my %seen;
+        while (!$seen{$d}++) {
+            return $d if -d "$d/.ccpraxis-local-data";
+            my $parent = dirname($d);
+            last if $parent eq $d;    # reached the filesystem / drive root
+            $d = $parent;
+        }
+    }
+
+    return Cwd::getcwd() // '.';
+}
 
 sub state_dir {
     my ($root) = @_;
-    $root //= $ENV{CLAUDE_PROJECT_DIR} // Cwd::abs_path("$DIR/../../..") // '.';
+    $root //= $ENV{CLAUDE_PROJECT_DIR};
+    $root = _resolve_project_root() unless defined $root && length $root;
     return "$root/.ccpraxis-local-data/.subagent-guard";
 }
 
