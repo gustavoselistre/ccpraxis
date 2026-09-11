@@ -1209,6 +1209,69 @@ sub op_set_decision {
     });
 }
 
+# -------------------------------------------------------------------------------------
+# op_set_title — rewrite the document's H1 title (line 1: `# <text>`).
+#
+# No existing verb owns this region (04-blueprint-title-verb spec §1): `set-meta` only
+# rewrites `key: value` lines inside the fenced metadata block, and `set-section`
+# explicitly refuses structural sections and operates on `##` headings, not the H1.
+# Fence-aware (spec §2.2): both real blueprints carry single-`#`-prefixed COMMENT lines
+# (e.g. `# worker_backend: claude`) inside the fenced metadata block, which a naive `^#`
+# scan would miscount as extra H1 candidates and refuse on every real invocation.
+# Refuse-rather-than-guess on no H1 / H1 not on line 1 / more than one candidate --
+# matching this script's existing posture (add-package refuses a missing depends_on
+# table rather than inventing one; set-section refuses a missing `## ` heading the same
+# way). Always normalises to a single space after `#` (spec §2.3), so idempotence falls
+# out of run_write's own `$new eq $orig` no-op branch -- no second check is added here.
+# -------------------------------------------------------------------------------------
+sub op_set_title {
+    my @args = @_;
+    my %opt;
+    my $ok;
+    { local $SIG{__WARN__} = sub { };
+      $ok = GetOptionsFromArray(\@args, \%opt, 'file=s', 'title=s'); }
+    arg_error('set-title', 'unrecognised option') unless $ok;
+    arg_error('set-title', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
+    for my $r (qw(file title)) {
+        arg_error('set-title', "missing required --$r") unless defined $opt{$r};
+    }
+    unless (field_safe($opt{title})) {
+        arg_error('set-title', '--title contains a pipe or newline');
+    }
+
+    run_write('set-title', $opt{file}, sub {
+        my ($orig) = @_;
+        my @lines = split /\n/, $orig, -1;
+
+        my $in_fence = 0;
+        my @candidates;
+        for my $i (0 .. $#lines) {
+            if ($lines[$i] =~ /^```/) { $in_fence = !$in_fence; next }
+            next if $in_fence;
+            push @candidates, $i if $lines[$i] =~ /^#(?!#)[ \t]+\S/;
+        }
+
+        if (!@candidates) {
+            return (undef, "no H1 (a single '# ' heading) found outside any fenced block in $opt{file} -- "
+                         . "refusing to invent one; the template places it on line 1.");
+        }
+        if (@candidates > 1) {
+            my $n = scalar @candidates;
+            my @onebased = map { $_ + 1 } @candidates;
+            return (undef, "$n '# ' headings found outside fenced blocks (lines " . join(', ', @onebased) . ') '
+                         . '-- refusing to guess which is the title.');
+        }
+        if ($candidates[0] != 0) {
+            my $n1 = $candidates[0] + 1;
+            return (undef, "the only '# ' heading found is on line $n1, not line 1 -- refusing to guess this "
+                         . "is the blueprint's title; move it to line 1, or this is not the H1.");
+        }
+
+        $lines[0] = '# ' . $opt{title};
+        return (join("\n", @lines), undef);
+    });
+}
+
 sub op_set_field {
     my @args = @_;
     my %opt;
@@ -1414,6 +1477,7 @@ my %DISPATCH = (
     'set-decision' => \&op_set_decision,
     'add-harvest'  => \&op_add_harvest,
     'set-field'    => \&op_set_field,
+    'set-title'    => \&op_set_title,
     'show'         => \&op_show,
     'deps'         => \&op_deps,
     'status'       => \&op_status,
