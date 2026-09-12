@@ -26,8 +26,33 @@
 #   perl scripts/run-tests.pl                    # everything
 #   perl scripts/run-tests.pl --fast             # skip the container tests
 #   perl scripts/run-tests.pl --jobs 8           # override parallelism
+#   perl scripts/run-tests.pl --nice             # low-impact: cap workers, see below
 #   perl scripts/run-tests.pl plugins/sandbox    # limit to a plugin or a glob
 #   perl scripts/run-tests.pl --state=failed     # re-run only last run's red files
+#
+# --nice / CCPRAXIS_TEST_JOBS -- a low-impact mode, added because the default
+# below (cores-2) is a throughput-maximising choice that is wrong for the
+# common case of an agent kicking off a sweep while the operator is still
+# using the machine. Named "--nice" after the Unix tool it rhymes with in
+# INTENT (be a considerate background citizen) -- it does NOT touch OS
+# scheduling priority the way `nice(1)` does; that would need to cover every
+# spawned git/podman child too, which is a separate, larger change.
+#
+# --nice caps parallelism at max(2, cores/4): a quarter of the machine,
+# floored at 2 rather than letting it round down to 1 on a 4-core host --
+# 1 worker turns a sweep serial and "unbearably long" rather than merely
+# slower. On this repo's reference 8-core host that is 2 workers, the same
+# total CPU-seconds spread over roughly four times the wall-clock, leaving
+# the operator three quarters of the machine.
+#
+# CCPRAXIS_TEST_JOBS=N is the same idea as an ambient default: set once in an
+# agent's environment so every sweep it kicks off is gentle without having to
+# remember a flag per invocation.
+#
+# Precedence (most to least specific): explicit `--jobs N` > `--nice` >
+# `CCPRAXIS_TEST_JOBS` env var > the plain cores-2 default. The plain default
+# is UNCHANGED -- this adds a choice, it does not remove the fast path for
+# someone who is actively waiting on the result.
 use strict;
 use warnings;
 use FindBin qw($Bin);
@@ -40,10 +65,11 @@ use POSIX qw(:sys_wait_h);
 my $ROOT     = "$Bin/..";
 my $ROOT_ABS = abs_path($ROOT) // $ROOT;
 
-my ($fast, $jobs, $state_mode, @targets) = (0, 0, 0);
+my ($fast, $jobs, $nice, $state_mode, @targets) = (0, 0, 0, 0);
 while (@ARGV) {
     my $a = shift @ARGV;
     if    ($a eq '--fast')            { $fast = 1 }
+    elsif ($a eq '--nice')            { $nice = 1 }
     elsif ($a eq '--jobs')            { $jobs = shift(@ARGV) || 0 }
     elsif ($a =~ /^--jobs=(\d+)$/)    { $jobs = $1 }
     elsif ($a eq '--state=failed')    { $state_mode = 1 }
@@ -59,10 +85,18 @@ if ($state_mode && @targets) {
     exit 2;
 }
 sub _usage { return <<'USAGE' }
-usage: perl scripts/run-tests.pl [--fast] [--jobs N] [--state=failed] [PATH-OR-GLOB ...]
+usage: perl scripts/run-tests.pl [--fast] [--jobs N] [--nice] [--state=failed] [PATH-OR-GLOB ...]
   --fast          skip tests that start real containers
   --jobs N        parallelism for non-container tests (default: cores - 2)
+  --nice          low-impact mode: cap parallelism at max(2, cores/4), leaving
+                  the machine usable for whoever else is on it. Does not touch
+                  OS scheduling priority (spawned git/podman children aren't
+                  covered by that). Env var CCPRAXIS_TEST_JOBS=N sets the same
+                  kind of ambient low-impact default without a per-run flag.
   --state=failed  re-run only the files recorded failing by the previous run
+
+Precedence for parallelism (most to least specific):
+  --jobs N  >  --nice  >  CCPRAXIS_TEST_JOBS env var  >  default (cores - 2)
 USAGE
 
 # --- state file (--state=failed) --------------------------------------------
@@ -162,10 +196,12 @@ for my $f (@files) {
 }
 @serial = () if $fast;
 
-if (!$jobs) {
-    my $cores = _cores();
-    $jobs = $cores > 3 ? $cores - 2 : 1;
-}
+$jobs = _resolve_jobs(
+    explicit_jobs => $jobs,
+    nice          => $nice,
+    env_jobs      => $ENV{CCPRAXIS_TEST_JOBS},
+    cores         => _cores(),
+);
 $jobs = scalar(@parallel) if $jobs > @parallel && @parallel;
 $jobs = 1 if $jobs < 1;
 
@@ -177,6 +213,31 @@ sub _cores {
         return $n if $n;
     }
     return 4;
+}
+
+# _resolve_jobs(%args) -> $jobs
+# Pure by construction (every input is a parameter, nothing read from %ENV or
+# @ARGV directly) so the precedence chain is unit-testable without spawning
+# the runner. Precedence, most to least specific:
+#   explicit_jobs (--jobs N)  >  nice (--nice)  >  env_jobs (CCPRAXIS_TEST_JOBS)
+#   >  the plain cores-2 default (unchanged from before --nice existed).
+sub _resolve_jobs {
+    my (%a) = @_;
+    my $cores = $a{cores} || 4;
+
+    return $a{explicit_jobs} if $a{explicit_jobs};
+
+    if ($a{nice}) {
+        my $n = int($cores / 4);
+        $n = 2 if $n < 2;
+        return $n;
+    }
+
+    if (defined $a{env_jobs} && $a{env_jobs} =~ /^\d+$/ && $a{env_jobs} > 0) {
+        return $a{env_jobs};
+    }
+
+    return $cores > 3 ? $cores - 2 : 1;
 }
 
 # run_one($file) -> \%result. The judgement rule the project already uses by
