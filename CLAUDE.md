@@ -81,15 +81,24 @@ across 330 files; run one at a time that is exactly what it costs, and a suite n
 is a suite that stops getting run.
 
 ```bash
-perl scripts/run-tests.pl --fast            # ~17min (1019s wall, 310 of 322 files; the 12 container tests are excluded)
+perl scripts/run-tests.pl --fast            # 317 of 330 files (13 container tests excluded)
 perl scripts/run-tests.pl                   # everything
 perl scripts/run-tests.pl plugins/sandbox   # one plugin
+perl scripts/run-tests.pl --state=failed    # only what failed last sweep
+perl scripts/run-tests.pl --nice            # low-impact: caps workers at max(2, cores/4)
 ```
+
+**The last measured full `--fast` run was 1047s over 308 files.** That figure is a MEASUREMENT,
+not a prediction, and the file count has moved since — re-measure rather than quoting it. Counts
+here drift every time a test is added, so prefer deriving them:
+`ls plugins/*/tests/t/*.t | wc -l` and
+`grep -lE 'TestSandbox|podman_run_capture|podman_bin|probe_image' plugins/*/tests/t/*.t | wc -l`.
 
 The work here is dominated by PROCESS CREATION, not CPU — a bare statusline spawn costs ~292ms on
 this host — so parallelism buys more than the core count suggests.
 
-**The runner keeps the 12 container tests SERIAL, deliberately.** They start real podman containers
+**The runner keeps the container tests SERIAL, deliberately** (13 at time of writing — derive it,
+do not trust the number). They start real podman containers
 against one podman machine, so running them concurrently makes them contend: slower in wall-clock
 AND flakier. That is the documented failure signature of this suite (`EXIT=124`/`255` with zero
 `not ok` lines — the process died, no assertion failed). They are classified by what they import,
