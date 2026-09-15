@@ -3,7 +3,9 @@ name: continuity
 description: Toggle or check explicit continuity arming for THIS session — a Stop gate that blocks
   ending a turn with nothing scheduled to resume it, for sessions doing unattended work with no
   blueprint, drive-solo run, or reporter involved. `on` arms, `off` disarms, no argument or
-  `status` reports current state. Use when the operator asks to be "watched" or to arm/disarm
+  `status` reports current state. Arming also holds the machine awake until it is turned off — the
+  wake-lock on the host, the container's busy-lease in a sandbox — automatically, with nothing for
+  the agent to manage. Use when the operator asks to be "watched" or to arm/disarm
   continuity, or when the agent is about to start open-ended unattended work with no blueprint.
 argument-hint: "[on|off|status]  (default: status)"
 user-invocable: true
@@ -35,6 +37,31 @@ One command both records the promise and keeps it: it writes the deadline, sleep
 a backgrounded command that exits is what actually re-invokes the session. When it elapses, poll
 whatever you were really waiting on and either finish or hold again. Pick the horizon to match what
 you are waiting for; it may not exceed the wake-up TTL (900s by default).
+
+## Arming also keeps the machine awake — automatically
+
+An armed session is unattended work, so the two things that end it silently are held off for as long
+as the arm stands:
+
+| where | what is held | what it stops |
+|---|---|---|
+| host (Windows) | the wake-lock (`keep-awake.ps1`) | the machine entering connected standby mid-run |
+| inside a sandbox | the busy-lease (`/tmp/.butler-busy`) | `heartbeat.sh` reaping the container — and, through the launcher dashboard's probe of that same file, the host sleeping behind it |
+
+`on` starts a detached refresher that re-asserts this every 60s; `off` releases it. The Stop gate
+restarts the refresher if it ever dies. **Nothing here needs you to run anything** — do not take out
+a lock by hand, and do not treat holding it as one of your responsibilities.
+
+Two details worth knowing rather than re-deriving:
+
+- It is machine-level, not per-session. Two armed sessions share one lock and the **last** `off`
+  releases it.
+- `status` reports `LEASE:` — `held`, `starting` (just asked; the helper records itself a moment
+  later), `releasing` (a sandbox `off`: the busy-lease is shared with fleet runs, so it is left to
+  go stale rather than deleted, and the container stays protected for the rest of the 600s window),
+  `released`, or `disabled` (`CCPRAXIS_NO_WAKELOCK` is set). It reports what is actually asserted,
+  so `armed` with `LEASE: released` means the session is watched but the machine is free to sleep —
+  say so rather than glossing it.
 
 ## If you have a question for the operator
 

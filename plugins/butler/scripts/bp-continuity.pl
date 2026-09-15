@@ -11,6 +11,14 @@
 #   arm    [--session <id>] [--by operator|agent]   (default --by agent)
 #   disarm [--session <id>]
 #   status [--session <id>]
+#   hold   [--seconds N]                            the bounded wait
+#   ask    --text "<question>"                      queue, do not stop
+#   lease  [--daemon]                               the wake-lock / busy-lease
+#
+# ARMING TAKES A LEASE ON THE MACHINE, and it is not optional or manual: the
+# host must not suspend, and a sandbox container must not reap itself, while a
+# session is armed. arm holds it, disarm releases it, and a detached refresher
+# (`lease --daemon`) keeps it asserted in between. See BpContinuityLease.pm.
 #
 # Session resolution: see resolve_session_full() and BpSession.pm.
 # ERROR (exit 1) when there is none, because this is a direct, non-hook
@@ -53,6 +61,10 @@ use File::Spec;
 my $SCRIPT_DIR = dirname(File::Spec->rel2abs(__FILE__));
 require "$SCRIPT_DIR/BpSession.pm";
 require "$SCRIPT_DIR/BpResumption.pm";
+# The wake-lock / busy-lease held for as long as anything is armed. See that
+# file's header for why arming needs one at all, and why the two platforms hold
+# two different things.
+require "$SCRIPT_DIR/BpContinuityLease.pm";
 
 my $cmd = shift @ARGV // '';
 
@@ -61,9 +73,10 @@ elsif ($cmd eq 'disarm') { cmd_disarm() }
 elsif ($cmd eq 'status') { cmd_status() }
 elsif ($cmd eq 'hold')   { cmd_hold()   }
 elsif ($cmd eq 'ask')    { cmd_ask()    }
+elsif ($cmd eq 'lease')  { cmd_lease()  }
 else {
     emit('STATUS', 'error');
-    emit('ERROR',  "Unknown command '$cmd' (usage: arm|disarm|status|hold|ask)");
+    emit('ERROR',  "Unknown command '$cmd' (usage: arm|disarm|status|hold|ask|lease)");
     exit 1;
 }
 
@@ -124,6 +137,7 @@ sub cmd_arm {
         emit('SESSION',  $sid);
         emit('ARMED_BY', $by);
         emit('SINCE',    $since);
+        hold_lease($dir);
         return;
     }
 
@@ -171,6 +185,65 @@ sub cmd_arm {
     emit('NOTE', 'the arm binds to this session at the next turn boundary, when '
                . 'the Stop hook can confirm which session actually printed this '
                . 'nonce. Run `status` after that to see it bound.');
+
+    # THE LEASE IS TAKEN AT ARMING TIME, NOT AT BINDING TIME. The ticket does
+    # not become a marker until the next Stop, and the turn in between can run
+    # for hours — a host that suspends during it loses exactly the work the arm
+    # was requested for. any_active() counts tickets for this reason.
+    hold_lease($dir);
+}
+
+# hold_lease($dir) — assert the wake-lock / busy-lease and make sure something
+# is refreshing it, then say so. Never fatal: failing to hold a lock must not
+# fail an arm, and — the rule bp-keepawake.pl's header sets out — it must never
+# be reported as held when it is not.
+sub hold_lease {
+    my ($dir) = @_;
+    my ($state, $daemon);
+    my $ok = eval { ($state, $daemon) = BpContinuityLease::converge($dir); 1 };
+    unless ($ok) {
+        my $err = $@ || 'unknown error';
+        chomp $err;
+        emit('WARN', "could not hold the keep-awake / busy lease: $err. The arm itself "
+                   . 'is in force; the machine may sleep (host) or the container may reap '
+                   . 'itself (sandbox) while this session is unattended.');
+        return;
+    }
+    emit('LEASE',        lease_label($dir, just_started => 1));
+    emit('LEASE_HOLDER', $daemon);
+}
+
+# lease_label($dir, %opt) -> the value to report for LEASE.
+#
+# REPORTS THE ARTIFACT, NOT THE REQUEST — the discipline bp-keepawake.pl's
+# header sets out ("never a false claim of holding one"). sync() returning
+# 'held' only means the hold was ASKED for; whether anything is actually
+# asserting it is a separate fact, and state() reads it off the artifacts.
+#
+#   held      the wake-lock helper is alive (host) / the busy-lease is fresh
+#             (sandbox).
+#   starting  we just asked. keep-awake.ps1 writes its own pid file a moment
+#             from now, so an immediate read says nothing yet; this is reported
+#             only on the call that did the asking, never by `status`.
+#   releasing we just let go, but the artifact has not gone cold yet. Only ever
+#             true in a sandbox, where releasing means STOPPING TOUCHING the
+#             busy-lease rather than deleting it (it is shared with a fleet
+#             run's own lease), so the container stays protected for the rest of
+#             the 600s window. Saying "released" there would be wrong in the
+#             other direction — the protection is real until the file ages out.
+#   disabled  CCPRAXIS_NO_WAKELOCK is set. Nothing is held, on purpose.
+#   unsupported  a Linux or macOS HOST, where neither mechanism exists. Arming
+#             still gates the Stop; it just does not keep the machine awake.
+#   released  nothing is holding it.
+sub lease_label {
+    my ($dir, %o) = @_;
+    return 'disabled' if $ENV{CCPRAXIS_NO_WAKELOCK};
+    my $s = eval { BpContinuityLease::state($dir) } // 'released';
+    return $s if $s eq 'unsupported' || $s eq 'starting';
+    if ($s eq 'held') {
+        return $o{just_released} ? 'releasing' : 'held';
+    }
+    return $o{just_started} ? 'starting' : 'released';
 }
 
 sub cmd_disarm {
@@ -206,10 +279,19 @@ sub cmd_disarm {
             emit('CONFIDENCE', $confidence);
             emit('NOTE',    'a pending arm was cancelled before it bound');
             disarm_confidence_warning($confidence);
+            release_lease($dir);
             return;
         }
         emit('STATUS',  'not_armed');
         emit('SESSION', $sid);
+        # STILL RE-SYNC THE LEASE. "This session was not armed" says nothing
+        # about whether ANY session is, and the common way to reach here is a
+        # marker the Stop gate already reaped — i.e. the last arm is gone and
+        # something may still be holding the machine awake for it. Skipping the
+        # release here left that to the refresher's next tick, which is up to a
+        # minute of a lock nobody wants. converge only lets go when the registry
+        # is genuinely empty, so this cannot cut another session's lease short.
+        release_lease($dir);
         exit 2;
     }
 
@@ -241,6 +323,30 @@ sub cmd_disarm {
     emit('SESSION', $sid);
     emit('CONFIDENCE', $confidence);
     disarm_confidence_warning($confidence);
+    release_lease($dir);
+}
+
+# release_lease($dir) — the mirror of hold_lease. NOT an unconditional release:
+# the lease is machine-level and two sessions can be armed at once, so converge
+# re-reads the registry and only lets go when the LAST arm is gone. The
+# refresher process reaches the same conclusion within a tick on its own; doing
+# it here as well is what makes "off" release immediately rather than eventually.
+sub release_lease {
+    my ($dir) = @_;
+    my $verdict;
+    my $ok = eval { ($verdict) = BpContinuityLease::converge($dir); 1 };
+    unless ($ok) {
+        my $err = $@ || 'unknown error';
+        chomp $err;
+        emit('WARN', "could not release the keep-awake / busy lease: $err "
+                   . '(it is leased, so it expires on its own).');
+        return;
+    }
+    # just_released only when this disarm actually let go. If another session is
+    # still armed the lease is genuinely, deliberately still HELD, and labelling
+    # that "releasing" would tell the operator the machine is about to be free
+    # when it is not.
+    emit('LEASE', lease_label($dir, just_released => (($verdict // '') eq 'released' ? 1 : 0)));
 }
 
 # A disarm on an UNVERIFIED id may have removed a marker belonging to nothing
@@ -309,6 +415,8 @@ sub cmd_status {
                 emit('NOTE', 'a ticket is waiting to bind at the next turn '
                            . 'boundary; nothing is enforced until it does');
 
+                lease_report($dir);
+
                 # AN ARM THAT NEVER BINDS MUST NOT LOOK LIKE ONE THAT HAS NOT
                 # BOUND YET. Binding needs the nonce to be findable in a
                 # transcript whose record names the session the Stop hook
@@ -358,6 +466,7 @@ sub cmd_status {
         emit('SINCE',    '');
         emit('WARN', 'the marker exists but its content is unreadable. The gate keys on '
                    . 'the file existing, so this session IS gated; disarm works normally.');
+        lease_report($dir);
         return;
     }
 
@@ -411,6 +520,55 @@ sub cmd_status {
                        . "enforcing nothing. Disarm and re-arm to rebind.");
         }
     }
+
+    lease_report($dir);
+}
+
+# lease_report($dir) — say whether the machine is actually being held awake,
+# and repair the holder if it has died.
+#
+# REPORTING THE TRUTH, NOT THE INTENT: state() reads the artifacts, so LEASE
+# says what is asserted right now rather than what an arm asked for. A session
+# that reports `armed` while the host is free to suspend is watched in name
+# only, and the whole point of `status` is to expose exactly that kind of gap
+# (it is why GATE_SEEN exists one paragraph up).
+#
+# It also REPAIRS, because status is the operator's natural "is this still
+# fine?" and a dead refresher is the one failure they would otherwise have no
+# way to act on. converge is idempotent and starts nothing under a test, so this
+# is safe to call from a read-only-looking verb.
+sub lease_report {
+    my ($dir) = @_;
+    my ($verdict, $holder);
+    my $ok = eval { ($verdict, $holder) = BpContinuityLease::converge($dir); 1 };
+    return unless $ok;
+    my $state = lease_label($dir);
+    emit('LEASE',        $state);
+    emit('LEASE_HOLDER', $holder);
+
+    # THE WARNING HAS TO FIRE ON THE FAILURES THAT ACTUALLY HAPPEN.
+    #
+    # It used to require LEASE_HOLDER 'refused', which in production is reachable
+    # only under CCPRAXIS_NO_WAKELOCK — and that case is excluded on the next
+    # line, so it could never fire at all. Every real degradation leaves a live
+    # refresher: powershell.exe missing from the HOOK's PATH (which differs from
+    # the agent's — the gate carries a .path-probe precisely because of that), a
+    # helper killed from outside, a registry that cannot be written. All of those
+    # print `LEASE: released / LEASE_HOLDER: running`, which was exactly the
+    # armed-but-unprotected state this function exists to expose, reported
+    # without comment.
+    #
+    # 'spawned' is excluded because it means the refresher started moments ago
+    # and has not had its first tick — 'released' there is the ordinary startup
+    # window, not a fault. 'starting' and 'unsupported' are states, not failures,
+    # and say enough on their own.
+    emit('WARN', 'the keep-awake / busy lease is NOT held for this armed session. On the '
+               . 'host that means the machine may suspend mid-run; in a sandbox it means '
+               . 'the container may reap itself. Check that powershell.exe is on PATH '
+               . '(host) and that the registry is writable, then re-arm.')
+        if $state eq 'released'
+        && ($holder eq 'running' || $holder eq 'refused')
+        && !$ENV{CCPRAXIS_NO_WAKELOCK};
 }
 
 # hold --seconds N : the BOUNDED WAIT.
@@ -519,22 +677,32 @@ sub cmd_hold {
     # immediately rather than when the wait ends.
     STDOUT->flush() if STDOUT->can('flush');
 
-    sleep_until($deadline);
+    # A `hold` is the one thing guaranteed to be running through the idle gaps
+    # of an armed session, so it refreshes the lease on every slice. This is the
+    # CHEAP path (stat + utime, no process), and it is belt to the refresher
+    # daemon's braces rather than a replacement for it: a hold only covers the
+    # gaps BETWEEN turns, and a long turn has none.
+    eval { BpContinuityLease::converge($dir); 1 };
+    sleep_until($deadline, sub { eval { BpContinuityLease::refresh($dir); 1 } });
 
     emit('STATUS',  'hold_elapsed');
     emit('SESSION', $sid);
     exit 0;
 }
 
-# sleep_until($epoch) — sleep in bounded slices so a clock jump or a signal
-# cannot turn a ten-minute wait into an indefinite one.
+# sleep_until($epoch, $on_tick) — sleep in bounded slices so a clock jump or a
+# signal cannot turn a ten-minute wait into an indefinite one. $on_tick, when
+# given, runs once per slice (before the sleep, so a zero-slice wait still
+# fires once) — the hook the lease refresh hangs off.
 sub sleep_until {
-    my ($deadline) = @_;
+    my ($deadline, $on_tick) = @_;
+    $on_tick->() if $on_tick;
     while (1) {
         my $left = $deadline - time();
         last if $left <= 0;
         $left = 60 if $left > 60;
         sleep $left;
+        $on_tick->() if $on_tick;
     }
 }
 
@@ -596,6 +764,50 @@ sub cmd_ask {
 # owns that path. Not in the continuity registry -- the queue is a property of
 # the PROJECT's work, and it is read by the statusline and by whatever reports
 # at the end, neither of which is session-scoped.
+# lease [--daemon] : the wake-lock / busy-lease verb.
+#
+# Two modes, and they are not variations of each other:
+#
+#   lease            one-shot. Converge the lease to whatever the registry says
+#                    it should be, make sure a refresher is running, print the
+#                    result. This is the repair verb — for the Stop gate's
+#                    safety net, and for an operator whose holder has died.
+#
+#   lease --daemon   BLOCKS. This is the refresher itself: re-assert the lease
+#                    every tick until nothing is armed any more, then release
+#                    and exit. Never run it in the foreground of an agent turn;
+#                    `arm` starts it detached.
+#
+# NOT session-scoped, deliberately. The lease is one machine-level resource; the
+# question it answers is "is ANYONE armed", not "am I". Two armed sessions share
+# one lock and the last disarm releases it.
+sub cmd_lease {
+    my $opts = parse_args(qw(daemon! tick session));
+    my $dir  = resolve_registry_dir_or_die();
+
+    if ($opts->{daemon}) {
+        my %o;
+        $o{tick} = $opts->{tick} if defined $opts->{tick} && $opts->{tick} =~ /^\d+$/;
+        my $r = BpContinuityLease::daemon_loop($dir, %o);
+        emit('STATUS', $r);
+        return;
+    }
+
+    my ($state, $holder);
+    my $ok = eval { ($state, $holder) = BpContinuityLease::converge($dir); 1 };
+    unless ($ok) {
+        my $err = $@ || 'unknown error';
+        chomp $err;
+        emit('STATUS', 'error');
+        emit('ERROR',  $err);
+        exit 1;
+    }
+    emit('STATUS',       $state);
+    emit('LEASE',        lease_label($dir, just_started => ($state eq 'held' ? 1 : 0)));
+    emit('LEASE_HOLDER', $holder);
+    emit('ARMED_ANY',    BpContinuityLease::any_active($dir) ? 'yes' : 'no');
+}
+
 sub questions_path {
     my $rs = "$SCRIPT_DIR/bp-runstate.pl";
     return undef unless -f $rs;
@@ -825,8 +1037,15 @@ sub continuity_marker {
 }
 
 sub parse_args {
-    my @known = @_;
-    my %known = map { $_ => 1 } @known;
+    # A name given as "foo!" is a BOOLEAN flag: present means true, and it does
+    # NOT consume the next argv element. Every flag used to demand a value, so
+    # a switch could only be spelled `--daemon 1` — which reads like a typo and
+    # invites `--daemon` followed by a real flag being eaten as its argument.
+    my %known;
+    for my $k (@_) {
+        if ($k =~ /^(.+)!$/) { $known{$1} = 'bool' }
+        else                 { $known{$k} = 'value' }
+    }
     my %opts;
     while (defined(my $arg = shift @ARGV)) {
         unless ($arg =~ /^--([\w-]+)$/ && $known{$1}) {
@@ -835,6 +1054,7 @@ sub parse_args {
             exit 1;
         }
         my $key = $1;
+        if ($known{$key} eq 'bool') { $opts{$key} = 1; next }
         my $val = shift @ARGV;
         unless (defined $val) {
             emit('STATUS', 'error');

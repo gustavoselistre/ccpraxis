@@ -136,6 +136,75 @@ fi
 
 touch "$MARK" 2>/dev/null || true
 
+# --- HOLD THE MACHINE AWAKE WHILE THIS SESSION IS ARMED ----------------------
+#
+# An armed session IS unattended work, so the two things that silently end it
+# must be held off for as long as the arm stands: the host suspending (Windows
+# connected standby) and, in a sandbox, heartbeat.sh reaping the container. The
+# refresher process started by `arm` does that; this block is its safety net at
+# the one moment the session is guaranteed to be alive and observable.
+#
+# THE TOUCHES ARE PURE SHELL AND SPAWN NOTHING. Both mechanisms are leased off a
+# file's mtime — keep-awake.ps1 polls keepawake.pid, heartbeat.sh polls
+# /tmp/.butler-busy — so re-asserting them is a stat and a utime, not a decision.
+# That matters here: this hook runs on EVERY turn end, and the 2026-08-13
+# incident (a machine buried in powershell.exe/conhost.exe until a forced
+# restart) came from putting a process spawn on exactly such a path. Starting a
+# helper is a decision, and decisions are left to bp-continuity.pl below.
+#
+# The busy-lease is touched only on Linux, i.e. inside a container: on the
+# Windows host there is nothing watching that file, and the wake-lock is the
+# mechanism that matters. See BpContinuityLease.pm for the full split.
+#
+# CCPRAXIS_NO_WAKELOCK SKIPS THE WHOLE BLOCK, TOUCHES INCLUDED. It used to gate
+# only the restart, which was worse than doing nothing: the touch kept an orphan
+# helper's 900s lease alive on every turn end while the one code path able to
+# RELEASE it was skipped, so "hold nothing" turned into "hold this one forever".
+# The test matches perl's truthiness (empty and "0" are off) so the two halves of
+# the mechanism cannot disagree about whether the opt-out is in force.
+NO_WAKELOCK=0
+case "${CCPRAXIS_NO_WAKELOCK:-}" in ''|0) ;; *) NO_WAKELOCK=1 ;; esac
+
+if [ -n "${CONT_DIR:-}" ] && [ "$NO_WAKELOCK" -eq 0 ]; then
+  # -s, not -f: an EMPTY pid file is BpKeepAwake's atomic claim, waiting for a
+  # helper that has not written its pid yet. Its age is the only thing that can
+  # expire it, so touching it would freeze a claim whose helper died at birth
+  # into a permanent "starting" that nothing ever replaces.
+  [ -s "$CONT_DIR/keepawake.pid" ] && touch "$CONT_DIR/keepawake.pid" 2>/dev/null
+  # $OSTYPE, not `uname -s`: uname is a fork+exec, and this block's whole claim
+  # is that it costs no process on a path that runs at every turn end. bash sets
+  # OSTYPE itself — "linux-gnu" in the container, "cygwin" in this host's
+  # Git-Bash (measured; "msys" in some builds — neither matches linux*, which is
+  # the only thing this needs).
+  case "${OSTYPE:-}" in
+    linux*) touch "${BP_BUSY_PATH:-/tmp/.butler-busy}" 2>/dev/null || true ;;
+  esac
+
+  # Restart the refresher if its heartbeat has gone stale. LIVENESS BY MTIME,
+  # NOT BY PID: bash cannot tell a live native Windows pid from a dead one
+  # (kill -0 reports a healthy one as dead — the asymmetry BpKeepAwake::_pid_alive
+  # exists to work around), whereas a file's age means the same thing on every
+  # platform and costs one stat. 300s is BpContinuityLease's $TICK_SECONDS *
+  # $STALE_TICKS; keep the two in step.
+  #
+  # A heartbeat stamped in the FUTURE (negative age) counts as stale, matching
+  # BpContinuityLease::ensure_daemon: a backwards clock jump would otherwise
+  # make a dead refresher look healthy for the whole skew, and a needless
+  # restart costs nothing because the flock makes the loser exit at once.
+  LEASE_PID_F="$CONT_DIR/lease.pid"
+  LEASE_STALE=1
+  if [ -f "$LEASE_PID_F" ] && [ "${MNOW:-0}" -gt 0 ]; then
+    LEASE_MT=$(bp_mtime "$LEASE_PID_F")
+    LEASE_AGE=$(( MNOW - LEASE_MT ))
+    if [ "$LEASE_MT" -gt 0 ] && [ "$LEASE_AGE" -ge 0 ] && [ "$LEASE_AGE" -lt 300 ]; then
+      LEASE_STALE=0
+    fi
+  fi
+  if [ "$LEASE_STALE" -eq 1 ]; then
+    perl "$HOOK_DIR/../scripts/bp-continuity.pl" lease >/dev/null 2>&1 || true
+  fi
+fi
+
 # --- escape hatch: one-shot file, consumed ----------------------------------
 if [ -f "$MARK.stop-ok" ]; then
   rm -f "$MARK.stop-ok" "$MARK.wakeup-pending" "$MARK.stop-blocks" 2>/dev/null

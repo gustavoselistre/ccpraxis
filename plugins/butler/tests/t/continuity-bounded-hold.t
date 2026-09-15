@@ -38,6 +38,13 @@
 # The identity half -- tickets, nonces, and the gate binding them -- is t/184.
 use strict;
 use warnings;
+
+# A TEST MUST NEVER ACTUATE A REAL WAKE-LOCK. This file drives bp-continuity.pl /
+# bp-runstate.pl / gate-continuity.sh, which hold the machine awake for an armed
+# session -- and they do it as SUBPROCESSES, where bp-keepawake.pl's `$0 =~ /\.t\z/`
+# guard cannot reach (its $0 is the .pl). CCPRAXIS_NO_WAKELOCK is the supported
+# opt-out and IS inherited across exec. Enforced by t/test-wakelock-hygiene.t.
+BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
 use Test::More;
 use FindBin qw($Bin);
 use File::Temp qw(tempdir);
@@ -291,8 +298,15 @@ sub reg { return tempdir(CLEANUP => 1) }
         # resolved through $HOME or a fixed path, this fails.
         my $tmp = tempdir(CLEANUP => 1);
         mkdir "$tmp/bin"; mkdir "$tmp/scripts";
-        for my $f (qw(bp-continuity.pl BpSession.pm BpResumption.pm)) {
-            my $src_f = "$Bin/../../scripts/$f";
+        # COPY THE WHOLE SCRIPT LAYER, not a hand-listed subset. The list used
+        # to name three files, so the first time bp-continuity.pl acquired a new
+        # `require` (BpContinuityLease.pm, for the keep-awake/busy lease) this
+        # test failed with "Can't locate ..." — a break that says nothing about
+        # the property under test, which is that the shim resolves its own
+        # location rather than assuming $HOME. A glob cannot go stale that way.
+        # 1.6 MB into a tempdir, once.
+        for my $src_f (glob("$Bin/../../scripts/*.pm"), glob("$Bin/../../scripts/*.pl")) {
+            my ($f) = $src_f =~ m{([^/\\]+)$};
             next unless -f $src_f;
             open my $r, '<:raw', $src_f or next;
             my $data = <$r>; close $r;
