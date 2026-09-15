@@ -65,6 +65,22 @@ use POSIX qw(:sys_wait_h);
 my $ROOT     = "$Bin/..";
 my $ROOT_ABS = abs_path($ROOT) // $ROOT;
 
+# NO TEST RUN MAY ACTUATE A REAL OS WAKE-LOCK.
+#
+# bp-keepawake.pl and BpContinuityLease.pm each refuse when $0 ends in ".t", and
+# that covers a test calling them in-process. It does NOT cover the common case:
+# a test that shells out to `perl bp-continuity.pl arm`, whose child sees $0 as a
+# .pl and happily fork+execs a detached refresher and a real keep-awake.ps1 with
+# its -PidFile pointing into a File::Temp directory. That is how 53 orphaned
+# helpers once filled this machine and forced a restart.
+#
+# Every test file that drives those scripts sets this itself (enforced by
+# plugins/butler/tests/t/test-wakelock-hygiene.t, which is what makes a direct
+# `perl some.t` safe too). Setting it here as well means a SWEEP is safe even
+# for a file nobody has classified yet — the guarantee should not depend on
+# whoever adds the next test having read the rule.
+$ENV{CCPRAXIS_NO_WAKELOCK} = 1;
+
 my ($fast, $jobs, $nice, $state_mode, @targets) = (0, 0, 0, 0);
 while (@ARGV) {
     my $a = shift @ARGV;
