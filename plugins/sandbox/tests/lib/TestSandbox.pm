@@ -87,7 +87,19 @@ sub new_temp_dir {
     my $base = "$home/.cache/sandbox-tests";
     require File::Path;
     File::Path::make_path($base) unless -d $base;
-    my $d = tempdir(DIR => $base, CLEANUP => 0);
+    # CLEANUP => 1, not 0: this used to opt out of File::Temp's own cleanup
+    # and rely solely on register_cleanup_dir() below plus this file's END
+    # block / SIG{INT,TERM,HUP} handlers to drain @CLEANUP_DIRS at exit. That
+    # registry DOES drain reliably for every exit path Perl can act on (normal
+    # exit, die, INT/TERM/HUP) -- exactly the same two paths the container
+    # reaping above documents. CLEANUP => 0 bought nothing on top of that: it
+    # doesn't survive a SIGKILL/hard-crash any better than CLEANUP => 1 would
+    # (File::Temp's own cleanup is itself an END-time hook, no more signal-safe
+    # than ours), so the only thing it was doing was DISABLING a second,
+    # independent safety net for the paths that already work, which is a pure
+    # loss. Leaving it at 1 costs nothing (both mechanisms check -d before
+    # acting) and covers a caller that forgets to invoke cleanup_all().
+    my $d = tempdir(DIR => $base, CLEANUP => 1);
     $d = winify_path($d);
     register_cleanup_dir($d);
     return $d;

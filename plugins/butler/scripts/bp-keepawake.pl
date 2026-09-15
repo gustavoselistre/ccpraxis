@@ -55,9 +55,35 @@ package BpKeepAwake;
 use strict;
 use warnings;
 use File::Basename qw(dirname);
+use Fcntl qw(O_WRONLY O_CREAT O_EXCL);
+use Errno ();
 use Cwd ();
 
 my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
+
+# STARTING_GRACE_SECONDS — how long a pid file with no pid in it counts as "a
+# helper is coming up" rather than "nothing is here".
+#
+# THE HOLE THIS CLOSES, MEASURED 2026-09-15: fifteen live keep-awake.ps1
+# helpers from a single registry, and the machine kept awake by all of them.
+# spawn() returns as soon as the fork+exec is away, but keep-awake.ps1 does not
+# write its own pid until PowerShell has started — of the order of a second, and
+# more on a loaded box. Every apply() inside that window saw no pid file at all,
+# concluded "no lock here", and spawned another. The idempotence check was
+# perfect and simply had nothing to look at yet.
+#
+# So spawning now CLAIMS the pid file first, and an unfilled claim is read as
+# "starting". 30s is far beyond any plausible PowerShell start and far short of
+# the 900s lease, so a helper that truly failed to come up is still replaced
+# long before its absence could matter.
+our $STARTING_GRACE_SECONDS = 30;
+
+# Read it through this rather than as $BpKeepAwake::STARTING_GRACE_SECONDS from
+# another file. This is `require`d at RUNTIME, so a fully-qualified read
+# elsewhere compiles before the `our` exists and perl warns "used only once:
+# possible typo" — a warning that is indistinguishable from a real typo, which
+# is the whole reason not to leave it standing.
+sub starting_grace_seconds { return $STARTING_GRACE_SECONDS }
 
 # should_be_on($phase) -> 0|1
 # active / pause-pending -> hold the lock; settled -> release it.
@@ -238,6 +264,18 @@ sub _pid_alive {
     return ($out =~ /\b\Q$pid\E\b/) ? 1 : 0;
 }
 
+# Public aliases for the two helpers above.
+#
+# BpContinuityLease needs exactly these facts — "is this recorded pid alive"
+# and "what pid is recorded" — and both are already solved HERE, correctly, for
+# the one platform that gets them wrong (see _pid_alive's header on why
+# kill(0,$pid) lies about a native Windows process). Reaching into the
+# underscore names from another package would be worse than either copying or
+# exporting; copying is what this repo has paid for three times already. So they
+# get a supported spelling instead.
+sub pid_alive { return _pid_alive(@_) }
+sub read_pid  { return _read_pid(@_)  }
+
 sub _read_pid {
     my ($pid_f) = @_;
     open my $fh, '<', $pid_f or return undef;
@@ -296,10 +334,62 @@ sub apply {
                 utime($now, $now, $pid_f);
                 return;
             }
+
+            # An EMPTY pid file is a claim this code made just before spawning,
+            # and the helper has not yet written itself into it. That is a lock
+            # STARTING, not a lock missing — see $STARTING_GRACE_SECONDS for the
+            # fifteen-helper storm that reading it the other way caused.
+            #
+            # -z, not !defined $pid: a file with unparseable CONTENT is corrupt,
+            # not starting. Nothing is coming to fix it, so it is replaced now
+            # rather than after a grace period spent waiting for nobody.
+            if (-z $pid_f) {
+                my $age = time - ((stat($pid_f))[9] // 0);
+                return if $age < $STARTING_GRACE_SECONDS;
+                $log->("WARN keepawake claim never filled after ${age}s; respawning");
+            }
+
+            # Either a recorded pid that is dead, or a claim that expired. Clear
+            # it so the atomic claim below can be taken.
+            unlink $pid_f;
         }
         return unless $ps_ok->();
-        eval { $spawn->($pid_f) };
+
+        # CLAIM THE FILE ATOMICALLY, THEN SPAWN. O_EXCL is what makes "is a
+        # helper already coming up?" and "I am the one starting it" a single
+        # indivisible step, so the window between spawning and the helper
+        # writing its own pid can no longer be read by anyone else as "nothing
+        # here". That window is where the fifteen helpers came from.
+        #
+        # It does NOT make the whole function atomic, and it is not claimed to:
+        # two callers that both find a DEAD pid recorded can both unlink it just
+        # above and then both take a fresh claim in turn. Closing that would need
+        # a lock around the read-decide-write as a whole. It is left open because
+        # the caller-side rule removes it — only the refresher ever asks for a
+        # hold, and it is single-instance by flock — and because the outcome
+        # there is two helpers, not fifteen, with the loser's lease expiring.
+        my $claim;
+        unless (sysopen($claim, $pid_f, O_WRONLY | O_CREAT | O_EXCL)) {
+            # EEXIST is the ordinary outcome of losing that race, and it is not
+            # a problem — stay silent. Anything else (an unwritable registry, a
+            # full disk) means no wake-lock will EVER be taken here, which is
+            # exactly the kind of failure that must not be invisible.
+            $log->("WARN keepawake cannot claim $pid_f: $!") unless $!{EEXIST};
+            return;
+        }
+        close $claim;
+
+        my $started = eval { $spawn->($pid_f) };
         $log->("WARN keepawake spawn failed: $@") if $@;
+
+        # A CLAIM NOBODY WILL FILL MUST NOT SURVIVE THE CALL THAT MADE IT.
+        # spawn() returns undef when it declined — inside a .t, or under
+        # CCPRAXIS_NO_WAKELOCK — and it dies when the fork or the helper file
+        # fails. Either way nothing is coming, so leaving the claim would both
+        # suppress the next 30s of attempts and, worse, fabricate the appearance
+        # of a lease: t/runstate-pause-holds-lease.t pins exactly that ("a pause
+        # never fabricates a lease from a test process"), and it caught this.
+        unlink $pid_f if !defined $started && -e $pid_f && -z $pid_f;
     } else {
         if (-e $pid_f) {
             my $pid = _read_pid($pid_f);

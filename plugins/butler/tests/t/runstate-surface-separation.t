@@ -27,6 +27,13 @@
 # Runs standalone: perl this file
 use strict;
 use warnings;
+
+# A TEST MUST NEVER ACTUATE A REAL WAKE-LOCK. This file drives bp-continuity.pl /
+# bp-runstate.pl / gate-continuity.sh, which hold the machine awake for an armed
+# session -- and they do it as SUBPROCESSES, where bp-keepawake.pl's `$0 =~ /\.t\z/`
+# guard cannot reach (its $0 is the .pl). CCPRAXIS_NO_WAKELOCK is the supported
+# opt-out and IS inherited across exec. Enforced by t/test-wakelock-hygiene.t.
+BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
 use Test::More;
 use FindBin qw($Bin);
 use File::Temp qw(tempdir);

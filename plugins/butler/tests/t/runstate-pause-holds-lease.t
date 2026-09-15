@@ -29,8 +29,19 @@
 # is fully observable though: with a live pid already recorded, apply() touches
 # the pid file and returns before it ever reaches spawn(). That is what the
 # lease actually depends on tick to tick, so it is the behaviour worth pinning.
+#
+# AND THE $0 GUARD DOES NOT REACH THIS FILE'S SUBPROCESSES — corrected 2026-09-15.
+# `pause` is exercised by running bp-runstate.pl, where $0 is bp-runstate.pl, not
+# a ".t". So sections C and D were reaching the REAL spawn and starting a real
+# keep-awake helper on every run; they passed only because apply() used to
+# return before the helper had written its pid file, so the assertion looked at
+# an empty directory a second too early. apply() now claims the pid file up
+# front (it had to, to stop a fifteen-helper storm), which made the leak
+# visible. CCPRAXIS_NO_WAKELOCK is the supported opt-out and IS inherited across
+# exec, so it is what actually holds the "no test leaks a wake-lock" line here.
 use strict;
 use warnings;
+BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
 use Test::More;
 use File::Temp qw(tempdir);
 use File::Basename qw(dirname);
@@ -102,7 +113,8 @@ sub pause_now {
     my $out = pause_now();
     like($out, qr/paused until/, 'a pause with no lease present still succeeds');
     ok(!-e $LEASE,
-       'a pause never fabricates a lease from a test process (spawn is .t-guarded)');
+       'a pause never fabricates a lease from a test process (CCPRAXIS_NO_WAKELOCK, '
+     . 'which — unlike the $0 guard — survives the exec into bp-runstate.pl)');
 }
 
 # ------------------------------- D. a broken lease never refuses a valid pause
