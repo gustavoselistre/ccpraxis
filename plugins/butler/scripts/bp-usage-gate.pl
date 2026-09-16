@@ -163,7 +163,10 @@ sub verdict_decision {
     unless ($poll->{status} == 200 && ref $poll->{parsed} eq 'HASH') {
         return { action => 'unavailable', until_epoch => undef, reason => 'telemetry' };
     }
-    my ($vu_ok) = BpContract::validate_usage($poll->{parsed});
+    # $now is the gate's own injected clock, not time(). A fixture that pins a
+    # moment must have its reset stamps judged against THAT moment, or the
+    # impossible-stamp rule would refuse every time-pinned reading in the suite.
+    my ($vu_ok) = BpContract::validate_usage($poll->{parsed}, $now);
     unless ($vu_ok) {
         return { action => 'unavailable', until_epoch => undef, reason => 'telemetry' };
     }

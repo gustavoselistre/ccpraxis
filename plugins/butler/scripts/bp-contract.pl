@@ -23,9 +23,72 @@ sub _is_num     { my $n = shift; defined $n && !ref $n && $n =~ /^-?\d+(?:\.\d+)
 sub _is_int     { my $n = shift; defined $n && !ref $n && $n =~ /^\d+$/ }
 sub _is_str     { my $s = shift; defined $s && !ref $s && length $s }
 
+# A WINDOW WHOSE RESET IS IN THE PAST IS NOT A STALE READING. IT IS A WRONG ONE.
+#
+# Measured over ~40 minutes on one session, no config change in between:
+#
+#   22:32Z  5h 18%  resets 2026-09-12T02:00Z   7d 79%   plausible
+#   23:00Z  5h 35%  resets 2026-09-10T03:49Z   7d 40%   IMPOSSIBLE
+#   23:25Z  5h 24%  resets 2026-09-12T02:00Z   7d 80%   plausible again
+#
+# The middle reading is self-inconsistent on its own terms: a window that resets
+# every five hours cannot have a reset time 36 hours in the past, and its 7-day
+# figure halved and recovered with no boundary crossed. The record is its own
+# evidence of being bad -- and nothing was checking (almanac 20260911-224528-e213).
+#
+# This matters because butler GATES on it. A reading wrong by 40 percentage
+# points either halts work that should proceed or lets work continue past a
+# ceiling, and a caller currently has no way to tell a good read from a bad one.
+#
+# FAILING HERE IS CHEAP, WHICH IS WHY THE CHECK BELONGS HERE. bp-usage-gate.pl
+# routes a validate_usage failure to action=unavailable/reason=telemetry -- "no
+# reading", not "pause". So a false positive costs one skipped poll, while a
+# false negative is a gate acting on a number that cannot be true.
+#
+# The bounds stay LOOSE on purpose. b28 is the cautionary case in this very
+# function: an over-strict usage contract false-positived a drift and paused
+# whole unattended fleets. $CLOCK_GRACE absorbs host/server skew in both
+# directions, and only a stamp that no correct server could emit is refused.
+# ONLY THE PAST BOUND. An earlier draft also refused a stamp further ahead than
+# one window allows, which is true of a correct server and false of this repo's
+# own fixtures: '2099-01-01T00:00:00Z' is the established idiom for "definitely
+# not expired" and appears throughout usage-governor.t. Refusing it turned every
+# time-pinned reading in the suite into action=unavailable.
+#
+# The measured defect was a stamp in the PAST, the report asked for exactly that
+# check, and b28 -- in this same function -- is the standing warning about
+# tightening a usage contract further than the evidence supports. So the upper
+# bound is deliberately absent rather than merely unimplemented.
+my %WINDOW_SPAN = (five_hour => 5 * 3600, seven_day => 7 * 86400);
+my $CLOCK_GRACE = 300;
+
+# _iso_epoch($iso) -> epoch | undef. Total; never dies on hostile input.
+sub _iso_epoch {
+    my ($iso) = @_;
+    return undef unless defined $iso && !ref $iso
+        && $iso =~ /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/;
+    require Time::Local;
+    my $e = eval { Time::Local::timegm($6, $5, $4, $3, $2 - 1, $1) };
+    return (defined $e && !$@) ? $e : undef;
+}
+
+# _reset_stamp_impossible($window, $iso, $now) -> reason | undef
+sub _reset_stamp_impossible {
+    my ($w, $iso, $now) = @_;
+    my $span = $WINDOW_SPAN{$w} or return undef;      # unknown window: not ours to judge
+    my $e = _iso_epoch($iso);
+    return undef unless defined $e;                   # unparseable is _is_iso8601's business
+    return "resets_at is in the past ($iso); a $w window cannot have already reset"
+        if $e < $now - $CLOCK_GRACE;
+    return undef;
+}
+
 # usage: GET /api/oauth/usage  →  five_hour/seven_day.{utilization:int%, resets_at:ISO}
+# $now is injectable so the impossible-stamp rule can be driven from a test
+# without waiting for a clock; every existing one-argument caller is unaffected.
 sub validate_usage {
-    my ($d) = @_;
+    my ($d, $now) = @_;
+    $now = time unless defined $now && !ref $now && $now =~ /^\d+$/;
     return (0, ['usage: response is not a JSON object']) unless ref $d eq 'HASH';
     my @p;
     for my $w (qw(five_hour seven_day)) {
@@ -39,7 +102,11 @@ sub validate_usage {
         # An idle window (utilization 0) legitimately has no resets_at — requiring it
         # here false-positived a contract-drift and paused whole unattended fleets (b28).
         if (_is_num($o->{utilization}) && $o->{utilization} > 0) {
-            push @p, "usage: $w.resets_at missing or not ISO-8601" unless _is_iso8601($o->{resets_at});
+            if (!_is_iso8601($o->{resets_at})) {
+                push @p, "usage: $w.resets_at missing or not ISO-8601";
+            } elsif (my $why = _reset_stamp_impossible($w, $o->{resets_at}, $now)) {
+                push @p, "usage: $w.$why";
+            }
         }
     }
     return (@p ? 0 : 1, \@p);
