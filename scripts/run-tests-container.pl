@@ -533,7 +533,17 @@ sub main {
     $ACTIVE_CONTAINER_NAME = $name;
     $ACTIVE_PODMAN_BIN     = $podman;
 
-    my $project_root = abs_path(dirname(abs_path(__FILE__)) . '/..');
+    # Separators FIRST, then dirname. __FILE__ can carry backslashes on Windows
+    # and dirname on a mixed-separator path misbehaves, so normalising before
+    # splitting is the order that matters -- not a style preference. Same shape
+    # as BpContinuityLease.pm's own __FILE__ handling and bp-turn-caps.pl's
+    # script_dir_for, and asserted repo-wide by turn-cap-consistency.t's C9,
+    # which is what caught this file doing it the raw way.
+    my $project_root = do {
+        (my $self = __FILE__) =~ s{\\}{/}g;
+        my $here = Cwd::abs_path($self) // $self;
+        abs_path(File::Basename::dirname($here) . '/..');
+    };
     my ($git_rc, $extract_rc) = materialize_tree($podman, $name, $ref, $project_root);
     if ($git_rc != 0 || $extract_rc != 0) {
         print STDERR "materialize_tree failed (git_rc=$git_rc, extract_rc=$extract_rc)\n";
