@@ -33,6 +33,7 @@ use warnings;
 use FindBin qw($Bin);
 use Test::More;
 use JSON::PP;
+use File::Temp qw(tempdir);
 
 my $ROOT  = "$Bin/../../../..";
 my $HOOKS = "$Bin/../../hooks/hooks.json";
@@ -160,20 +161,59 @@ SKIP: {
 {
     my $cmd = "git $V";
 
-    my ($rc_bare) = run_guard($cmd);
+    # THE IDLE PREMISE IS CONSTRUCTED, NOT ASSUMED (bug 20260916-150236-6684).
+    #
+    # E2 asserts the run-scoped guard ALLOWS when no butler run is active. It
+    # used to establish "no butler run is active" by simply not setting
+    # anything -- which reads the REAL machine-level registry. So the case was
+    # green on an idle machine and RED whenever a drive-solo run was actually
+    # in progress, i.e. exactly when this suite gets run. Measured red at
+    # 2026-09-16 mid-drive with 22 ok / 1 not ok, on a tree that had not
+    # touched the guard or this file.
+    #
+    # The guard was right and the fixture was wrong: bp_drive_any_active reads
+    # the on-disk marker deliberately (that is E4's whole point -- a Task
+    # subagent inherits no BP_*), so an "idle" assertion has to POINT IT
+    # SOMEWHERE KNOWN rather than hope the machine is quiet.
+    #
+    # bp_drive_active_dir already honours CCPRAXIS_DRIVE_ACTIVE_DIR and
+    # validates it as absolute (lib.sh:688), so an empty File::Temp dir is all
+    # the construction needed -- no production change, and the same shape the
+    # continuity tests already use for CCPRAXIS_CONTINUITY_ACTIVE_DIR.
+    #
+    # All THREE cases get it, not just E2. E1 and E3 were passing for reasons
+    # that happened to coincide with their claims: during a live drive E1
+    # ("blocks unconditionally") and E3 ("blocks because BP_LEDGER is set")
+    # would both have blocked on the ambient marker instead, proving nothing.
+    # A test that can pass for the wrong reason is not pinning what it says.
+    my $idle_dir = tempdir(CLEANUP => 1);
+    my %idle_env = (CCPRAXIS_DRIVE_ACTIVE_DIR => $idle_dir);
+
+    opendir(my $dh, $idle_dir) or die "cannot read constructed idle dir: $!";
+    my @entries = grep { $_ ne '.' && $_ ne '..' } readdir $dh;
+    closedir $dh;
+    is(scalar(@entries), 0,
+       'E0: the constructed drive-active registry is genuinely empty -- guarding this '
+     . 'block\'s own premise, so an "allows" result below cannot come from a fixture '
+     . 'that quietly had a marker in it');
+
+    my ($rc_bare) = run_guard($cmd, env => \%idle_env);
     is($rc_bare, 2,
        'E1: invoked BARE (ccpraxis .claude/settings.json) it still blocks unconditionally -- '
-     . 'the original incident\'s home is unchanged');
+     . 'the original incident\'s home is unchanged. With no run active, so the block is '
+     . 'attributable to the bare invocation and not to an ambient marker');
 
-    my ($rc_scoped_idle) = run_guard($cmd, args => '--only-during-butler-run');
+    my ($rc_scoped_idle) = run_guard($cmd, args => '--only-during-butler-run',
+                                           env  => \%idle_env);
     is($rc_scoped_idle, 0,
        'E2: run-scoped with no butler run active, it ALLOWS -- the operator keeps their own '
      . 'tools in their own work, which is the whole reason the flag exists');
 
     my ($rc_scoped_worker) = run_guard($cmd, args => '--only-during-butler-run',
-                                             env  => { BP_LEDGER => 'x' });
+                                             env  => { %idle_env, BP_LEDGER => 'x' });
     is($rc_scoped_worker, 2,
-       'E3: run-scoped inside a butler-launched worker, it BLOCKS');
+       'E3: run-scoped inside a butler-launched worker, it BLOCKS -- and with the registry '
+     . 'empty, BP_LEDGER is the only thing that can be causing it');
 
     # And the predicate that covers the case this whole report was about: a
     # drive-solo Task subagent inherits no BP_* at all, so liveness has to be
