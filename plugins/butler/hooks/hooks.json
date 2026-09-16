@@ -46,6 +46,11 @@
          {
             "hooks" : [
                {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-git-mutations.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               },
+               {
                   "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-bash.sh\"",
                   "timeout" : 15,
                   "type" : "command"
