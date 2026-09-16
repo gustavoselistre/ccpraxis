@@ -1740,7 +1740,13 @@ my $LSRC = slurp($LAUNCHER_SRC);
         for my $k (0 .. $#$inv - 1) {
             next unless $inv->[$k]     =~ /\bstart\b/;
             next unless $inv->[$k + 1] =~ /touch/;
-            next unless $inv->[$k + 1] =~ m{/tmp/\.launcher-alive};
+            # Either spelling of the sentinel. The literal path moved behind
+            # $LAUNCHER_ALIVE_PATH when every podman-exec call site was wrapped
+            # in `sh -c` to stop MSYS2 rewriting container-side POSIX paths
+            # (busy-lease-path-conversion.t). The ORDERING this assertion pins
+            # -- touch immediately after start, nothing else in between -- is
+            # untouched by that, and is still what is being required here.
+            next unless $inv->[$k + 1] =~ m{/tmp/\.launcher-alive|\$LAUNCHER_ALIVE_PATH};
             $adjacent = 1;
             last;
         }

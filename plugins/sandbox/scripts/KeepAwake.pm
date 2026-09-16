@@ -40,6 +40,45 @@ sub should_stay_awake {
     return ($age <= $stale) ? 1 : 0;
 }
 
+# classify_lease_stat_failure($output, $expected_path) -> $verdict | undef
+#
+# THE THIRD THING A `stat` FAILURE CAN MEAN. The busy-lease probe runs
+# `stat -c %Y <lease>` inside the container and, until 2026-09-16, read ANY
+# "No such file or directory" as 'lease-absent' -- a fact about the CONTAINER,
+# which on_probe releases the wake-lock for immediately and without tolerance.
+#
+# On Windows that was wrong often enough to cost a night's fleet run. MSYS2
+# rewrites argv elements that look like POSIX paths on their way into a native
+# binary, so podman was handed the HOST's Windows temp directory and stat
+# truthfully reported that no such file existed -- there. The container's lease
+# was being refreshed every few seconds the whole time.
+#
+# Every stat implementation in play (GNU coreutils, busybox) quotes the
+# offending path back in its message, so a quoted path that is NOT the one we
+# asked for is positive evidence that the argument was rewritten in flight.
+# That is a fact about US, and belongs in 'probe-failed' where on_probe holds
+# through a tolerance rather than giving up.
+#
+# Returns:
+#   undef            -- not a "no such file" failure; the caller's other
+#                       classification paths still apply, unchanged.
+#   'lease-absent'   -- a genuine absence: the message names our path, or names
+#                       none at all.
+#   'path-rewritten' -- the message names a DIFFERENT path.
+#
+# The no-path-named case deliberately falls back to 'lease-absent' rather than
+# to the failure verdict: a stat variant that stays quiet must not be able to
+# strand the wake-lock held forever after a run ends. Only positive evidence of
+# rewriting diverges.
+sub classify_lease_stat_failure {
+    my ($output, $expected_path) = @_;
+    return undef unless defined $output && $output =~ /no such file or directory/i;
+    return 'lease-absent' unless defined $expected_path && length $expected_path;
+    my ($named) = ($output =~ /['"]([^'"]+)['"]/);
+    return 'lease-absent' unless defined $named && length $named;
+    return ($named eq $expected_path) ? 'lease-absent' : 'path-rewritten';
+}
+
 # new(start => \&start, stop => \&stop, on_event => \&on_event) — a lifecycle
 # holder.
 #   start->()        spawns the wake-lock helper, returns an opaque handle (PID).

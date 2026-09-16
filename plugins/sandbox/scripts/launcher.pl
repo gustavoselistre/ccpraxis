@@ -57,6 +57,45 @@ use SpendPanel ();  # b37: pure Claude/Go/Zen spend status struct for the dashbo
 use Resources ();   # s09: pure resource-probe parsers + the injectable probe seam
 use RunState ();    # s10: pure orchestrator/run-state summarizer for the dashboard
 
+# THE HOST CANNOT PROBE A CONTAINER'S PIDS, SO IT ASKS THE SAMPLER INSTEAD.
+#
+# A sandboxed run writes its orchestrator and coordinator PIDs from INSIDE the
+# container, which has a private PID namespace (launcher.pl passes no
+# --pid=host). kill(0,...) on this host therefore cannot answer for them, and
+# _pid_alive below correctly degrades to UNKNOWN rather than fabricating a
+# "dead". Correct -- but it meant the Run panel showed `orchestrator unknown`
+# for the entire life of every sandboxed run, against an orchestrator the
+# operator could see was alive, and the same blindness left finished workers
+# indistinguishable from wedged ones (20260915-230820-d33e items 2 and 3).
+#
+# The container sampler is already exec'ing into the container every
+# $CONTAINER_POLL_SECONDS. It now brings back the container's PID list, which
+# turns "cannot answer" into a real answer for exactly the namespace the
+# markers were written in. Refreshed lazily from the snapshot the sampler
+# already writes -- one file read, TTL'd, never a subprocess from here.
+my %CONTAINER_PIDS;            # pid => 1, as of the last snapshot read
+my $CONTAINER_PIDS_AT = 0;     # host time() of that read (0 = never)
+my $CONTAINER_PIDS_TTL = 5;    # re-read the snapshot at most this often
+my $CONTAINER_PIDS_MAX_AGE = 50;  # a snapshot older than this answers nothing
+
+# _container_pids_fresh() -> \%pids | undef. undef means "no usable reading",
+# which is what keeps _pid_alive's UNKNOWN reachable rather than silently
+# turning every unprobeable pid into a confident "dead".
+sub _container_pids_fresh {
+    my $now = time;
+    if ($now - $CONTAINER_PIDS_AT >= $CONTAINER_PIDS_TTL) {
+        $CONTAINER_PIDS_AT = $now;
+        my $snap = eval { _container_snapshot_read() };
+        %CONTAINER_PIDS = ();
+        if (ref $snap eq 'HASH' && ref $snap->{container_pids} eq 'ARRAY'
+            && defined $snap->{measured_at} && $snap->{measured_at} =~ /^\d+$/
+            && ($now - $snap->{measured_at}) <= $CONTAINER_PIDS_MAX_AGE) {
+            $CONTAINER_PIDS{$_} = 1 for grep { defined && /^\d+$/ } @{ $snap->{container_pids} };
+        }
+    }
+    return %CONTAINER_PIDS ? \%CONTAINER_PIDS : undef;
+}
+
 # _pid_alive($pid) -> 1 | 0 | undef
 #
 # Liveness by SIGNAL, never by command-line matching. A probe that greps a
@@ -84,6 +123,13 @@ sub _pid_alive {
     # this host cannot prove is its own to probe -- degrade to UNKNOWN, and
     # let RunState's "unknown liveness never demotes 'running'" rule (and
     # quiet_probe's state=='running' OR-clause) fail safe instead.
+    # ...unless the sampler has a current census of the container's own PID
+    # namespace, which is where a sandboxed run's markers were written. With
+    # one in hand, absence from it IS a real answer -- and it is the answer
+    # that lets a finished worker stop looking wedged.
+    if (my $pids = _container_pids_fresh()) {
+        return $pids->{$pid} ? 1 : 0;
+    }
     return undef;                   # ESRCH (or any other errno) -> UNKNOWN, never a fabricated "dead"
 }
 
@@ -949,6 +995,13 @@ my $SPEND_GLOBAL_DIR          = $LAUNCHER_DIR;
 my $SPEND_SAMPLER_PID         = "$LAUNCHER_DIR/spend-sampler.pid";
 my $CONTAINER_SAMPLER_PID     = "$LAUNCHER_DIR/container-sampler.pid";
 my $CONTAINER_SNAPSHOT_FILE   = "$LAUNCHER_DIR/.container-snapshot.json";
+# The two CONTAINER-SIDE paths, named once so every podman-exec call site spells
+# them identically -- which is what the "asked for X, got Y" guard in
+# _busy_lease_probe compares against. Both are absolute POSIX paths INSIDE the
+# container and must never be translated for the host; see every call site
+# wrapping them in `sh -c` for why.
+my $BUSY_LEASE_PATH     = "/tmp/.butler-busy";
+my $LAUNCHER_ALIVE_PATH = "/tmp/.launcher-alive";
 # t11-tui-hot-reload: the mtimes the currently-loaded render modules had when
 # this process read them. Populated once at dashboard entry and advanced only
 # for a module that actually reloaded -- see _hot_reload's closing note on why
@@ -1146,6 +1199,18 @@ my $CONTAINER_SNAPSHOT_MAX_AGE = 50;
 # before falling back to releasing, so a genuinely dead container still
 # releases the lock well within the same launch.
 my $KEEPAWAKE_PROBE_TOLERANCE = 3;
+
+# How often the keep-awake DECISION is written down, whether or not it changed.
+#
+# It used to be written only on a transition, which meant the steady state --
+# held, for the entire length of a run -- logged nothing. `busy_age` appeared
+# zero times across every launch log on the reporting host, so neither a caller
+# inside the sandbox nor the operator outside could tell a working keep-awake
+# from a broken one; should_stay_awake was a pure function whose output nobody
+# recorded (20260911-224616-e8e0). Matched to the manager heartbeat's own
+# cadence: one line every two minutes is free, and it makes the mechanism
+# falsifiable.
+my $KEEPAWAKE_LOG_SECONDS = 120;
 
 # s17-statusline-and-output-hygiene (spec S5): the ONE heartbeat/tick
 # predicate, called from BOTH _history_events (below) and the
@@ -5731,6 +5796,7 @@ sub enter_dashboard {
     my $cached_busy_age         = undef;   # B5: age (s) of /tmp/.butler-busy in CONTAINER time, or undef
     my $cached_busy_stamp       = 0;       # host time() when $cached_busy_age was measured
     my $cached_probe_result     = { state => 'lease-absent' };   # s21: KeepAwake's pinned probe struct
+    my $last_keepawake_log      = 0;       # when the periodic keep-awake decision was last written
     my $cached_needs_you        = 0;       # B3: escalations only the OPERATOR can clear
     my $cached_triage_queued    = 0;       # ...and those queued for the escalation resolver
     my $cached_backpack         = undef;   # B4: backpack items + per-item approval
@@ -6160,6 +6226,20 @@ sub enter_dashboard {
                 install_warning => $INSTALL_WARNING,
                 busy_age        => $busy_age,
                 stay_awake      => $stay,
+                # THE READING, NOT JUST THE NUMBER DERIVED FROM IT. busy_age is
+                # undef for two completely different reasons -- "there is no
+                # lease" and "we could not read one" -- and the panel used to
+                # render both as "none (no active run)". The operator then saw
+                # a definite negative for a lease that was being refreshed
+                # every few seconds (20260915-230820-d33e). Pass the probe
+                # state through so the view can tell those apart.
+                lease_probe     => { state  => $cached_probe_result->{state},
+                                     detail => $cached_probe_result->{detail} },
+                # What the wake-lock is ACTUALLY doing, as opposed to what this
+                # gather would like it to do. They diverge exactly when a probe
+                # failure is being held through, which is the case worth
+                # rendering honestly.
+                keepawake_held  => ($KEEPAWAKE && $KEEPAWAKE->running) ? 1 : 0,
                 needs_you        => $cached_needs_you,
                 triage_queued    => $cached_triage_queued,
                 backpack         => $cached_backpack,
@@ -6189,9 +6269,47 @@ sub enter_dashboard {
         },
         keepawake => sub {
             my ($st) = @_;
-            my $act = $KEEPAWAKE->sync($st->{stay_awake} ? 1 : 0);
-            log_ev('keepawake', { want => ($st->{stay_awake} ? 1 : 0), action => $act,
-                                  busy_age => $st->{busy_age} }) if $act ne 'noop';
+            # THE PROBE OWNS THIS DECISION; THIS SEAM ONLY CONVERGES TO IT.
+            #
+            # This runs on every state refresh, while the probe behind it is
+            # throttled to one round per $CONTAINER_POLL_SECONDS. During a
+            # probe failure the cached age is deliberately FROZEN and its
+            # timestamp is not advanced, so the extrapolated $busy_age above
+            # grows without bound -- and this seam, re-deriving staleness from
+            # it, would eventually cross $BUSY_STALE and release the very lock
+            # on_probe was holding on purpose. Two decision sites, one of them
+            # ignorant of the probe state, is how the tolerance got defeated.
+            #
+            # So: when the last reading was 'probe-failed', leave the lock
+            # exactly as on_probe left it.
+            my $probe_state = ref $st->{lease_probe} eq 'HASH'
+                            ? ($st->{lease_probe}{state} // '') : '';
+            my $act = 'noop';
+            if ($probe_state ne 'probe-failed') {
+                $act = $KEEPAWAKE->sync($st->{stay_awake} ? 1 : 0);
+                log_ev('keepawake', { want => ($st->{stay_awake} ? 1 : 0), action => $act,
+                                      busy_age => $st->{busy_age} }) if $act ne 'noop';
+            }
+            # AND THE STEADY STATE GETS WRITTEN DOWN. Logging only transitions
+            # meant the state that actually matters -- held, hour after hour --
+            # wrote nothing at all: `busy_age` appeared zero times across every
+            # launch log on the reporting host, so "is the keep-awake working?"
+            # had no answer available to either side (20260911-224616-e8e0).
+            # Throttled to the heartbeat's own cadence, so it costs one line
+            # every two minutes.
+            my $now_ka = time;
+            if ($now_ka - $last_keepawake_log >= $KEEPAWAKE_LOG_SECONDS) {
+                $last_keepawake_log = $now_ka;
+                log_ev('keepawake_decision', {
+                    want       => ($st->{stay_awake} ? 1 : 0),
+                    held       => ($KEEPAWAKE->running ? 1 : 0),
+                    busy_age   => $st->{busy_age},
+                    stale      => $BUSY_STALE,
+                    probe      => ($probe_state ne '' ? $probe_state : undef),
+                    detail     => (ref $st->{lease_probe} eq 'HASH' ? $st->{lease_probe}{detail} : undef),
+                    action     => $act,
+                });
+            }
         },
         spawn         => \&_spawn_session,
         stop_runs     => sub { my ($st, $prog) = @_; _lifecycle_run('stop-runs',     $st, $prog) },
@@ -6388,8 +6506,8 @@ sub _lifecycle_run {
             }
             # Bounded (:5s each) -- a wedged podman must not hang await_quiet's
             # poll loop indefinitely and freeze the TUI (see _run_timed above).
-            my $bm = _run_timed(qq{$PODMAN exec "$CONTAINER_NAME" stat -c %Y /tmp/.butler-busy 2>/dev/null}, 5);
-            my $cn = _run_timed(qq{$PODMAN exec "$CONTAINER_NAME" date +%s 2>/dev/null}, 5);
+            my $bm = _run_timed(qq{$PODMAN exec "$CONTAINER_NAME" sh -c 'stat -c %Y $BUSY_LEASE_PATH' 2>/dev/null}, 5);
+            my $cn = _run_timed(qq{$PODMAN exec "$CONTAINER_NAME" sh -c 'date +%s' 2>/dev/null}, 5);
             my ($lmt)  = ($bm && $bm =~ /^(\d+)/) ? ($1) : ();
             my ($cnow) = ($cn && $cn =~ /^(\d+)/) ? ($1) : ();
             my $busy_age;
@@ -6508,7 +6626,7 @@ sub recover_container {
             # is kept because touching early is unconditionally correct and free,
             # NOT because of a ten-second cliff that never existed.
             if ($code == 0) {
-                my $touch_out = `$PODMAN exec "$CONTAINER_NAME" touch /tmp/.launcher-alive 2>&1`;
+                my $touch_out = `$PODMAN exec "$CONTAINER_NAME" sh -c 'touch $LAUNCHER_ALIVE_PATH' 2>&1`;
             }
             my $err = _trim_err($out);
             # MINOR-4: a container removed while the machine was down classifies
@@ -6562,7 +6680,7 @@ sub _heartbeat_once {
     # across the live frame (the corruption André saw). Backticks + 2>&1 keep it
     # off-screen (MSYS2_ARG_CONV_EXCL=* is set, so the /tmp path passes through),
     # and the captured reason is surfaced in the launch log instead.
-    my $out = `$PODMAN exec "$CONTAINER_NAME" touch /tmp/.launcher-alive 2>&1`;
+    my $out = `$PODMAN exec "$CONTAINER_NAME" sh -c 'touch $LAUNCHER_ALIVE_PATH' 2>&1`;
     my $rc  = $?;
     if ($rc != 0) {
         my $state = `$PODMAN inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null`;
@@ -6605,16 +6723,38 @@ sub _heartbeat_once {
 # tell "container gone" apart from "merely could not be asked right now".
 sub _busy_lease_probe {
     my ($container) = @_;
+
+    # THE PATH GOES INSIDE `sh -c`, AND THAT IS LOAD-BEARING ON WINDOWS.
+    #
+    # `podman exec <ctr> stat -c %Y /tmp/.butler-busy` hands podman.exe -- a
+    # NATIVE Windows binary -- an argv element that starts with a slash. MSYS2
+    # rewrites those into Windows paths on the way past, so what the container
+    # actually received was
+    #
+    #     stat: cannot statx 'C:/Users/ANDR~1/AppData/Local/Temp/.butler-busy'
+    #
+    # and the "No such file" below read it as lease-absent: a definite fact
+    # about the CONTAINER, which releases the wake-lock at once. The machine
+    # then slept under a live fleet. Measured on this host 2026-09-16; the
+    # probe had been blind since efdd028 (2026-08-25).
+    #
+    # Wrapping the whole command in `sh -c '...'` makes the argv element start
+    # with `stat`, not `/`, so there is nothing for MSYS2 to convert. This is
+    # the project's stated preference (CLAUDE.md, "Windows landmines"): a shape
+    # that is correct under EITHER conversion state beats one that depends on
+    # MSYS2_ARG_CONV_EXCL being set, because it cannot be broken by a caller's
+    # environment. The sampler that calls this used to clear that variable.
+    #
     # Read mtime first, then the container's own clock, so the inter-exec gap
     # can't read negative (matches the prior host/container-clock-skew fix).
-    my $bm = `$PODMAN exec "$container" stat -c %Y /tmp/.butler-busy 2>&1`;
+    my $bm = `$PODMAN exec "$container" sh -c 'stat -c %Y $BUSY_LEASE_PATH' 2>&1`;
     my $rc = $?;
     if ($rc == 0) {
         my ($lmt) = ($bm =~ /^(\d+)/);
         unless (defined $lmt) {
             return { state => 'probe-failed', detail => 'unparsable stat output: ' . _trim_err($bm) };
         }
-        my $cn = `$PODMAN exec "$container" date +%s 2>/dev/null`;
+        my $cn = `$PODMAN exec "$container" sh -c 'date +%s' 2>/dev/null`;
         my ($cnow) = ($cn && $cn =~ /^(\d+)/) ? ($1) : ();
         unless (defined $cnow) {
             return { state => 'probe-failed', detail => 'could not read container clock' };
@@ -6624,13 +6764,37 @@ sub _busy_lease_probe {
     }
     # Non-zero: is this "the lease file genuinely doesn't exist" (exec itself
     # succeeded, `stat` just failed) or "could not even run the exec"?
-    if ($bm =~ /no such file or directory/i) {
-        return { state => 'lease-absent' };
+    # ...but only if the file it could not find is the one we ASKED for. The
+    # rule itself is pure and lives in KeepAwake so it can be exercised against
+    # the real measured strings; see classify_lease_stat_failure for why a
+    # rewritten path is a fact about us rather than about the container.
+    if (my $verdict = KeepAwake::classify_lease_stat_failure($bm, $BUSY_LEASE_PATH)) {
+        return { state => 'lease-absent' } if $verdict eq 'lease-absent';
+        return { state => 'probe-failed',
+                 detail => "lease path was rewritten before podman saw it (asked for $BUSY_LEASE_PATH): "
+                           . _trim_err($bm) };
     }
+    # WHETHER THE CONTAINER IS GONE IS ITSELF A QUESTION THAT CAN GO UNANSWERED.
+    #
+    # `podman inspect` prints nothing when the podman CLIENT cannot reach the
+    # machine at all -- the host suspending the WSL2 VM does exactly this. The
+    # old code took the resulting empty string, compared it to 'running', and
+    # returned container-gone: a definite negative, released with no tolerance.
+    # The launch logs carry 267 of these as `container_gone state=` with an
+    # empty state and "Cannot connect to Podman" as the reason, which is the
+    # signature of a client that could not ask rather than a container that
+    # died. An unanswerable inspect is probe-failed, which on_probe holds
+    # through $KEEPAWAKE_PROBE_TOLERANCE before giving up.
     my $state = `$PODMAN inspect --format '{{.State.Status}}' "$container" 2>/dev/null`;
+    my $inspect_rc = $?;
     chomp $state if defined $state;
     $state //= '';
     my $reason = _trim_err($bm);
+    if ($inspect_rc != 0 || $state eq '') {
+        return { state => 'probe-failed',
+                 detail => ($reason ne '' ? "could not reach podman to confirm container state; $reason"
+                                          : 'could not reach podman to confirm container state') };
+    }
     if ($state ne 'running') {
         return { state => 'container-gone', detail => ($reason ne '' ? "state=$state; $reason" : "state=$state") };
     }
@@ -7768,6 +7932,13 @@ sub _container_sampler_round {
 
     my $probe   = _busy_lease_probe($container);
     my $machine = _machine_state();
+    # The container's own PID namespace, so the host can answer liveness for
+    # PIDs a sandboxed run wrote from inside it. `ls /proc` is the cheapest
+    # census available and needs no extra tooling in the image; wrapped in
+    # `sh -c` for the same conversion reason as every other exec here.
+    my $pidlist = `$PODMAN exec "$container" sh -c 'ls /proc' 2>/dev/null`;
+    my @container_pids = ($? == 0 && defined $pidlist)
+        ? (grep { /^\d+$/ } split /\s+/, $pidlist) : ();
 
     my $snap = {
         v            => 1,
@@ -7786,6 +7957,12 @@ sub _container_sampler_round {
         # probe_errors came to ship inert two commits ago.
         status_why   => $status_why,
         machine      => $machine,
+        # EMPTY AND ABSENT MEAN DIFFERENT THINGS HERE. An exec that failed
+        # leaves this absent, and _container_pids_fresh then declines to
+        # answer at all -- which is what preserves _pid_alive's UNKNOWN. A
+        # successful exec always yields at least pid 1, so an empty list
+        # cannot arise from a healthy container and is not special-cased.
+        (@container_pids ? (container_pids => \@container_pids) : ()),
         probe        => (ref $probe eq 'HASH' ? $probe : { state => 'probe-failed',
                                                            detail => 'probe returned no result' }),
     };
@@ -7797,10 +7974,25 @@ sub _container_sampler_round {
 # _container_sampler_main($container, $owner_pid) -> exit code.
 sub _container_sampler_main {
     my ($container, $owner_pid) = @_;
-    # Same reason the other two samplers clear it: the parent `local`s it
-    # immediately before exec, which leaves it set for this process's entire
-    # life and its whole subtree.
-    delete $ENV{MSYS2_ARG_CONV_EXCL};
+    # THIS SAMPLER KEEPS MSYS2_ARG_CONV_EXCL, AND IT IS THE ONE THAT MUST.
+    #
+    # The resources and spend samplers clear it because they go on to run MSYS
+    # tools that WANT POSIX->Windows translation. This one does not: every
+    # subprocess it spawns is podman.exe, a native Windows binary, and the
+    # arguments it hands over are container-side POSIX paths that must arrive
+    # verbatim. Clearing the variable here -- copied from the other two when
+    # this sampler was split out in efdd028 -- put MSYS2 back in the path of
+    # `stat /tmp/.butler-busy`, which was rewritten to the host's Windows TEMP
+    # directory. stat then failed "No such file", _busy_lease_probe read that
+    # as lease-absent, and the wake-lock was never taken out at all: zero
+    # keepawake events across every launch log on the reporting host, while a
+    # fleet ran for sixteen hours and the machine slept under it.
+    #
+    # The call sites are now wrapped in `sh -c` and so are correct under either
+    # conversion state -- belt as well as braces, per CLAUDE.md's rule that the
+    # opt-out and the translation are one technique. This line is the braces.
+    # Do not "restore symmetry" with the other two samplers by deleting it.
+    $ENV{MSYS2_ARG_CONV_EXCL} = '*' if $WINDOWS_FAMILY;
     while (1) {
         last unless kill(0, $owner_pid);
         eval { _write_file_atomic($CONTAINER_SAMPLER_PID, "$$ $owner_pid " . time . "\n"); 1 };
