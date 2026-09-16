@@ -1615,15 +1615,35 @@ sub _run_body {
         push @lines, $r if @$r;
     }
 
+    # "I COULD NOT READ THE LEASE" AND "THERE IS NO LEASE" ARE DIFFERENT FACTS,
+    # and this row used to print the second one for both. An operator watching
+    # a live fleet saw `busy-lease none (no active run)` beside `keep-awake
+    # released (PC may sleep)` while, inside the container, the lease was being
+    # refreshed every two to ten seconds (20260915-230820-d33e). Only one of
+    # those two facts justifies letting the machine sleep, so only one of them
+    # may be rendered as a definite negative.
+    my $probe   = (ref $state->{lease_probe} eq 'HASH') ? $state->{lease_probe} : {};
+    my $pstate  = defined $probe->{state} ? $probe->{state} : '';
     my ($busy_text, $busy_role);
-    if (!defined $state->{busy_age})   { ($busy_text, $busy_role) = ('none (no active run)', 'text.muted'); }
+    if ($pstate eq 'probe-failed') {
+        my $why = defined $probe->{detail} && length $probe->{detail} ? $probe->{detail} : 'reason unrecorded';
+        $why = substr($why, 0, 44) . '...' if length $why > 47;
+        ($busy_text, $busy_role) = ("unreadable ($why)", 'state.warn');
+    }
+    elsif (!defined $state->{busy_age})   { ($busy_text, $busy_role) = ('none (no active run)', 'text.muted'); }
     elsif ($state->{stay_awake})       { ($busy_text, $busy_role) = ('active (' . fmt_duration($state->{busy_age}) . ' ago)', 'state.ok'); }
     else                                 { ($busy_text, $busy_role) = ('idle ('   . fmt_duration($state->{busy_age}) . ' ago)', 'state.warn'); }
     my $busy_row = row({ label => 'busy-lease', value => [ { text => $busy_text, role => $busy_role } ], force => 1 });
     push @lines, $busy_row if @$busy_row;
 
-    my ($keep_text, $keep_role) = $state->{stay_awake}
-        ? ('holding (PC stays awake)', 'state.ok') : ('released (PC may sleep)', 'text.muted');
+    # Report what the lock IS doing, not what this frame would like it to do.
+    # The two diverge exactly while a probe failure is being held through --
+    # the one moment the row is worth reading.
+    my $held = defined $state->{keepawake_held} ? $state->{keepawake_held} : $state->{stay_awake};
+    my ($keep_text, $keep_role) =
+          (!$held)                     ? ('released (PC may sleep)', 'text.muted')
+        : ($pstate eq 'probe-failed')  ? ('holding through an unreadable probe', 'state.warn')
+        :                                ('holding (PC stays awake)', 'state.ok');
     my $keep_row = row({ label => 'keep-awake', value => [ { text => $keep_text, role => $keep_role } ], force => 1 });
     push @lines, $keep_row if @$keep_row;
 
