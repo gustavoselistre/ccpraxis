@@ -685,6 +685,49 @@ sub get_freetext_arg {
 # Op handlers.
 # =====================================================================================
 
+# "status: done" WHILE PIPELINE STEPS ARE STILL OPEN.
+#
+# bp-drive-next.pl SKIPS a package whose status is done. So a package marked done
+# prematurely silently stops being scheduled: its review never runs, its fix-batch
+# never runs, its validation is never recorded, and nothing says so. It simply
+# reads as finished. Three packages in one run ended that way, two from the
+# driver's own bookkeeping and one from a second writer, and the end state is
+# identical in both cases -- which is the argument for a check rather than more
+# care (almanac 20260911-224554-e404).
+#
+# It is silent BY CONSTRUCTION, and that is what makes it worth refusing rather
+# than warning about. A destructive git command announces itself the moment a
+# test fails against a missing file. A falsely-completed package announces
+# nothing at all; the only way to notice is to open the ledger and compare
+# status: against the checkboxes, which is how it was found -- by accident, while
+# a human filled in a status table by hand.
+#
+# WHICH STEPS MAY BE LEFT OPEN, and why this is not a judgement call. The
+# canonical pipeline (blueprint/templates/package-ledger.md:54-61) marks its
+# conditional steps in their own text: step 1 "skip if scope already maps
+# cleanly", step 8 "only if package touches UI". Those may legitimately stay
+# unchecked -- most packages touch no UI, and refusing them would wedge every
+# non-UI package the moment this shipped. Steps 2-7 carry no such wording and
+# are unconditional.
+#
+# '[~]' is accepted alongside '[x]' so that "skipped deliberately" and "forgotten"
+# stop looking identical, which the report asked for.
+sub open_unconditional_steps {
+    my ($B) = @_;
+    my @open;
+    return @open unless defined $B;
+    # The Pipeline section only: from its heading to the next h2.
+    my ($sec) = ($B =~ /^##\s+Pipeline\b[^\n]*\n(.*?)(?=^##\s|\z)/ms);
+    return @open unless defined $sec;
+    for my $line (split /\n/, $sec) {
+        next unless $line =~ /^\s*-\s*\[(.)\]\s*(.+?)\s*$/;
+        my ($mark, $text) = ($1, $2);
+        next if $mark =~ /[xX~]/;          # done, or deliberately skipped
+        next if $text =~ /\b(?:only if|skip if)\b/i;   # conditional by its own wording
+        push @open, $text;
+    }
+    return @open;
+}
 sub op_set_status {
     my @args = @_;
     my %opt;
@@ -699,7 +742,28 @@ sub op_set_status {
             "'$opt{status}' is not a recognised status; allowed values: " . join(', ', @STATUSES));
     }
     my $iso = iso_now();
-    run_op('set-status', $opt{ledger}, sub { return splice_set_status($_[0], $opt{status}, $iso) });
+    # The gate lives INSIDE the splice callback, not in run_op's $post_cb: that
+    # one fires after the rename (:644), which would refuse a write that had
+    # already happened. reject_error exits 2, so nothing reaches disk.
+    run_op('set-status', $opt{ledger}, sub {
+        my ($orig) = @_;
+        my ($new, $notfound) = splice_set_status($orig, $opt{status}, $iso);
+        return ($new, $notfound) unless defined $new;
+        if ($opt{status} eq 'done') {
+            my @open = open_unconditional_steps($new);
+            if (@open) {
+                reject_error('set-status', $opt{ledger},
+                    'refuses status: done while ' . scalar(@open)
+                    . ' unconditional pipeline step(s) are still unchecked: '
+                    . join('; ', map { my $t = $_; $t = substr($t, 0, 60) . '...' if length $t > 63; $t } @open)
+                    . '. A package marked done stops being scheduled, so this would silently '
+                    . 'end the package with that work never run. Tick the steps that are '
+                    . 'genuinely complete, or mark a deliberately-skipped one "- [~]".');
+            }
+        }
+        return ($new, $notfound);
+    });
+
 }
 
 sub op_append_attempt {
