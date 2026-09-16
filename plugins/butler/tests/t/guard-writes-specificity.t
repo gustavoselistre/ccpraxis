@@ -37,8 +37,8 @@ my $J    = JSON::PP->new->canonical;
 # the fake BP_PROJECT_ROOT/BP_DIR trees built below would sit INSIDE the one
 # path the guard is contractually required to wave through -- every case,
 # including the ones this file asserts should be DENIED, would then exit 0
-# for the wrong reason, and pass vacuously. Anchor in the native Windows temp
-# dir instead (HostCaps::tempdir_args(), the same technique documented in
+# for the wrong reason, and pass vacuously. Anchor in the ccpraxis scratch root
+# instead (HostCaps::tempdir_args(), the same technique documented in
 # t/subprocess-containment.t), whose absolute form does not match /tmp/*.
 my $ROOT = tempdir(tempdir_args(), CLEANUP => 1);
 sub fwd { (my $p = shift) =~ s{\\}{/}g; $p }

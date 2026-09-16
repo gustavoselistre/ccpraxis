@@ -55,7 +55,7 @@ my $REAL_PATH = $CLEAN_ENV{PATH} // '/usr/bin:/bin';
 # then EVERY fixture file is exempt, the audit correctly reports nothing, and 11
 # assertions fail claiming "the audit is not live" when in truth the fixture had
 # placed itself inside the one directory the audit is contractually required to
-# ignore. HostCaps::tempdir_args() anchors in the native temp dir, whose absolute
+# ignore. HostCaps::tempdir_args() anchors in the ccpraxis scratch root, whose absolute
 # form (C:/Users/.../Temp/...) does not match ^/tmp/.
 my $TEST_BASE = tempdir(
     (-d '/root' && -w '/root') ? (DIR => '/root') : HostCaps::tempdir_args(),

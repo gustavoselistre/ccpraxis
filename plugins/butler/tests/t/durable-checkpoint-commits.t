@@ -43,7 +43,7 @@ my $UJ     = JSON::PP->new->utf8->canonical;
 # out of conversion is only safe TOGETHER WITH hand-translating your own paths.
 # The orchestrator opts out; this file never translated. HostCaps::git_path is
 # the translation, applied at each git call site.
-# Anchored in the native temp dir, NOT merely translated at the call sites.
+# Anchored in the ccpraxis scratch root, NOT merely translated at the call sites.
 # git_path() below covers this file's OWN git calls, but the code under test
 # (BpOrch::checkpoint) runs git against the root it is handed and does no
 # translation of its own -- correct for the Linux container it ships to. So the

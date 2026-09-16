@@ -39,7 +39,7 @@
 # this, a naive test run risks depositing a stray "./C:/..." tree in the real repository, exactly the
 # landmine documented in the project CLAUDE.md.
 #
-# Fixtures are anchored under the native Windows TEMP dir (HostCaps::tempdir_args), never /tmp:
+# Fixtures are anchored under the ccpraxis scratch root (HostCaps::tempdir_args), never /tmp:
 # rotate requires the ledger path be of the exact shape ".../packages/<pkg>.md" or it exits 3 before
 # doing anything (reproduced), and every fixture built here has that shape plus a sibling reports/.
 # Nothing here ever opens a real blueprint's ledger for writing.

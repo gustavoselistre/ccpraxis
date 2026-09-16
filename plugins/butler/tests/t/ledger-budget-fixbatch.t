@@ -34,7 +34,7 @@
 # `bash -c 'cd "$WD" && perl ...'` under an explicit, fresh, otherwise-empty scratch directory,
 # and DR's direct ensure_dir_exists() call runs after an explicit chdir into its own fresh,
 # otherwise-empty scratch directory, verified empty again afterward. Fixtures are anchored under
-# the native Windows TEMP dir (HostCaps::tempdir_args), never /tmp, and every ledger path used has
+# the ccpraxis scratch root (HostCaps::tempdir_args), never /tmp, and every ledger path used has
 # the required ".../packages/<pkg>.md" shape with a sibling reports/.
 
 use strict;
