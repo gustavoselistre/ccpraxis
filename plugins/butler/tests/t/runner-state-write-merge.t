@@ -52,7 +52,17 @@ my $BOUND = 20;
         # source text containing a classification marker (run-tests.pl:75)
         # -- classified serial, and dropped entirely under --fast (:78), so
         # it must never appear in @results, @red, or the state file.
-        'serial-marker.t' => "#!/usr/bin/env perl\n# would call podman_bin() if ever run\nprint \"not ok 1 - must never run under --fast\\n\";\nexit 1;\n",
+        #
+        # THE PLATFORM MARKER IS LOAD-BEARING, not decoration (test-platform-split
+        # package 03, blueprint Decision 16). This fixture is written to disk and
+        # run through the real run-tests.pl, so it meets the marker gate -- which
+        # sits BEFORE the container heuristic and which --fast does not exempt.
+        # Without a marker it is REFUSED (red, and in the state file) rather than
+        # classified serial and dropped, which is what AC-1's two assertions below
+        # actually observe. The gate is right; this fixture simply predates it.
+        # Decision 16 marked RunnerStateHarness's three generators; this literal
+        # is hand-rolled here and so was not reached by that fix.
+        'serial-marker.t' => "#!/usr/bin/env perl\n# platform: any\n# would call podman_bin() if ever run\nprint \"not ok 1 - must never run under --fast\\n\";\nexit 1;\n",
     );
     my $red_path = File::Spec->catfile($fixture, 'tests', 't', 'quick-red.t');
     my $state_dir = tempdir(CLEANUP => 1);

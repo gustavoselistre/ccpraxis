@@ -56,17 +56,17 @@ sub runner_script { return File::Spec->catfile(repo_root(), 'scripts', 'run-test
 # exit code and the "not ok" line count are both fully deterministic --
 # exactly the two signals run_one() in run-tests.pl judges a file by.
 sub green_source {
-    return "#!/usr/bin/env perl\nprint \"ok 1 - fixture pass\\n\";\nexit 0;\n";
+    return "#!/usr/bin/env perl\n# platform: any\nprint \"ok 1 - fixture pass\\n\";\nexit 0;\n";
 }
 sub red_source {
     my ($label) = @_;
     $label //= 'fixture forced failure';
-    return "#!/usr/bin/env perl\nprint \"not ok 1 - $label\\n\";\nexit 1;\n";
+    return "#!/usr/bin/env perl\n# platform: any\nprint \"not ok 1 - $label\\n\";\nexit 1;\n";
 }
 sub sleeper_source {
     my ($secs) = @_;
     $secs //= 5;
-    return "#!/usr/bin/env perl\nsleep($secs);\nprint \"not ok 1 - fixture forced failure after sleep\\n\";\nexit 1;\n";
+    return "#!/usr/bin/env perl\n# platform: any\nsleep($secs);\nprint \"not ok 1 - fixture forced failure after sleep\\n\";\nexit 1;\n";
 }
 
 # make_fixture_tree(%files) -> $dir

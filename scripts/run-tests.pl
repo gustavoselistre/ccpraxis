@@ -61,9 +61,23 @@ use File::Spec;
 use File::Path qw(make_path);
 use Cwd qw(abs_path);
 use POSIX qw(:sys_wait_h);
+# bsd_glob(), NOT the builtin glob() -- the builtin word-splits its PATTERN
+# argument on whitespace (csh-style), so an explicit target whose own path
+# contains a space (e.g. a real checkout under "C:\Users\Andre\Personal
+# Files") silently matches nothing and the whole invocation exits "no test
+# files matched" without ever naming the file. Same defect, same fix, as
+# scripts/backfill-test-platform.pl (package 02) -- fix-batch
+# 03-enforce-marker step 7, finding A2.
+use File::Glob qw(bsd_glob);
 
 my $ROOT     = "$Bin/..";
 my $ROOT_ABS = abs_path($ROOT) // $ROOT;
+
+# TestPlatform is package 01's sole decision point for a file's platform
+# marker; loaded by literal path (not `use lib` + `use TestPlatform`) because
+# this is a top-level script, not a package, and $ROOT_ABS is only known at
+# runtime, not at BEGIN time.
+require File::Spec->catfile($ROOT_ABS, qw(plugins butler tests lib TestPlatform.pm));
 
 # NO TEST RUN MAY ACTUATE A REAL OS WAKE-LOCK.
 #
@@ -155,6 +169,18 @@ sub _relpath {
     my ($abs) = @_;
     my $rel = File::Spec->abs2rel($abs, $ROOT_ABS);
     $rel =~ s{\\}{/}g;
+    # A refusal message exists so a human can FIND the file. $ROOT_ABS on this
+    # host is always MSYS-style (/c/Development/ccpraxis); an explicit target
+    # given/produced in Windows drive-letter style (C:/Users/...) has no
+    # common ancestor abs2rel can express cleanly, so the "relative" result
+    # still embeds the raw "C:/..." segment after a run of "../" hops
+    # (reproduced live: "../../../../C:/Users/..."). That is longer AND
+    # harder to follow than either a clean relative or a clean absolute path
+    # -- worse than doing nothing. Fall back to the absolute path whenever
+    # the computed "relative" form still looks like a second drive-letter
+    # path spliced onto a climb; this never fires for a real in-tree file
+    # (fix-batch 03-enforce-marker step 7, finding A3).
+    return $abs if $rel =~ m{^(?:\.\./)*[A-Za-z]:[/\\]};
     return $rel;
 }
 
@@ -189,28 +215,56 @@ if ($state_mode) {
     @files = map { _to_abs($_) } @live;
 } elsif (@targets) {
     for my $t (@targets) {
-        my @m = glob($t);
-        @m = glob("$t/tests/t/*.t")  if !@m || -d $t;
-        @m = glob("$ROOT/$t")        unless @m;
-        @m = glob("$ROOT/$t/tests/t/*.t") unless @m;
+        my @m = bsd_glob($t);
+        @m = bsd_glob("$t/tests/t/*.t")  if !@m || -d $t;
+        @m = bsd_glob("$ROOT/$t")        unless @m;
+        @m = bsd_glob("$ROOT/$t/tests/t/*.t") unless @m;
         push @files, grep { /\.t$/ && -f $_ } @m;
     }
 } else {
-    push @files, glob("$ROOT/plugins/*/tests/t/*.t");
+    push @files, bsd_glob("$ROOT/plugins/*/tests/t/*.t");
 }
 @files = sort @files;
 unless (@files) { print STDERR "no test files matched\n"; exit 2 }
 
-# CLASSIFY BY WHAT THE FILE IMPORTS, not by a tag someone has to remember.
-my (@serial, @parallel);
+# MARKER GATE, then CLASSIFY BY WHAT THE FILE IMPORTS, not by a tag someone
+# has to remember. The marker gate runs FIRST and unconditionally (no --fast
+# exemption, no opt-out): a file whose platform declaration is not `legal`
+# is refused rather than guessed into a lane, per Decision 2/4 (blueprint
+# test-platform-split, package 03-enforce-marker). Refusal is per-file, not
+# a whole-run abort, so the rest of the sweep still runs and reports, and
+# --state=failed still has something to retry.
+my (@serial, @parallel, @refused);
 for my $f (@files) {
-    open my $fh, '<', $f or next;
+    open my $fh, '<', $f or next;      # UNCHANGED: unreadable file silently
+                                        # skipped, exactly as before this gate existed.
+    # KNOWN, ACCEPTED TRADEOFF (not changed by fix-batch 03-enforce-marker
+    # step 7): this is a full-file slurp, not TestPlatform::read_prefix's
+    # bounded 4096-byte read, even though parse_marker() only ever looks at
+    # the first 4096 bytes internally. It predates the marker gate -- the
+    # pre-existing container heuristic below needs the WHOLE file text (its
+    # pattern can appear anywhere) -- and the spec deliberately pins reusing
+    # this one read for both checks rather than adding a second, bounded
+    # read. Measured cost: ~500x slower than read_prefix on a 200MB fixture
+    # (0.2s vs 0.0004s), scaling linearly with file size; immeasurable
+    # against a real ~1000s sweep of normal-sized .t files, but a real cost
+    # against a pathologically large file landing in plugins/*/tests/t/.
+    # Flagged for whoever next touches this collection/classify loop; fixing
+    # it here would be a behavioural change to the runner's hot path beyond
+    # this batch's scope.
     my $src = do { local $/; <$fh> };
     close $fh;
+
+    my $marker = TestPlatform::parse_marker($src);
+    if ($marker->{outcome} ne 'legal') {
+        push @refused, { file => $f, marker => $marker };
+        next;   # never guess a lane for a file whose declared need is unknown
+    }
+
     if ($src =~ /TestSandbox|podman_run_capture|podman_bin|probe_image/) { push @serial, $f }
     else                                                                { push @parallel, $f }
 }
-@serial = () if $fast;
+@serial = () if $fast;   # UNCHANGED: --fast never touches @refused
 
 $jobs = _resolve_jobs(
     explicit_jobs => $jobs,
@@ -320,6 +374,70 @@ if (@parallel) {
 # --- serial phase ----------------------------------------------------------
 push @results, run_one($_) for @serial;
 
+# --- refused phase -----------------------------------------------------------
+# A refused file never spawned a process; it is synthesised as a red result so
+# it flows through the existing report/state/exit-code machinery unchanged.
+push @results, _refusal_result($_) for @refused;
+
+# _marker_fix_message($file, $marker) -- the exact, pinned refusal text per
+# outcome/reason (blueprint test-platform-split, package 03-enforce-marker,
+# spec section 1.4). Both surfaces (this script and
+# plugins/butler/tests/t/test-platform-hygiene.t) decide SOLELY through
+# TestPlatform::parse_marker; this sub only turns its outcome/reason into the
+# words a human fixes the file from -- never a second regex over marker
+# syntax.
+# _escape_marker_text($text) -- renders C0 control characters and DEL
+# inertly (a readable "\xHH" escape, not silent stripping) before marker text
+# reaches a terminal or the state file. Without this, a malformed marker line
+# containing a raw \r or an ANSI escape reaches the printed "not ok" line
+# verbatim -- a .t file can then visually spoof or overwrite its own refusal
+# line during a live sweep (confirmed live by the red-team: an embedded \r
+# repaints the terminal line; a raw ESC carries a full ANSI sequence through).
+# This is the ONLY place marker text is rendered for output -- both callers
+# below (unrecognized-value/malformed-marker-line's raw[0], and
+# conflicting-markers' joined list) route through it. Escaping, not
+# stripping, so the message still tells the human what is actually in their
+# file (fix-batch 03-enforce-marker step 7, finding A1).
+sub _escape_marker_text {
+    my ($text) = @_;
+    $text = '' unless defined $text;
+    $text =~ s/([\x00-\x1f\x7f])/sprintf('\\x%02x', ord($1))/ge;
+    return $text;
+}
+
+sub _marker_fix_message {
+    my ($file, $marker) = @_;
+    my $rel = _relpath($file);
+    my $body;
+    if ($marker->{outcome} eq 'absent') {
+        $body = 'no platform marker found. Fix: add "# platform: windows|linux|any" near the top '
+              . 'of the file (within the first 4096 bytes).';
+    } elsif ($marker->{outcome} eq 'invalid' && $marker->{reason} eq 'unrecognized-value') {
+        my $raw = _escape_marker_text($marker->{raw}[0] // '');
+        $body = qq{unrecognized platform value "$raw". Fix: change it to one of: windows, linux, any.};
+    } elsif ($marker->{outcome} eq 'invalid' && $marker->{reason} eq 'conflicting-markers') {
+        my $joined = join(', ', map { _escape_marker_text($_) } @{ $marker->{raw} // [] });
+        $body = "conflicting platform markers found ($joined). Fix: keep exactly one "
+              . '"# platform: ..." line with a single legal value.';
+    } elsif ($marker->{outcome} eq 'invalid' && $marker->{reason} eq 'malformed-marker-line') {
+        my $raw = _escape_marker_text($marker->{raw}[0] // '');
+        $body = qq{malformed platform marker line ("$raw"). Fix: use exactly "# platform: windows|linux|any" }
+              . '(lowercase keyword "platform", one legal value, no trailing text).';
+    } else {
+        # Defensive fallback for any future fourth reason value -- must never
+        # fire against today's TestPlatform.pm.
+        $body = 'platform marker is not legal. Fix: use exactly "# platform: windows|linux|any".';
+    }
+    return "PLATFORM MARKER REFUSED: $rel -- $body";
+}
+
+sub _refusal_result {
+    my ($entry) = @_;
+    my $msg = _marker_fix_message($entry->{file}, $entry->{marker});
+    return { file => $entry->{file}, rc => 1, notok => 1, secs => 0,
+             out => "not ok 1 - $msg\n", refused => 1 };
+}
+
 # --- report ----------------------------------------------------------------
 my $wall = time - $start;
 my @red  = grep { $_->{rc} != 0 } @results;
@@ -331,7 +449,9 @@ if (@red) {
     print "\nRED:\n";
     for my $r (sort { $a->{file} cmp $b->{file} } @red) {
         printf "  %-52s exit=%-3d notok=%d%s\n", basename($r->{file}), $r->{rc}, $r->{notok},
-            ($r->{notok} == 0 ? '   <- died, no failing assertion' : '');
+            ($r->{notok} == 0 ? '   <- died, no failing assertion'
+                              : $r->{refused} ? '   <- refused: platform marker missing/invalid'
+                                               : '');
         for my $line (grep { /^not ok/ } split /\n/, $r->{out}) {
             print "      $line\n";
         }
