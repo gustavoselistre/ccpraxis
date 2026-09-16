@@ -23,6 +23,21 @@ use MountSpec qw(winify_path convert_v_to_mount);
 use Exporter qw(import);
 use File::Temp qw(tempdir);
 use File::Path qw(remove_tree);
+use File::Basename qw(dirname);
+use Cwd qw(abs_path);
+
+# HostCaps.pm: the sole owner of scratch_root() (blueprint test-platform-
+# split, package 04-scratch-root). __FILE__-derived, never FindBin/$Bin --
+# $Bin above is the INVOKING SCRIPT's directory (a process-wide singleton),
+# not this module's own directory, so it is only correct when THIS file is
+# the one doing the requiring of its OWN siblings (MountSpec, above); a
+# sibling-lookup for HostCaps needs this module's own path regardless of who
+# required it. Bareword `require HostCaps;` (not a string-path require) so
+# every caller lands on the identical %INC key and the file loads exactly
+# once no matter which of HostCaps.pm / StewardTest.pm / TestSandbox.pm is
+# required first.
+use lib dirname(abs_path(__FILE__)) . "/../../../butler/tests/lib";
+require HostCaps;
 
 our @EXPORT_OK = qw(
     podman_bin
@@ -76,15 +91,31 @@ sub new_container_name { return _tag() . '-c' }
 
 # winify_path comes from MountSpec.pm (imported above).
 
-# Anchor temp dirs under $HOME (or $USERPROFILE on Windows). On WSL2-backed
-# Docker/Podman, $HOME is reachable via /mnt/c automounts; same on Linux
-# native; same on macOS via virtiofs. Git-Bash /tmp is in a 9p namespace
-# the VM may not see (historical Hyper-V bug — kept the anchor for
-# portability across backends).
+# Anchor temp dirs under HostCaps::scratch_root()."/sandbox" (blueprint
+# test-platform-split, package 04-scratch-root) when defined -- i.e. on
+# Windows, or under any platform where CCPRAXIS_SCRATCH_ROOT is set.
+# HostCaps::scratch_root() dying on a bad override propagates uncaught here,
+# deliberately -- see HostCaps.pm.
+#
+# When scratch_root() is undef (non-Windows, no override), fall back to
+# EXACTLY today's pre-existing behavior: $HOME (or $USERPROFILE) is where
+# WSL2-backed Docker/Podman, Linux-native and macOS-virtiofs backends all
+# reach a bind-mounted host path from inside a container (Git-Bash /tmp is
+# in a 9p namespace the VM may not see -- historical Hyper-V bug). The
+# HOME/USERPROFILE lookup, and its die-if-missing, only happen on this
+# branch now -- on this Windows host scratch_root() is always defined, so
+# requiring HOME/USERPROFILE to be set when nothing downstream needs either
+# would be a new, avoidable failure mode with no compensating benefit.
 sub new_temp_dir {
-    my $home = $ENV{HOME} // $ENV{USERPROFILE};
-    die "neither HOME nor USERPROFILE set" unless defined $home;
-    my $base = "$home/.cache/sandbox-tests";
+    my $scratch = HostCaps::scratch_root();
+    my $base;
+    if (defined $scratch) {
+        $base = "$scratch/sandbox";
+    } else {
+        my $home = $ENV{HOME} // $ENV{USERPROFILE};
+        die "neither HOME nor USERPROFILE set" unless defined $home;
+        $base = "$home/.cache/sandbox-tests";
+    }
     require File::Path;
     File::Path::make_path($base) unless -d $base;
     # CLEANUP => 1, not 0: this used to opt out of File::Temp's own cleanup

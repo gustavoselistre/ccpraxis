@@ -29,6 +29,22 @@ our @EXPORT_OK = qw(
 my $LIB_DIR = dirname(abs_path(__FILE__));
 my $SCRIPT  = abs_path("$LIB_DIR/../../scripts/vault-sync.pl");
 
+# ── HostCaps.pm: the sole owner of scratch_root() (blueprint test-platform-
+# split, package 04-scratch-root). __FILE__-derived, never FindBin/$Bin --
+# $Bin is a process-wide singleton set from the INVOKING SCRIPT's directory,
+# not this module's own directory, so it would resolve differently depending
+# on which plugin's .t required us. Bareword `require HostCaps;` (not a
+# string-path require) so every caller lands on the identical %INC key and
+# the file loads exactly once no matter which of HostCaps.pm / StewardTest.pm
+# / TestSandbox.pm is required first.
+#
+# NOTE: computed inline here, not via the pre-existing $LIB_DIR variable
+# above -- `use lib` is a compile-time (BEGIN-time) construct, so it runs
+# BEFORE the runtime `my $LIB_DIR = ...` assignment above has executed;
+# interpolating $LIB_DIR here would silently see it undef.
+use lib dirname(abs_path(__FILE__)) . "/../../../butler/tests/lib";
+require HostCaps;
+
 sub vault_sync_script { return $SCRIPT }
 
 # ── assertions ──────────────────────────────────────────────────────
@@ -82,21 +98,54 @@ sub done_testing {
 # A unique temp root, auto-removed at process exit. Returned in /c/-style POSIX
 # form — the SAME form vault-sync.pl uses internally (norm_path) and passes to
 # native git, relying on MSYS to convert /c/... -> C:\... (run_vs/_run keep that
-# conversion ON; see _msys_convert_on). We deliberately prefer C:/Users/Public:
-# it is pure-ASCII and free of 8.3 short names, so msys-perl and native git agree
-# byte-for-byte on every path. The user-profile TEMP is "C:\Users\ANDR~1\..." —
-# its short name resolves inconsistently across the perl/git boundary, breaking
-# local git remotes. (Off Windows these substitutions are no-ops; /tmp is used.)
+# conversion ON; see _msys_convert_on). The first candidate is
+# HostCaps::scratch_root()."/steward" (blueprint test-platform-split, package
+# 04-scratch-root): a single ccpraxis-owned root, pure-ASCII, spelled
+# identically across the perl/git boundary (Decision 11) — unlike the
+# user-profile TEMP, which Windows reports as "C:\Users\ANDR~1\..." while
+# abs_path returns the long form, and that disagreement is what breaks local
+# git remotes. HostCaps::scratch_root() dying on a bad CCPRAXIS_SCRATCH_ROOT
+# override propagates uncaught here, deliberately — see HostCaps.pm. (Off
+# Windows scratch_root() is undef, so the existing $ENV{TEMP}/$ENV{TMP}//tmp
+# candidates are used exactly as before.)
 sub temproot {
+    my $scratch = HostCaps::scratch_root();
+    my $first   = defined $scratch ? "$scratch/steward" : undef;
     my $base;
-    for my $cand ('/c/Users/Public', $ENV{TEMP}, $ENV{TMP}, '/tmp') {
-        next unless defined $cand && length $cand;
-        my $p = $cand;
-        $p =~ s|\\|/|g;
-        $p =~ s|^([a-zA-Z]):/|"/" . lc($1) . "/"|e;
-        if (-d $p && -w $p) { $base = $p; last; }
+    if (defined $first) {
+        # A3 (fix-batch, package 04-scratch-root, red-team M3): this
+        # candidate's role changed from cosmetic (a hardcoded convenience
+        # path, C:/Users/Public) to LOAD-BEARING -- it is now the one root a
+        # single Defender exclusion is supposed to cover. Silently falling
+        # through to %TEMP%/tmp here would defeat this whole package's
+        # purpose with no diagnostic, so unlike the pre-existing candidate
+        # tail below (kept only for the non-Windows/no-override case), this
+        # branch is authoritative: create it, and DIE LOUDLY, naming the
+        # path and reason, if it cannot be created or is not writable.
+        eval { make_path($first) unless -d $first; 1 }
+            or die "StewardTest: could not create scratch subdirectory "
+                 . "'$first' (HostCaps::scratch_root().'/steward'): $@\n";
+        die "StewardTest: scratch subdirectory '$first' "
+          . "(HostCaps::scratch_root().'/steward') exists but is not "
+          . "writable by the current process; refusing to fall back to "
+          . "\%TEMP\%/tmp, which would silently defeat the "
+          . "Defender-exclusion consolidation this root exists for.\n"
+            unless -w $first;
+        $base = $first;
+        $base =~ s|\\|/|g;
+        $base =~ s|^([a-zA-Z]):/|"/" . lc($1) . "/"|e;
+    } else {
+        # Fallthrough tail, unchanged from before this package: only
+        # reached when scratch_root() is undef (non-Windows, no override).
+        for my $cand ($ENV{TEMP}, $ENV{TMP}, '/tmp') {
+            next unless defined $cand && length $cand;
+            my $p = $cand;
+            $p =~ s|\\|/|g;
+            $p =~ s|^([a-zA-Z]):/|"/" . lc($1) . "/"|e;
+            if (-d $p && -w $p) { $base = $p; last; }
+        }
+        die "StewardTest: no writable temp base found\n" unless $base;
     }
-    die "StewardTest: no writable temp base found\n" unless $base;
     my $root = tempdir('steward-test-XXXXXX', DIR => $base, CLEANUP => 1);
     $root =~ s|\\|/|g;
     $root =~ s|^([a-zA-Z]):/|"/" . lc($1) . "/"|e;

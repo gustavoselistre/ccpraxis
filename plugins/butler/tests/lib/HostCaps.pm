@@ -31,6 +31,7 @@ our @EXPORT_OK = qw(
     symlink_works chmod_works signals_work have_jq
     data_dir_ancestor native_tmp tempdir_args git_path
     corpus_blueprint_dir corpus_fixture
+    scratch_root
 );
 
 use File::Temp qw(tempdir);
@@ -68,15 +69,136 @@ sub native_tmp {
 # Splice into a tempdir() call: tempdir(HostCaps::tempdir_args(), CLEANUP => 1)
 #
 # NOTE: prefer git_path() below for fixtures whose paths are also COMPARED
-# against abs_path() results. Anchoring the tempdir itself in %TEMP% makes it a
-# Windows-form path, while abs_path() on MSYS always returns POSIX form, so
+# against abs_path() results. Anchoring the tempdir itself under
+# scratch_root()'s own subdirectory (formerly %TEMP%, before blueprint
+# test-platform-split package 04-scratch-root) makes it a Windows-form path,
+# while abs_path() on MSYS always returns POSIX form, so
 # `is($got, "$ROOT/x")` starts failing on the path STYLE rather than on the
 # behaviour under test. Measured: it silently broke four otherwise-correct
 # assertions in t/22. Translate at the call site instead of at the source when
 # the path has perl-side readers as well as native ones.
 sub tempdir_args {
-    my $base = native_tmp();
-    return $base ? (DIR => $base) : ();
+    my $root = scratch_root();
+    return () unless defined $root;
+    my $dir = "$root/butler";
+    make_path($dir) unless -d $dir;
+    return (DIR => $dir);
+}
+
+# --- scratch_root ------------------------------------------------------------
+#
+# The SOLE owner of the ccpraxis test-scratch root (blueprint test-platform-
+# split, package 04-scratch-root, Decision 6/7). StewardTest.pm and
+# TestSandbox.pm do NOT implement this themselves -- they `require HostCaps`
+# (bareword, via an __FILE__-derived `use lib`, so every caller lands on the
+# identical %INC key and the file loads exactly once) and call
+# HostCaps::scratch_root() fully-qualified.
+#
+# Consolidates three previously-independent scratch bases (HostCaps'
+# %TEMP%-anchored tempdir_args, StewardTest's C:/Users/Public, TestSandbox's
+# $HOME/.cache/sandbox-tests) into ONE root so a single Windows Defender
+# exclusion covers all test scratch, without excluding the whole of %TEMP%
+# (drive-by downloads land there) or C:/Users/Public (declined, Decision 10).
+#
+# Default: C:/ccpraxis-scratch (Decision 7 -- a drive-root ASCII path,
+# deliberately, not the untranslated-POSIX-path stray class the user-global
+# CLAUDE.md warns about). Overridable via CCPRAXIS_SCRATCH_ROOT for CI, with
+# the override VALIDATED (absolute, exists) rather than trusted -- a bad
+# override DIES rather than silently falling back, so a broken CI pipeline is
+# never masked as "just used the platform default".
+#
+# NOTE: this is a NEW, separate function. native_tmp()/tempdir_args()'s prior
+# behavior and git_path()'s substitution target are NOT touched by this sub --
+# see native_tmp()'s own header comment for why it must stay %TEMP%-anchored
+# (it is a translation table for MSYS's physical /tmp mount, not a choice of
+# scratch root).
+#
+# MEMOIZED FOR THE LIFE OF THE PROCESS: mutating $ENV{CCPRAXIS_SCRATCH_ROOT}
+# after the first call here has no effect -- the first result is cached in
+# %cache and handed to every later caller in this process, silently, by
+# design (same pattern as native_tmp()'s own cache, above). A caller that
+# needs to exercise a second override value must do so in a fresh
+# subprocess, not via `local $ENV{CCPRAXIS_SCRATCH_ROOT} = ...` in-process --
+# see StewardTest.pm's own header for the identical discipline applied to
+# vault-sync.pl's HOME handling, and this package's own oracle
+# (scratch-root-single.t's "MEMOIZATION FORCES SUBPROCESSES" note) for the
+# concrete pattern.
+#
+# OVERRIDE VALIDATION (blueprint test-platform-split, Decision 12): the
+# override does not sit BESIDE the default root, it BECOMES the root, so it
+# inherits the native-path constraint the default root must also satisfy --
+# not merely "absolute" in the generic sense. On Windows a bare POSIX-style
+# absolute path (a leading '/' with no drive letter) is refused outright: a
+# native binary resolves that leading '/' against the CURRENT DRIVE, not a
+# POSIX root, which is exactly the shape of the 2026-06-12 576-stray
+# incident this whole package exists to prevent (e.g.
+# CCPRAXIS_SCRATCH_ROOT=/usr is a real, existing directory on Git-for-Windows
+# that maps to C:\Program Files\Git\usr -- passing an "absolute + exists"
+# check while landing test scratch inside the Git install tree). Off Windows
+# a POSIX absolute path stays correct, since the override is the only way
+# scratch_root() returns anything there at all.
+#
+# The override is also never canonicalized: a '..' segment (or a
+# symlink/junction) is refused outright rather than silently resolved --
+# consistent with this function's "refuse rather than guess" doctrine
+# elsewhere (the relative-path and does-not-exist checks below).
+sub scratch_root {
+    return $cache{scratch_root} if exists $cache{scratch_root};
+
+    my $override = $ENV{CCPRAXIS_SCRATCH_ROOT};
+    if (defined $override && length $override) {
+        (my $p = $override) =~ s{\\}{/}g;
+        my $is_windows = $^O =~ /^(MSWin32|cygwin|msys)$/;
+
+        if ($is_windows) {
+            # A bare POSIX-style absolute path (leading '/', no drive letter)
+            # is REFUSED on Windows, distinctly from "relative" -- see the
+            # header comment above for why this exact shape is the hazard.
+            die "CCPRAXIS_SCRATCH_ROOT is set to '$override', a bare "
+              . "POSIX-style absolute path. On Windows a native binary "
+              . "(git.exe, podman.exe) resolves a leading '/' against the "
+              . "CURRENT DRIVE, not a POSIX root -- the same drive-root "
+              . "resolution hazard that left 576 stray entries on "
+              . "2026-06-12. Use a drive-letter form instead (e.g. "
+              . "C:/ci-scratch), or unset the variable to use the default "
+              . "root.\n"
+                if $p =~ m{^/} && $p !~ m{^[A-Za-z]:/};
+            die "CCPRAXIS_SCRATCH_ROOT is set to a relative path ('$override'); "
+              . "it must be absolute. Refusing rather than guessing.\n"
+                unless $p =~ m{^[A-Za-z]:/};
+        } else {
+            die "CCPRAXIS_SCRATCH_ROOT is set to a relative path ('$override'); "
+              . "it must be absolute. Refusing rather than guessing.\n"
+                unless $p =~ m{^/};
+        }
+
+        # A '..' segment is refused outright, never silently resolved --
+        # catches both literal traversal and (since a '..' component is what
+        # would need to be walked through) the common shape a copy-pasted
+        # symlink-relative path would take.
+        die "CCPRAXIS_SCRATCH_ROOT is set to '$override', which contains a "
+          . "'..' path segment. It must be given in canonical form (no "
+          . "'..'); refusing rather than guessing which directory you "
+          . "mean.\n"
+            if $p =~ m{(?:^|/)\.\.(?:/|\z)};
+
+        if (-e $p && !-d $p) {
+            die "CCPRAXIS_SCRATCH_ROOT is set to '$override', but that path "
+              . "exists and is not a directory. Point it at a directory, or "
+              . "unset the variable to use the default root.\n";
+        }
+        die "CCPRAXIS_SCRATCH_ROOT is set to '$override', but that directory "
+          . "does not exist. Create it first, or unset the variable to use "
+          . "the default root.\n"
+            unless -d $p;
+        return $cache{scratch_root} = $p;
+    }
+
+    return $cache{scratch_root} = undef unless $^O =~ /^(MSWin32|cygwin|msys)$/;
+
+    my $default = 'C:/ccpraxis-scratch';
+    make_path($default) unless -d $default;
+    return $cache{scratch_root} = $default;
 }
 
 # --- git_path --------------------------------------------------------------
