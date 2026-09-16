@@ -250,9 +250,40 @@ if [ -f "$MARK.wakeup-pending" ]; then
   # second time could only reproduce that gap. bp-resumption.pl answers instead,
   # over the same module bp-runstate.pl uses. The marker is consumed either way,
   # so a stale one can never be spent twice.
-  VERIFY_OUT=$(perl "$HOOK_DIR/../scripts/bp-resumption.pl" verify \
-                 --file "$MARK.wakeup-pending" --ttl "$WAKEUP_TTL_S" 2>&1)
-  VERIFY_RC=$?
+  # THE RECORD ON DISK IS ALWAYS THE EXPIRED ONE AT THIS MOMENT, AND THAT IS
+  # STRUCTURAL RATHER THAN UNLUCKY.
+  #
+  # What re-invokes an armed session is the PREVIOUS hold's own expiry. So a
+  # woken turn begins with an expired record on disk, dispatches a fresh
+  # background `hold`, and ends. The Stop hook then reads the same file the new
+  # hold is racing to write. Measured (almanac 20260916-105540-0d46): the gate
+  # read at 10:54:16, the background hold wrote at 10:54:17, and a session that
+  # had done exactly what the skill instructs was blocked by one second.
+  #
+  # Every continuity cycle is that race, so retrying is not papering over a
+  # flake -- it is reading the file at a moment when the answer can be right.
+  # The wait only happens on the path that is ABOUT TO BLOCK THE TURN, which is
+  # the expensive outcome; a permitted stop still costs one verify and no sleep.
+  # Bounded hard, because a gate that hangs is worse than one that refuses.
+  VERIFY_RETRY_MAX=12          # x 250ms = 3s ceiling
+  VERIFY_RETRY=0
+  while : ; do
+    VERIFY_OUT=$(perl "$HOOK_DIR/../scripts/bp-resumption.pl" verify \
+                   --file "$MARK.wakeup-pending" --ttl "$WAKEUP_TTL_S" 2>&1)
+    VERIFY_RC=$?
+    [ "$VERIFY_RC" -eq 0 ] && break
+    # Only the refusals a not-yet-written record can produce are worth waiting
+    # out. A marker that is present and genuinely invalid -- not bounded, no
+    # pid, a dead or recycled process -- will not become valid by waiting, and
+    # must refuse at once.
+    case "$VERIFY_OUT" in
+      *'deadline has passed'*|*unreadable*|*'no deadline'*|*'no write timestamp'*|*'cannot open'*|*'does not exist'*) ;;
+      *) break ;;
+    esac
+    VERIFY_RETRY=$((VERIFY_RETRY + 1))
+    [ "$VERIFY_RETRY" -ge "$VERIFY_RETRY_MAX" ] && break
+    sleep 0.25
+  done
 
   if [ "$VERIFY_RC" -eq 0 ]; then
     # A VALID MARKER IS NOT CONSUMED. It used to be removed on every stop,
