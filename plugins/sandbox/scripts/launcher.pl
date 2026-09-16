@@ -49,6 +49,7 @@ use CcpraxisWorkCopy qw(workcopy_route workcopy_refusal_outcome);
 use ProtectedPaths qw(path_relation protected_roots target_self_codes normalize_path);
 use LaunchLog ();   # B1: durable per-launch diagnostic log (next to us in scripts/)
 use Dashboard ();   # B2: the raw-ANSI TUI dashboard framework
+use WtProfile ();   # sandbox-wt-profile/02: [c]-press profile fragment ensure + name
 use TokenInfo ();   # s08: pure access/refresh token status struct for the dashboard
 use SpendPanel ();  # b37: pure Claude/Go/Zen spend status struct for the dashboard
                     # (the LAUNCHER loads it and computes; Dashboard.pm renders the
@@ -8680,6 +8681,71 @@ sub _row_time_key {
     return $1 * 3600 + $2 * 60 + $3;
 }
 
+# >>> wt-profile:BEGIN
+# wt_profile_plan(%seams) -> { profile => $name_or_undef, event => $event_or_undef }
+#
+# Pure, seam-driven decision for the [c] launch-claude hotkey: should the new
+# window open under the ccpraxis Windows Terminal profile, and if not, what
+# reason should the launch log carry? This function performs no I/O of its
+# own — every side effect happens through the three caller-supplied seams
+# (resolve_root, ensure, profile_name) — so it can be extracted and eval'd
+# into a fresh package by a test without ever touching a real filesystem.
+#
+# Contract (see specs/02-launch-claude-uses-profile-spec.md sec 2.2):
+#   - success: { profile => $name, event => undef }
+#   - failure: { profile => undef, event => { type => 'launch_profile_degraded',
+#                                              fields => { reason => $code } } }
+#   profile and event are mutually exclusive on every path. Every seam call is
+#   fenced so this function itself never raises and never emits a warning.
+sub wt_profile_plan {
+    my (%seams) = @_;
+
+    my $make_degrade = sub {
+        my ($reason) = @_;
+        $reason = 'bad_result' if defined($reason) && ref($reason);
+        $reason = 'unknown' unless defined($reason) && $reason =~ /\S/;
+        return {
+            profile => undef,
+            event   => { type => 'launch_profile_degraded', fields => { reason => $reason } },
+        };
+    };
+
+    # Step 1: resolve the fragment root.
+    my $root_result;
+    my $root_ok = eval {
+        local $SIG{__WARN__} = sub { };
+        $root_result = $seams{resolve_root}->();
+        1;
+    };
+    return $make_degrade->('ensure_threw') unless $root_ok;
+    return $make_degrade->('bad_result')   unless ref($root_result) eq 'HASH';
+    return $make_degrade->($root_result->{reason}) unless $root_result->{ok};
+
+    # Step 2: ensure the fragment file is written/current.
+    my $ensure_result;
+    my $ensure_ok = eval {
+        local $SIG{__WARN__} = sub { };
+        $ensure_result = $seams{ensure}->($root_result->{root});
+        1;
+    };
+    return $make_degrade->('ensure_threw') unless $ensure_ok;
+    return $make_degrade->('bad_result')   unless ref($ensure_result) eq 'HASH';
+    return $make_degrade->($ensure_result->{reason}) unless $ensure_result->{ok};
+
+    # Step 3: the profile name to hand to spawn_argv.
+    my $name;
+    my $name_ok = eval {
+        local $SIG{__WARN__} = sub { };
+        $name = $seams{profile_name}->();
+        1;
+    };
+    return $make_degrade->('ensure_threw')   unless $name_ok;
+    return $make_degrade->('no_profile_name') unless defined($name) && length($name);
+
+    return { profile => $name, event => undef };
+}
+# <<< wt-profile:END
+
 # _spawn_session — the dashboard's launch-claude hotkey: open a NEW Windows
 # Terminal window running the internal connector entry
 # (`claude-sandbox --session <project>`). A native wt.exe can't exec the .ps1 by
@@ -8715,7 +8781,14 @@ sub _spawn_session {
         return 'redraw';
     }
 
-    my $argv = Dashboard::spawn_argv('wt', { cmd => \@inner });   # ['wt.exe','-w','new',…]
+    my $plan = wt_profile_plan(
+        resolve_root => sub { WtProfile::fragment_root() },
+        ensure       => sub { WtProfile::ensure_fragment($_[0]) },
+        profile_name => sub { WtProfile::profile_name() },
+    );
+    eval { log_ev($plan->{event}{type}, $plan->{event}{fields}); 1 } if $plan->{event};
+
+    my $argv = Dashboard::spawn_argv('wt', { cmd => \@inner, profile => $plan->{profile} });   # ['wt.exe','-w','new', -p <profile>?, …]
     log_ev('launch_session', { mode => 'wt' });
     my $rc = system(@$argv);   # returns immediately (detached window)
     log_ev('launch_session_done', { mode => 'wt', exit => ($rc >> 8) });
