@@ -60,9 +60,15 @@ for my $group (@{ $pre || [] }) {
 }
 ok(scalar @bash_cmds, 'A1: some hooks are registered for Bash')
     or diag('nothing registered for Bash at all -- A2 would be vacuous');
-ok((grep { /guard-git-mutations\.sh/ } @bash_cmds),
+my @ggm = grep { /guard-git-mutations\.sh/ } @bash_cmds;
+ok(scalar @ggm,
    'A2: guard-git-mutations.sh is registered by the PLUGIN, so it travels to every project')
     or diag("Bash-reaching hooks are:\n  " . join("\n  ", @bash_cmds));
+is(scalar(grep { !/--only-during-butler-run/ } @ggm), 0,
+   'A3: ...and every travelling registration is RUN-SCOPED. hooks.json reaches every project '
+ . 'on the machine, so a bare one here would deny these commands in the operator\'s own '
+ . 'unrelated work -- the objection hooks-json-route-registration.t AC7 was written to hold, '
+ . 'and the reason this registration took a flag rather than being dropped in as-is');
 
 # ===========================================================================
 # B. UNGATED. The whole point is that it is not scoped to worker sessions.
@@ -92,10 +98,13 @@ SKIP: {
 my $V = 'st' . 'ash';
 
 sub run_guard {
-    my ($command) = @_;
+    my ($command, %opt) = @_;
+    my $args = $opt{args} // '';
     my $payload = JSON::PP->new->encode({ tool_name => 'Bash', tool_input => { command => $command } });
     my $tmp = "$Bin/.guard-probe.$$";
-    open my $fh, '|-', "bash \"$GUARD\" > \"$tmp\" 2>&1" or die "spawn: $!";
+    local %ENV = (%ENV, %{ $opt{env} || {} });
+    delete $ENV{BP_LEDGER} unless ($opt{env} || {})->{BP_LEDGER};
+    open my $fh, '|-', "bash \"$GUARD\" $args > \"$tmp\" 2>&1" or die "spawn: $!";
     print $fh $payload;
     close $fh;
     my $rc = $? >> 8;
@@ -138,6 +147,41 @@ SKIP: {
     my $s = do { local (@ARGV, $/) = ($settings); <> };
     like($s, qr/guard-git-mutations\.sh/,
          'D1: ccpraxis .claude/settings.json still registers the guard directly');
+}
+
+# ===========================================================================
+# E. THE SCOPING FLAG, EXERCISED. Three populations, and the answers differ.
+#
+# This is the assertion set that keeps the fix from being an imposition. The
+# guard reaches butler work in every project; it does not reach the operator's
+# own ordinary sessions in projects that have nothing to do with butler.
+# ===========================================================================
+{
+    my $cmd = "git $V";
+
+    my ($rc_bare) = run_guard($cmd);
+    is($rc_bare, 2,
+       'E1: invoked BARE (ccpraxis .claude/settings.json) it still blocks unconditionally -- '
+     . 'the original incident\'s home is unchanged');
+
+    my ($rc_scoped_idle) = run_guard($cmd, args => '--only-during-butler-run');
+    is($rc_scoped_idle, 0,
+       'E2: run-scoped with no butler run active, it ALLOWS -- the operator keeps their own '
+     . 'tools in their own work, which is the whole reason the flag exists');
+
+    my ($rc_scoped_worker) = run_guard($cmd, args => '--only-during-butler-run',
+                                             env  => { BP_LEDGER => 'x' });
+    is($rc_scoped_worker, 2,
+       'E3: run-scoped inside a butler-launched worker, it BLOCKS');
+
+    # And the predicate that covers the case this whole report was about: a
+    # drive-solo Task subagent inherits no BP_* at all, so liveness has to be
+    # readable from disk rather than from the environment.
+    my $src2 = do { local (@ARGV, $/) = ($GUARD); <> };
+    like($src2, qr/bp_drive_any_active/,
+         'E4: the scope predicate consults the on-disk drive-solo marker, not just the '
+       . 'environment -- a Task subagent dispatched by a driver inherits no BP_* but can '
+       . 'still see the marker, and that subagent is exactly what destroyed the package');
 }
 
 done_testing();

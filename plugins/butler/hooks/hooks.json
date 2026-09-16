@@ -46,7 +46,7 @@
          {
             "hooks" : [
                {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-git-mutations.sh\"",
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-git-mutations.sh\" --only-during-butler-run",
                   "timeout" : 15,
                   "type" : "command"
                },

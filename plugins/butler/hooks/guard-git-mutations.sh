@@ -36,6 +36,42 @@ source "$HOOK_DIR/lib.sh"
 # TODAY's raw-fallback behavior (AC17), never to unconditional allow.
 [ -r "$HOOK_DIR/../scripts/bp-lib.sh" ] && source "$HOOK_DIR/../scripts/bp-lib.sh"
 
+# --only-during-butler-run: THE PLUGIN-WIDE REGISTRATION IS SCOPED. THE
+# ccpraxis ONE IS NOT.
+#
+# This guard has to reach two different populations, and they want different
+# answers.
+#
+#   * ccpraxis's own .claude/settings.json registers it BARE. That is where the
+#     original incident happened and the protection there is unconditional, as
+#     the header above argues. Unchanged.
+#
+#   * The plugin's hooks.json registers it WITH THIS FLAG. hooks.json travels to
+#     every project on the machine, and hooks-json-route-registration.t's AC7
+#     deferred that registration for a reason worth respecting: registering it
+#     bare would apply it to EVERY session on this machine, butler-related or
+#     not, and confiscate `git st`+`ash` from the operator's own ordinary work
+#     in unrelated projects. That is not a side effect anyone signed up for.
+#
+# So the travelling registration fires only while a butler run is actually in
+# progress. Crucially the predicate is bp_drive_any_active -- a FILESYSTEM check,
+# not an environment one -- so it still covers the case the guard exists for: a
+# Task subagent dispatched by a drive-solo driver inherits none of the BP_*
+# contract, but it can see the same marker directory. BP_LEDGER is accepted too,
+# for butler-launched workers.
+#
+# Without this flag nothing changes, so the ccpraxis registration and every
+# existing direct invocation behave exactly as before.
+BP_RUN_SCOPED=0
+for _arg in "$@"; do
+  [ "$_arg" = "--only-during-butler-run" ] && BP_RUN_SCOPED=1
+done
+if [ "$BP_RUN_SCOPED" = "1" ]; then
+  if [ -z "${BP_LEDGER:-}" ]; then
+    bp_drive_any_active || exit 0
+  fi
+fi
+
 bp_read_payload closed
 
 # See lib.sh:bp_json_get. This used to hard-require jq, which the Windows host

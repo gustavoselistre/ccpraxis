@@ -401,7 +401,7 @@ sub nonblank_lines { return grep { /\S/ } split /\n/, $_[0] }
     # assertion actually pins -- that ledger-guard.sh is not in the Bash block --
     # still fails the moment it appears.
     is_deeply([ map { $_->{command} } @{ $b1->{hooks} // [] } ],
-              [ $cmd_of->('guard-git-mutations.sh'),
+              [ $cmd_of->('guard-git-mutations.sh') . ' --only-during-butler-run',
                 $cmd_of->('guard-bash.sh'), $cmd_of->('mark-wakeup.sh'),
                 $cmd_of->('gate-headless-background.sh'), $cmd_of->('guard-judge-checks.sh'),
                 $cmd_of->('guard-validation-interlock.sh') ],
