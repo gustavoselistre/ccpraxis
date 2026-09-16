@@ -89,6 +89,7 @@ use Cwd ();
 
 my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
 require "$DIR/bp-keepawake.pl";
+require "$DIR/BpSession.pm";
 
 # The refresher's cadence, and the pid-file heartbeat window derived from it.
 # 60s is an order of magnitude inside both leases it refreshes (keep-awake.ps1's
@@ -204,6 +205,54 @@ sub ttl_hours {
     return $h;
 }
 
+# $FIND_TRANSCRIPT — a seam, not a setting, same shape as $PLATFORM above.
+# Production never sets it; any_active() falls back to
+# BpSession::find_transcript. Tests set
+# `local $BpContinuityLease::FIND_TRANSCRIPT = sub { ... }` so the liveness
+# filter can be exercised against fixture paths instead of the real
+# ~/.claude/projects tree.
+our $FIND_TRANSCRIPT;
+
+# TRANSCRIPT_LIVENESS_SECONDS — how stale a resolved transcript may be before
+# its session is treated as provably dead rather than merely quiet.
+#
+# Reuses BpSession::transcript_files' OWN precedent for this exact number: its
+# default max_age is 3600, on the reasoning that a transcript untouched for an
+# hour cannot be the one currently in use. The longest LEGITIMATE transcript
+# silence here is bounded by the wake-up TTL (900s — a `hold` may not exceed
+# it without refreshing), so 3600s leaves roughly 4x headroom over that while
+# still being 12x tighter than the 12h marker TTL below. It is not the same
+# question ensure_daemon's pid-file staleness asks (that is "is the refresher
+# still ticking", answered every $TICK_SECONDS) and the two are not harmonised
+# on purpose — different clocks, different owners.
+our $TRANSCRIPT_LIVENESS_SECONDS = 3600;
+
+# _marker_is_live($session_id) -> 1|0
+#
+# A READ-ONLY liveness filter, never a reaper: it only ever changes whether a
+# marker counts toward "something is armed" in THIS process's answer, and
+# never touches the marker file itself (see any_active's own header on why
+# non-reaping is deliberate here). Resolution and the stat both fail SAFE —
+# every undeterminable case answers "live" — mirroring vault-sync.pl's
+# lock_holder_is_dead, which returns "not dead" on any errno it cannot
+# interpret. Getting this backwards would turn a merely-quiet session into a
+# released lock out from under a live one; getting the fail-open direction
+# right just means the 12h TTL keeps doing the job it already did.
+sub _marker_is_live {
+    my ($session_id) = @_;
+    my $find = $FIND_TRANSCRIPT // \&BpSession::find_transcript;
+    my $path = eval { $find->($session_id) };
+    return 1 if $@;              # the resolver itself blew up -- undeterminable
+    return 1 unless defined $path && length $path;   # no transcript found
+
+    my @st = stat($path);
+    return 1 unless @st;         # stat failed -- undeterminable
+
+    my $age = time() - $st[9];
+    return 1 if $age < 0;        # future mtime: clock skew, not evidence of death
+    return $age <= $TRANSCRIPT_LIVENESS_SECONDS ? 1 : 0;
+}
+
 # ---------------------------------------------------------------------------
 # any_active($dir) -> 0|1
 #
@@ -224,6 +273,19 @@ sub ttl_hours {
 # lock. Expiry is still honoured — a marker past the TTL does not count — so the
 # lease releases at the right moment either way; the file is simply left for the
 # next Stop hook to reap.
+#
+# A LIVENESS FILTER SITS ON TOP OF THE TTL, FOR THE SAME NON-REAPING REASON.
+# A crashed session's marker is fresh by mtime — nothing touched it after the
+# crash — so the 12h TTL alone holds the machine-global wake-lock for up to 12h
+# past the crash, self-healing only when some UNRELATED session's Stop hook
+# happens to sweep. _marker_is_live resolves the marker's basename (the
+# session id) to its transcript via BpSession::find_transcript and skips the
+# marker when that transcript is provably stale — never deletes it, exactly
+# like the TTL check above. It is strictly additive: it can only make this
+# function skip a marker the TTL would have counted, never count one the TTL
+# already rejected, and every undeterminable case (no transcript, a failed
+# stat, a future mtime) counts the marker as active, same as before this
+# filter existed.
 sub any_active {
     my ($dir) = @_;
     return 0 unless defined $dir && -d $dir;
@@ -256,6 +318,7 @@ sub any_active {
         my $f = "$dir/$e";
         next unless -f $f;
         next if ((stat($f))[9] // 0) < $cutoff;
+        next unless _marker_is_live($e);
         closedir $dh;
         return 1;
     }
