@@ -226,17 +226,40 @@ sub commands_matching {
 }
 
 # ===========================================================================
-# E. AC7 -- hooks.json does NOT gain guard-git-mutations.sh or
-#    guard-subagent-stall.sh as a side effect of this edit (spec §2.4,
-#    behavior 6). Neither carries bp_hook_gate/BP_LEDGER, so widening either
-#    would apply it to EVERY session on this machine, butler-related or not
-#    -- this is the regression guard that makes "not a side effect" checkable.
+# E. AC7 -- neither guard-git-mutations.sh nor guard-subagent-stall.sh may reach
+#    every session on this machine as an UNSCOPED side effect. Neither carries
+#    bp_hook_gate/BP_LEDGER, so a bare registration in hooks.json -- which
+#    travels to every project -- would apply it to sessions that have nothing to
+#    do with butler, and confiscate the operator's own tools in their own work.
+#
+#    E1 WAS "does not mention guard-git-mutations.sh anywhere", deferring the
+#    registration entirely as "a materially larger, separately-decided policy
+#    change". That decision has now been made, on evidence: registered nowhere
+#    but ccpraxis's own settings.json, the guard protected sessions working on
+#    ccpraxis and nobody else, and the incident it exists to prevent happened
+#    again in another project on 2026-09-11, taking a completed package
+#    implementation off disk (almanac 20260911-211454-863c).
+#
+#    THE OBJECTION THIS BLOCK RECORDED IS STILL RIGHT, so it is enforced rather
+#    than dropped: the travelling registration carries
+#    --only-during-butler-run, which gates on bp_drive_any_active or BP_LEDGER.
+#    A filesystem predicate, deliberately -- a Task subagent dispatched by a
+#    drive-solo driver inherits no BP_* but can still see the marker. So the
+#    guard reaches the sessions that need it without reaching the ones that do
+#    not. A BARE registration here must still fail.
 # ===========================================================================
 {
-    unlike($hooksjson_raw, qr/guard-git-mutations\.sh/,
-       'E1: hooks.json does not mention guard-git-mutations.sh anywhere '
-     . '(deferred by write-set construction, spec §2.4 -- widening it is a materially larger, '
-     . 'separately-decided policy change, not a side effect of this package)');
+    # Matched against the DECODED document, not the raw text: in raw JSON the
+    # closing quote is backslash-escaped, and a regex written to step over that
+    # escape is a regex about JSON encoding rather than about registration.
+    my @ggm = commands_matching($hooksjson, qr/guard-git-mutations\.sh/);
+    cmp_ok(scalar @ggm, '>', 0,
+       'E1a: hooks.json registers guard-git-mutations.sh, so the guard travels with the plugin');
+    my @unscoped = grep { $_ !~ /--only-during-butler-run/ } @ggm;
+    is(scalar @unscoped, 0,
+       'E1b: ...and EVERY such registration is run-scoped -- an unscoped one would apply to '
+     . 'every session on this machine, which is the objection AC7 was originally written to hold');
+
     unlike($hooksjson_raw, qr/guard-subagent-stall\.sh/,
        'E2: hooks.json does not mention guard-subagent-stall.sh anywhere either');
 }

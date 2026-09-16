@@ -790,10 +790,22 @@ is(action_of('0'),     'deny', 'AC-29 [pure]: bp_ws_action_of "0" -> DENY');
     # must NOT append here" -- survives verbatim, and wait-shape-guard.sh appearing
     # in this block still fails.
     is_deeply([ map { $_->{command} } @{ $b1->{hooks} // [] } ],
-              [ $cmd_of->('guard-bash.sh'), $cmd_of->('mark-wakeup.sh'),
+    # UPDATED 2026-09-16 (almanac 20260911-211454-863c). guard-git-mutations.sh
+    # is registered here FIRST, and in the RUN-SCOPED form. It was previously
+    # registered only in ccpraxis's own .claude/settings.json, so the hook
+    # written to stop a destructive git command protected sessions working on
+    # ccpraxis and nobody else -- and the incident it exists to prevent then
+    # happened again in another project, taking a completed package
+    # implementation off disk. The --only-during-butler-run flag is what makes
+    # this registration acceptable to ship machine-wide; see
+    # hooks-json-route-registration.t's AC7 for the objection it answers.
+    # Brought up to reality rather than loosened: the list stays EXACT and
+    # ORDERED, so what this assertion actually pins still fails on sight.
+              [ $cmd_of->('guard-git-mutations.sh') . ' --only-during-butler-run',
+                $cmd_of->('guard-bash.sh'), $cmd_of->('mark-wakeup.sh'),
                 $cmd_of->('gate-headless-background.sh'), $cmd_of->('guard-judge-checks.sh'),
                 $cmd_of->('guard-validation-interlock.sh') ],
-              'AC-34: block 1 command list is exactly the five registered Bash hooks IN ORDER (b15 must NOT append here)');
+              'AC-34: block 1 command list is exactly the six registered Bash hooks IN ORDER (b15 must NOT append here)');
     my $b2 = $pre->[2] // {};
     is($b2->{matcher}, 'Task', 'AC-34: block 2 matcher unchanged');
     is_deeply([ map { $_->{command} } @{ $b2->{hooks} // [] } ],

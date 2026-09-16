@@ -580,7 +580,7 @@ sub register_fresh {
         }
     }
 
-    acquire_lock($VAULT_LOCK) or emit_error("Vault lock held by another session.");
+    acquire_lock($VAULT_LOCK) or emit_error("Vault lock held by another session." . lock_refusal_detail());
 
     # Pull latest before adding our new project entry (avoid push conflict)
     vault_git_ok('fetch', 'origin');
@@ -672,7 +672,7 @@ sub register_fresh {
 sub register_link {
     my ($cwd, $slug) = @_;
 
-    acquire_lock($VAULT_LOCK) or emit_error("Vault lock held by another session.");
+    acquire_lock($VAULT_LOCK) or emit_error("Vault lock held by another session." . lock_refusal_detail());
 
     # Pull latest before mutating vault metadata
     vault_git_ok('fetch', 'origin');
@@ -989,7 +989,7 @@ sub cmd_sync_project {
     my $pmeta_path = project_metadata_path($cwd);
     emit_error("Project metadata missing at $pmeta_path") unless -f $pmeta_path;
 
-    acquire_lock($VAULT_LOCK)            or emit_error("Vault lock held by another session.");
+    acquire_lock($VAULT_LOCK)            or emit_error("Vault lock held by another session." . lock_refusal_detail());
     acquire_lock("$vproj/.lock")          or emit_error("Project lock for '$slug' held by another session.");
 
     # BEFORE anything judges the vault's cleanliness. An existing vault's
@@ -1218,7 +1218,7 @@ sub cmd_resolve_conflict {
     my $cwd = $entry->{path};
     my $vproj = vault_project_dir($slug);
 
-    acquire_lock($VAULT_LOCK)    or emit_error("Vault lock held by another session.");
+    acquire_lock($VAULT_LOCK)    or emit_error("Vault lock held by another session." . lock_refusal_detail());
     acquire_lock("$vproj/.lock")  or emit_error("Project lock held by another session.");
 
     unless (validate_relative_path($path)) {
@@ -1277,7 +1277,7 @@ sub cmd_commit_and_push {
     my $cwd = $entry->{path};
     my $vproj = vault_project_dir($slug);
 
-    acquire_lock($VAULT_LOCK)   or emit_error("Vault lock held by another session.");
+    acquire_lock($VAULT_LOCK)   or emit_error("Vault lock held by another session." . lock_refusal_detail());
     acquire_lock("$vproj/.lock") or emit_error("Project lock held by another session.");
 
     # Pre-rename sensitive scan: check all staged .tmp files that will become vault content
@@ -2385,6 +2385,54 @@ sub registry_remove_project {
 # Locking
 # ═══════════════════════════════════════════════════════════════════════
 
+# WHY THE LOCK HOLDER'S PID IS WRITTEN DOWN AND, UNTIL NOW, NEVER READ.
+#
+# acquire_lock records the holder's session id, PID and timestamp, but only the
+# TIMESTAMP was ever read back: a holder that died -- killed, crashed, or taken
+# out with its whole WSL VM -- kept every project in the vault waiting out the
+# full $LOCK_STALE_SEC ceiling, with nothing able to tell "busy" from "dead"
+# (almanac 20260829-193916-e091). Thirty minutes is a backstop, not an answer.
+#
+# ONLY A POSITIVE "DEAD" RECLAIMS. kill(0,...) can prove a process exists
+# (success, or EPERM for one owned by another user) and can prove nothing at all
+# on ESRCH under a foreign PID namespace -- the same asymmetry launcher.pl's
+# _pid_alive documents. So an unknown answer is treated as ALIVE and falls
+# through to the age ceiling, which is the safe direction: reclaiming a lock
+# whose holder is still working would let two syncs write the vault at once,
+# while waiting out thirty minutes merely costs time.
+#
+# PID reuse can only produce a false "alive", never a false "dead", so it too
+# degrades into the existing ceiling rather than into a corrupted vault.
+sub lock_holder_is_dead {
+    my ($pid) = @_;
+    return 0 unless defined $pid && !ref($pid) && $pid =~ /^\d+$/ && $pid > 0;
+    return 0 if $pid == $$;
+    local $!;
+    return 0 if kill(0, $pid);   # exists
+    return 0 if $!{EPERM};       # exists, not ours to signal
+    return 1 if $!{ESRCH};       # positively absent
+    return 0;                    # any other errno: we could not tell -- assume alive
+}
+
+# Detail about the most recent REFUSED acquire, so the call sites can say more
+# than "held by another session". Set only on refusal; read immediately after.
+our %LAST_LOCK_REFUSAL;
+
+# lock_refusal_detail() -> a one-line ", held by ..." suffix, or ''.
+sub lock_refusal_detail {
+    return '' unless %LAST_LOCK_REFUSAL;
+    my $pid  = $LAST_LOCK_REFUSAL{pid};
+    my $age  = $LAST_LOCK_REFUSAL{age};
+    my @bits;
+    push @bits, "pid $pid"                    if defined $pid && length $pid;
+    push @bits, "held for " . int($age) . "s" if defined $age && $age =~ /^\d+$/;
+    push @bits, "lock file $LAST_LOCK_REFUSAL{path}" if defined $LAST_LOCK_REFUSAL{path};
+    return '' unless @bits;
+    return ' Holder: ' . join(', ', @bits)
+         . '. It is reclaimed automatically once the holder exits, or after '
+         . int($LOCK_STALE_SEC / 60) . ' minutes.';
+}
+
 sub acquire_lock {
     # Fix C2 (red-team): atomic acquire/reclaim via flock on a sibling
     # `.flock` file. Previously two processes could both read a stale
@@ -2420,9 +2468,15 @@ sub acquire_lock {
         my $age = time() - ($info->{epoch} // 0);
         if ($info->{session_id} && $info->{session_id} eq $SESSION_ID) {
             # Our own lock — refresh below
+        } elsif (lock_holder_is_dead($info->{pid})) {
+            # The holder is provably gone — reclaim at once rather than making
+            # every project wait out the ceiling for a process that cannot
+            # come back.
+            # Reclaim below
         } elsif ($age > $LOCK_STALE_SEC) {
             # Stale — reclaim below
         } else {
+            %LAST_LOCK_REFUSAL = (pid => $info->{pid}, age => $age, path => $path);
             flock($flock_fh, LOCK_UN);
             close $flock_fh;
             return 0;  # Another active session
@@ -2444,6 +2498,7 @@ sub acquire_lock {
     close $flock_fh;
 
     $HELD_LOCKS{$path} = $SESSION_ID;
+    %LAST_LOCK_REFUSAL = ();
     return 1;
 }
 

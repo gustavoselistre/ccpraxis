@@ -19,6 +19,9 @@ require "$Bin/../../scripts/bp-contract.pl";
     is(scalar @$p, 0, 'AC-1: idle windows with resets_at absent have no problems');
 }
 
+
+# 2026-06-22T00:00:00Z. See the note above each captured fixture.
+my $CAPTURE_NOW = 1782000000;
 # ---- AC-2: idle window, resets_at explicitly undef -> OK -------------------
 {
     my ($ok, $p) = BpContract::validate_usage({
@@ -34,7 +37,7 @@ require "$Bin/../../scripts/bp-contract.pl";
     my ($ok, $p) = BpContract::validate_usage({
         five_hour => { utilization => 0, resets_at => '2026-06-22T05:59:59.7+00:00' },
         seven_day => { utilization => 0, resets_at => '2026-06-22T17:59:59+00:00' },
-    });
+    }, $CAPTURE_NOW);
     is($ok, 1, 'AC-3: idle windows with a valid supplied resets_at pass');
     is(scalar @$p, 0, 'AC-3: idle windows with a valid supplied resets_at have no problems');
 }
@@ -44,7 +47,7 @@ require "$Bin/../../scripts/bp-contract.pl";
     my ($ok, $p) = BpContract::validate_usage({
         five_hour => { utilization => 0 },
         seven_day => { utilization => 12, resets_at => '2026-06-22T17:59:59+00:00' },
-    });
+    }, $CAPTURE_NOW);
     is($ok, 1, 'AC-4: mixed idle/active payload passes');
     is(scalar @$p, 0, 'AC-4: mixed idle/active payload has no problems');
 }
@@ -54,7 +57,7 @@ require "$Bin/../../scripts/bp-contract.pl";
     my ($ok, $p) = BpContract::validate_usage({
         five_hour => { utilization => 58, resets_at => '2026-06-22T05:59:59+00:00' },
         seven_day => { utilization => 7 },
-    });
+    }, $CAPTURE_NOW);
     is($ok, 0, 'AC-5: active seven_day window with resets_at absent fails');
     ok((grep { /seven_day\.resets_at/ } @$p), 'AC-5: a problem matches qr/seven_day\.resets_at/');
     ok((grep { $_ eq 'usage: seven_day.resets_at missing or not ISO-8601' } @$p),

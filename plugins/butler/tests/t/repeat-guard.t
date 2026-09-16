@@ -387,10 +387,22 @@ is(gate_verdict_call('Edit', 'worksite', 1),  'deny',  'AC-21: regression - bp_g
     # list stays EXACT and ORDERED, so b10's claim (repeat-guard.sh must never
     # appear in a block it does not own) still fails the moment it does.
     is_deeply([ map { $_->{command} } @{ $b1->{hooks} // [] } ],
-              [ $cmd_of->('guard-bash.sh'), $cmd_of->('mark-wakeup.sh'),
+    # UPDATED 2026-09-16 (almanac 20260911-211454-863c). guard-git-mutations.sh
+    # is registered here FIRST, and in the RUN-SCOPED form. It was previously
+    # registered only in ccpraxis's own .claude/settings.json, so the hook
+    # written to stop a destructive git command protected sessions working on
+    # ccpraxis and nobody else -- and the incident it exists to prevent then
+    # happened again in another project, taking a completed package
+    # implementation off disk. The --only-during-butler-run flag is what makes
+    # this registration acceptable to ship machine-wide; see
+    # hooks-json-route-registration.t's AC7 for the objection it answers.
+    # Brought up to reality rather than loosened: the list stays EXACT and
+    # ORDERED, so what this assertion actually pins still fails on sight.
+              [ $cmd_of->('guard-git-mutations.sh') . ' --only-during-butler-run',
+                $cmd_of->('guard-bash.sh'), $cmd_of->('mark-wakeup.sh'),
                 $cmd_of->('gate-headless-background.sh'), $cmd_of->('guard-judge-checks.sh'),
                 $cmd_of->('guard-validation-interlock.sh') ],
-              'AC-20: block 1 command list is exactly the five registered Bash hooks IN ORDER (repeat-guard.sh appearing here still fails)');
+              'AC-20: block 1 command list is exactly the six registered Bash hooks IN ORDER (repeat-guard.sh appearing here still fails)');
 
     my $b2 = $pre->[2] // {};
     is($b2->{matcher}, 'Task', 'AC-20: block 2 matcher unchanged');
@@ -404,7 +416,12 @@ is(gate_verdict_call('Edit', 'worksite', 1),  'deny',  'AC-21: regression - bp_g
             $n++;
             ok(defined($h->{type}) && $h->{type} eq 'command'
                && defined($h->{timeout}) && $h->{timeout} == 15
-               && defined($h->{command}) && $h->{command} =~ m{^bash "\$\{CLAUDE_PLUGIN_ROOT\}/hooks/[a-z-]+\.sh"$},
+               # Trailing flags are part of the house shape now: the travelling
+               # guard-git-mutations.sh registration carries
+               # --only-during-butler-run, which is what keeps it from applying
+               # to every session on the machine. Still anchored at both ends,
+               # so a command with a path or a shell operator in it fails.
+               && defined($h->{command}) && $h->{command} =~ m{^bash "\$\{CLAUDE_PLUGIN_ROOT\}/hooks/[a-z-]+\.sh"(?: --[a-z-]+)*$},
                "AC-20: existing PreToolUse hook entry #$n has type=command, timeout=15, correct command shape");
         }
     }

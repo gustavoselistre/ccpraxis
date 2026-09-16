@@ -161,13 +161,37 @@ sub scan_tree {
 # ---------------------------------------------------------------------------------------------
 # Snapshot load / save.
 # ---------------------------------------------------------------------------------------------
+# THE SNAPSHOT ROUND-TRIP STAYS IN THE BYTE DOMAIN, END TO END.
+#
+# Every path in a snapshot comes from readdir, which yields RAW BYTES -- on this
+# host `Andre`-with-an-acute arrives as the two bytes \xc3\xa9, not as one
+# character. The audit compares those keys against a later readdir, stats them,
+# and prints them. Bytes are the only domain in which all three of those work.
+#
+# save_snapshot encoded without ->utf8 and printed to an unlayered handle, so
+# the raw bytes reached the file and the file was valid UTF-8. load_snapshot
+# then read it back with decode_json, which IS ->utf8 -- it DECODED those bytes
+# into characters. A key that went in as ten bytes came back as nine characters
+# and could never again equal what readdir produced.
+#
+# Diffing a snapshot against ITSELF therefore reported every non-ASCII path
+# twice, once [deleted] and once [new], with identical byte sizes: 429 findings
+# on a project where nothing had been written, because the person's name is
+# Andre-with-an-acute (almanac 20260915-224959-7836). A tool whose findings are
+# overwhelmingly false teaches people to ignore its true ones, which is worse
+# than not having the tool.
+#
+# The fix is symmetry, not encoding: DO NOT DECODE. Both halves are explicitly
+# :raw and neither side uses ->utf8, so bytes go out and the same bytes come
+# back. This also removes the "Wide character in print" warning further down,
+# which was the same defect surfacing at the report writer.
 sub save_snapshot {
     my ($path, $entries) = @_;
     my $dir = $path;
     $dir =~ s{[/\\][^/\\]+$}{};
     make_path($dir) if length($dir) && !-d $dir;
     my $json = JSON::PP->new->canonical->encode({ entries => $entries });
-    open(my $fh, '>', $path) or die "cannot write snapshot $path: $!\n";
+    open(my $fh, '>:raw', $path) or die "cannot write snapshot $path: $!\n";
     print $fh $json;
     close $fh;
 }
@@ -175,11 +199,12 @@ sub save_snapshot {
 sub load_snapshot {
     my ($path) = @_;
     die "snapshot file does not exist: $path\n" unless -f $path;
-    open(my $fh, '<', $path) or die "cannot read snapshot $path: $!\n";
+    open(my $fh, '<:raw', $path) or die "cannot read snapshot $path: $!\n";
     local $/;
     my $text = <$fh>;
     close $fh;
-    my $decoded = eval { JSON::PP::decode_json($text) };
+        # NOT decode_json: that is ->utf8, and decoding here IS the bug above.
+    my $decoded = eval { JSON::PP->new->decode($text) };
     die "malformed snapshot JSON in $path: $@\n" if $@;
     die "malformed snapshot structure in $path (missing 'entries' object)\n"
         unless ref($decoded) eq 'HASH' && ref($decoded->{entries}) eq 'HASH';

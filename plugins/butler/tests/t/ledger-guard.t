@@ -390,11 +390,22 @@ sub nonblank_lines { return grep { /\S/ } split /\n/, $_[0] }
     # rather than loosened: it stays EXACT and ORDERED, so b12's claim -- that it
     # appended only to its own block 0 -- still fails the moment ledger-guard.sh
     # appears here, which is the whole point of pinning it.
+    # UPDATED 2026-09-16 (almanac 20260911-211454-863c). guard-git-mutations.sh
+    # is now registered here, FIRST. It was previously registered only in
+    # ccpraxis's own .claude/settings.json, so the hook written to stop a
+    # destructive `git st`+`ash` protected sessions working on ccpraxis and
+    # nobody else -- and the incident it exists to prevent then happened again,
+    # in another project, taking a completed package implementation off disk.
+    # Brought up to reality rather than loosened, on the same principle the note
+    # above records: the list stays EXACT and ORDERED, so the claim this
+    # assertion actually pins -- that ledger-guard.sh is not in the Bash block --
+    # still fails the moment it appears.
     is_deeply([ map { $_->{command} } @{ $b1->{hooks} // [] } ],
-              [ $cmd_of->('guard-bash.sh'), $cmd_of->('mark-wakeup.sh'),
+              [ $cmd_of->('guard-git-mutations.sh') . ' --only-during-butler-run',
+                $cmd_of->('guard-bash.sh'), $cmd_of->('mark-wakeup.sh'),
                 $cmd_of->('gate-headless-background.sh'), $cmd_of->('guard-judge-checks.sh'),
                 $cmd_of->('guard-validation-interlock.sh') ],
-              'AC-36: block 1 command list is exactly the five registered Bash hooks IN ORDER (ledger-guard.sh appearing here still fails)');
+              'AC-36: block 1 command list is exactly the six registered Bash hooks IN ORDER (ledger-guard.sh appearing here still fails)');
     my $b2 = $pre->[2] // {};
     is($b2->{matcher}, 'Task', 'AC-36: block 2 matcher unchanged');
     is_deeply([ map { $_->{command} } @{ $b2->{hooks} // [] } ],

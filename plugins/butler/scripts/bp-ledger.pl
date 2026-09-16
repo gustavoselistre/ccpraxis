@@ -271,6 +271,51 @@ my @REQUIRED_KEYS = qw(package blueprint status write_set last_updated);
 # use for. Two vocabularies on purpose -- do not "unify" them.
 my @STATUSES      = qw(pending running converging reviewing done blocked parked dropped);
 
+# A STRINGIFIED PERL REFERENCE IN A LEDGER BODY IS NEVER INTENTIONAL.
+#
+# Observed on a live run (almanac 20260915-191939-da6e): a package's Escalation
+# section ended
+#
+#     ...or adding the boolean fallback.SCALAR(0x5c7bd4bd3308)
+#
+# welded onto the last sentence with no separator. A writer interpolated a ref
+# where it meant the referent, so whatever that text WAS is gone -- not
+# mis-rendered, lost -- and nothing refused the write, because the section still
+# parses as prose. The Escalation section is exactly what the orchestrator and
+# the reporter read to decide what a blocked package needs.
+#
+# WHY THIS IS NOT PART OF validate_bytes. run_op validates the ORIGINAL bytes as
+# well as the new ones, and a ledger that already carries this corruption would
+# then reject every subsequent operation -- bricking the package this rule exists
+# to protect. So the check is DIFFERENTIAL: it fires only when an operation
+# INTRODUCES a ref address that was not already there. Existing damage stays
+# operable and repairable; new damage cannot get in.
+#
+# Blessed refs stringify as Foo=HASH(0x...), so the optional class prefix is
+# matched too.
+my $REF_ADDR_RE = qr/(?:\w+=)?(?:SCALAR|ARRAY|HASH|CODE|REF|GLOB|Regexp|FORMAT|LVALUE|IO)\(0x[0-9a-fA-F]+\)/;
+
+sub count_ref_addrs {
+    my ($B) = @_;
+    return 0 unless defined $B && length $B;
+    my $n = 0;
+    $n++ while $B =~ /$REF_ADDR_RE/g;
+    return $n;
+}
+
+# validate_no_new_ref_addr($orig, $new) -> $detail | undef
+sub validate_no_new_ref_addr {
+    my ($orig, $new) = @_;
+    my $before = count_ref_addrs($orig);
+    my $after  = count_ref_addrs($new);
+    return undef if $after <= $before;
+    my ($sample) = ($new =~ /($REF_ADDR_RE)/);
+    return 'would write a stringified Perl reference into the ledger body ('
+         . (defined $sample ? $sample : 'ref address')
+         . '). That is always a writer bug -- the value it points at is being '
+         . 'LOST, not merely mis-rendered. Dereference it before writing.';
+}
+
 sub validate_bytes {
     my ($B) = @_;
 
@@ -551,6 +596,9 @@ sub run_op {
 
     my $detail2 = validate_bytes($new);
     reject_error($sub, $path, $detail2) if defined $detail2;
+
+    my $ref_detail = validate_no_new_ref_addr($orig, $new);
+    reject_error($sub, $path, $ref_detail) if defined $ref_detail;
 
     my $lu_detail = last_updated_check($orig, $new);
     reject_error($sub, $path, $lu_detail) if defined $lu_detail;
