@@ -1402,12 +1402,24 @@ sub find_wt {
 # command opaque means the wrapping logic stays pure/testable while the launcher
 # owns the platform-correct invocation (a native wt.exe/`start` can't exec the
 # .ps1 by bare name, so the launcher passes a `powershell.exe -File …` cmd).
-# ctx: { cmd => [...], comspec }.
+# ctx: { cmd => [...], comspec, profile }.
+# ctx.profile is an optional Windows Terminal profile NAME (never a GUID; see
+# WtProfile::profile_name()), honoured only in the 'wt' mode. When defined and
+# non-empty it is inserted as two separate argv elements, '-p' and the name,
+# between 'new' and @cmd -- never joined into one shell-quoted string, since
+# system(@argv) here is always the list form. With no profile the output is
+# byte-identical to before this key existed.
 sub spawn_argv {
     my ($mode, $ctx) = @_;
     $ctx ||= {};
     my @cmd = @{ $ctx->{cmd} || [] };
-    return ['wt.exe', '-w', 'new', @cmd]                            if $mode eq 'wt';
+    if ($mode eq 'wt') {
+        my $profile = $ctx->{profile};
+        if (defined $profile && length $profile) {
+            return ['wt.exe', '-w', 'new', '-p', $profile, @cmd];
+        }
+        return ['wt.exe', '-w', 'new', @cmd];
+    }
     return [($ctx->{comspec} || 'cmd.exe'), '/c', 'start', '', @cmd] if $mode eq 'start';
     return undef;   # inline: caller runs the connector in-process
 }
