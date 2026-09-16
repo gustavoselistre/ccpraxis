@@ -26,6 +26,14 @@
 # a slow gate is one an agent learns to route around.
 use strict;
 use warnings;
+# THIS FILE DRIVES gate-continuity.sh, WHICH HOLDS A REAL OS WAKE-LOCK.
+#
+# Arming is what takes the lock out, and this file arms sessions repeatedly. Set
+# BEFORE anything else, because a run that forgets leaves keep-awake processes
+# on the host with nothing left that knows to reap them -- the exact failure
+# test-wakelock-hygiene.t exists to catch, and which it caught on this file's
+# first draft.
+BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
 use FindBin qw($Bin);
 use lib "$Bin/../../scripts";
 use Test::More;

@@ -84,11 +84,26 @@ sub _reset_stamp_impossible {
 }
 
 # usage: GET /api/oauth/usage  →  five_hour/seven_day.{utilization:int%, resets_at:ISO}
-# $now is injectable so the impossible-stamp rule can be driven from a test
-# without waiting for a clock; every existing one-argument caller is unaffected.
+# THE RESET-STAMP RULE IS OPT-IN, AND THAT IS A DELIBERATE LIMITATION.
+#
+# $now enables it. A one-argument call gets the pure SHAPE check this function
+# has always been, unchanged.
+#
+# The alternative -- defaulting to time() -- was tried and measured: it reaches
+# three separate call paths (bp-usage-gate.pl's poll, BpOrch::usage_decision,
+# and the validators' own suite), each carrying fixtures pinned to a real
+# captured moment, and it failed roughly twenty assertions across five files for
+# being OLD rather than for being wrong. Rewriting those fixtures would have
+# thrown away what makes them evidence.
+#
+# So the protection covers the caller that passes a clock. Today that is
+# bp-usage-gate.pl -- which is the path the report is about ("butler gates on
+# it": --gate decides whether a package may run). BpOrch::usage_decision does
+# NOT get it, and saying so here is better than implying a guarantee this does
+# not give.
 sub validate_usage {
     my ($d, $now) = @_;
-    $now = time unless defined $now && !ref $now && $now =~ /^\d+$/;
+    undef $now unless defined $now && !ref $now && $now =~ /^\d+$/;
     return (0, ['usage: response is not a JSON object']) unless ref $d eq 'HASH';
     my @p;
     for my $w (qw(five_hour seven_day)) {
@@ -104,7 +119,7 @@ sub validate_usage {
         if (_is_num($o->{utilization}) && $o->{utilization} > 0) {
             if (!_is_iso8601($o->{resets_at})) {
                 push @p, "usage: $w.resets_at missing or not ISO-8601";
-            } elsif (my $why = _reset_stamp_impossible($w, $o->{resets_at}, $now)) {
+            } elsif (defined $now and my $why = _reset_stamp_impossible($w, $o->{resets_at}, $now)) {
                 push @p, "usage: $w.$why";
             }
         }

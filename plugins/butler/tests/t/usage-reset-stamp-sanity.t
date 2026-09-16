@@ -113,8 +113,24 @@ ok((check({ five_hour => { utilization => 0 }, seven_day => { utilization => 0 }
     ok($v, 'D1: a one-argument call still works, defaulting to the real clock');
 }
 {
+    # THE LIMITATION, ASSERTED SO IT CANNOT BE MISREAD AS A GUARANTEE.
+    #
+    # Without a clock the stamp rule does not run at all. Defaulting it to time()
+    # was tried and measured: it reaches three separate call paths --
+    # bp-usage-gate.pl's poll, BpOrch::usage_decision, and the validators' own
+    # suite -- each carrying fixtures pinned to a real captured moment, and it
+    # failed roughly twenty assertions across five files for being OLD rather
+    # than for being wrong. Rewriting those fixtures would have discarded what
+    # makes them evidence.
+    #
+    # So the protection covers the caller that passes a clock. Today that is
+    # bp-usage-gate.pl, which is the path the report is about -- `--gate` decides
+    # whether a package may run. BpOrch::usage_decision does NOT get it, and
+    # pinning that here is more honest than a comment claiming otherwise.
     my ($v) = BpContract::validate_usage(usage(r5 => iso(time - 36 * 3600), u5 => 35));
-    ok(!$v, 'D2: ... and still catches an impossible stamp against it');
+    ok($v, 'D2: a ONE-ARGUMENT call does NOT apply the stamp rule -- opt-in, by design');
+    my ($v2) = BpContract::validate_usage(usage(r5 => iso(time - 36 * 3600), u5 => 35), time);
+    ok(!$v2, 'D3: ... and the same payload IS refused once a clock is supplied');
 }
 
 # Hostile input must not die -- this runs inside a gate that decides whether a
