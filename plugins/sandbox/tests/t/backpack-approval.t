@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # BackpackApproval.pm — per-item, machine-local approval memory for backpack
 # items (the launcher's root-command install gate, #21).
 #

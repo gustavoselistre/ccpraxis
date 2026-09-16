@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # b43 oracle. Derived ONLY from
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b43-spec.md
 # section 3 (G1..G11, DC-1..DC-11).

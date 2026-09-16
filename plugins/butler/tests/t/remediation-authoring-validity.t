@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 131 — r02
 #
 # Oracle for specs/r02-spec.md §4 (AC-1..AC-16).

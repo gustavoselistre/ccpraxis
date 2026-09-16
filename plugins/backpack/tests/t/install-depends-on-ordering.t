@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # ORACLE for b01-backpack-install-accounting criterion 4 (spec section 2.3,
 # cases 4/5/6/7 of spec section 3), written BLIND to any implementation --
 # backpack.pl at HEAD has no `depends_on` field, no topological ordering, no

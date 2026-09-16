@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # b32 oracle. Derived ONLY from
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b32-spec.md
 # §2 (contracts), §3 (behaviours) and §4 (acceptance criteria A1..A16).

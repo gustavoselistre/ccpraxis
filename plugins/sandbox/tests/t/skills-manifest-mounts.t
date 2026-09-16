@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # p01-sandbox-plugin-provisioning — spec.md §2.1, Observable behaviors 1-2.
 #
 # skills.pl's `cmd_mounts` is spec'd to grow an optional --manifest FILE

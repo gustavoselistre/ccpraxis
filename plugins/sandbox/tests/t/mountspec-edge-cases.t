@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # MountSpec corner cases — paths with spaces, mixed separators, edge
 # detection between "looks like a path" and "looks like a volume name".
 # These don't usually break in practice but are worth pinning.

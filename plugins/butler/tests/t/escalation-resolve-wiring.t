@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 173 — the escalation-resolve judge path is actually wired.
 #
 # WHAT IS BEING PROTECTED

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # A3 orchestrator process-management (bp-orchestrator.pl): every DETERMINISTIC
 # decision the loop makes, plus the disk/marker/queue helpers and the assembled
 # --once tick — all with an injected clock / registry / transport / launch seam,

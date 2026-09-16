@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # 136 — IMMUTABLE ORACLE for w02-dispatch-budget-and-
 # interrupt's per-dispatch budget record (package BpDispatchLog in
 # plugins/butler/scripts/bp-dispatch-log.pl — DOES NOT EXIST YET at the time

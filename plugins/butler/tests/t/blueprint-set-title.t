@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 04-blueprint-title-verb oracle. Derived ONLY from
 # .ccpraxis-local-data/blueprints/test-naming-hygiene/specs/04-blueprint-title-verb-spec.md
 # (11 ACs, mapped to DC1..DC6).

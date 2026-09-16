@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # s14 — unit + end-to-end tests for the butler-session filter.
 # Spec: /project/.ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/11-spec.md
 #

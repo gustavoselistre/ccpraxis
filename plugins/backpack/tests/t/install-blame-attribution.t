@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # ORACLE for b01-backpack-install-accounting criterion 5 (spec section 2.4,
 # case 8 of spec section 3), written BLIND to any implementation. Reproduces
 # the incident's actual misattribution shape: `project-setup:gh-auth` fails

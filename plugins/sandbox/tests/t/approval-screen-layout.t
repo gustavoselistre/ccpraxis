@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 192 — the backpack approval screen's layout.
 #
 # WHY A SECURITY GATE HAS A LAYOUT ORACLE

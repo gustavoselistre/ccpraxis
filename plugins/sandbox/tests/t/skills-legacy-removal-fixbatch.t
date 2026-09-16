@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # p01-sandbox-plugin-provisioning — fix-batch step 7 regression coverage for
 # findings F1, F2, F3 (reports/p01-sandbox-plugin-provisioning/{reviewer,redteam}-step6.md,
 # fixbatch-step7.md). Nothing here re-covers t/85's existing, still-valid

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # THE ORACLE for blueprint sandbox-wt-profile, package
 # 02-launch-claude-uses-profile, written from
 #   .ccpraxis-local-data/blueprints/sandbox-wt-profile/specs/02-launch-claude-uses-profile-spec.md

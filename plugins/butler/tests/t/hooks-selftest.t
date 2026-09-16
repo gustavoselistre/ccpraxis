@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # A8 hooks self-test (bp-hooks-selftest.sh) — the DETERMINISTIC parts:
 #   - verdict_from_oracle: the deliberate asymmetry (only a clean, positively-
 #     evidenced denial is a PASS; forbidden-present is always a breach; anything

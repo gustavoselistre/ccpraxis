@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # A real 3-way conflict on the synthetic _host-memory path: two
 # machines edit the same memory file away from a common base, and sync must
 # DETECT the conflict (not silently clobber). Proves classify() + the conflict

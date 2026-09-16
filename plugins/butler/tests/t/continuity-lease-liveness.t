@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # any_active's liveness filter does not pin the machine-global wake-lock
 # behind a crashed session for up to 12h.
 #

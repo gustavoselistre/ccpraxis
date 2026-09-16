@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # b17-answer-decision-completeness oracle. Derived ONLY from
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b17-answer-decision-completeness-spec.md
 # (the four verified defects in section 0, the C1..C8 acceptance criteria in section 2).

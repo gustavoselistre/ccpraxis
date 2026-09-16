@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 181 — the launch decision, driven through every state it can be in.
 #
 # WHY THIS EXISTS, AND WHY IT IS NOT A GREP. t/180 asserts the SHAPE of the

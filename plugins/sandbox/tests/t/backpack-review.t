@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # BackpackReview.pm — the interactive per-item approval walk (#21). Driven here
 # through in-memory filehandles + an injectable `remove` seam so every decision
 # path of this AS-ROOT install gate is exercised without a real terminal or a

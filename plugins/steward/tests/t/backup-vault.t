@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 23 -- oracle for blueprint backup-driver, package
 # 04-vault-and-todos (scripts/backup/Vault.pm).
 #

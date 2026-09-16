@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # ORACLE for b01-backpack-install-accounting criteria 2/3 (spec section 2.1/
 # 2.2, cases 1/2/3 of spec section 3), written BLIND to any implementation --
 # backpack.pl at HEAD has no --declared flag, no ABSENT disposition, and no

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # The drive-solo run's dead-man's switch.
 #
 # WHY A SECOND MECHANISM EXISTS

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Oracle for p02-container (blueprint butler-and-dashboard-overhaul).
 #
 # IMMUTABLE ORACLE: written from the spec BEFORE the implementation exists.

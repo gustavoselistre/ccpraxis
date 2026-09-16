@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # 184 — WHICH SESSION AM I, and who is allowed to say.
 #
 # THE FAILURE THIS REPLACES. bp-continuity.pl guessed the live session id from

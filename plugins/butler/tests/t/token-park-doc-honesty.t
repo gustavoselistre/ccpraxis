@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # e04-honest-terminal-reporting, AC5 (-> DC5): three documentation surfaces
 # still describe the RETIRED pause-token terminal-relogin-park behavior, even
 # though bp-usage-gate.pl/bp-token-keeper.pl/bp-drive-next.pl's own

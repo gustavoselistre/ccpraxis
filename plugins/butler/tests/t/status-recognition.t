@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # b21-status-blueprint-recognition oracle. Derived from
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b21-status-blueprint-recognition-spec.md
 # §4.1 (test cases T1..T20, mapped to AC-1..AC-15). Written BLIND to the implementation:

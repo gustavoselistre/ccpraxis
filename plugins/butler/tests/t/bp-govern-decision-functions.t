@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # A3 governance decision functions (bp-govern.pl): burn-rate cadence (#8),
 # derived trip point (#9), refresh timing (#11), ISO->epoch (A0). Pure + exact.
 use strict;

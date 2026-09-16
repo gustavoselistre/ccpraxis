@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Regression for 20260911-225720-4c57 (defect 4): `list` printed a bare
 # "N report(s)" with no hint the answer was scoped to one project. Asked to
 # "fetch all bug reports", an agent reached for `list`, got a confident

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # The .launcher directory contains launcher-managed metadata that the
 # container must NOT write to: cache hashes (backpack-trusted-hash et al),
 # snapshot files, blueprint canonicals, container metadata. A compromised

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # t/159 — immutable oracle for BpState.pm, the s01
 # package (spec: .ccpraxis-local-data/blueprints/butler-and-dashboard-overhaul/
 # specs/s01-spec.md).

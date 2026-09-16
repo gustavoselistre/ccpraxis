@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # b09-and-verdict-archive: harvest turn-budget scaling
 # (BpJudge::harvest_max_turns), immediate starvation/crash detection
 # (BpJudge::judge_liveness), the one-fresh-budget escalation ladder + the

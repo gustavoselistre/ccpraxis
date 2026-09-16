@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # 185 — the four legs must agree about where the registry is.
 #
 # WHY FOUR COPIES EXIST AT ALL. The continuity registry path is resolved

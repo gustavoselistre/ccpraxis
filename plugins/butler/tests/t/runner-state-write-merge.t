@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Pins the write/merge semantics of the --state=failed spec (section 2.3):
 # the state file is written from the SAME @red data the RED: block already
 # prints, never a second computation; a scope-narrower (--fast excluding

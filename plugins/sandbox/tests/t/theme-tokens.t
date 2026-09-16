@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # 64 — ORACLE for package 02-design-tokens (blueprint
 # unified-tui-design-system), specs/02-design-tokens-spec.md. Written BLIND to
 # any Theme.pm implementation — directly from the spec's numbered behaviours

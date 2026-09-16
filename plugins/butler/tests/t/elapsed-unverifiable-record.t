@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/178 -- `elapsed` must not FABRICATE an uptime for a record it cannot evaluate.
 #
 # Found while driving agent-telemetry/02. `elapsed_seconds($started_at, $now)` is

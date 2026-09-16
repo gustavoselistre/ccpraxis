@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 140 — the oracle package g02 exists to
 # force into being (done criteria 2 and 5; spec §3 behaviors 1/2/7, AC2, AC5).
 #

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # THE PANEL GRID'S BORDERS -- glyph choice, collapsing, and viewport edges.
 #
 # The grid landed (operator request, 2026-08-25: borders on all sides except

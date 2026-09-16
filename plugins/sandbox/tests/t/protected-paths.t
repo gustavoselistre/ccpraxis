@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # Oracle tests for ProtectedPaths (q01-protected-roots), derived from
 #   .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/q01-protected-roots-spec.md
 #

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Package 12 — the launch prompts package 08 handed back.
 #
 # Package 08 moved the launch flow into the TUI but deliberately excluded three

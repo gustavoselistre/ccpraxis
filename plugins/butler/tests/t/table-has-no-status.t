@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/118 — s03-drop-table-status-column oracle.
 #
 # WRITTEN BLIND TO THE IMPLEMENTATION, derived from

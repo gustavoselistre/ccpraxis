@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 68 -- ORACLE for package 08 (blueprint
 # unified-tui-design-system), specs/08-spec.md. Written BLIND
 # to any tui/LaunchScreens.pm implementation -- it does not exist yet --

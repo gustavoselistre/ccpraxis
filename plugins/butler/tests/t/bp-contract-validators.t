@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # A8 contract-validators (bp-contract.pl): good shapes pass, drifted shapes are
 # caught with precise, itemized problems (Decision #29 — detect Anthropic-side
 # drift, never proceed on unrecognized data).

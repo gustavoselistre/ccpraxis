@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # Regression oracle: the Resources sample round costs ONE powershell.exe, not three.
 #
 # WHY THIS EXISTS. The operator had to force-restart this machine twice with the

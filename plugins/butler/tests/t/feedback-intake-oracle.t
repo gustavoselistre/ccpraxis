@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 use strict;
 use warnings;
 use utf8;   # this source embeds literal em-dash (U+2014) SKILL.md/DECOMPOSED.md literals;

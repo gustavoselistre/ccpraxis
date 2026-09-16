@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # s15: oracle for the new `wait_input` seam in Dashboard::run().
 #
 # Spec: .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/s15-spec.md

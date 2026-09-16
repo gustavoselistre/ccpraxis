@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # A5 judges: the pure decision core (BpJudge::) exhaustively, then the orchestrator
 # seam end-to-end via the real BpOrch::run({once=>1}) with a stubbed judge spawn +
 # on-disk verdicts (no real `claude`). Covers the harvest knob (audit/gate), the

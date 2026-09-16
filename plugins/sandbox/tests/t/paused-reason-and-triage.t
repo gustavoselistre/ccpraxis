@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 182 -- IMMUTABLE ORACLE for package
 # 01 (blueprint agent-telemetry), specs/
 # 01-spec.md. Derived from the spec's SS4

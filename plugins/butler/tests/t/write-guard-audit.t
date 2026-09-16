@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/100 — the two report artifacts a01-write-integrity-
 # reread-under-lock must leave on disk (spec §4 AC15, AC18).
 #

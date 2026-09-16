@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Dir-bind + CLAUDE_CONFIG_DIR shape (s02-config-safety-implement spec
 # B38-B41 / AC23): the probe container mounts the host claude-home
 # directory at /root/.claude (RW dir bind, as before) and sets

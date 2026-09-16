@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # e03-autonomous-resolution oracle, part 1: BpResolve's PURE gates
 # (verdict_shape_ok / verdict_in_bounds / confidence_gate / chronic_scoping_bump)
 # and its deterministic apply-step (apply_verdict), plus the --digest CLI.

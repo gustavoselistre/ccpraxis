@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 20 -- oracle for blueprint backup-driver, package
 # 01-driver-skeleton (scripts/backup.pl + scripts/backup/Run.pm).
 #

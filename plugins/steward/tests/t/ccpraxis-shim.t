@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # 15 — the `ccpraxis` dispatcher shim and its install hook.
 #
 # WHY THIS EXISTS. The skills that drive steward's scripts spelled out a

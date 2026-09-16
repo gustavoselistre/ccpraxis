@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/104 — a02-api-and-guard-defects, DEFECT 4.
 # skills/reporter/SKILL.md shows `--note "<guidance>"` inline (lines ~112, ~128
 # at scout time); a backticked example inside a double-quoted shell argument is

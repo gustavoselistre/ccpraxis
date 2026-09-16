@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 141 -- oracle for the REGISTRATION-ROUTE
 # half of g02's fix (spec §2.1/§2.2/§2.3/§2.4, AC3/AC4/AC7, done criteria
 # 3/4/6). Complements 140 (which pins the SCRIPTS' cwd/env independence,

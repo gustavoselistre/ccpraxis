@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # backpack.pl encoding + verify-surfacing regressions.
 #
 #   1. UTF-8 is encoded EXACTLY ONCE. backpack.pl has `use utf8` (so source-literal

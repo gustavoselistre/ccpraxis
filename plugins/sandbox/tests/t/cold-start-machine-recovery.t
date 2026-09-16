@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # Regression oracle: a STOPPED podman machine must not end the launch.
 #
 # THE OPERATOR'S REPORT (2026-08-14): "I am now trying to launch claude-sandbox

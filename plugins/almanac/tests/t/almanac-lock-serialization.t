@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Genuine OS-process serialization over one shared record: two independent
 # writers both land their change (in some order, neither lost), mutual
 # exclusion is observable in a trace rather than merely inferred from a final

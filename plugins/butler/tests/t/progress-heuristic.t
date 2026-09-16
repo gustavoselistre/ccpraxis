@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/63 — immutable oracle for b11-turns-backstop.
 #
 # Derived ONLY from

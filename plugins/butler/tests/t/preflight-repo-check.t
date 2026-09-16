@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # p02 — tests for the NEW `repo.usable` preflight check.
 #
 # Spec: .ccpraxis-local-data/blueprints/sandbox-refuse-in-place/specs/p02-spec.md

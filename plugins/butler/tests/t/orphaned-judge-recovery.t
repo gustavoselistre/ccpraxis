@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/82 — immutable oracle for b31-orphaned-judge-marker-recovery.
 #
 # Derived ONLY from

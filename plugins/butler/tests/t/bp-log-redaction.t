@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # A3/A8 run logger (bp-log.pl, Decision #30): structured JSON lines, secrets
 # redacted, crash-safe append.
 use strict;

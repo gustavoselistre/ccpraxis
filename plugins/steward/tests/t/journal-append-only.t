@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 11 — the sync journal is append-only, and every way that
 # could go wrong is pinned here.
 #

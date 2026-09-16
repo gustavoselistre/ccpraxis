@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # A6 simulation harness: drive the REAL BpOrch::run (NOT --once) across MANY ticks
 # with a fake clock + a scripted fake world — coordinators that progress / finish /
 # crash / wedge on cue, and judges that return verdicts on cue — and assert the

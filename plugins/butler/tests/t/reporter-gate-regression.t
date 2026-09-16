@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # 145 — g03-reporter-stop-gate, DC5/DC8: the
 # reporter branch must not weaken the driver's existing stop discipline, and
 # the pre-existing oracle suite must be re-measured against the SAME pass

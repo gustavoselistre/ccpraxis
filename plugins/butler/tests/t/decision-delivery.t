@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # b18-and-park-loop oracle. Derived ONLY from
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b18-and-park-loop-spec.md
 # (the scout in section 0, THE RULE in section 1, C1..C7 in section 3).

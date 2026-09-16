@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 10 — a marketplace discrepancy with a permanent
 # answer must not be asked twice.
 #

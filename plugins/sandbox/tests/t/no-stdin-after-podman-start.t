@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Regression: any interactive prompt (STDIN read) in launcher.pl must
 # happen BEFORE the container is started, OR be inside a sub that's only
 # called during pre-start setup. The container's keep-alive bash CMD

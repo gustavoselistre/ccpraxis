@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Oracle for b38 (blueprint sandbox-butler-overhaul).
 #
 # IMMUTABLE ORACLE: written from the spec BEFORE the implementation exists.

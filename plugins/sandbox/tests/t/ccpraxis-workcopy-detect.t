@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # Tests for CcpraxisWorkCopy — the detection + routing module (p01).
 #
 # IMMUTABLE ORACLE: the implementer conforms to the API + behavior here.

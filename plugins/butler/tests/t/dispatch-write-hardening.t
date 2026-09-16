@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 181 -- three fixes from the agent-telemetry/
 # 03-dispatch-write-path fix-batch (review + red-team reports at
 # .ccpraxis-local-data/blueprints/agent-telemetry/reports/03-{review,redteam}.md):

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 176 — toolfix-drivesolo-arm.
 #
 # THE LIVE DEFECT THIS PINS, OBSERVED THIS SESSION, NOT HYPOTHESISED. A real

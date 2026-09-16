@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # b40-isolation oracle. Derived ONLY from
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b40-isolation-spec.md
 # sections 0, 2, 3, 4, 5, 6, 7, 9 (acceptance criteria C1..C10, mapped 1:1 in the header of each

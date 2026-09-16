@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # ORACLE for b01-backpack-install-accounting criterion 4's required artifact
 # (spec section 2.3 "The required audit table", case 9 of spec section 3),
 # written BLIND to any implementation -- backpack.pl at HEAD has no `deps`

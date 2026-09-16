@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # b37-spend-surfaces oracle. Derived ONLY from
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b37-spend-surfaces-spec.md
 # sections 0-4 (criteria C1..C11).

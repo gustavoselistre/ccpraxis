@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # 71
 #
 # The harness itself is the system under test here.

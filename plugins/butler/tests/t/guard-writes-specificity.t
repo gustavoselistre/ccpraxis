@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/101 — a02-api-and-guard-defects, DEFECT 1.
 # guard-writes.sh classifies a path as "a test" by test_paths prefix-match ALONE
 # (hooks/lib.sh:92 match_any, called from guard-writes.sh:46), so a broad

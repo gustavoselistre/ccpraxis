@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # s04-render-foundation: the render/span oracle for Dashboard.pm.
 #
 # This file is the IMMUTABLE ORACLE for blueprint s04-render-foundation

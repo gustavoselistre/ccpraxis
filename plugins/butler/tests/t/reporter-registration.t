@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 142 — g03-reporter-stop-gate, PILLAR 1: registration,
 # and its disjointness from the driver's own trigger.
 #

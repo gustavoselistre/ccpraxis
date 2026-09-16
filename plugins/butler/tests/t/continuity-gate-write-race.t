@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # THE STOP GATE RACES THE HOLD IT JUST TOLD THE SESSION TO DISPATCH.
 #
 # An armed session that had done exactly what the continuity skill instructs was

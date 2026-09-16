@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 146 — oracle for w03-validation-interlock,
 # derived ONLY from
 # .ccpraxis-local-data/blueprints/butler-and-dashboard-overhaul/specs/w03-validation-interlock-spec.md

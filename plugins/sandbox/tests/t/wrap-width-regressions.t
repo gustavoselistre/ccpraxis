@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 77 -- fix-batch step-7 regression coverage for
 # t02-wrap-on-overflow (blueprint butler-and-dashboard-overhaul).
 #

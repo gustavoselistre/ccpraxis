@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Pins the launcher's post-refactor mount layout: /root/.claude is a
 # host bind of <project>/.ccpraxis-local-data/claude-home ($CLAUDE_DATA),
 # not a volume. /root/.claude.json is NOT a single-file bind: the global

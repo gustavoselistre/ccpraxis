@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Enforces four naming rules across every file collected by
 # glob("plugins/*/tests/t/*.t") -- the exact same collection expression
 # scripts/run-tests.pl uses to build its suite:

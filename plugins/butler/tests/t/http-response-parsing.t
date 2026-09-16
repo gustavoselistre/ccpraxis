@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # BpHttp::parse_response — the curl-output status/body splitter (pure). The curl
 # transport appends "\n%{http_code}" so the trailing line is the 3-digit status;
 # this asserts that split across the cases the orchestrator/keeper rely on.

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # Oracle for blueprint package 01-platform-marker (blueprint test-platform-split).
 # Derived ONLY from
 # .ccpraxis-local-data/blueprints/test-platform-split/specs/01-platform-marker-spec.md

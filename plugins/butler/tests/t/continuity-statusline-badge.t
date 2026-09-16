@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # 151 -- g01-explicit-continuity-arming, THE
 # STATUSLINE BADGE: scripts/statusline.pl (repo root) -- NOT
 # plugins/butler/scripts/bp-statusline.pl, which the live statusline never

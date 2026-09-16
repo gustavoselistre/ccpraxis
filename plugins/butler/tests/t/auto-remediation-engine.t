@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 26 — b07
 #
 # Oracle for the auto-remediation engine, written from

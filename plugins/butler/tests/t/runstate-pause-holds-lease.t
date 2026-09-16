@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # A paused run must keep holding the machine awake.
 #
 # THE CHICKEN-AND-EGG THIS CLOSES

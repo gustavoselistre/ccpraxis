@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # B1 launch logging: LaunchLog.pm — the launcher's durable per-launch JSON-line
 # diagnostic log. Part 1 covers the pure formatter (format_event), including the
 # André-byte round-trip (no Ã© re-encode). Part 2 covers the file I/O: distinct

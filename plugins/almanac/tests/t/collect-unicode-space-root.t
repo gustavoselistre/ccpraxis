@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Regression for 20260911-225720-4c57 (defect 2): a registered project whose
 # path holds a space AND a non-ASCII character (steward's real job-search
 # entry: "/c/Users/André/Personal Files/Job search") was silently absent from

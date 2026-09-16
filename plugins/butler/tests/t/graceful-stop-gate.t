@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # A4 graceful-stop gate — the allow-park/deny-work matrix (bp_gate_verdict), the
 # stop-signal detection + precedence (bp_active_stop_signal), the gate-stop.sh
 # resumable-pause clause, and the gate-shutdown.sh PreToolUse wiring. The pure

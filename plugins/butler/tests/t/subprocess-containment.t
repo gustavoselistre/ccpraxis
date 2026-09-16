@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # b20-subprocess-write-containment oracle. Derived ONLY from
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b20-subprocess-write-containment-spec.md
 # section 5, acceptance criteria C1..C11.

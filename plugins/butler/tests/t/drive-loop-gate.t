@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # 94 — the drive-solo driver's stop discipline.
 #
 # WHAT IS BEING PROTECTED

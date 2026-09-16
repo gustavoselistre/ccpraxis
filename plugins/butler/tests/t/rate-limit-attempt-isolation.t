@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/80 — immutable oracle for b29.
 #
 # Derived ONLY from

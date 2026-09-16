@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 73
 #
 # Two operator complaints about the dashboard, which turned out to be ONE

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t01-resources-sampler — the oracle for blueprint tui-operator-feedback.
 #
 # Closes the operator's first reported complaint, verbatim: "the resources

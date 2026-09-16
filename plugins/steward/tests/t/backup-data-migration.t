@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 08 — steward's per-project backup state (the
 # registration metadata + the 3-way-merge cache base) moved out of the project's
 # .claude/ (Claude Code's own dir) into the single .ccpraxis-local-data/ data

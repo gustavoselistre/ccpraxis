@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # 16 — two defects found by using the tools, not
 # by reading them. Both had shipped, and both were invisible in normal output.
 #

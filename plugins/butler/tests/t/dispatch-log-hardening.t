@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/179 -- hardening fixes from the agent-telemetry/02-dispatch-record-attribution
 # red-team report (.ccpraxis-local-data/blueprints/agent-telemetry/reports/02-redteam.md).
 #

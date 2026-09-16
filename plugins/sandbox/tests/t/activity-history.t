@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # s13: recent activity across restarts.
 #
 # This file is the ORACLE for blueprint sandbox-butler-overhaul, package

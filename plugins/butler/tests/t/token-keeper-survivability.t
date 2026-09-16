@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # A3 token-keeper (bp-token-keeper.pl, Decisions #11/#12/#30): every survivability
 # branch, with an INJECTED http transport — no live network, no real creds.
 use strict;

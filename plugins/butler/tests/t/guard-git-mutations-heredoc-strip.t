@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 170 -- oracle for t09-guard-hooks-stripping's
 # guard-git-mutations.sh changes (spec .ccpraxis-local-data/blueprints/
 # tui-operator-feedback/specs/t09-guard-hooks-stripping-spec.md SS0/SS2.4/SS3/SS4).

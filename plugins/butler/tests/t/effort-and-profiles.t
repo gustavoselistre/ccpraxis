@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/75 — immutable oracle for b23-effort-quality-and-turn-sizing.
 #
 # Derived ONLY from

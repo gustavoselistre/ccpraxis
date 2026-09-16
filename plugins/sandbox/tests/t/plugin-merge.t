@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Fix 2 tier-2 merge-preserve + provenance. Re-materializing the plugin
 # registries from the host selection each launch must NOT clobber plugins /
 # marketplaces installed INSIDE the sandbox. materialize-plugins must:

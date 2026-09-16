@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # B2 dashboard framework: Dashboard.pm — the raw-ANSI TUI for `claude-sandbox`.
 #
 # PART 1  pure helpers: decide_mode, fmt_age, clip_pad, find_exe.

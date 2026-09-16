@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 153 — s05-retire-reconciler-drift-paths: the copies
 # ARE unrepresentable, which is the whole thesis.
 #

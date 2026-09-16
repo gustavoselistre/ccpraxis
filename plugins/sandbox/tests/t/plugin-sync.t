@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Fix 2 PluginSync: the copy-model file reconcile. reconcile_copy_plan makes the
 # host-tier in claude-home equal EXACTLY the current copy-plan — refresh selected
 # (host authoritative), remove what was placed before that's gone now (no

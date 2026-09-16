@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 138 — IMMUTABLE ORACLE for w02's SKILL.md
 # doctrine changes to plugins/butler/skills/drive-solo/SKILL.md: the
 # per-dispatch budget stamp (§2.4 step 1), the interrupt-and-report move

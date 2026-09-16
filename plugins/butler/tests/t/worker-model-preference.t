@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # b35 oracle. Derived ONLY from
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b35-spec.md
 # §2 (resolution cascade), §3 (fallback ladder, incl. the MEASURED §3.1 hazard), §4 (reason

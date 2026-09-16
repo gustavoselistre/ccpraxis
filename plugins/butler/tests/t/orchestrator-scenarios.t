@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # A3 orchestrator LOOP scenarios — drive the real BpOrch::run({once=>1}) through
 # the survivability paths end-to-end with injected clock/registry/transport/launch
 # (no live network, no real claude). This complements t/06 (pure decisions + one

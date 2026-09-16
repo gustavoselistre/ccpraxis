@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Pins the parallelism precedence chain the runner's usage text promises:
 #
 #   explicit `--jobs N`  >  `--nice`  >  the CCPRAXIS_TEST_JOBS env var  >

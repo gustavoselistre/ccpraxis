@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Oracle for b02-backpack-owns-path — DC4, static content assertions.
 # Spec section 2.5's docs sibling: AC11-AC13. No subprocess execution here --
 # these are pure text checks over tracked files.

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Oracle for making bp_read_payload (lib.sh:83) safe to call MORE THAN ONCE
 # in the same hook process. Today it performs one BOUNDED `read -r -d ''
 # -t TIMEOUT` straight into the global PAYLOAD on every bare call, with no

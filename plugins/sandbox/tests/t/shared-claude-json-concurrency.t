@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Shared claude-home/.claude.json — no corruption under real concurrency,
 # on the REAL 9p/drvfs dir bind (s01 row 13, s02 spec §3 B42-B51).
 #

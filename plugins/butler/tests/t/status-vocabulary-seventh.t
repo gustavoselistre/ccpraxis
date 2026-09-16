@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Regression oracle for the SEVENTH package status, `dropped`.
 #
 # THE DEFECT THIS PINS. `dropped` is written as a terminal status by

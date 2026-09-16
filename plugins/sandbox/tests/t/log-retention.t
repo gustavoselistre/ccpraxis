@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 72 — LaunchLog::prune_logs.
 #
 # claude-home/sandbox-logs/ was never pruned. Two files per launch accumulated

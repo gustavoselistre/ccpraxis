@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # e03-autonomous-resolution oracle, part 2: the orchestrator-side wiring --
 # the new 'chronic-scoping' %KIND_REGISTRY entry, the fourth judge-kind
 # dispatch reuse ('escalation-resolve'), the new bp-escalation-resolver agent

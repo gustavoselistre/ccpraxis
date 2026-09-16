@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # 25 -- oracle for blueprint backup-driver, package
 # 06-skill-becomes-wrapper (plugins/steward/skills/backup/SKILL.md, rewritten).
 #

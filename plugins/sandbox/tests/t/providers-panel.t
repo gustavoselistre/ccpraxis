@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 79 -- ORACLE for package t01 (blueprint
 # butler-and-dashboard-overhaul), specs/t01-spec.md. Derived
 # from the spec's §4 observable behaviors and §5 acceptance criteria, and

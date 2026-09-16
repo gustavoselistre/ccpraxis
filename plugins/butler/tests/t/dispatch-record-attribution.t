@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 177 -- IMMUTABLE ORACLE for
 # agent-telemetry/02.
 #

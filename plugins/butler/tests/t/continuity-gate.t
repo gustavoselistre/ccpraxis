@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # 150 -- g01-explicit-continuity-arming, THE STOP GATE:
 # gate-continuity.sh plus its reap, and the mark-wakeup.sh extension that
 # feeds it.

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Oracle for b02-backpack-owns-path — fix-batch step7 regressions.
 #
 # Covers the findings the step6 red-team/reviewer surfaced that survived to

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Oracle for the array-indexing extension to lib.sh's dotted-path scalar
 # lookup (contract at lib.sh:100, both branches at lib.sh:118): a
 # digit-shaped path segment must resolve as a zero-based array index into

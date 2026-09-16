@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 02 — fresh register + host-memory PUSH. Proves the
 # synthetic _host-memory tracked path resolves to ~/.claude/projects/<enc>/memory
 # on this machine, gets walked, and lands in the vault under

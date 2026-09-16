@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Pins the --state=failed CLI grammar from
 # .ccpraxis-local-data/blueprints/test-naming-hygiene/specs/03-runner-state-failed-spec.md
 # section 2.1: only the single-token "--state=failed" spelling is state-mode;

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # PortAlloc.pm — pure port-block allocation logic (no podman, no filesystem).
 # Pins all acceptance criteria from blueprint fix-multiple-running-sandboxes /
 # package 01-module.  Criterion mapping is noted per test.

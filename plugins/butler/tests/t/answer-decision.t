@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # A7 unblock: bp-answer-decision.pl — the mechanical, atomic unblock the reporter
 # runs once a human has answered a runs/escalations/ decision. Part 1 exhausts the
 # pure plan_answer/kind_family matrix (per-kind allowed actions, fail-closed on a

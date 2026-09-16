@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Hook path-walk termination, and drive-solo session scoping.
 #
 # TWO DEFECTS, both found from a live report ("an agent hangs at: running stop

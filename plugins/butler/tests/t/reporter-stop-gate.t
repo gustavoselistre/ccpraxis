@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # 143 — g03, PILLARS 2 and 4: the gate
 # FIRES for a registered reporter and does NOT fire for a non-reporter, both
 # directions exercised end to end; and the refusal names the REPORTER's own

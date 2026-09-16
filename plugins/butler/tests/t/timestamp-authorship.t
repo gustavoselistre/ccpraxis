@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # b27-ledger — the Stop gate stamps last_updated: from
 # iso_now() (bp-lib.sh) rather than letting a clockless agent author it from
 # memory. Written from spec/b27-ledger-spec.md ONLY — no

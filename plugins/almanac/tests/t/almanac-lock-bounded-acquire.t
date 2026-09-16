@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Bounded exclusive-lock acquisition: the deadline is LOCK_NB polling, never
 # `alarm`; the uncontended path is fast and the degenerate zero-budget case is
 # well-defined; a second acquire from the SAME process is refused immediately

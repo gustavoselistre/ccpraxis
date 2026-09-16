@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # t10 -- the oracle for blueprint tui-operator-feedback.
 #
 # Two filed reports about a run's own lifecycle, both closed here, and both

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # All three perl entry points (launcher.pl, bootstrap.pl, TestSandbox.pm)
 # ship the same docker-or-podman detection helper. This test confirms:
 #   - the detector picks SOMETHING on a host where one of them is installed

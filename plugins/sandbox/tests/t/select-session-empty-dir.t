@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Empty sessions dir should produce NEW without showing the picker. This
 # is the "fresh sandbox" path — first launch, no prior work to resume.
 

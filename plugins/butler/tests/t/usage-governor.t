@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/18 — immutable oracle for bp-usage-gate.pl (02).
 #
 # Tests the NEW `verdict` subcommand + the pure `BpUsageGate::verdict_decision`

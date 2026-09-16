@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/110 -- regression tests for the a03-ledger-budget-irreducible
 # step-6 fix-batch (reviewer-step6.md MAJOR + red-team-step6.md MAJOR-1/MAJOR-2). Derived from
 # the pipeline-step-7 dispatch, not the original spec (those cases are already pinned by the

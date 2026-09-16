@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 75 -- ORACLE for package t02 (blueprint
 # butler-and-dashboard-overhaul), specs/t02-spec.md. Written
 # BLIND to any implementation of tui::Frame::wrap_line -- it does not exist

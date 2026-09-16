@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Oracle for b02-backpack-owns-path — DC1, `cmd_install --profile-path`.
 # Spec section 2.3. This file NEVER writes to a real /etc/profile.d — every
 # case below uses --profile-path pointed at a File::Temp tempdir, exactly as

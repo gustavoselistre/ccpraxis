@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 139 — IMMUTABLE ORACLE for w02's
 # §2.5 edit to plugins/butler/skills/coordinator-protocol/SKILL.md:
 # criterion 6 ("coordination, not a dependency" with e03) is satisfied by

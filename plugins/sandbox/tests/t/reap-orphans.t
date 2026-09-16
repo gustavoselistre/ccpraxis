@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 108 — the orphan reaper selects exactly what it should, and nothing else.
 #
 # Bug report 20260828-095201-7c1e: a perl.exe running a throwaway probe out of a

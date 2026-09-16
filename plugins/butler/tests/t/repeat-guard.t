@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # b10-repeat-command-guard oracle. Derived from
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b10-repeat-command-guard-spec.md
 # §4 (AC-1..AC-22). Written BLIND to any implementation: repeat-guard.sh does not exist yet and

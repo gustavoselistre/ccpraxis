@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 12 — a fresh registration's FIRST commit must
 # actually store the files, and must not poison the cache if it does not.
 #

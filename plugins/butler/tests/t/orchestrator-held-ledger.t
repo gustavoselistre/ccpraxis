@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/105 — a02-api-and-guard-defects, DEFECT 5.
 # A package row added to blueprint.md with NO packages/<pkg>.md ledger yet is
 # derived as 'pending' (bp-orchestrator.pl:1902, ledger_fm(...) // 'pending'),

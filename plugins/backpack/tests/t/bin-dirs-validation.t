@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Oracle for b02-backpack-owns-path — DC1 (schema) + DC2 (cmd_add authoring
 # path). Derived from
 # .ccpraxis-local-data/blueprints/butler-and-dashboard-overhaul/specs/b02-backpack-owns-path-spec.md

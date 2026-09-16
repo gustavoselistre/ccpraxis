@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 180 — NOTHING IS BUILT BEFORE THE OPERATOR HAS ANSWERED, and a version
 # mismatch is not a question.
 #

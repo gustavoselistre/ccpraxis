@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # 149 -- g01-explicit-continuity-arming, THE TOGGLE SURFACE:
 # `bp-continuity.pl arm|disarm|status`.
 #

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Fix 3 — ConnectorHold: when a connector's `podman exec -it ... claude` drops
 # because the engine/container died (vs a clean user quit), the launcher must
 # hold the Windows Terminal tab open with a diagnostic instead of vanishing.

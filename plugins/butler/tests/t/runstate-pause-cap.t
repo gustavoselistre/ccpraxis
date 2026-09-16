@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # A pause may not outlive this session's prompt cache.
 #
 # WHY THE CAP EXISTS

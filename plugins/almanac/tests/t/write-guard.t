@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/02 — bug reports are writable only through almanac-bug.pl.
 #
 # The state machine's freeze is only as good as the ban on editing around it, so

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/88 — immutable oracle for b44.
 # Tests B1..B10 from specs/b44-spec.md §4.
 # (B11 — no collateral damage to t/06 / t/17 — is verified by the coordinator

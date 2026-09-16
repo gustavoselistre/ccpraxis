@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # p01-sandbox-plugin-provisioning — driver correction after implementer-step4:
 # the operator's decision log (blueprint decision entry 2026-08-14T00:50:44Z,
 # "ONE-TIME REMOVAL OF THESE TWO, THEN WARN-ONLY") authorises removal of the

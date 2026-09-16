@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Pins render_frame's SPAN-LEVEL row diff (the top-row spinner-flash fix):
 # a changed row no longer always re-emits `\e[<row>;1H\e[K` + the whole row.
 # It finds the longest common span PREFIX and span SUFFIX (role+text equal,

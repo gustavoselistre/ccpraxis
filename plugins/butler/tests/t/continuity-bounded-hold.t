@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # 183 — the two changes that stop /butler:continuity
 # from lying about being armed, and from accepting a promise nothing will keep.
 #

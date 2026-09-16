@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # 137 — the w02 FOLD: gate-drive-loop.sh consults
 # bp-runstate.pl's effective 'paused' state as an ADDITIONAL escape from
 # BLOCK, on top of everything t/drive-loop-gate.t already pins.

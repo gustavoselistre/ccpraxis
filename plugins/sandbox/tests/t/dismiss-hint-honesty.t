@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/183 -- '[d] dismiss' must only appear when 'd' will dismiss something visible.
 #
 # Reported from the field 2026-09-09: "on `[r] no module changed on disk

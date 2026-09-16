@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/114 — accepting a harvest failure must be DURABLE.
 #
 # THE BUG. `bp-answer-decision.pl --action accept` set the ledger to `done` and

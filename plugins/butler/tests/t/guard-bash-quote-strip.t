@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # 167 -- oracle for t09-guard-hooks-stripping's guard-bash.sh
 # changes (spec .ccpraxis-local-data/blueprints/tui-operator-feedback/specs/
 # t09-guard-hooks-stripping-spec.md SS2.2/SS2.3/SS3/SS4).

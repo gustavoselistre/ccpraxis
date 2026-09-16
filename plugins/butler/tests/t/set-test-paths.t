@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/102 — a02-api-and-guard-defects, DEFECT 2.
 
 # `bp-blueprint.pl set-test-paths` does not exist yet: nothing today can change a

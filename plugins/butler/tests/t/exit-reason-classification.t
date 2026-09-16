@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/68 — immutable oracle for b16-exit-reason-and-cold-escalation.
 #
 # Derived ONLY from

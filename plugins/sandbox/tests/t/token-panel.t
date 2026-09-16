@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # s08: access + refresh token status (TokenInfo.pm + launcher
 # _gather_tokens wiring + Dashboard.pm Token panel).
 #

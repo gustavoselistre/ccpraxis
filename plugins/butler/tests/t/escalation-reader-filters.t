@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # e02-escalation-classification-layer oracle, part 2: the reader side --
 # bp-wait-for-decision.pl's `category` field + `--category` filter,
 # bp-answer-decision.pl's new read-only `--list [--category ...]` surface, and

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 119 — oracle for gate-headless-background.sh
 # (h01-headless-background-gate spec §2.1, done criteria 1/2/3/7).
 #

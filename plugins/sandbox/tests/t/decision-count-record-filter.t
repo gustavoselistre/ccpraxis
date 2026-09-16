@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # "NEEDS YOU: 1 DECISION WAITING" AGAINST AN EMPTY QUEUE, FOREVER.
 #
 # The escalations directory for a live run held exactly one entry:

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # b49-agent-worker-turn-doctrine oracle.
 #
 # WHY THIS TEST EXISTS

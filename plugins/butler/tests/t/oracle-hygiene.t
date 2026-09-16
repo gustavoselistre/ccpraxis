@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 00 — the shared-shape lint, as a TEST.
 #
 # WHY THIS IS A TEST AND NOT JUST A SCRIPT

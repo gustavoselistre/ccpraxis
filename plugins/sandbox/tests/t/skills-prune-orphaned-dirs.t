@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # p01-sandbox-plugin-provisioning — spec.md §2.3, Observable behavior 5.
 #
 # PluginSync::prune_orphaned_dirs($dest_root, $keep_names) does NOT exist yet

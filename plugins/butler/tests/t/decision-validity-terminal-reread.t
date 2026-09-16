@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # e04-honest-terminal-reporting, AC3 (-> DC3): a decision must never be queued
 # against a package whose re-read-under-lock ledger status is already
 # 'done'/'dropped'. a01 already ships the re-read-under-lock GATE mechanism

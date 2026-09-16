@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # An ARMED session holds the machine awake, on both platforms, until it is
 # turned off.
 #

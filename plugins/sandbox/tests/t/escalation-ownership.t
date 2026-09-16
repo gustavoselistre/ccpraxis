@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 97 — "needs you" means the operator, not the queue.
 #
 # WHAT IS BEING PROTECTED

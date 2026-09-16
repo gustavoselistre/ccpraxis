@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # 144 — g03-reporter-stop-gate, PILLAR 3: the
 # --surface separation on bp-runstate.pl, and the concrete collision it
 # exists to prevent.

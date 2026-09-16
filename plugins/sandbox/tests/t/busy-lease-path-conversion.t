@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # THE BUSY-LEASE PROBE MUST SURVIVE MSYS2 PATH CONVERSION.
 #
 # Measured defect, 2026-09-16, reported as 20260915-230820-d33e. The container

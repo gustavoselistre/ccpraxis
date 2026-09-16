@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # p01-sandbox-plugin-provisioning — AC-9 (maps to done-criterion 6, "a
 # marketplace copy that leaves a plugin uncached").
 #

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 66 — ORACLE for package 06 (blueprint
 # unified-tui-design-system), specs/06-spec.md. Written BLIND
 # to any tui/DashboardScreen.pm implementation -- it does not exist yet --

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Decision #10 / Ruling B (2026-07-28) — the .claude.json relocation migration.
 #
 # WHY THIS FILE EXISTS. The harvest audit failed this package because no

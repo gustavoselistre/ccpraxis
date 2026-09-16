@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # DIFFING A SNAPSHOT AGAINST ITSELF MUST REPORT ZERO.
 #
 # bp-containment-audit.pl exists so a coordinator can run it around a step that

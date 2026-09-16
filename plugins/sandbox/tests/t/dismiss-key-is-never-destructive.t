@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/189 -- the key that DISMISSES on one screen must not DESTROY on another.
 #
 # Bug 20260908-193156-2cee, mechanism 2. The operator's words were "there's an

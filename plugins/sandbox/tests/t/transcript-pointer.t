@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Oracle for b02-backpack-owns-path — DC5 (AC14, AC15) + a supplementary
 # assertion tying DC2's flagged migration consequence to something
 # machine-checkable (item_hash / is_approved, BackpackApproval.pm).

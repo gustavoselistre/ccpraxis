@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # 134 — IMMUTABLE ORACLE for w01-bp-watch's CLI surface
 # (plugins/butler/scripts/bp-watch.pl, `unless (caller)` block).
 #

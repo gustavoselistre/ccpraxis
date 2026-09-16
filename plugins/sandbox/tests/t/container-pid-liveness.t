@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # THE HOST CANNOT PROBE A CONTAINER'S PIDS, AND USED TO HAVE NO WAY TO ASK.
 #
 # A sandboxed run writes its orchestrator and coordinator PIDs from inside the

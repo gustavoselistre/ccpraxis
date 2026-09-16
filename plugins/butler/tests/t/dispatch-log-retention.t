@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/182 -- the dispatch-log store must SHRINK, and the over-cap path must heal.
 #
 # Bug 20260908-225444-b9db. The store only ever grew: `start` wrote one record

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t07 -- the oracle for blueprint tui-operator-feedback.
 #
 # Operator, verbatim: "the TUI for GSA says 'needs you: 1 decision waiting'

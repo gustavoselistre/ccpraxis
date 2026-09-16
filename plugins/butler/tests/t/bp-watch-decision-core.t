@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # 133 — IMMUTABLE ORACLE for w01-bp-watch's pure
 # decision core (package BpWatch in plugins/butler/scripts/bp-watch.pl).
 #

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 161 — s04: "finished but marked running"
 # becomes unwritable. Spec: .ccpraxis-local-data/blueprints/butler-and-dashboard-
 # overhaul/specs/s04-spec.md.

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 07 — scope item 4: when this machine's local tracked_paths
 # grow beyond what the vault metadata.json records, the next sync-project must
 # write the union back into the vault metadata (within its own commit) so a future

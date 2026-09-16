@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # t/112 — the stop gate is a STATE MACHINE.
 #
 # THE FAILURE. A turn that ends mid-run schedules nothing: no notification is

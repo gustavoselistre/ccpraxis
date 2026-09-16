@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t02-spend-persistence — the sandbox-side oracle for blueprint tui-operator-feedback.
 #
 # Closes half of the operator's second complaint, verbatim: "the claude spend

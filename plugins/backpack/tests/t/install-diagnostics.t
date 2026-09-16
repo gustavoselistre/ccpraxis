@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # When a backpack item installs but its post-install verify fails, the install
 # pass must surface WHY — not just the verify command (which is usually
 # self-silencing, e.g. `… 2>/dev/null | grep -q …`). cmd_install re-runs the

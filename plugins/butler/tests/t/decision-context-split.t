@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # b42 oracle. Derived ONLY from
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b42-spec.md
 # section 5 (C1..C7) plus the frozen ground truth in

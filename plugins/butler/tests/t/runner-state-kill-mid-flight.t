@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Pins AC-6 and AC-7 of the --state=failed spec (DC5 in the package ledger):
 # a sweep killed mid-flight (SIGTERM, then SIGKILL if it does not yield) must
 # leave the state file exactly as it was before the invocation started -- no

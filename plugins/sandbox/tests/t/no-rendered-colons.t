@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t05-no-colons -- the oracle for blueprint tui-operator-feedback.
 #
 # Operator, verbatim: "we use way too many instances of the character `:`. Its

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/106 — a02-api-and-guard-defects, DEFECT 6.
 #
 # guard-git-mutations.sh greps the WHOLE command STRING (:48, :56), so prose that

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 190 — `host-only: true` on the plugin path.
 #
 # WHAT WAS WRONG

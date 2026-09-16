@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 05 — hard-excludes are honoured both at WALK time (a tracked
 # directory containing an excluded path) and at REGISTER time (refusing an
 # excluded path outright). The blueprints/<name>/runs/ regex exclude is the

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # b19-ledger-timestamp-integrity oracle. Derived ONLY from
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b19-ledger-timestamp-integrity-spec.md
 # §2 (the checks), §3 (one implementation, both sites) and §4 (acceptance criteria C1..C9).

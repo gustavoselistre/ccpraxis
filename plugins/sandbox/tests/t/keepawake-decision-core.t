@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # KeepAwake.pm (B5) — the keep-awake decision + the seam-injected lifecycle
 # holder. The actual Windows wake-lock (keep-awake.ps1 / SetThreadExecutionState)
 # and whether the machine really stays awake are verified on a real desktop

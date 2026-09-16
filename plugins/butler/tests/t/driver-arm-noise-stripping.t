@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 164 — d03-one-shell-noise-stripper.
 #
 # Spec: specs/d03-one-shell-noise-stripper-spec.md §3 (observable behaviors),

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/107 — a02-api-and-guard-defects, DEFECT 7.
 # bp-blueprint.pl's locate_table latches onto the FIRST `|`-row anywhere in the
 # document containing the literal "depends_on" as its header -- an ordinary

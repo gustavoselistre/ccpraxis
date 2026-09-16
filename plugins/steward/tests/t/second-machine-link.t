@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 03 — the cross-machine guarantee from Decision #1: host
 # memories pushed from machine A are pulled on machine B into B's OWN encoded
 # memory dir (computed from B's cwd), NOT machine A's. Machine 1 pushes; machine

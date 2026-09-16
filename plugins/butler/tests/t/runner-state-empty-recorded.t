@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Pins AC-4 of the --state=failed spec (03-runner-state-failed-spec.md
 # section 2.4): when there is nothing recorded -- the state file never
 # existed, or exists but is empty -- "--state=failed" must print the exact

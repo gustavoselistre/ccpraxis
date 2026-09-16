@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/103 — a02-api-and-guard-defects, DEFECT 3.
 # `add-decision --text` currently accepts a newline/CR and SILENTLY SQUASHES it
 # (bp-blueprint.pl:766, `$text =~ s/[\r\n]+/ /g`) while `--id` is validated with

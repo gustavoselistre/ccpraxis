@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Holds MountSpec::v_to_mount accountable for the bind/volume distinction.
 #
 # REGRESSION: the launcher used to hardcode `type=bind` for every mount,

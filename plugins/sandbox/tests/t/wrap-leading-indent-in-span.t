@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 191 — a wrapped row keeps the indent it arrived
 # with, even when that indent is baked into a content span.
 #

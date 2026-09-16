@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # Oracle tests for b39, derived from
 #   .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b39-spec.md
 #

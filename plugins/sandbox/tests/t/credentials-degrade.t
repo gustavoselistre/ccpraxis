@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Fix 1 robustness: materialize-credentials must DEGRADE (preserve in-container
 # mcpOAuth) rather than ABORT the launch when its own accumulator output is
 # persistently unparseable. That output is a real file in the RW claude-home dir

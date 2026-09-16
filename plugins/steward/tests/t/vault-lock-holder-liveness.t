@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # THE VAULT LOCK WROTE THE HOLDER'S PID DOWN AND NEVER READ IT.
 #
 # acquire_lock records three things about whoever holds the vault lock: session

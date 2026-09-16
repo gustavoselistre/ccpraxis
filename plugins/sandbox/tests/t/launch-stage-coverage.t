@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 37 — EVERY LONG STRETCH OF THE LAUNCH FLOW IS INSIDE A STAGE.
 #
 # WHY THIS EXISTS. `_launch_stage_begin` is the only thing that repaints during

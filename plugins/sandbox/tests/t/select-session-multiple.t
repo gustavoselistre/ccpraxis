@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Picker with multiple session jsonl files: verify "Start a new session"
 # is always option 1, sessions are ordered most-recent-first, and the
 # line-prompt fallback honors the user's choice (e.g. choosing 2 yields

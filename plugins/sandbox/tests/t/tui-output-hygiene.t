@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # s17-statusline-and-output-hygiene: sandbox indicator, output hygiene while
 # the alt-screen is owned, fork-cadence reduction, and current-session
 # heartbeat filtering.

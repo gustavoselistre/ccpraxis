@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # A8 preflight (bp-preflight.pl): asserts environment support from the manifest
 # and HALTS LOUD on an unsupported platform (Decisions #29/#31). A bare linux
 # host must NOT be mistaken for our sandbox.

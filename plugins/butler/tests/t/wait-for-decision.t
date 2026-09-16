@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # A7 watcher: bp-wait-for-decision.pl — the reporter's token-free blocking watcher
 # over runs/escalations/. Part 1 exhausts the pure decision core (decision_id /
 # parse_seen / fresh_decisions). Part 2 drives the blocking wait_loop with injected

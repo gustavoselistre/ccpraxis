@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 67 — ORACLE for package 07 (blueprint
 # unified-tui-design-system), specs/07-spec.md. Written BLIND
 # to any tui/BackpackScreen.pm implementation -- it does not exist yet --

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t03-activity-column -- the oracle for blueprint tui-operator-feedback.
 #
 # Closes the operator's third request, verbatim: "the Recent activity could

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Regression test for the install-pass heartbeat pattern in launcher.pl.
 #
 # Bug history: the launcher used to land its first /tmp/.launcher-alive

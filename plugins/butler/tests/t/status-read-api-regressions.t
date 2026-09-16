@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/160 — regression coverage for BpState.pm
 # added in the s01-status-read-api fix-batch step 7, for two defects that
 # survived to step 6 without t/159 (the immutable oracle) catching them:

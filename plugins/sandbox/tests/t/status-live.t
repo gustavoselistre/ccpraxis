@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # s07-live-status: spinner + status colour + OS window title.
 #
 # This file is the IMMUTABLE ORACLE for blueprint sandbox-butler-overhaul,

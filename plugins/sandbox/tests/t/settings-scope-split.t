@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Oracle for the settings-scope split: machine-local state in
 # .claude/settings.local.json, shared project state in .claude/settings.json.
 #

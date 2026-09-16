@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # 21 -- oracle for blueprint backup-driver, package
 # 02-preflight-and-config (scripts/backup/Preflight.pm).
 #

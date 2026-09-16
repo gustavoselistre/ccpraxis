@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # 135 — IMMUTABLE ORACLE for w01-bp-watch's doctrine
 # surface: criterion 10 (registers as a legitimate wake-up), criterion 10a
 # (self-contained arm, no forgettable re-arm), the --keepawake lease refresh,

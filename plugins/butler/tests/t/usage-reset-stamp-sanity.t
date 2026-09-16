@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # A USAGE READING THAT CONTRADICTS ITSELF MUST NOT REACH A GATE.
 #
 # Measured over roughly forty minutes in one session, no config change between:

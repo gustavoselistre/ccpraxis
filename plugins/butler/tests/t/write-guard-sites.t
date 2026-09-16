@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/99 — the four converted sites of a01-write-integrity-
 # reread-under-lock (spec §3 S1-S4, §4 AC9-AC14/AC16/AC17).
 #

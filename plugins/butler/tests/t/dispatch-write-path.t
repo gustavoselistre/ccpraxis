@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 180 -- IMMUTABLE ORACLE for agent-telemetry/03.
 #
 # Spec: .ccpraxis-local-data/blueprints/agent-telemetry/specs/03-spec.md

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 24 — b05
 #
 # Oracle for the whole-blueprint conformance gate, written from

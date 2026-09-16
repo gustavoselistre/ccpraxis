@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # b46 oracle. Derived ONLY from
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b46-spec.md
 # section 4 (C1..C8). Renumbered to t/90 per spec section 0 (t/87 is already b42's).

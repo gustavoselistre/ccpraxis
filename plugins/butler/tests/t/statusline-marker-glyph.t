@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 166 -- blueprint tui-operator-feedback, package
 # t06-statusline-marker (specs/t06-statusline-marker-spec.md, AC1-AC15).
 #

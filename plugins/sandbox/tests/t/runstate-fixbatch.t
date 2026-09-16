@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # agent-telemetry 04-runstate-run-and-package-facts consolidated fix-batch:
 # covers the two behavioural fixes that have no home in the existing
 # immutable oracle (t/runstate-package-facts.t, which permits exactly one

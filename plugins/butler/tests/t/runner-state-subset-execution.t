@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Pins AC-3 of the --state=failed spec: with a non-empty, all-live recorded
 # list, "--state=failed" executes EXACTLY those recorded files -- proven by a
 # third, unrecorded fixture file that must never appear anywhere in the

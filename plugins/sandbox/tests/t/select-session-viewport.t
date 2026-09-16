@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Unit tests for the select-session.pl picker's viewport + display helpers —
 # the pure functions behind the scrolling TUI fix. The TUI render loop itself
 # needs a real TTY (covered by attended live-checks), but its load-bearing

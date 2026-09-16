@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 121 — oracle for guard-judge-checks.sh (h01 spec §2.2,
 # done criterion 6, AC6).
 #

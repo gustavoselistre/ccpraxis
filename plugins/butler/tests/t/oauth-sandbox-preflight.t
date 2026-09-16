@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 16 — oracle tests for the oauth_usable($d,$now_ms)
 # pure predicate and the oauth.sandbox_login manifest entry.
 #

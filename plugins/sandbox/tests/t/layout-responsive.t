@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # s05-responsive-layout: the two-column layout oracle for Dashboard.pm.
 #
 # This file is the IMMUTABLE ORACLE for blueprint sandbox-butler-overhaul,

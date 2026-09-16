@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # b01 — the immutable test oracle.
 #
 # Derived ONLY from specs/02-spec.md (AC-1..AC-26).

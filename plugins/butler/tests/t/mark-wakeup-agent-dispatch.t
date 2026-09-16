@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 120 — oracle for done criterion 4, the
 # HIGHEST-VALUE test in this package (h01-headless-background-gate spec
 # §2.3/§2.4, AC4).

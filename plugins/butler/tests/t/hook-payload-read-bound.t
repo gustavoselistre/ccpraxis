@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 175 -- the hook payload read is BOUNDED.
 #
 # WHAT THIS PINS. Every butler hook used `PAYLOAD=$(cat)`, an unbounded read.

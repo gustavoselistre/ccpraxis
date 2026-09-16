@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Regression for 20260911-225720-4c57 (defect 2's second half): a registered
 # project whose root no longer resolves on this machine used to vanish from
 # `collect` with NO diagnostic at all -- silence is what hid six open

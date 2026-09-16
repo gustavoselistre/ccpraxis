@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 122 — oracle for the REVISED registration
 # decision (g02 spec §2.1-§2.3, INVERTING h01's original §2.5 decision):
 # gate-headless-background.sh and guard-judge-checks.sh register ONLY in

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # A STRINGIFIED PERL REFERENCE MUST NOT REACH A LEDGER BODY.
 #
 # Observed on a live run, almanac 20260915-191939-da6e. A package's Escalation

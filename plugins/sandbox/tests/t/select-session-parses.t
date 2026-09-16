@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # select-session.pl must handle a real-shaped JSONL session:
 #  - extract the session UUID
 #  - skip <local-command-*> meta lines and tool_result entries when

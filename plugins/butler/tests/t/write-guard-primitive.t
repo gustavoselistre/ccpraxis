@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/98 — immutable oracle for BpWrite::guarded_write,
 # the a01-write-integrity-reread-under-lock primitive (spec §2.3-2.4, §8).
 # Covers AC1-AC8. `bp-write-guard.pl` does not exist yet -> the require below

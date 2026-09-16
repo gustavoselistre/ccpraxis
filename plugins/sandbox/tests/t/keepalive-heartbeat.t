@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Validates the container's keep-alive pattern that the Containerfile
 # bakes in: a heartbeat-only loop that watches /tmp/.launcher-alive
 # mtime and reaps the container if the sentinel goes stale.

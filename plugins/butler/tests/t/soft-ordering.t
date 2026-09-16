@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/74 — immutable oracle for b22-constraint.
 # Tests C1..C9 from specs/b22-constraint-spec.md §5 against the
 # ready-set computation with INJECTED state (%meta/%status/$running passed

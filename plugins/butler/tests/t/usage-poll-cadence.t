@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/81 — immutable oracle for b30-floor.
 #
 # Derived from

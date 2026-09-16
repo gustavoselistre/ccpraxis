@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/04 — a load-modify-write race cannot defeat the
 # freeze guarantee.
 #

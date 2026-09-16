@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # SandboxLock.pm (04-build-race-lock) — unit tests for the NEW module.
 # Acceptance criteria L1–L6 (spec: 04-build-race-lock-spec.md).
 #

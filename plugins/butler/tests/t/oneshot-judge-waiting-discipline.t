@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/113 — a one-shot judge must never be told
 # to background its work.
 #

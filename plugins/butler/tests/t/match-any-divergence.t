@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/108 — a02-api-and-guard-defects, drift guard.
 #
 # match_any is defined TWICE:

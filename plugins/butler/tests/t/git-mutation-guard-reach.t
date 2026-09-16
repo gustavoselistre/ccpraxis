@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # THE GUARD EXISTED, WAS CORRECT, AND PROTECTED ALMOST NOBODY.
 #
 # guard-git-mutations.sh was written after a prohibited `git st'.'ash` took a

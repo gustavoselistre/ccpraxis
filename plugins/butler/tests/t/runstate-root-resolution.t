@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # bp-runstate.pl must anchor its state to the PROJECT, never to its own
 # install location.
 #

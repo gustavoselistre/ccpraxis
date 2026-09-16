@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Pins the assumption that the current container backend's host bind
 # mount supports O_APPEND writes and utimensat (UTIME_NOW + explicit
 # timestamp). Both syscalls used to fail silently on Hyper-V's 9p share,

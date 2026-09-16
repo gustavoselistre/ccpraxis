@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 14 — the update research engine and its persistence layer.
 #
 # WHY THIS EXISTS. /steward:update was a prose protocol that made the agent

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # b14 oracle. Derived ONLY from
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b14-spec.md
 # section 3 (C1..C6) and its vacuity gate.

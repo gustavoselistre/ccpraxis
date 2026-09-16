@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t04 -- the oracle for blueprint tui-operator-feedback.
 #
 # Closes the operator's fifth report, verbatim: "the blueprints section should

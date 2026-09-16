@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/119 — oracle for r01.
 #
 # Derived ONLY from

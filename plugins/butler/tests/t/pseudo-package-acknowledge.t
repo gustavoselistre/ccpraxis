@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # e04-honest-terminal-reporting, AC2 (-> DC2): dag-stalled/remediation-escalation
 # decisions are filed against pseudo-packages ('_dag'/'_remediation') with NO
 # ledger file -- bp-answer-decision.pl must give them an `acknowledge` verb

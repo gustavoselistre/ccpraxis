@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # Oracle tests for s03, derived from
 #   .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/s03-spec.md
 #

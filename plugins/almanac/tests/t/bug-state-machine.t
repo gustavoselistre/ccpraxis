@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/01 — bug reports are frozen once ccpraxis picks them up.
 #
 # The guarantee: a report's body cannot change from `reviewing` onward, so a

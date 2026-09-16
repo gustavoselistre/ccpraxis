@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Multi-session use case: two `claude-sandbox` invocations on the same
 # project share the SAME container and the SAME host bind mount of
 # claude-home. This test exercises the shared-state guarantees that

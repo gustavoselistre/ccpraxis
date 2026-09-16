@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # b28 — an idle usage window (utilization 0) legitimately
 # omits resets_at; validate_usage must require resets_at only for a window
 # whose utilization is numeric and strictly > 0. See spec section 3/4.

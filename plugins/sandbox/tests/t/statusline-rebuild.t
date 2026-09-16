@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # 69 -- the ORACLE for blueprint unified-tui-design-system,
 # package 10
 # (specs/10-spec.md).

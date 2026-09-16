@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 88 -- ORACLE for package d02-wrap-every-surface
 # (blueprint ccpraxis-tooling-debt), specs/d02-wrap-every-surface-spec.md.
 # Written BLIND to any implementation of the banner-wrap fix -- Screen.pm's

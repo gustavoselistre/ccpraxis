@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 26 — a plugin that ships but is never registered.
 #
 # WHAT HAPPENED

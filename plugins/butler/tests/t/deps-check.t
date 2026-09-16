@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 20 — BpDepsCheck::run classifies dependency/runtime-version governance
 # violations (EOL runtimes, undeclared toolchains, missing/uncommitted lockfiles, freshly
 # published pins) into BLOCK/WARN findings per spec 05-dependency-version-governance §4

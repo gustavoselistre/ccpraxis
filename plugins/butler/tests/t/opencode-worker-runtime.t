@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # b34 oracle. Derived ONLY from
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b34-spec.md
 # §3, acceptance criteria E1..E14 (mapped 1:1 to DC-1..DC-14, see the spec's own mapping table).

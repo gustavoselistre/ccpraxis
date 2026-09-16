@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # e04-honest-terminal-reporting, AC1 (-> DC1): a crashed harvest judge (verdict
 # 'error') must not be reported with the same operator text as a real failed
 # verdict ('fail') -- byte-identical today, per

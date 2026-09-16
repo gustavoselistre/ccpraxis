@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # bp_clear_stale_shutdown (bp-lib.sh / #28): an explicit dispatch clears a stale
 # terminal .shutdown so a freshly-launched orchestrator actually runs instead of
 # winding down on tick 1. (The orchestrator HONORING a live .shutdown is unchanged

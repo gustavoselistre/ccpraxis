@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # b51-turn-cap-single-source oracle.
 #
 # WHY THIS EXISTS

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 13 — installing must not destroy a config the user
 # already had.
 #

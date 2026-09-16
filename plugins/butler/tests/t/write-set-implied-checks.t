@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # b50 oracle.
 #
 # THE PROBLEM (external report, techcontas-ux-refine, 13 packages):

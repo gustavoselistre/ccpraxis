@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t/76 — oracle for b24, derived ONLY from
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b24-spec.md
 # (C1..C10, sec.5) and its two corrected ledger claims (sec.0): the blueprint has 71 packages,

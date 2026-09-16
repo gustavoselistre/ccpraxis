@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # s09: podman machine + container + host resources.
 #
 # This file is the IMMUTABLE ORACLE for blueprint sandbox-butler-overhaul,

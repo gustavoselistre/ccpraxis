@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 06 — refresh-default-tracked picks up default paths that
 # came into existence AFTER registration (the synthetic _host-memory among them)
 # and is idempotent: a second run adds nothing and reports already_tracked

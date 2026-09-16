@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Regression suite for the b01-backpack-install-accounting step-7 fix-batch.
 # Each block below reproduces a defect from the step-6 reviewer/red-team
 # reports that the immutable oracle files (03-06) did NOT catch -- that is

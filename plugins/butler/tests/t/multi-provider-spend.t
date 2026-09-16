@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # b36-governance oracle. Derived ONLY from
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b36-governance-spec.md
 # section 3, acceptance criteria C1..C10, and section 3a (the REVISIT TRIGGER).

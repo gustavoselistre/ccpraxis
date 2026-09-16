@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # b41-tracking oracle. Derived ONLY from
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b41-tracking-spec.md
 # section 3 (C1..C11) plus the measured s07 numbers frozen in section 0/1 of that spec.

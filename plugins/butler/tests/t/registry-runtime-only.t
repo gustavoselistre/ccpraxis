@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # s02: runs/registry.json becomes strictly runtime-only.
 # Its `status` key is removed from every writer/reader inside this package's
 # write set (bp-orchestrator.pl, bp-lib.sh; bp-baseline.pl needs no change

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 123 — oracle for done criterion 5 (h01 spec §2.6/§2.7,
 # AC5): the prose is fixed too, as the EXPLANATION, not the mechanism.
 #

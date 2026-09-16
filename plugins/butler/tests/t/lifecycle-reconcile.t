@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # 97 — bp-lifecycle.pl, the derived-state reconciler.
 #
 # The defect this file pins down, stated once:

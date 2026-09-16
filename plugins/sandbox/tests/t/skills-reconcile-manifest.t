@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # p01-sandbox-plugin-provisioning — spec.md Observable behaviors 3, 4, 6, 7;
 # AC-4, AC-5, AC-8a.
 #

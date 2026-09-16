@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # e02-escalation-classification-layer oracle, part 1: the three emitters
 # (BpOrch::queue_needs_you, BpOrch::_enter_pause_manual, BpOrch::_block_and_queue)
 # gain a REQUIRED `category` argument, enforced by a shared _require_category gate

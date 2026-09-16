@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # t02-spend-persistence — the butler-side oracle for blueprint tui-operator-feedback.
 #
 # Covers the two writer-side defects behind the operator's complaint that "the

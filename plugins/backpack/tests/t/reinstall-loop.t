@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # Oracle for b02-backpack-owns-path — DC3, THE LOAD-BEARING CRITERION.
 #
 # Spec section 2.3/2.4: writing /etc/profile.d/backpack-path.sh is NOT

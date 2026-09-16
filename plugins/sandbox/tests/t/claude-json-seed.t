@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # ClaudeConfig::heal_claude_json — the self-heal for claude-home/.claude.json's
 # onboarding bypass. A 0-byte / corrupt config (left by an interrupted in-place
 # write or two connectors writing the one shared file) was treated as "present"

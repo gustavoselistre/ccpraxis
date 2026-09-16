@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: windows
 # 165 — d04: the DRIVE-SOLO and
 # REPORTER registries stop guessing $PWD.
 #
