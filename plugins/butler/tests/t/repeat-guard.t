@@ -402,7 +402,16 @@ is(gate_verdict_call('Edit', 'worksite', 1),  'deny',  'AC-21: regression - bp_g
               [ $cmd_of->('guard-git-mutations.sh') . ' --only-during-butler-run',
                 $cmd_of->('guard-bash.sh'), $cmd_of->('mark-wakeup.sh'),
                 $cmd_of->('gate-headless-background.sh'), $cmd_of->('guard-judge-checks.sh'),
-                $cmd_of->('guard-validation-interlock.sh') ],
+                $cmd_of->('guard-validation-interlock.sh'),
+                # UPDATED 2026-09-17: guard-run-finish.sh, registered LAST. An agent
+                # read five background tasks dying as the operator pressing Stop and
+                # wound a session down with an in-flight package's required check
+                # never run. Brought up to reality rather than loosened -- the list
+                # stays EXACT and ORDERED. THIS ASSERTION EXISTS IN THREE FILES
+                # (here, ledger-guard.t AC-36, wait-shape-guard.t AC-34 / repeat-guard.t
+                # AC-20); updating one and not the others is how it sat red for weeks
+                # before, and is exactly what the full plugin sweep caught this time.
+                $cmd_of->('guard-run-finish.sh') ],
               'AC-20: block 1 command list is exactly the six registered Bash hooks IN ORDER (repeat-guard.sh appearing here still fails)');
 
     my $b2 = $pre->[2] // {};

@@ -21,6 +21,13 @@
 # Everything here is hermetic: a File::Temp project root with fabricated ledgers
 # and a fabricated transcript. Nothing reads the real blueprints, the real
 # registry or the real session.
+# test-wakelock-hygiene.t R3: this file's denial text names `bp-continuity.pl
+# hold`, a wake-lock actuator, so the repo-wide rule requires the opt-out even
+# though nothing here actually takes a lock. The rule is deliberately keyed on
+# NAMING an actuator rather than calling one -- a test that can be read as
+# taking a wake-lock is one somebody will eventually copy.
+BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
+
 use strict;
 use warnings;
 use FindBin qw($Bin);
