@@ -1301,4 +1301,66 @@ assert_corpus_untouched();
     }
 }
 
+{   # ---- AC-32 (V4a): an EMPTY write_set is refused.
+    #
+    # Report 20260916-180317-71de: a ledger was rewritten to a 727-byte stub with
+    # a bare `write_set:` and nothing after it, losing test_paths, checks,
+    # max_turns, effort, Inputs, Constraints and most of Scope. It PASSED
+    # validation, because @REQUIRED_KEYS checks a key is PRESENT, never that it
+    # carries a value.
+    #
+    # An empty write set is not a degraded state, it is a dead one: guard-writes
+    # permits nothing, so the package relaunches, writes nothing, and blocks
+    # again with no field left to explain why. The rule already existed in
+    # bp-auditor's DAG-integrity list ("no package declares an empty
+    # `write_set`") -- enforced at authoring time by an agent, and not by the
+    # sanctioned WRITER, which is how the stub reached disk.
+    # The canonical fixture uses the LIST form, so replacing the `write_set:`
+    # line alone leaves its "  - path" item behind and the field is NOT empty.
+    # Removing that item is what makes this fixture the stub the report
+    # describes -- and getting it wrong first is how the two-form contract was
+    # discovered at all.
+    # THE CANONICAL FIXTURE USES THE LIST FORM, so replacing the `write_set:`
+    # line alone leaves its "  - path" item behind and the field is NOT empty.
+    # Getting this wrong first is how the two-form contract was discovered:
+    # `write_set:` accepts a colon-delimited scalar AND a YAML-ish list, and a
+    # rule written against only the scalar turned 100 assertions red.
+    my $empty = clean_ledger();
+    $empty =~ s/^write_set:.*$/write_set:/m;
+    $empty =~ s/^\s+-\s+\S+\n//m;
+    my ($rc_empty, undef, $err_empty) = run_pl(['validate', '--ledger', stage_bytes($empty)]);
+    is($rc_empty, 2, 'AC-32: a bare `write_set:` with no value is REFUSED');
+    like($err_empty, qr/is EMPTY/, 'AC-32: ...and the message says so plainly');
+    like($err_empty, qr/20260916-180317-71de/, 'AC-32: ...and cites the report');
+}
+
+{   # ---- AC-33 (V4c): a Windows DRIVE LETTER in write_set is always corrupt.
+    #
+    # Found while validating AC-31's rule against the archive, NOT from a
+    # symptom. These fields are split on ":", so `C:/Users/...` splits into "C"
+    # and "/Users/...": a blueprint targeting another project by absolute
+    # Windows path has a corrupt write set FROM THE MOMENT IT IS AUTHORED, with
+    # no symptom until a guard refuses a write nobody expected it to refuse. The
+    # bare "C" is the dangerous half -- depending on the matcher it can match far
+    # MORE than intended, not less.
+    #
+    # Four ledgers in `_archive/audit-remediation/packages/` carry exactly this,
+    # so the blueprint ran with silently corrupt write sets throughout. They are
+    # archived and are left as they are; this stops the next one.
+    my $drive = clean_ledger();
+    $drive =~ s{^write_set:.*$}{write_set: C:/Users/x/Personal Files/p/CLAUDE.md:lib/b.pm}m;
+    $drive =~ s/^\s+-\s+\S+\n//m;
+    my ($rc_drv, undef, $err_drv) = run_pl(['validate', '--ledger', stage_bytes($drive)]);
+    is($rc_drv, 2, 'AC-33: a Windows drive letter in write_set is REFUSED');
+    like($err_drv, qr/drive letter/, 'AC-33: ...and the message names the cause');
+
+    # NON-VACUITY: a repo-relative write_set with no drive letter still passes,
+    # so AC-33 is not rejecting every write_set.
+    my $rel = clean_ledger();
+    $rel =~ s{^write_set:.*$}{write_set: lib/a.pm:lib/b.pm}m;
+    $rel =~ s/^\s+-\s+\S+\n//m;
+    my ($rc_rel) = run_pl(['validate', '--ledger', stage_bytes($rel)]);
+    is($rc_rel, 0, 'AC-33: NON-VACUITY -- an ordinary repo-relative write_set validates clean');
+}
+
 done_testing();

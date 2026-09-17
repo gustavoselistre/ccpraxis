@@ -356,6 +356,67 @@ sub validate_bytes {
              . join(', ', @STATUSES) . '.';
     }
 
+    # V4a — write_set: must not be EMPTY.
+    #
+    # Bug 20260916-180317-71de: a ledger was rewritten to a 727-byte stub with a
+    # bare `write_set:` and nothing after it, losing test_paths, checks,
+    # max_turns, effort, Inputs, Constraints and most of Scope. It passed
+    # validation, because @REQUIRED_KEYS checks a key is PRESENT, never that it
+    # carries a value.
+    #
+    # AN EMPTY WRITE SET IS NOT A DEGRADED STATE, IT IS A DEAD ONE. guard-writes
+    # permits nothing, so the package cannot write a single file -- it would
+    # relaunch, be unable to touch its own deliverables, and block again, with no
+    # field left to explain why.
+    #
+    # The rule already existed and was enforced in the wrong place: bp-auditor's
+    # DAG-integrity list says in as many words "no package declares an empty
+    # `write_set`". That is an authoring-time check by an agent. This is the
+    # sanctioned WRITER, and a writer that accepts a state its own auditor
+    # forbids is how the stub reached disk. Same shape as V4b below, which was
+    # added for the same reason an hour earlier.
+    #
+    # Verified before shipping: every ledger in the tree, active and archived,
+    # carries a non-empty write_set, so this rejects nothing that exists.
+    # THE FIELD HAS TWO LEGAL FORMS, and the first draft of these rules knew only
+    # one. A colon-delimited scalar (`write_set: a/b.pm:c/d.t`) is what every
+    # ledger in this tree uses -- and a YAML-ish list is ALSO accepted:
+    #
+    #   write_set:
+    #     - plugins/butler/scripts/bp-ledger.pl
+    #
+    # ledger-api.t's own canonical fixture uses the list form. Validating the
+    # scalar-only rules against "every ledger in the tree" missed this entirely,
+    # because the tree happens to use one form and the oracle uses the other --
+    # 100 assertions went red the moment the rules ran against it. A check
+    # written against the data you have, rather than the format you accept, is a
+    # check that passes until someone uses the other half of the contract.
+    my $field_segments = sub {
+        my ($field) = @_;
+        my ($i, $scalar) = (-1, undef);
+        for my $n (0 .. $#FML) {
+            if ($FML[$n] =~ /^\Q$field\E:\s*(.*?)\s*$/) { $i = $n; $scalar = $1; last }
+        }
+        return (undef, ()) if $i < 0;
+        my @items;
+        for my $n ($i + 1 .. $#FML) {
+            last unless $FML[$n] =~ /^\s+-\s*(.*?)\s*$/;
+            push @items, $1 if length $1;
+        }
+        return ($scalar, @items);
+    };
+
+    {
+        my ($ws, @items) = $field_segments->('write_set');
+        if (defined $ws && $ws eq '' && !@items) {
+            return 'frontmatter write_set: is EMPTY. A package whose write set permits nothing '
+                 . 'cannot edit its own deliverables -- it would relaunch, write nothing, and block '
+                 . 'again with no field left to explain why. This is the shape a truncated ledger '
+                 . 'takes (report 20260916-180317-71de); if the package genuinely owns no files, it '
+                 . 'should not be a package.';
+        }
+    }
+
     # V4b — write_set:/test_paths: segments must be PATHS, not prose.
     #
     # Bug 20260916-175013-34af. These fields are a single COLON-DELIMITED string,
@@ -377,14 +438,41 @@ sub validate_bytes {
     # field is malformed AT REST and every layer below faithfully propagates it,
     # so the only place to stop it is where the ledger is written.
     #
-    # The test is whitespace, deliberately: prose always contains a space, and a
-    # write-set entry never can -- a path with a space is already unrepresentable
-    # in a colon-delimited list, so this forbids nothing that previously worked.
+    # The test is whitespace. The FIRST justification written here was that "a
+    # path with a space is already unrepresentable in a colon-delimited list, so
+    # this forbids nothing that previously worked" -- and that was WRONG, caught
+    # by running the rule over every ledger in the tree including the archive:
+    #
+    #   _archive/audit-remediation/packages/08-job-search-coherence.md
+    #   write_set: C:/Users/André/Personal Files/Job search/CLAUDE.md:C:/Users/...
+    #
+    # Absolute paths, with spaces, targeting another project. The rule flags it,
+    # and flagging it is CORRECT -- but not for the reason first given. That
+    # field was already broken before anyone annotated anything, because a
+    # WINDOWS DRIVE LETTER CONTAINS A COLON: splitting it yields "C",
+    # "/Users/André/Personal Files/Job search/CLAUDE.md", "C", ... So the
+    # colon-delimited write_set format cannot express an absolute Windows path
+    # AT ALL, and a blueprint that targets another project by absolute path has
+    # a silently corrupt write set from the moment it is authored.
+    #
+    # That is a separate finding from 34af and is recorded in the V4c check
+    # below rather than left implicit in a whitespace rule that happens to catch
+    # it. The honest statement of THIS rule is narrower than the original: it
+    # forbids prose, and it also refuses space-bearing absolute paths, which the
+    # format could never carry safely in the first place.
     for my $field (qw(write_set test_paths)) {
-        my $val;
-        for my $l (@FML) { if ($l =~ /^\Q$field\E:\s*(.*?)\s*$/) { $val = $1; last } }
-        next unless defined $val && length $val;
-        for my $seg (split /:/, $val, -1) {
+        my ($val, @items) = $field_segments->($field);
+        next unless defined $val;
+
+        # DEFER TO V4c WHEN A DRIVE LETTER IS PRESENT. An absolute Windows path
+        # splits into a bare drive letter plus a remainder that usually contains
+        # spaces, so this whitespace rule fires first and reports "not a path"
+        # -- true, but a symptom. The drive letter is the root cause and the
+        # more useful message, so it gets to speak.
+        next if join(':', (length $val ? $val : ()), @items) =~ m{(?:^|:)[A-Za-z]:[/\\]};
+
+        my @segs = ((length $val ? split(/:/, $val, -1) : ()), @items);
+        for my $seg (@segs) {
             next unless length $seg;
             next unless $seg =~ /\s/;
             return "frontmatter $field: contains a segment that is not a path: \"$seg\". "
@@ -393,6 +481,36 @@ sub validate_bytes {
                  . 'DROPS the annotated path from the write set (report 20260916-175013-34af). '
                  . 'Put explanatory prose in the Scope section, never in this field.';
         }
+    }
+
+    # V4c — a Windows DRIVE LETTER in write_set:/test_paths: is always corrupt.
+    #
+    # Found 2026-09-17 while validating V4b against the archive, not filed from
+    # a symptom -- which is why it is worth its own check rather than being left
+    # to the whitespace rule that happened to catch one instance.
+    #
+    # These fields are split on ":". `C:/Users/...` therefore splits into "C" and
+    # "/Users/...", so a blueprint targeting another project by absolute Windows
+    # path has a silently corrupt write set FROM THE MOMENT IT IS AUTHORED --
+    # before anyone annotates anything, and with no symptom until a guard refuses
+    # a write nobody expected it to refuse. The bare "C" pattern is also the
+    # dangerous half: depending on the matcher it can match far more than
+    # intended, not less.
+    #
+    # The format cannot carry absolute Windows paths, so the rule is to say so at
+    # the point of writing rather than to let the field look plausible.
+    for my $field (qw(write_set test_paths)) {
+        my ($val, @items) = $field_segments->($field);
+        next unless defined $val;
+        my $joined = join(':', (length $val ? $val : ()), @items);
+        next unless length $joined;
+        next unless $joined =~ m{(?:^|:)([A-Za-z]):[/\\]};
+        my $drive = $1;
+        return "frontmatter $field: contains a Windows drive letter (\"$drive:\"). This field is "
+             . 'split on ":", so an absolute Windows path splits into a bare drive letter plus the '
+             . 'rest and the intended path is never matched -- the field is corrupt from the moment '
+             . 'it is written, with no symptom until a guard refuses a write. Use repository-'
+             . 'relative paths.';
     }
 
     # V5 — required sections, presence only, prefix matches. No uniqueness constraint.
