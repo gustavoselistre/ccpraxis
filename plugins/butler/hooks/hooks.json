@@ -74,6 +74,11 @@
                   "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-validation-interlock.sh\"",
                   "timeout" : 15,
                   "type" : "command"
+               },
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-run-finish.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
                }
             ],
             "matcher" : "Bash"

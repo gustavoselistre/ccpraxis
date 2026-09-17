@@ -167,6 +167,7 @@ when the trigger applies:
 |---|---|
 | `.ccpraxis-local-data/RESUME.md` | **IF IT EXISTS, AT THE START OF EVERY SESSION, BEFORE ANYTHING ELSE.** A previous session paused mid-initiative and wrote down what is in flight, what must not be restarted, and which baselines are stale. Its absence means no session is mid-flight — the normal state. Delete it when its work is genuinely finished; a stale one is worse than none |
 | `.ccpraxis-local-data/guidance/push-straight-to-main.md` | pushing, or about to flag a "Bypassed rule violations" warning |
+| `.ccpraxis-local-data/guidance/only-the-operator-ends-a-run.md` | about to run `bp-runstate.pl finish`, `bp-continuity.pl disarm`, or anything else that makes a Stop gate inert. **A run ends when the operator says so in their own message — nothing else.** Background tasks dying, even all at once, is not a stop instruction; it is work to resume |
 | `.ccpraxis-local-data/guidance/escalate-product-decisions-only.md` | about to ask the operator anything mid-run |
 | `.ccpraxis-local-data/guidance/fix-ccpraxis-defects-in-place.md` | a real defect surfaces outside the current package's write set |
 | `docs/design-conventions.md` (tracked) | making a design call — packaging, approval flows, what to enforce in code — or hitting a Windows/Perl oddity that smells environmental |
