@@ -47,7 +47,13 @@ HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 0
 # draft of this file did, and the test caught it. `open` is the right mode: on a
 # stdin timeout an observer stands aside rather than denying, matching this
 # guard's fail-open direction (see the header -- open means ALLOW the stop).
-bp_read_payload open || exit 0
+# The call stands ALONE with its fail direction as the argument, and no `||`
+# tail: bp_read_payload EXITS by itself on a stdin timeout (exit 0 for `open`,
+# exit 2 for `closed`), so a `|| exit 0` is not only redundant, it implies the
+# helper RETURNS non-zero when it does not. hook-payload-read-bound.t's AC2
+# pins the exact one-line shape repo-wide, and it caught this on the full sweep
+# -- the check that a scripts/-scoped or hooks/-scoped change never runs.
+bp_read_payload open
 [ -n "${PAYLOAD:-}" ] || exit 0
 
 CMD="$(bp_json_get "$PAYLOAD" tool_input.command 2>/dev/null)" || exit 0

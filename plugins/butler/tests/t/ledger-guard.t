@@ -401,12 +401,31 @@ sub nonblank_lines { return grep { /\S/ } split /\n/, $_[0] }
     # above records: the list stays EXACT and ORDERED, so the claim this
     # assertion actually pins -- that ledger-guard.sh is not in the Bash block --
     # still fails the moment it appears.
+    # UPDATED 2026-09-17. guard-run-finish.sh is now registered here, LAST. An
+    # agent read five background tasks dying as the operator pressing Stop, ran
+    # `bp-runstate finish` and `bp-continuity disarm`, and wound a session down
+    # with the in-flight package's own required check never run -- not for the
+    # first time. The operator's verdict on the guidance note written first was
+    # "that's just prose, and I don't think it's enough", so the rule became a
+    # hook. Brought up to reality rather than loosened, on the same principle
+    # every note above records: the list stays EXACT and ORDERED, so the claim
+    # this assertion actually pins -- that ledger-guard.sh is not in the Bash
+    # block -- still fails the moment it appears.
+    #
+    # Worth recording about the mechanism rather than the entry: this assertion
+    # was RED for weeks once before, because two packages appended here without
+    # updating it and nobody noticed. It was caught THIS time by the full --fast
+    # sweep, on a package that had just added `full-sweep` to its own checks
+    # after shipping a defect a sweep would have caught. The rule lives in a
+    # test that a hooks/-scoped change never runs, which is precisely what the
+    # blueprint's checks-table exists to force.
     is_deeply([ map { $_->{command} } @{ $b1->{hooks} // [] } ],
               [ $cmd_of->('guard-git-mutations.sh') . ' --only-during-butler-run',
                 $cmd_of->('guard-bash.sh'), $cmd_of->('mark-wakeup.sh'),
                 $cmd_of->('gate-headless-background.sh'), $cmd_of->('guard-judge-checks.sh'),
-                $cmd_of->('guard-validation-interlock.sh') ],
-              'AC-36: block 1 command list is exactly the six registered Bash hooks IN ORDER (ledger-guard.sh appearing here still fails)');
+                $cmd_of->('guard-validation-interlock.sh'),
+                $cmd_of->('guard-run-finish.sh') ],
+              'AC-36: block 1 command list is exactly the seven registered Bash hooks IN ORDER (ledger-guard.sh appearing here still fails)');
     my $b2 = $pre->[2] // {};
     is($b2->{matcher}, 'Task', 'AC-36: block 2 matcher unchanged');
     is_deeply([ map { $_->{command} } @{ $b2->{hooks} // [] } ],
