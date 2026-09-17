@@ -1363,4 +1363,34 @@ assert_corpus_untouched();
     is($rc_rel, 0, 'AC-33: NON-VACUITY -- an ordinary repo-relative write_set validates clean');
 }
 
+{   # ---- AC-34 (V4d): `depends_on:` is not a ledger frontmatter field.
+    #
+    # Report 20260916-185610-8ee1: a PHANTOM FIELD -- written by hand, read by
+    # NOTHING, validated by nothing, absent from the template that defines what
+    # a ledger contains. The scheduler's DAG comes from blueprint.md's
+    # package-status table (bp-drive-next.pl says so), and no script reads a
+    # ledger's frontmatter depends_on.
+    #
+    # It looks exactly as authoritative as write_set and test_paths, which ARE
+    # contracts. The harm measured was COMPREHENSION, not scheduling: the
+    # report's own filer inferred a scheduling hazard from it and filed at the
+    # wrong severity before checking which representation the scheduler reads.
+    #
+    # Measured before the rule landed: ZERO of the 32 active ledgers carried it.
+    # This forbids nothing in use; it stops it coming back.
+    my $dep = clean_ledger();
+    $dep =~ s/^(status:.*)$/$1\ndepends_on: 01-a,02-b/m;
+    my ($rc_dep, undef, $err_dep) = run_pl(['validate', '--ledger', stage_bytes($dep)]);
+    is($rc_dep, 2, 'AC-34: a depends_on: frontmatter key is REFUSED');
+    like($err_dep, qr/not a ledger field/, 'AC-34: ...and says it is not a ledger field');
+    like($err_dep, qr/Dependency edges/,
+         'AC-34: ...and names where ordering belongs instead, so the refusal is actionable');
+    like($err_dep, qr/20260916-185610-8ee1/, 'AC-34: ...and cites the report');
+
+    # NON-VACUITY: the same ledger WITHOUT the key still validates, so AC-34 is
+    # rejecting the key rather than something else the edit happened to disturb.
+    my ($rc_nodep) = run_pl(['validate', '--ledger', stage_bytes(clean_ledger())]);
+    is($rc_nodep, 0, 'AC-34: NON-VACUITY -- the identical ledger without depends_on validates clean');
+}
+
 done_testing();

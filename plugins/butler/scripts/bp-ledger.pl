@@ -513,6 +513,40 @@ sub validate_bytes {
              . 'relative paths.';
     }
 
+    # V4d — a ledger may not carry a `depends_on:` frontmatter field.
+    #
+    # Report 20260916-185610-8ee1 established it is a PHANTOM FIELD: written by
+    # hand, read by NOTHING, validated by nothing, and absent from the template
+    # that defines what a ledger contains. The scheduler's DAG comes from
+    # blueprint.md's package-status table -- bp-drive-next.pl says so in as many
+    # words -- and no script anywhere reads a ledger's frontmatter depends_on.
+    #
+    # It looks exactly as authoritative as write_set and test_paths, which ARE
+    # contracts. The measured harm was comprehension, not scheduling: a
+    # coordinator reading "this file alone", which every ledger header promises
+    # is sufficient, learns nothing about ordering or learns something false;
+    # and the report's own filer inferred a scheduling hazard from it and filed
+    # at the wrong severity before checking which representation the scheduler
+    # reads.
+    #
+    # Measured 2026-09-17 before adding this: ZERO of the 32 active ledgers
+    # carry the field. So this forbids nothing in use -- it stops it coming
+    # back, which is the report's own revised suggestion 1 (delete it entirely
+    # rather than reconcile two sources that can only ever disagree).
+    #
+    # Ordering belongs in a `## Dependency edges` SECTION, in prose, where a
+    # reader can see the reason and not just the edge.
+    {
+        for my $l (@FML) {
+            next unless $l =~ /^depends_on:/;
+            return 'frontmatter depends_on: is not a ledger field. The scheduler builds its DAG '
+                 . 'from blueprint.md\'s package-status table and NOTHING reads this key, so a '
+                 . 'second copy here can only ever drift out of agreement with the one that counts '
+                 . '(report 20260916-185610-8ee1). Put ordering, and the reason for it, in a '
+                 . '"## Dependency edges" section instead.';
+        }
+    }
+
     # V5 — required sections, presence only, prefix matches. No uniqueness constraint.
     my @sections = (
         ['## Next action',             qr/^## Next action/m],
