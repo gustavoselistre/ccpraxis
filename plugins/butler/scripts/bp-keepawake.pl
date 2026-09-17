@@ -20,11 +20,17 @@
 # wake-lock gets ONE definition and both drivers call it.
 #
 # WHAT IT ACTUATES. The sandbox plugin's keep-awake.ps1, rather than
-# re-deriving the P/Invoke. That helper documents the non-obvious part:
-# ES_DISPLAY_REQUIRED is load-bearing on Modern Standby (S0) machines, where
-# ES_SYSTEM_REQUIRED alone does NOT hold the box out of connected standby. Both
-# plugins ship from the same tree, so the relative path holds in the clone, in
-# the live install, and under the container's marketplace mount.
+# re-deriving the P/Invoke. Both plugins ship from the same tree, so the relative
+# path holds in the clone, in the live install, and under the container's
+# marketplace mount.
+#
+# THIS BLOCK USED TO REPEAT THE HELPER'S CLAIM that ES_DISPLAY_REQUIRED is
+# load-bearing on Modern Standby. MEASURED FALSE 2026-09-17 and dropped from the
+# helper: the machine entered connected standby with that request held and
+# refreshing, for "Reason: Idle Timeout", which no ES_* flag addresses. The
+# reasoning now lives in ONE place -- keep-awake.ps1's header -- rather than
+# being restated here, because a claim copied into a second file is a claim that
+# gets corrected in only one of them. Read it there.
 #
 # WE PASS -PidFile, AND THE REASON MATTERS — the opposite choice leaked 2.7 GB.
 #
