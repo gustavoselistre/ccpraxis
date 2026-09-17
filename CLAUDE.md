@@ -136,6 +136,36 @@ These have each cost real debugging time. Details in the user-global `CLAUDE.md`
     symptom: Windows resolves the leading `/` against the current drive, so the path is silently
     created at the **drive root** as `C:\c\...`. That cost 576 stray entries on 2026-06-12; see
     `plugins/steward/tests/t/no-drive-root-strays.t`. Never set the variable shell-wide.
+- **A pid is only meaningful in the namespace that produced it.** Git-for-Windows perl runs under
+  MSYS2, which keeps its **own** pid numbering. `ps -W` prints both columns, and they are different
+  numbers for one process:
+
+  ```
+     PID    PPID    WINPID   COMMAND
+  832282       1    159020   /usr/bin/perl        <- one process, two ids
+  ```
+
+  perl's `$$`, `getppid()`, `kill()` and every `.pid` file a perl script writes are **MSYS** pids.
+  `Get-CimInstance Win32_Process`, `Get-Process`, `Stop-Process` and `taskkill` take **WINPIDs**.
+  **Crossing them does not error — it answers "no such process"**, which reads as a finding rather
+  than a bug. Measured 2026-09-17: `Get-Process -Id 832282` reported gone while that process was the
+  live launcher, and a whole false theory about orphaned samplers was published on the strength of
+  it before `ps -W` settled it. The same mismatch had been live in `scripts/reap-orphans.pl`, which
+  collected WINPIDs from CIM and verified its kills with `kill(0, …)`, so **every kill reported
+  success** and its `failed` list could never be populated (`13f7c12`, report
+  `20260917-033101-c455`). Pick one namespace per code path and stay in it; verify by re-querying
+  the source the pid came from, never by asking the other side.
+
+- **`getppid()` is 1 for a detached spawn here**, immediately and while everything is alive — not
+  only after a parent dies. It is not a usable owner-liveness signal for anything the launcher
+  spawns. Measured, same day, while proposing a fix that depended on it.
+
+- **`-t STDOUT` does not notice a destroyed console.** Measured: eight seconds after the console host
+  was killed, a live perl process still reported `-t STDOUT` true and its writes still returned
+  success — the bytes are accepted and discarded. `-t` asks whether the handle looks like a
+  character device, never whether anything is on the other end. A launcher polling it renders
+  happily into nothing (report `20260917-032358-bc45`).
+
 - **Paths contain non-ASCII** (`André`). Nothing may assume ASCII paths. Round-trip registry values
   as UTF-8 bytes; never re-encode something already decoded.
 - **`podman machine set --disk-size` fails on WSL machines** (exit 125). Grow via WSL instead:
