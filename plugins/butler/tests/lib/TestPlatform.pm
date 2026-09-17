@@ -191,6 +191,36 @@ sub parse_marker {
         $bounded = ($last_nl == -1) ? '' : substr($bounded, 0, $last_nl + 1);
     }
 
+    # THE DECLARATION IS POSITIONAL: it must appear before any heredoc, POD or
+    # __DATA__/__END__. Bug 20260916-221455-96a7, both directions.
+    #
+    # Everything below is line-anchored raw-text matching, which cannot tell
+    # code from the inside of a heredoc body, a POD block or a __DATA__ section.
+    # That cut BOTH ways and the second way is the one nobody anticipated:
+    #
+    #   FORGERY  -- a file with no declaration anywhere perl executes, but a
+    #               marker-shaped line inside a heredoc, parsed `legal`. Under
+    #               package 06's routing that no longer merely guesses a
+    #               platform, it SELECTS AN OPERATING SYSTEM.
+    #   FALSE CONFLICT -- a file that correctly declares `# platform: windows`
+    #               at the top and then writes a marker-bearing fixture through
+    #               a heredoc (the natural idiom in this suite, since package 02
+    #               gave every .t a marker so fixtures need one too) parsed
+    #               `invalid/conflicting-markers`: REFUSED and reported red,
+    #               with the diagnostic pointing at a line its author never
+    #               meant as a declaration.
+    #
+    # A positional rule fixes both at once and is far easier to explain than any
+    # content rule: text after the first heredoc/POD/__DATA__ is not a
+    # declaration, so it can neither forge one nor collide with one. Forgery now
+    # yields `absent`, which REFUSES LOUDLY -- exactly what Decision 4 asks for
+    # and what the old behaviour silently skipped.
+    #
+    # MEASURED BEFORE SHIPPING, across all 352 .t files in the tree: 352
+    # unchanged, 0 changed. The rule is a no-op on the live corpus and only
+    # affects the shapes the bug describes.
+    $bounded = _code_prefix($bounded);
+
     my @raw = ($bounded =~ /^[ \t]*#[ \t]*platform[ \t]*:[ \t]*(\S+)[ \t]*\r?$/mg);
 
     if (@raw) {
@@ -218,6 +248,40 @@ sub parse_marker {
     }
 
     return { outcome => 'absent', value => undef, reason => undef, raw => [] };
+}
+
+# _code_prefix($text) -- everything up to, but not including, the first line
+# that begins a region perl does not execute as code. PRIVATE.
+#
+# Deliberately a LINE SCAN rather than a perl parse. A real parse is the only
+# way to be exactly right about heredocs, and it is far more surface to get
+# subtly wrong than the thing it would fix -- the same reasoning
+# guard-git-mutations.sh records for choosing a raw fallback over a quoting
+# walk with escape/comment/heredoc sub-states.
+#
+# The three shapes, and why each is unambiguous enough for a line scan:
+#   * `__DATA__` / `__END__` -- must be alone on a line, by perl's own rules.
+#   * POD -- begins at `^=` followed by an identifier character, by perl's own
+#     rules. `=cut` ends it, but we never resume: a declaration after a POD
+#     block is already far past where a marker belongs.
+#   * a heredoc INTRODUCER (`<<EOF`, `<<'EOF'`, `<<"EOF"`, `<<~EOF`) anywhere
+#     in a line. This is the loose one: `<<` is also left-shift and can appear
+#     in a string. Cutting early on a false positive costs a marker that sits
+#     BELOW a heredoc introducer -- which yields `absent`, a LOUD refusal, not
+#     a silent misclassification. Measured across the tree: no live file has a
+#     marker in that position.
+sub _code_prefix {
+    my ($text) = @_;
+    return '' unless defined $text;
+    my $offset = 0;
+    for my $line (split /(?<=\n)/, $text) {
+        return substr($text, 0, $offset)
+            if $line =~ /^__(?:DATA|END)__[ \t]*\r?\n?\z/
+            || $line =~ /^=[A-Za-z]/
+            || $line =~ /<<~?(?:'[^']*'|"[^"]*"|\\?[A-Za-z_]\w*)/;
+        $offset += length $line;
+    }
+    return $text;
 }
 
 1;

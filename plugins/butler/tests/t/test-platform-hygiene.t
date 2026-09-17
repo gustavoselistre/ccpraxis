@@ -505,12 +505,41 @@ ok(!-e $ghost, 'PART 7 setup: the ghost fixture path genuinely does not exist on
                  . "my \$fixture_body = <<'EOF';\n# platform: any\nnot really asserted\nEOF\n"
                  . "print \"ok 1\\n\"; exit 0;\n";
     my $marker = TestPlatform::parse_marker($smuggled);
-    is($marker->{outcome}, 'legal',
-        'PART 13 (KNOWN GAP, filed separately, not fixed here): a "# platform: any" line inside a '
-      . 'heredoc body is currently accepted as a genuine top-of-file declaration by '
-      . 'TestPlatform::parse_marker, even though the outer file never actually declared its own '
-      . 'platform need. Root cause is package 01\'s TestPlatform.pm, out of this package\'s write '
-      . 'set -- this assertion documents the gap, it does not endorse it.');
+    is($marker->{outcome}, 'absent',
+        'PART 13 (GAP NOW CLOSED, 20260916-221455-96a7): a "# platform: any" line inside a '
+      . 'heredoc body is NO LONGER accepted as a genuine top-of-file declaration -- the file never '
+      . 'declared a platform, so it is `absent` and refuses loudly, which is what Decision 4 asks '
+      . 'for. This assertion previously expected `legal` and the comment above predicted exactly '
+      . 'this change; the fix is a POSITIONAL rule in package 01\'s TestPlatform.pm -- a '
+      . 'declaration must appear before any heredoc, POD or __DATA__. Measured across all 352 .t '
+      . 'files before shipping: 0 changed outcome. Original note follows, kept because it is the '
+      . 'record of the gap being tracked rather than rediscovered: root cause is package 01\'s '
+      . 'TestPlatform.pm, out of that package\'s write '
+      . 'set -- this assertion documented the gap, it did not endorse it.');
+
+    # THE OTHER DIRECTION, which nobody anticipated and which bites in ordinary
+    # use rather than under attack. A file that CORRECTLY declares its platform
+    # and then writes a marker-bearing fixture through a heredoc -- the natural
+    # idiom here, since every .t needs a marker so fixtures need one too -- used
+    # to parse `invalid/conflicting-markers`: refused, reported red, with the
+    # diagnostic pointing at a line its author never meant as a declaration.
+    my $correct = "#!/usr/bin/env perl\n# platform: windows\n"
+                . "my \$fixture = <<'EOF';\n# platform: any\nEOF\n"
+                . "print \"ok 1\\n\"; exit 0;\n";
+    my $cm = TestPlatform::parse_marker($correct);
+    is($cm->{outcome}, 'legal',
+        'PART 13b: a CORRECTLY declared file that writes a marker-bearing fixture through a '
+      . 'heredoc is legal, not a conflict -- the false-refusal half of 96a7, and the half that '
+      . 'fires in ordinary work rather than under a contrived file');
+    is($cm->{value}, 'windows',
+        'PART 13b: ...and it keeps the platform the AUTHOR declared, not the one in the fixture');
+
+    # NON-VACUITY: the positional rule must not simply ignore every marker. A
+    # file whose declaration sits before any heredoc still parses normally.
+    my $plain = "#!/usr/bin/env perl\n# platform: any\nprint \"ok 1\\n\"; exit 0;\n";
+    is(TestPlatform::parse_marker($plain)->{value}, 'any',
+        'PART 13c: NON-VACUITY -- an ordinary declaration with no heredoc anywhere still parses, '
+      . 'so 13a and 13b are not passing because the parser stopped seeing markers at all');
 }
 
 done_testing();
