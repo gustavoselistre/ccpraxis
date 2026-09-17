@@ -161,4 +161,72 @@ sub pad {
         'AC9: an unrelated command yields no session');
 }
 
+# ===========================================================================
+# THE PID NAMESPACE. Bug 20260917-033101-c455.
+#
+# enumerate_windows collects pids from `Get-CimInstance Win32_Process`, which are
+# WINDOWS pids. perl's kill(), getppid() and $$ under Git-for-Windows are MSYS
+# pids -- different numbers for the same process (`ps -W` prints both columns).
+# Crossing them does not error; it answers "no such process", which reads as a
+# real answer.
+#
+# The old kill block used perl `kill(0, $winpid)` to VERIFY a taskkill. That is
+# false for every live Windows process, so $ok became 1 unconditionally: EVERY
+# KILL REPORTED SUCCESS and @failed could not be populated. It was found after
+# two launchers survived 37 hours on this host and the reaping story could not
+# be trusted either way.
+#
+# These are SOURCE assertions, not behavioural ones, for the reason this file
+# states at the top: a test for a reaper that actually reaps is a test that can
+# take out the operator's own work.
+# ===========================================================================
+{
+    open my $ns_fh, '<', $SCRIPT or BAIL_OUT("cannot read $SCRIPT");
+    my $src = do { local $/; <$ns_fh> };
+    close $ns_fh;
+
+    # COMMENTS STRIPPED FIRST. The script DESCRIBES the removed kill(0,...) at
+    # length in the comment explaining why it went, so a raw scan finds the very
+    # string it is asserting is absent. Same non-comment scan lane-routing.t and
+    # hook-payload-read-bound.t use -- forgetting it here cost a red run.
+    my $code = $src;
+    $code =~ s/^[ \t]*#[^\n]*$//mg;
+
+    my $probe = qr/kill\(\s*0\s*,/;
+
+    unlike($code, $probe,
+        'NS1: no kill(0,...) liveness probe survives -- that is the MSYS-namespace check that made every kill report success');
+
+    like($src, qr/sub terminate_pid/,
+        'NS2: killing goes through terminate_pid, so exactly one place chooses the namespace');
+
+    # \r?\n, because this tree carries CRLF files and a bare \n\} silently ran
+    # past the sub and swallowed the rest of the script -- which is why NS3
+    # passed (something matched) while NS4 and NS5 failed against it.
+    # The CAPTURE GROUP is load-bearing: a successful match with no group
+    # returns (1) in list context, so `my ($body) = ...` silently bound the
+    # string "1" and NS4/NS5 then asserted against it. NS3 passed throughout,
+    # because "1" is defined -- an existence check cannot notice this.
+    my ($body) = $src =~ /(sub terminate_pid.*?\r?\n\})/s;
+    ok(defined $body, 'NS3: terminate_pid has an extractable body');
+    like($body, qr/taskkill/,
+        'NS4: on Windows it kills with taskkill, which speaks WINPID -- the namespace enumerate_windows collected from');
+    like($body, qr/kill\('TERM'/,
+        'NS5: ...and keeps perl kill(TERM) for POSIX, where the pid namespaces do not split');
+
+    like($src, qr/\bmy\s+%still\s*=\s*map\b[^;]*\benumerate\(\)/,
+        'NS6: verification RE-ENUMERATES from the same source the candidates came from, so it cannot disagree with itself about namespaces');
+    # [^}]* cannot span the real line, because the subscript itself contains a
+    # brace: `$still{ $c->{pid} } ? \@failed : \@killed`.
+    like($code, qr/\$still\{.*?\?\s*\\\@failed\s*:\s*\\\@killed/s,
+        'NS7: a pid still present after the kill is reported FAILED -- the assertion the old design was incapable of making');
+
+    # COUNTER-FIXTURE. NS1 is an `unlike`, and an unlike whose pattern matches
+    # nothing passes for free. This proves the pattern does match the exact line
+    # it was written to forbid.
+    my $old_line = 'my $ok = (kill(0, $c->{pid}) ? 0 : 1);';
+    like($old_line, $probe,
+        'NS8: COUNTER-FIXTURE -- the NS1 pattern really does match the removed line, so NS1 is not vacuous');
+}
+
 done_testing();
