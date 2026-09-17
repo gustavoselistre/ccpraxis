@@ -220,7 +220,29 @@ sub _read_state_file {
     my $raw = <$fh>;
     close $fh;
     return () unless defined $raw && length $raw;
-    return split /\n/, $raw;
+
+    # NORMALISE ON READ TOO, not only on write. Report 20260916-162952-5ae3.
+    #
+    # Folding `x/../` in _relpath stops NEW mismatched entries being recorded.
+    # It does nothing for the ones already on disk: %ran is keyed on the freshly
+    # computed shape, a stored entry in the old shape never matches it, so the
+    # merge reads it as "not touched by this run" and carries it forward --
+    # forever. Measured after fixing only the write side: all three phantom
+    # entries survived a run that executed those exact files and reported them
+    # green.
+    #
+    # A fix that cannot clear the entries that prompted the report is half a
+    # fix, and the half that looks finished.
+    my @out;
+    for my $l (split /\n/, $raw) {
+        next unless length $l;
+        $l =~ s{\\}{/}g;
+        $l =~ s{^\./}{};
+        1 while $l =~ s{(?:^|/)(?!\.\./)[^/]+/\.\./}{/};
+        $l =~ s{^/}{};
+        push @out, $l;
+    }
+    return @out;
 }
 
 # _to_abs($relpath) -- reconstructs a real path from a relpath recorded in the
@@ -253,6 +275,36 @@ sub _relpath {
     # path spliced onto a climb; this never fires for a real in-tree file
     # (fix-batch 03-enforce-marker step 7, finding A3).
     return $abs if $rel =~ m{^(?:\.\./)*[A-Za-z]:[/\\]};
+
+    # COLLAPSE INTERIOR `x/../` LEXICALLY. Report 20260916-162952-5ae3, the
+    # over-reporting half, and this is its mechanism -- found by reading the
+    # state file rather than by reasoning about it. It currently holds TWO
+    # SHAPES FOR THE SAME TREE:
+    #
+    #   plugins/butler/tests/t/repeat-guard.t                    <- one shape
+    #   scripts/../plugins/butler/tests/t/cache-state.t          <- the other
+    #
+    # abs2rel does no `..` folding, so an $abs that arrived with an interior
+    # climb keeps it. Both forms RESOLVE on disk, so the vanished-entry pruning
+    # never removes the odd one -- and because %ran is keyed on the freshly
+    # computed shape, the stale shape is never "touched by this run" either, so
+    # the merge carries it forward FOREVER. That is a permanent phantom entry:
+    # a file reported failing that passes when you run it, which is exactly
+    # what this report measured and what makes the baseline untrustworthy.
+    #
+    # Measured 2026-09-17: three such entries, all three green standalone --
+    # cache-state.t, git-mutation-guard-reach.t, animation-cadence.t, the last
+    # two fixed earlier the same day and unable to clear themselves.
+    #
+    # LEXICAL, not realpath, and deliberately so: the comment above explains why
+    # this function must not re-resolve, and folding `a/b/../c` to `a/c` is a
+    # pure string operation that cannot disagree with how fixture paths are
+    # constructed elsewhere. A LEADING `../` is left alone -- it means genuinely
+    # outside the tree and there is nothing to fold it against.
+    $rel =~ s{^\./}{};
+    1 while $rel =~ s{(?:^|/)(?!\.\./)[^/]+/\.\./}{/};
+    $rel =~ s{^/}{};
+
     return $rel;
 }
 
