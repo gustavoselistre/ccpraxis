@@ -2479,6 +2479,26 @@ sub _load_state {
     my (%meta, %status, %att, %pid, %sid);
     for my $pkg (keys %$dag) {
         my $raw_status = ledger_fm($bpdir, $pkg, 'status');
+
+        # RE-READ ONCE BEFORE BELIEVING A NEGATIVE. Report 20260917-023637-0f99:
+        # a false `awaiting-ledger` escalation fired for a package whose ledger
+        # was present, healthy and `status: running` with a live coordinator.
+        # Timed to the second, the ledger, its `.lock` and the escalation all
+        # carry the same mtime -- the orchestrator read the path during the
+        # coordinator's own ATOMIC WRITE, in the instant `rename()` swaps the
+        # file in, when neither the old nor the new name resolves.
+        #
+        # This is a TOCTOU on a correct atomic write, not a broken one: the
+        # writer is doing exactly the right thing and the reader is sampling at
+        # the wrong moment. The window is microseconds, so a single re-read
+        # after a brief settle closes it -- and the cost is paid ONLY on the
+        # negative, which is rare and which today produces a wrong answer
+        # anyway. Believing a first negative here escalates a healthy package
+        # to the operator and holds it from launching.
+        if (!defined $raw_status) {
+            select(undef, undef, undef, 0.05);
+            $raw_status = ledger_fm($bpdir, $pkg, 'status');
+        }
         $status{$pkg} = $raw_status // 'pending';
         # fix-batch F2 (redteam-step6 MEDIUM): a ledger file that EXISTS but
         # whose frontmatter will not parse (unresolved merge conflict, a
@@ -2496,7 +2516,15 @@ sub _load_state {
         # accounting (:596), and (c) files an operator-visible needs-you
         # escalation every tick until the ledger is repaired (:2420-2452) --
         # so "unknown" is held, not silently treated as "pending".
-        my $file_exists = -f "$bpdir/packages/$pkg.md" ? 1 : 0;
+        # Same race, same remedy (20260917-023637-0f99): `-f` samples a single
+        # instant, and during an atomic rename that instant can fall in the gap.
+        # Re-stat once before concluding the ledger is missing.
+        my $lpath = "$bpdir/packages/$pkg.md";
+        my $file_exists = -f $lpath ? 1 : 0;
+        if (!$file_exists) {
+            select(undef, undef, undef, 0.05);
+            $file_exists = -f $lpath ? 1 : 0;
+        }
         $meta{$pkg}   = { deps => $dag->{$pkg}, write_set => (ledger_fm($bpdir, $pkg, 'write_set') // ''), priority => ledger_fm($bpdir, $pkg, 'priority'), requires_clean_tree => ledger_fm($bpdir, $pkg, 'requires_clean_tree'), ledger_missing => (!$file_exists || !defined $raw_status) ? 1 : 0 };
         $att{$pkg}    = $reg->{$pkg}{attempt} // 0;
         $pid{$pkg}    = $reg->{$pkg}{pid};
