@@ -19,13 +19,22 @@ The blueprint directory path. Read `blueprint.md` and every ledger under `packag
 - **Untestable done criteria** — anything a coordinator couldn't verify mechanically from disk.
 - **Write-set hazards** — overlaps between packages eligible to run in parallel; write sets that obviously miss files the scope implies.
 - **Hidden dependencies** — package A's inputs are produced by package B without a `depends_on` edge.
-- **Write-set-implied checks** — REQUIRED pass, and **run it, do not eyeball it**:
+- **Write-set-implied checks** — REQUIRED pass. **You cannot run it, and you must not pretend to.**
 
   ```
   perl plugins/butler/scripts/bp-checks.pl audit --blueprint <blueprint.md>
   ```
 
-  Exit 1 means some package omits a check its own write set implies; report each as a finding naming the package and the check. Exit 0 with *"no checks-table"* is **not** a failure — the table is project-supplied by design (this toolchain is stack-agnostic; its own blueprints are pure Perl and declare none), and a blueprint without one implies nothing.
+  **This instruction used to read "run it, do not eyeball it", and you have no Bash tool** — your `tools:` line is `Read, Grep, Glob, Write`, deliberately, because your containment to the blueprint files is the instrument. So the instruction was unfollowable as written, and audit-07 of `butler-gate-ergonomics` found it had been hand-derived for **seven consecutive rounds**, each one reporting a result nobody executed.
+
+  The check stays REQUIRED; what changed is who runs it. **The dispatcher runs it and gives you the output.** Your job is to use it and to refuse to proceed without it:
+
+  - Output supplied → treat it as authoritative and report each omission as a finding naming the package and the check.
+  - **Output NOT supplied → that is itself a FINDING**, and a blocking one. Say plainly that the required check was not run and that your verdict cannot cover it. Do not hand-derive it from the ledgers and present the result as if it were the command's; a derived answer and an executed one are not the same claim, and the whole point of this check is that it is mechanical.
+
+  Exit 1 means some package omits a check its own write set implies. Exit 0 with *"no checks-table"* is **not** a failure — the table is project-supplied by design (this toolchain is stack-agnostic; its own blueprints are pure Perl and declare none), and a blueprint without one implies nothing.
+
+  The same rule covers anything else you are asked to execute: **an agent asked to run what it cannot run should report the gap, never simulate the result.**
 
   This moves detection from execution time to **authoring time**, which is where it is cheap. The failure it prevents is a defect that sits latent until the closing gate and surfaces as an ownerless mystery on whichever package happens to run last — long after the package that caused it closed. Attribution for one such lint error needed a `git log -S`.
 
