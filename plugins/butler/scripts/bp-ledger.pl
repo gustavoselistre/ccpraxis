@@ -356,6 +356,45 @@ sub validate_bytes {
              . join(', ', @STATUSES) . '.';
     }
 
+    # V4b — write_set:/test_paths: segments must be PATHS, not prose.
+    #
+    # Bug 20260916-175013-34af. These fields are a single COLON-DELIMITED string,
+    # exported verbatim into BP_WRITE_SET by bp-launch.sh and split on ':' by
+    # guard-writes.sh. An author who annotates the field in prose --
+    #
+    #   write_set: a/b.pm:c/d.t:e/f.pl — in scope for ONE thing only: the entry point
+    #
+    # -- produces FOUR patterns instead of three, and the third is
+    # "e/f.pl — in scope for ONE thing only", which matches no file on disk. The
+    # bare path `e/f.pl` is then NOT IN THE WRITE SET AT ALL, and the package
+    # cannot edit a file its own blueprint mandates in three places. Measured:
+    # `match_any "scripts/fleet-orchestrator.pl" "$BP_WRITE_SET"` -> NOMATCH.
+    #
+    # WHY IT MUST BE CAUGHT HERE AND NOT LATER. Nothing re-derives BP_WRITE_SET
+    # mid-session -- guard-writes.sh reads only the env var -- so the corrupt
+    # value is fixed for the session's lifetime and no in-session ledger repair
+    # unblocks the running coordinator. A relaunch is the only recovery. The
+    # field is malformed AT REST and every layer below faithfully propagates it,
+    # so the only place to stop it is where the ledger is written.
+    #
+    # The test is whitespace, deliberately: prose always contains a space, and a
+    # write-set entry never can -- a path with a space is already unrepresentable
+    # in a colon-delimited list, so this forbids nothing that previously worked.
+    for my $field (qw(write_set test_paths)) {
+        my $val;
+        for my $l (@FML) { if ($l =~ /^\Q$field\E:\s*(.*?)\s*$/) { $val = $1; last } }
+        next unless defined $val && length $val;
+        for my $seg (split /:/, $val, -1) {
+            next unless length $seg;
+            next unless $seg =~ /\s/;
+            return "frontmatter $field: contains a segment that is not a path: \"$seg\". "
+                 . 'These fields are colon-delimited and are split on ":" by guard-writes.sh, so '
+                 . 'an annotation containing a colon silently splits into extra patterns and '
+                 . 'DROPS the annotated path from the write set (report 20260916-175013-34af). '
+                 . 'Put explanatory prose in the Scope section, never in this field.';
+        }
+    }
+
     # V5 — required sections, presence only, prefix matches. No uniqueness constraint.
     my @sections = (
         ['## Next action',             qr/^## Next action/m],

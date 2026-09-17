@@ -1258,4 +1258,47 @@ sub assert_corpus_untouched {
 
 assert_corpus_untouched();
 
+{   # ---- AC-31 (V4b): write_set:/test_paths: segments must be PATHS, not prose.
+    #
+    # Report 20260916-175013-34af. The field is a single COLON-DELIMITED string,
+    # exported verbatim into BP_WRITE_SET and split on ':' by guard-writes.sh.
+    # An annotation containing a colon splits into extra patterns and DROPS the
+    # annotated path from the write set, so a package cannot edit a file its own
+    # blueprint mandates. It is caught HERE because nothing re-derives
+    # BP_WRITE_SET mid-session -- the corrupt value is fixed for the session's
+    # lifetime and only a relaunch recovers.
+    #
+    # The real corrupt field from the report, verbatim.
+    my $annotated = 'scripts/JRM/TickHarness.pm:scripts/t/tick-harness.t:'
+                  . 'scripts/fleet-orchestrator.pl -- the orchestrator is in scope for '
+                  . 'ONE thing only: exposing the entry point';
+
+    my $bad = clean_ledger();
+    $bad =~ s/^write_set:.*$/write_set: $annotated/m;
+    my $pb = stage_bytes($bad);
+    my ($rc_bad, undef, $err_bad) = run_pl(['validate', '--ledger', $pb]);
+    is($rc_bad, 2, 'AC-31: a write_set carrying prose with a colon is REFUSED');
+    like($err_bad, qr/not a path/,
+         'AC-31: ...and the message says the segment is not a path');
+    like($err_bad, qr/20260916-175013-34af/,
+         'AC-31: ...and cites the report, so the next reader finds the measurement rather than re-deriving it');
+
+    # NON-VACUITY, both directions. The same ledger with the annotation removed
+    # must PASS -- otherwise AC-31 could be passing because the rule rejects
+    # every write_set, which would block every package in the repo.
+    my $good = clean_ledger();
+    $good =~ s{^write_set:.*$}{write_set: scripts/JRM/TickHarness.pm:scripts/t/tick-harness.t:scripts/fleet-orchestrator.pl}m;
+    my $pg = stage_bytes($good);
+    my ($rc_good) = run_pl(['validate', '--ledger', $pg]);
+    is($rc_good, 0, 'AC-31: NON-VACUITY -- the identical three-path write_set without the annotation validates clean');
+
+    # test_paths carries the same shape and the same hazard.
+    my $badtp = clean_ledger();
+    $badtp =~ s{^test_paths:.*$}{test_paths: t/a.t:t/b.t -- and also: the slow one}m;
+    if ($badtp ne clean_ledger()) {
+        my ($rc_tp) = run_pl(['validate', '--ledger', stage_bytes($badtp)]);
+        is($rc_tp, 2, 'AC-31: test_paths: is held to the same rule, since it is split the same way');
+    }
+}
+
 done_testing();
