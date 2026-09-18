@@ -69,10 +69,15 @@ STOP_OK_MAX_CARRY=3   # how many blocked-by-a-sibling stops .stop-ok may survive
 # bp_drive_active_dir, so the total per-Stop fork count in the common case
 # goes from 1 to 2, not from 0 to 1. Accepted, not eliminated -- see the
 # package spec §5).
+# This used to ask only "does any file exist in the registry", which is true
+# forever once a marker leaks -- and reporter markers DID leak, because the only
+# reap below runs against the current session's own id and a dead reporter never
+# returns to match it. bp_reporter_any_active answers the same question but reaps
+# expired markers on the way past, so a dead reporter stops making every session
+# on the machine do the expensive path on every Stop.
 REPORTER_MAYBE=0
-if RDIR=$(bp_reporter_active_dir 2>/dev/null) && [ -d "$RDIR" ]; then
-  set -- "$RDIR"/*
-  [ -e "${1:-}" ] && REPORTER_MAYBE=1
+if bp_reporter_any_active 2>/dev/null; then
+  REPORTER_MAYBE=1
 fi
 if [ "$REPORTER_MAYBE" = "0" ]; then
   bp_drive_any_active || exit 0

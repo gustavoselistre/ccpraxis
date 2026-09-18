@@ -718,6 +718,70 @@ bp_reporter_active_dir() {
   return 0
 }
 
+# bp_reporter_ttl_hours -> the staleness limit, sanitised. Mirrors
+# bp_drive_ttl_hours; keeps the env var gate-drive-loop.sh already honoured
+# (CCPRAXIS_REPORTER_TTL_H) so the two reap paths cannot disagree about the age
+# of the same marker.
+bp_reporter_ttl_hours() {
+  local h="${CCPRAXIS_REPORTER_TTL_H:-12}"
+  case "$h" in ''|*[!0-9]*) h=12 ;; esac
+  [ "$h" -gt 0 ] 2>/dev/null || h=12
+  printf '%s' "$h"
+}
+
+# bp_reporter_any_active -> rc 0 if ANY reporter session is registered, AFTER
+# reaping expired markers.
+#
+# THE SAME BUG AS bp_drive_any_active's, one registry over, and not fixed when
+# that one was. gate-drive-loop.sh does TTL-reap a reporter marker -- but only
+# the marker matching the CURRENT session id, and a dead reporter never comes
+# back to match its own. So reporter markers were immortal in exactly the way
+# that function's header describes, and the pre-check above it did no reaping at
+# all: it asked only "does any file exist".
+#
+# Measured on this host 2026-09-18: .reporter-active held a marker from
+# 2026-09-13, five days old, alongside one from a session that ended the
+# previous evening. Neither could ever be collected.
+#
+# The cost is the one the drive header already names. A single leaked marker
+# keeps this true forever, so gate-drive-loop.sh skips its bp_drive_any_active
+# early-exit on EVERY Stop of EVERY session on the machine, parsing a payload and
+# spawning a JSON reader instead of returning after two stats. A registry that
+# only grows is a slow reintroduction of the bug it replaced.
+#
+# Pure stat + rm, no subprocess, over a directory holding one entry per
+# CONCURRENT reporter.
+bp_reporter_any_active() {
+  local dir now ttl mt f live=1
+  dir=$(bp_reporter_active_dir) || return 1
+  [ -d "$dir" ] || return 1
+
+  now=$(date +%s 2>/dev/null || echo 0)
+  ttl=$(bp_reporter_ttl_hours)
+
+  # "${1:-}" not "$1": under `set -u` with nullglob an unmatched glob leaves $1
+  # UNSET and the hook dies instead of reporting "nothing active". Same reasoning
+  # as bp_drive_any_active, same trap.
+  set -- "$dir"/*
+  [ -e "${1:-}" ] || return 1
+
+  live=0
+  for f in "$@"; do
+    [ -f "$f" ] || continue
+    if [ "$now" -gt 0 ]; then
+      mt=$(bp_mtime "$f")
+      if [ "$mt" -gt 0 ] && [ $(( (now - mt) / 3600 )) -ge "$ttl" ]; then
+        rm -f "$f" 2>/dev/null
+        continue
+      fi
+    fi
+    live=$((live + 1))
+  done
+
+  [ "$live" -gt 0 ] || return 1
+  return 0
+}
+
 # bp_drive_any_active -> rc 0 if ANY driver session is registered.
 # The cheap pre-check: when nothing is driving anywhere (the overwhelmingly
 # common case) a hook can return before parsing its payload, so an unrelated

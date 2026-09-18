@@ -330,6 +330,70 @@ use constant TIMED_OUT => 124;
      . 'discriminates on age rather than clearing the registry');
 }
 
+# ===========================================================================
+# G'. THE SAME RULE FOR THE REPORTER REGISTRY, which did not have it.
+#
+# Section G above fixed the drive registry. The reporter registry is a sibling
+# with the identical shape and never got the same treatment: gate-drive-loop.sh
+# TTL-reaped a reporter marker, but only the one matching the CURRENT session
+# id, and a dead reporter never comes back to match its own. Its pre-check did
+# no reaping at all — it asked only whether any file existed.
+#
+# Measured on the host 2026-09-18: .reporter-active held a marker from
+# 2026-09-13, five days old, next to one from a session that had ended the
+# previous evening. Neither was collectable by any code path.
+#
+# The cost is the one section G already names: a single leaked marker keeps the
+# pre-check true forever, so every session on the machine takes the expensive
+# path on every Stop.
+# ===========================================================================
+{
+    my $tmp    = tempdir(CLEANUP => 1);
+    my $rdir   = "$tmp/reporter";
+    make_path($rdir);
+
+    my $old = time - (120 * 3600);   # five days, the age actually observed
+    open my $d, '>', "$rdir/reporter-dead" or die;
+    print $d "$tmp\n"; close $d;
+    utime $old, $old, "$rdir/reporter-dead";
+
+    open my $l, '>', "$rdir/reporter-live" or die;
+    print $l "$tmp\n"; close $l;
+
+    my $out = `bash -c 'set -u; shopt -s nullglob; source "$HOOKS/lib.sh"; CCPRAXIS_REPORTER_ACTIVE_DIR="$rdir" bp_reporter_any_active; echo "rc=\$?"' 2>&1`;
+
+    like($out, qr/rc=0/, "G'1 a live reporter marker still reports active");
+    unlike($out, qr/unbound variable/,
+        "G'2 survives set -u + nullglob, like its drive sibling");
+    ok(!-e "$rdir/reporter-dead",
+        "G'3 the five-day-old marker is reaped by whoever comes past");
+    ok(-e "$rdir/reporter-live",
+        "G'4 counter-fixture: the fresh marker survives the same sweep");
+
+    # And with nothing but stale markers the answer must flip to "nothing
+    # active" -- otherwise the reap happens but the expensive path is still
+    # taken, which is the whole cost this exists to avoid.
+    my $rdir2 = "$tmp/reporter2";
+    make_path($rdir2);
+    open my $s, '>', "$rdir2/only-dead" or die;
+    print $s "$tmp\n"; close $s;
+    utime $old, $old, "$rdir2/only-dead";
+
+    my $out2 = `bash -c 'set -u; shopt -s nullglob; source "$HOOKS/lib.sh"; CCPRAXIS_REPORTER_ACTIVE_DIR="$rdir2" bp_reporter_any_active; echo "rc=\$?"' 2>&1`;
+    like($out2, qr/rc=1/, "G'5 an all-stale registry answers 'nothing active'");
+    ok(!-e "$rdir2/only-dead", "G'6 and is emptied on the way past");
+
+    # An empty and a missing registry must answer the same way, not abort.
+    for my $case ([ "$tmp/reporter-missing", 'a missing registry' ],
+                  [ "$tmp/reporter-empty",   'an empty registry'  ]) {
+        my ($dir, $what) = @$case;
+        make_path($dir) if $what =~ /empty/;
+        my $o = `bash -c 'set -u; shopt -s nullglob; source "$HOOKS/lib.sh"; CCPRAXIS_REPORTER_ACTIVE_DIR="$dir" bp_reporter_any_active; echo "rc=\$?"' 2>&1`;
+        like($o, qr/rc=1/, "G'7 $what answers 'nothing active'");
+        unlike($o, qr/unbound variable/, "G'8 $what does not abort the shell");
+    }
+}
+
 
 # ===========================================================================
 # H. The director call is bounded on every platform.
