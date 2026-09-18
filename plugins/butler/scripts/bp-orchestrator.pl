@@ -888,6 +888,89 @@ sub suspend_gap {
     return \%v;
 }
 
+# --- COORDINATOR DEATH EVIDENCE (report 20260917-155539-b6bf).
+#
+# 436 watchdog relaunches across two days recorded exit_reason "unknown" -- which
+# is what terminal_verdict returns whenever the last jsonl line is not a `result`
+# object, i.e. whenever the process was killed mid-stream. The report's summary:
+# "436 deaths produce 436 identical log lines with no distinguishing information,
+# and a reader has no way to tell one cause from another. A defect that recurs
+# 436 times and leaves no evidence is one that cannot be fixed, only absorbed."
+#
+# The transcripts existed the whole time; nothing looked at them when a session
+# died. This does, through the SAME bounded tail reader b29 already uses -- one
+# rule, two callers, and no second implementation that could slurp a multi-GB
+# stream into the orchestrator's hot loop.
+#
+# SHAPE, NOT CONTENT. Coordinator transcripts contain prompts. This records the
+# sequence of event types, the tool NAMES in the tail, and any error string the
+# CLI itself emitted -- enough to tell "died mid-Bash" from "died waiting on a
+# dispatched Agent" from "died right after an API error", and not enough to copy
+# anybody's prompt into a log.
+#
+# The report's items 1 and 3 -- the real exit status, and a per-package death cap
+# -- are NOT here. Recording the exit status means restructuring bp-launch.sh's
+# detached launch, which changes what `$!` records and therefore what the
+# liveness and kill paths target; that belongs in a package with a spec and a
+# red-team, not in a forensic read. (The report asks for waitpid, which cannot
+# work at all: bp-launch.sh runs `setsid nohup claude ... &` inside a subshell
+# that exits immediately, so the coordinator is reparented and no ancestor has a
+# wait status to collect.)
+sub coordinator_death_evidence {
+    my ($runs, $pkg, $max_lines) = @_;
+    $max_lines = 40 unless defined $max_lines && $max_lines =~ /\A\d+\z/ && $max_lines > 0;
+
+    my $file = "$runs/$pkg.jsonl";
+    my %ev = (tail_types => [], tail_tools => [], last_error => undef,
+              jsonl_bytes => undef, tail_lines => 0);
+
+    my @st = stat($file);
+    $ev{jsonl_bytes} = $st[7] if @st;
+
+    my $objs = eval { _tail_jsonl_objs($file, $max_lines) } || [];
+    return \%ev unless ref $objs eq 'ARRAY' && @$objs;
+
+    my (@types, @tools, $err);
+    for my $o (@$objs) {
+        next unless ref $o eq 'HASH';
+        my $t = (defined $o->{type} && !ref $o->{type}) ? $o->{type} : '?';
+        push @types, $t;
+
+        # Tool NAMES only. The stream-json shape puts them under
+        # message.content[].name for a tool_use block.
+        my $msg = $o->{message};
+        if (ref $msg eq 'HASH' && ref $msg->{content} eq 'ARRAY') {
+            for my $b (@{ $msg->{content} }) {
+                next unless ref $b eq 'HASH';
+                next unless defined $b->{type} && !ref $b->{type} && $b->{type} eq 'tool_use';
+                push @tools, $b->{name} if defined $b->{name} && !ref $b->{name};
+            }
+        }
+        # An error string the CLI emitted about ITSELF is a diagnostic, not user
+        # content, and is the single most useful line in the whole tail.
+        for my $k (qw(error subtype)) {
+            next unless defined $o->{$k} && !ref $o->{$k};
+            $err = "$k=$o->{$k}" if $o->{$k} =~ /error/i;
+        }
+    }
+    $ev{tail_lines} = scalar @types;
+    # Collapse consecutive repeats: 40 lines of "assistant,user" tells a reader
+    # nothing that "assistant,user x20" does not, and keeps the log line bounded.
+    my @collapsed;
+    for my $t (@types) {
+        if (@collapsed && $collapsed[-1]{t} eq $t) { $collapsed[-1]{n}++ }
+        else { push @collapsed, { t => $t, n => 1 } }
+    }
+    $ev{tail_types} = [ map { $_->{n} > 1 ? "$_->{t} x$_->{n}" : $_->{t} } @collapsed ];
+    # Last few distinct tool names, most recent last.
+    my (%seen_tool, @uniq);
+    for my $tn (@tools) { push @uniq, $tn unless $seen_tool{$tn}++ }
+    @uniq = @uniq[-6 .. -1] if @uniq > 6;
+    $ev{tail_tools} = \@uniq;
+    $ev{last_error} = $err;
+    return \%ev;
+}
+
 # --- did the package make SEMANTIC progress since the snapshot taken at launch?
 # Deliberately NOT jsonl growth (a max-turns run always appends lines, so growth
 # would make every exhaustion look productive) and NOT a ledger mtime bump (a
@@ -4190,8 +4273,16 @@ sub run {
                             # ledger fallback when no --max-turns is passed).
                             my $budget = _reg_int($reg->{$pkg}{max_turns});
                             push @args, '--max-turns', $budget if defined $budget;
+                            # b6bf: attach forensic evidence ONLY for the anonymous
+                            # deaths. A clean `success` or a `max_turns` exhaustion
+                            # already says what happened; adding a tail to those
+                            # would put noise on every ordinary relaunch and bury
+                            # the 436 that carry no information at all.
+                            my $death = ($tv->{verdict} eq 'unknown')
+                                      ? coordinator_death_evidence($runs, $pkg) : undef;
                             _log($log, 'watchdog_relaunch', { package => $pkg, mode => $mode, age_min => $age,
-                                attempts => $att->{$pkg}, exit_reason => $tv->{verdict} });
+                                attempts => $att->{$pkg}, exit_reason => $tv->{verdict},
+                                ($death ? (death_evidence => $death) : ()) });
                             my $snap = launch_snapshot($bpdir, $runs, $pkg, $now);
                             my $rc = $launch->({ pkg => $pkg, args => \@args, kind => $mode });
                             $note_exec->($pkg, $rc);
