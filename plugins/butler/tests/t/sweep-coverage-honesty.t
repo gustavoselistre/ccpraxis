@@ -14,10 +14,19 @@
 # invisible is the same defect one level up: the number is accurate and the
 # conclusion drawn from it is not.
 #
-# The other half of 02db -- that the serial lane is a text match on
-# TestSandbox|podman_run_capture|podman_bin|probe_image rather than "starts a
-# real container", so files that merely DISCUSS the lane are dropped with the
-# ones that use it -- is a lane-model change and is NOT asserted here.
+# The other half of 02db -- that the serial lane is a TEXT MATCH on four
+# container-related identifiers in a file's own source, rather than a real
+# answer to "does this start a container", so a file that merely DISCUSSES the
+# lane is dropped with the ones that use it -- is a lane-model change and is NOT
+# asserted here.
+#
+# This file learned that the hard way and the scar is deliberate. Its first
+# version pasted those four identifiers into this header to explain them, which
+# classified IT as serial -- so the test guarding --fast's honesty was itself
+# excluded from every --fast sweep, silently, and only showed up because the
+# skip list it adds went and named it. The identifiers are described rather than
+# quoted here for exactly that reason. Do not paste them back in; grep
+# classify_file() in scripts/run-tests.pl if you need the literal set.
 use strict;
 use warnings;
 use FindBin qw($Bin);
