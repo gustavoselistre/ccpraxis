@@ -131,6 +131,39 @@ if command -v perl >/dev/null 2>&1; then
             close $b;
             next if $archived;
         }
+        # A BLUEPRINT NOBODY HAS LAUNCHED HAS NOTHING IN FLIGHT.
+        #
+        # This scan used to count every `pending` package in every non-archived
+        # blueprint, which made AUTHORING a blueprint permanently prevent
+        # disarming: a drafted package sits at `pending` from birth and only
+        # leaves it when someone drives it, so the more planning existed on disk
+        # the more locked every session became, forever. Measured 2026-09-18 --
+        # 43 packages across six blueprints reported as outstanding with no run
+        # live, no coordinator dispatched, the bug queue empty and the suite
+        # green. The session could not stop, and idling is not the safe side of
+        # this guard: it abandons nothing but never ends.
+        #
+        # The question this guard actually wants answered is "would stopping
+        # ABANDON work that is in flight", and a blueprint that has never been
+        # launched cannot have any. Execution always leaves a trace under runs/:
+        # bp-launch.sh writes registry.json on every launch, the orchestrator
+        # holds a .orchestrator marker while alive, and a coordinator writes its
+        # own <pkg>.jsonl transcript. Requiring ANY of the three is deliberately
+        # generous -- a false "launched" only costs the old behaviour, while a
+        # false "never launched" is the failure this guard exists to prevent.
+        my $runs = "$dir/$bp/runs";
+        my $launched = 0;
+        if (-d $runs) {
+            $launched = 1 if -e "$runs/registry.json" || -e "$runs/.orchestrator";
+            unless ($launched) {
+                if (opendir(my $rd, $runs)) {
+                    $launched = 1 if grep { /\.jsonl$/ } readdir $rd;
+                    closedir $rd;
+                }
+            }
+        }
+        next unless $launched;
+
         my $pdir = "$dir/$bp/packages";
         -d $pdir or next;
         opendir(my $pd, $pdir) or next;
