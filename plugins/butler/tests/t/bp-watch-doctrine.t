@@ -26,6 +26,7 @@ use FindBin qw($Bin);
 use Test::More;
 use File::Temp qw(tempdir);
 use File::Path qw(make_path);
+use JSON::PP ();
 
 my $WATCH     = "$Bin/../../scripts/bp-watch.pl";
 my $WATCHDOG  = "$Bin/../../scripts/bp-watchdog.pl";
@@ -278,6 +279,53 @@ sub run_watch_env {
     ok(defined $mtime_after && $mtime_after < $old + 60,
        'E4: Mode B (--blueprint, no --keepawake flag given) never refreshes the lease either — '
      . 'refreshing is opt-in via the flag, never an ambient side effect of any bp-watch.pl run');
+}
+
+# ===========================================================================
+# F. --self-pause — the watch registers ITSELF as the guard-subagent-stall.sh
+#    watcher, in-process, via BpRunState::pause, with no separate `ps`/pause
+#    dance required of the caller. Root-cause fix for a real incident: a
+#    driver session, instead of arming bp-watch.pl at all, wrote its own
+#    throwaway sleep-loop watcher on an arbitrary short interval unrelated to
+#    any dispatch's actual duration.
+# ===========================================================================
+{
+    my $root = tempdir(CLEANUP => 1);
+    my $data = "$root/.ccpraxis-local-data";
+    my $bp   = "$data/blueprints/bpx";
+    make_path("$bp/packages");
+    write_ledger($bp, 'p1', 'status: running');
+
+    my ($rc, $out) = run_watch_env('--arm', '--package', 'bpx/p1', '--max-seconds', '3',
+                                    '--poll', '1', '--self-pause', '--reason', 'F-fixture',
+                                    '--data', $data);
+
+    like($out, qr/--self-pause: paused until \d+, watched by pid \d+/,
+         'F1: --self-pause prints confirmation naming a real watcher pid');
+
+    my $state_path = "$data/.subagent-guard/run-state.json";
+    ok(-f $state_path, 'F2: the pause landed in THIS FIXTURE\'s data root (--data honoured), '
+                      . 'not the real project\'s run-state — the root-cause bug this test guards');
+    my $json = do { local (@ARGV, $/) = ($state_path); <> };
+    my $rec  = JSON::PP->new->decode($json);
+    is($rec->{state}, 'paused', 'F3: state is paused');
+    like($rec->{reason}, qr/F-fixture/, 'F4: the --reason text was recorded');
+    like($rec->{watching}, qr/bpx\/p1/, 'F5: --watching names the watched package');
+}
+{
+    # Counter-fixture: without --self-pause, nothing is written to run-state
+    # at all — proves F1-F5 are attributable to the flag.
+    my $root = tempdir(CLEANUP => 1);
+    my $data = "$root/.ccpraxis-local-data";
+    my $bp   = "$data/blueprints/bpx";
+    make_path("$bp/packages");
+    write_ledger($bp, 'p1', 'status: running');
+
+    run_watch_env('--arm', '--package', 'bpx/p1', '--max-seconds', '3', '--poll', '1',
+                  '--data', $data);   # no --self-pause
+
+    ok(!-f "$data/.subagent-guard/run-state.json",
+       'F6 counter-fixture: WITHOUT --self-pause, no run-state file is written at all');
 }
 
 done_testing();

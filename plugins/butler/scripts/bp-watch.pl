@@ -266,7 +266,7 @@ sub usage {
 usage: bp-watch.pl --arm --max-seconds N (--package BP/PKGID | --blueprint BP)
                     [--pid-file PATH | --expect-pids P1,P2,...]
                     [--artifact PATH[:PATH...]] [--poll SECS] [--data DIR]
-                    [--keepawake]
+                    [--keepawake] [--self-pause [--reason TEXT]]
 
 --max-seconds is REQUIRED, no default.
 
@@ -325,6 +325,8 @@ unless (caller) {
         elsif ($a eq '--poll')        { $opt{poll}         = shift @ARGV }
         elsif ($a eq '--data')        { $opt{data}         = shift @ARGV }
         elsif ($a eq '--keepawake')   { $opt{keepawake}    = 1 }
+        elsif ($a eq '--self-pause')  { $opt{self_pause}   = 1 }
+        elsif ($a eq '--reason')      { $opt{reason}       = shift @ARGV }
         else                          { push @unknown, $a }
     }
     if (@unknown) {
@@ -458,6 +460,52 @@ unless (caller) {
     # INVARIANT 3: reused, not reimplemented. BpRunState::pid_alive is the
     # ONLY liveness primitive this file calls.
     require "$DIR/bp-runstate.pl";
+
+    # --self-pause: register THIS process (its own real pid, not a caller's
+    # guess) as the guard-subagent-stall.sh watcher, via BpRunState::pause
+    # in-process -- no subprocess, no second `ps` lookup to find our own pid.
+    #
+    # WHY THIS EXISTS. Before it did, the only documented path to satisfy the
+    # stop-gate around a dispatch was three manual steps: background this
+    # script, `ps`-grep its own pid back out, then call `bp-runstate.pl pause
+    # --watcher-pid <that pid>` separately. That friction is exactly what
+    # produced a real incident: a driver session, instead of doing that
+    # dance, wrote its own throwaway `sleep`-loop watcher sized by guesswork
+    # (5 minutes, with no relation to anything) rather than to this script's
+    # own `--max-seconds`, and re-armed it many more times than the actual
+    # work required -- BpRunState::pause's own header already names this
+    # exact shape ("a backgrounded sleep loop armed solely to satisfy the
+    # gate") as a known failure mode. `--self-pause` collapses the dance to
+    # one flag: the watcher IS the pause, so there is nothing left to invent.
+    #
+    # `until` is `now + max_seconds` UNCLAMPED here -- BpRunState::pause
+    # applies its own 50-minute cap regardless of what is asked, so this
+    # deliberately does not duplicate that constant or that decision; a
+    # `--max-seconds` under an hour (the common case) passes through exactly,
+    # and a longer one is clamped by the one place that owns the cap.
+    if ($opt{self_pause}) {
+        my $watching = sprintf('%s %s (max %ss)', $mode, ($mode eq 'package' ? $opt{package} : $bpname), $max_seconds);
+        # $DATA is the resolved .ccpraxis-local-data dir (respects --data /
+        # CCPRAXIS_DATA_DIR / walk-up, same as everything else in this file);
+        # BpRunState wants its PARENT (the project root) -- passing undef here
+        # would instead auto-resolve via git-toplevel/cwd, silently targeting
+        # the WRONG root whenever --data points somewhere else (a test
+        # fixture, a non-default project layout). Must stay the same root
+        # this watch itself is reading from, or a caller who disagrees with
+        # the pause can never find where it actually landed.
+        require File::Basename;
+        my ($ok, $msg) = BpRunState::pause(File::Basename::dirname($DATA),
+            watcher_pid => $$,
+            until       => time + $max_seconds,
+            watching    => $watching,
+            reason      => ($opt{reason} // "bp-watch.pl self-armed, watching $watching"),
+        );
+        print STDERR "bp-watch: --self-pause: $msg\n";
+        # Non-fatal on refusal (e.g. a race on the state file) -- the watch
+        # itself is still valid and still worth running; a caller relying on
+        # the pause should check this line, but a failed self-pause must
+        # never stop a legitimate watch from proceeding.
+    }
 
     my $art_before = @art_paths ? BpWatch::artifact_snapshot(\@art_paths) : {};
 
