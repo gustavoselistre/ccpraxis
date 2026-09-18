@@ -55,6 +55,49 @@ longest_glob_match() {
   return 0
 }
 
+# show_patterns LABEL PATTERNS
+#   Emits PATTERNS one per line to stderr, each as it will actually be matched
+#   after the ':' split, and marks any element containing whitespace.
+#
+#   Bug 20260916-175013-34af. These fields are a single colon-delimited string.
+#   An author who annotates the field in prose -- `a.pm:b.t:c.pl -- in scope for
+#   ONE thing only: the entry point` -- gets FOUR patterns instead of three, and
+#   the annotated path silently stops being in the write set. bp-ledger.pl's V4b
+#   check now refuses to WRITE such a field, but a session launched before that
+#   landed still carries the corrupt value in BP_WRITE_SET, and nothing
+#   re-derives it mid-session.
+#
+#   The refusal used to print the RAW string, so the corruption was invisible
+#   unless the reader mentally split on ':' and noticed the prose. The report's
+#   closing line is that this would have turned a half-session of misdiagnosis
+#   into a five-second read: a coordinator seeing "outside your write set" for a
+#   path that is plainly listed diagnoses a SCOPE dispute and escalates for a
+#   re-scope it does not need. The scope was already right; only its
+#   serialization was broken.
+#
+#   Display only. Nothing here participates in the allow/deny decision.
+show_patterns() {
+  local label="$1" pats="$2" pat
+  if [ -z "$pats" ]; then
+    printf '  %s: (empty)\n' "$label" >&2
+    return 0
+  fi
+  printf '  %s, as %d pattern(s) after splitting on ":" --\n' \
+         "$label" "$(printf '%s' "$pats" | awk -F: '{print NF}')" >&2
+  local IFS=':'
+  set -f
+  # shellcheck disable=SC2086
+  for pat in $pats; do
+    case "$pat" in
+      *[[:space:]]*) printf '    %s   <-- contains whitespace: not a path (report 20260916-175013-34af)\n' "$pat" >&2 ;;
+      '')            printf '    (empty element)\n' >&2 ;;
+      *)             printf '    %s\n' "$pat" >&2 ;;
+    esac
+  done
+  set +f
+  return 0
+}
+
 bp_read_payload closed
 FP=$(bp_json_get "$PAYLOAD" tool_input.file_path tool_input.notebook_path)
 [ -n "$FP" ] || exit 0
@@ -123,5 +166,8 @@ fi
 if [ "$IN_TESTS" -eq 0 ]; then exit 0; fi
 if match_any "$REL" "${BP_WRITE_SET:-}"; then exit 0; fi
 
-echo "BLOCKED: $REL is outside this package's write set. write_set=$BP_WRITE_SET test_paths=${BP_TEST_PATHS:-—}. If this file genuinely must change, that is a scope problem: record it in the ledger under 'Next action' / escalation, set status to blocked or finish without it — the orchestrator re-scopes packages, coordinators do not." >&2
+echo "BLOCKED: $REL is outside this package's write set." >&2
+show_patterns "write_set" "${BP_WRITE_SET:-}"
+show_patterns "test_paths" "${BP_TEST_PATHS:-}"
+echo "If the path you tried to write appears above only as part of a LONGER element, this package's write_set was serialized wrong and the scope is already correct — relaunch is the only recovery, because nothing re-derives BP_WRITE_SET mid-session. Otherwise this is a scope problem: record it in the ledger under 'Next action' / escalation, set status to blocked or finish without it — the orchestrator re-scopes packages, coordinators do not." >&2
 exit 2
