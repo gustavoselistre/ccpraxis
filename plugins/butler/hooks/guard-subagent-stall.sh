@@ -225,7 +225,26 @@ case "$EVENT" in
     # window the file never had.
     _clear_pending() { : > "$STATE" 2>/dev/null || true; }
 
-    [ -f "$STATE_DIR/force-stop" ] && { _clear_pending; exit 0; }
+    # ONE-SHOT, CONSUMED ON USE -- it was not, and that was a trap.
+    #
+    # Until 2026-09-18 this only tested for the file and never removed it, so a
+    # single touch disabled this guard PERMANENTLY, silently, for every later
+    # turn and every later run in the project. Nothing said so: the denial text
+    # below advertises the override as the way out of one blocked stop, and its
+    # sibling lever on gate-drive-loop.sh (.stop-ok) genuinely IS one-shot. Two
+    # sibling gates, opposite lifetimes, and the dangerous one was the quiet one.
+    #
+    # Found the way these things usually are -- by using it. The override was
+    # touched to end one turn, and the guard stayed inert for the rest of the
+    # session until someone thought to look.
+    #
+    # Consuming it makes the override mean what it says: this stop is allowed.
+    # Wanting the next one allowed is a decision worth making again.
+    if [ -f "$STATE_DIR/force-stop" ]; then
+        rm -f "$STATE_DIR/force-stop" 2>/dev/null || true
+        _clear_pending
+        exit 0
+    fi
 
     RS="$HOOK_DIR/../scripts/bp-runstate.pl"
     [ -f "$RS" ] || exit 0                      # fail open: no state machine, no gate
@@ -276,7 +295,9 @@ Pick one, then stop:
 The pause needs a watcher that is RUNNING and OUTLIVES the work -- arm
 bp-watch.pl around the dispatch; never pass the work's own pid.
 Doing the work now, in this turn, also resolves it.
-Why: this file's header. Override: touch $STATE_DIR/force-stop
+Why: this file's header.
+Override (ONE-SHOT -- consumed on use, allows exactly this stop):
+  touch $STATE_DIR/force-stop
 EOF
     exit 2
     ;;

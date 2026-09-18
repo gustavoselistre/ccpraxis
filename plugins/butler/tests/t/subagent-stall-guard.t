@@ -292,6 +292,23 @@ sub newroot { my $r = tempdir(CLEANUP => 1); mkdir "$r/.ccpraxis-local-data"; re
     my $d = "$r/.ccpraxis-local-data/.subagent-guard";
     open my $f, '>', "$d/force-stop" or die $!; close $f;
     is((fire($r, stop()))[0], 0, 'force-stop overrides the gate outright');
+
+    # ONE-SHOT, AND THIS IS THE HALF THAT WAS MISSING. Until 2026-09-18 the
+    # override was only TESTED for, never removed, so one touch disabled this
+    # guard permanently and silently -- for every later turn and every later run
+    # in the project. Its sibling lever on gate-drive-loop.sh (.stop-ok) is
+    # genuinely one-shot, so two sibling gates had opposite lifetimes and the
+    # dangerous one was the quiet one. Found by using it: the override was
+    # touched to end a single turn, and the guard stayed inert for the rest of
+    # the session.
+    ok(!-e "$d/force-stop",
+        'force-stop is CONSUMED on use, not left behind to disable the guard forever');
+
+    # And the proof that consuming it restores the gate rather than merely
+    # tidying a file: the very next stop, with the same dispatch still
+    # unresolved, must block again.
+    is((fire($r, stop()))[0], 2,
+        'the NEXT stop is gated again -- the override allowed exactly one');
 }
 
 {   # NOT bp_hook_gate'd: it must fire in drive-solo, which is where subagents
