@@ -172,10 +172,14 @@ if (defined $__msys2_before_container_require) {
 
 sub _usage { return <<'USAGE' }
 usage: perl scripts/run-tests.pl [--fast] [--jobs N] [--nice] [--state=failed] [PATH-OR-GLOB ...]
-  --fast          skip host-serial tests that start real containers (a
-                  property of a file's own content). This does NOT touch the
-                  container LANE below -- if that is enabled, its files still
-                  run there regardless of --fast.
+  --fast          skip the host-serial lane. Membership is a TEXT MATCH on a
+                  file's own source, NOT an answer to "does this start a real
+                  container" -- a file that merely mentions the container
+                  helpers is skipped too (report 20260918-042312-02db). The
+                  summary names every file skipped, so check it rather than
+                  reading "0 serial" as "there were none". This does NOT touch
+                  the container LANE below -- if that is enabled, its files
+                  still run there regardless of --fast.
   --jobs N        parallelism for non-container tests (default: cores - 2)
   --nice          low-impact mode: cap parallelism at max(2, cores/4), leaving
                   the machine usable for whoever else is on it. Does not touch
