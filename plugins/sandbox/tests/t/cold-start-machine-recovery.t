@@ -172,10 +172,26 @@ ok(defined $drain_body, 'A4: its body is locatable');
 like($drain_body // '', qr/print\s+STDERR\s+\$captured/,
     'A4: it PRINTS the captured text -- not just a "see the log" pointer');
 
+# $SIG{INT}/$SIG{TERM} were refactored (sandbox-launcher-lifecycle package 01,
+# AC-2) into a one-line call to the shared _teardown_and_exit(), which is
+# where the drain now actually lives. So for those two contexts, follow the
+# call rather than requiring the drain inline in the handler body itself --
+# the union of "handler body + what it calls" is what's asserted, not the
+# literal handler text.
+my ($teardown_body) = $src =~ /sub\s+_teardown_and_exit\s*\{(.*?)\n\}/s;
+
 for my $ctx ('END', '$SIG{INT}', '$SIG{TERM}') {
-    my ($line) = grep { index($_, $ctx) >= 0 && /_stderr_capture/ } split /\n/, $src;
-    ok(defined $line, "A4: $ctx touches the STDERR capture at all");
-    like($line // '', qr/_stderr_capture_drain\(\)/,
+    my $find_re = $ctx eq 'END'
+        ? qr/^\Q$ctx\E\s*\{/
+        : qr/^\Q$ctx\E\s*=/;
+    my ($line) = grep { /$find_re/ } split /\n/, $src;
+    my $body = $line;
+    if (defined $line && index($line, '_teardown_and_exit') >= 0 && defined $teardown_body) {
+        $body = $teardown_body;
+    }
+    ok(defined $body && index($body, '_stderr_capture') >= 0,
+        "A4: $ctx touches the STDERR capture at all");
+    like($body // '', qr/_stderr_capture_drain\(\)/,
         "A4: $ctx DRAINS the capture rather than only restoring the handle");
 }
 

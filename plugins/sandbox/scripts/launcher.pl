@@ -1189,6 +1189,12 @@ my $CONTAINER_POLL_SECONDS = 20;
 # Resources uses for its own snapshot (MAX_AGE = 60 against a 23s interval).
 my $CONTAINER_SNAPSHOT_MAX_AGE = 50;
 
+# sandbox-launcher-lifecycle package 01 (spec sec 2.3): how often the
+# gather-round throttle re-checks whether the owning console-host process is
+# still alive. Independent of $CONTAINER_POLL_SECONDS -- a different signal,
+# a different cadence.
+my $CONSOLE_LIVENESS_POLL_SECONDS = 5;
+
 # s21-keep-awake-probe-failure-handling (spec S2.3): how many CONSECUTIVE
 # 'probe-failed' busy-lease results KeepAwake::on_probe holds the wake-lock
 # through before releasing it as a sustained failure -- a NAMED constant, not
@@ -2023,8 +2029,29 @@ sub _rmtree {
 # every signal path -- alt-screen off, cursor shown, title popped, ReadMode
 # restored -- before the STDERR restore and before reset_terminal(). Its
 # once-guard is what makes a second Ctrl-C during teardown safe.
-$SIG{INT}  = sub { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; _stderr_capture_drain(); log_ev('signal', { sig => 'INT' });  _keepawake_release_global(); _resources_sampler_release_global(); _spend_sampler_release_global(); _container_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 130 };
-$SIG{TERM} = sub { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; _stderr_capture_drain(); log_ev('signal', { sig => 'TERM' }); _keepawake_release_global(); _resources_sampler_release_global(); _spend_sampler_release_global(); _container_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 143 };
+# _teardown_and_exit -- the one full, correct teardown chain, extracted so
+# "the same path" is a source fact rather than a claim to trust
+# (sandbox-launcher-lifecycle package 01, spec sec 2.4). Called identically by
+# $SIG{INT}/$SIG{TERM} below and by the console-liveness poll (see the gather
+# closure) when the owning console host is confirmed gone without a signal
+# ever being delivered.
+sub _teardown_and_exit {
+    my ($sig_label, $code) = @_;
+    tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST;
+    _stderr_capture_drain();
+    log_ev('signal', { sig => $sig_label });
+    _keepawake_release_global();
+    _resources_sampler_release_global();
+    _spend_sampler_release_global();
+    _container_sampler_release_global();
+    LaunchLog::close_log($LAUNCH_LOG);
+    _close_transcript();
+    SandboxLock::release_all();
+    reset_terminal();
+    exit $code;
+}
+$SIG{INT}  = sub { _teardown_and_exit('INT', 130) };
+$SIG{TERM} = sub { _teardown_and_exit('TERM', 143) };
 # 03-resources-reader-model fix-batch (red-team L15): closing the terminal
 # window -- the single most common way a user ends a dashboard -- sends HUP,
 # not INT/TERM, and perl does not run END blocks on an uncaught terminating
@@ -5806,6 +5833,7 @@ sub enter_dashboard {
     my $cached_resources        = undef;   # s09/03: the reader's return value. undef means the detached sampler has not written a snapshot yet (or fork() failed) -- the panel is deliberately absent, never undef-as-a-bug.
     my $cached_runs             = [];      # s10: RunState::summarize struct, initialised to [] so the "runs" key is never undef
     my $last_inspect            = 0;
+    my $last_console_check      = 0;       # sandbox-launcher-lifecycle 01: stamp for the console-liveness throttle
     my $last_resources          = 0;       # s09: stamp for the throttled probe cadence
     my $bp_host_file      = "$CLAUDE_DATA/backpack.json";
     my $bp_appr_file      = "$LAUNCHER_DIR/backpack-approvals.json";
@@ -5883,6 +5911,35 @@ sub enter_dashboard {
     # ...and launcher.pl's own mtime, for the same reason and with the opposite
     # remedy: it can never be reloaded, so a change to it means RELAUNCH.
     { my @st = stat($SELF_PL); $LAUNCHER_MTIME_AT_START = $st[9] if @st; }
+
+    # sandbox-launcher-lifecycle package 01-launcher-and-its-terminal (spec
+    # sec 2.3): once, before Dashboard::run, learn the WINPID of the console
+    # host that owns this launcher's terminal window, so the gather-round poll
+    # below can notice when that window is destroyed without a signal ever
+    # being delivered. undef => mechanism disarmed; the poll is then a
+    # permanent no-op (never falls back to a guess).
+    my $CONSOLE_HOST_WINPID;
+    if ($WINDOWS_FAMILY) {
+        my ($self_wp, $r1) = self_winpid(
+            ps_w     => sub { my $r = `ps -W 2>/dev/null`; return (defined $r && $? != -1) ? $r : undef },
+            self_pid => sub { $$ },
+        );
+        if (defined $self_wp) {
+            my ($host_wp, $r2) = console_host_winpid($self_wp,
+                cim_ancestry => sub {
+                    my $ps = q{powershell.exe -NoProfile -NonInteractive -Command }
+                           . q{"Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Select-Object ProcessId,ParentProcessId,Name | ConvertTo-Json -Compress -Depth 3"};
+                    my $r = `$ps 2>/dev/null`;
+                    return (defined $r && $? != -1) ? $r : undef;
+                },
+            );
+            $CONSOLE_HOST_WINPID = $host_wp;
+            log_ev('console_liveness_armed', { self_winpid => $self_wp, console_host_winpid => $host_wp, reason => $r2 });
+        } else {
+            log_ev('console_liveness_disarmed', { reason => $r1 });
+        }
+    }
+
     my $rc = Dashboard::run(
         color     => 1,
         # The two t11 seams. Dashboard.pm contains no system/exec/fork and
@@ -6128,6 +6185,28 @@ sub enter_dashboard {
                 $last_inspect  = $now;
                 $probed_now    = 1;
             }
+            # sandbox-launcher-lifecycle package 01 (spec sec 2.3): a second,
+            # independent throttle -- did our owning console host disappear
+            # without ever delivering a signal? $CONSOLE_HOST_WINPID is undef
+            # whenever the mechanism is disarmed (non-Windows, ps -W
+            # unavailable, or no console host found in the ancestry chain), in
+            # which case this whole block is a permanent no-op.
+            if ($CONSOLE_HOST_WINPID && $now - $last_console_check >= $CONSOLE_LIVENESS_POLL_SECONDS) {
+                $last_console_check = $now;
+                my $verdict = winpid_alive($CONSOLE_HOST_WINPID,
+                    cim_probe => sub {
+                        my $ps = q{powershell.exe -NoProfile -NonInteractive -Command }
+                               . qq{"Get-CimInstance Win32_Process -Filter 'ProcessId=$CONSOLE_HOST_WINPID' -ErrorAction SilentlyContinue | Select-Object ProcessId,Name | ConvertTo-Json -Compress -Depth 3"};
+                        my $r = `$ps 2>/dev/null`;
+                        my $exec_ok = ($? != -1);
+                        return ($exec_ok ? $r : undef, $exec_ok);
+                    },
+                );
+                if ($verdict eq 'gone') {
+                    _teardown_and_exit('CONSOLE-GONE', 143);
+                }
+                # 'alive' or 'unknown': no action. 'unknown' is not evidence of death.
+            }
             # 03-resources-reader-model: the probe round no longer runs here at
             # all. A detached sampler (forked in enter_dashboard, see
             # _resources_sampler_start/_resources_sampler_round) does the
@@ -6331,8 +6410,9 @@ sub enter_dashboard {
             # $cached_status and re-deciding the wake-lock off a stale busy_age.
             # They are `my` lexicals of enter_dashboard (:2842-2843), reachable
             # only from a closure -- hence this shape.
-            $last_inspect   = 0;
-            $last_resources = 0;
+            $last_inspect       = 0;
+            $last_console_check = 0;
+            $last_resources     = 0;
             return $r;
         },
         # 07-backpack-screen S2.3/E-A: the three persistence seams the [b]
@@ -8745,6 +8825,136 @@ sub wt_profile_plan {
     return { profile => $name, event => undef };
 }
 # <<< wt-profile:END
+
+# >>> console-liveness:BEGIN
+# sandbox-launcher-lifecycle package 01-launcher-and-its-terminal
+# (specs/01-launcher-and-its-terminal-spec.md sec 2.1). Three pure,
+# seam-driven functions -- no I/O of their own -- so they can be extracted
+# and eval'd into a fresh package by a test without ever touching a real
+# subprocess or WMI. Real I/O closures are wired at the call sites, outside
+# this region, in launcher.pl proper.
+
+# self_winpid(%seams) -> ($winpid_or_undef, $reason)
+#   seams (both required): ps_w => sub { returns raw "ps -W" stdout text, or
+#                           undef on exec failure }
+#                           self_pid => sub { returns the MSYS pid to match,
+#                           i.e. $$ }
+sub self_winpid {
+    my (%seams) = @_;
+    my $raw = $seams{ps_w}->();
+    return (undef, 'ps-w-unavailable') unless defined $raw && $raw =~ /\S/;
+    my $pid = $seams{self_pid}->();
+    my @lines = split /\r?\n/, $raw;
+
+    # Locate PID/WINPID by parsing the header row's own field names rather
+    # than trusting a pinned column index -- ps -W's layout varies by build
+    # (this host's real Cygwin/Git-for-Windows ps has 8 columns: PID PPID
+    # PGID WINPID TTY UID STIME COMMAND, not the 4-column PID PPID WINPID
+    # COMMAND some other ps builds use). Self-correcting against future
+    # column-order drift; fails safe (undef), never guesses a wrong index.
+    # Column-name discovery is confined to the header row (line 0) only --
+    # scanning into data rows risks a literal 'WINPID'/'PID' token
+    # coincidentally appearing in a process's COMMAND field and silently
+    # producing a wrong index.
+    my ($pid_idx, $winpid_idx);
+    my @header_cols = @lines ? split(' ', $lines[0]) : ();
+    for my $i (0 .. $#header_cols) {
+        $pid_idx = $i if !defined($pid_idx) && $header_cols[$i] eq 'PID';
+        $winpid_idx = $i if $header_cols[$i] eq 'WINPID';
+    }
+    return (undef, 'winpid-column-not-found') unless defined $winpid_idx;
+    return (undef, 'pid-column-not-found') unless defined $pid_idx;
+
+    for my $line (@lines) {
+        my @cols = split ' ', $line;
+        next unless @cols > $pid_idx && @cols > $winpid_idx;
+        next unless $cols[$pid_idx] =~ /^\d+$/;
+        next unless $cols[$pid_idx] == $pid;
+        return (undef, 'winpid-not-numeric') unless $cols[$winpid_idx] =~ /^\d+$/;
+        return ($cols[$winpid_idx], 'ok');
+    }
+    return (undef, 'no-matching-row');
+}
+
+# console_host_winpid($self_winpid, %seams) -> ($winpid_or_undef, $reason)
+#   seams (required): cim_ancestry => sub { returns raw JSON text of
+#     Get-CimInstance Win32_Process | Select ProcessId,ParentProcessId,Name
+#     | ConvertTo-Json -Compress -Depth 3 (see spec sec 2.2 for the pinned
+#     command), or undef on exec failure }
+#   Walks ParentProcessId upward from $self_winpid, bounded to 64 hops
+#   (mirrors reap-orphans.pl's own-ancestry guard), and returns the WINPID of
+#   the NEAREST ancestor whose Name matches, case-insensitively, one of:
+#   conhost.exe, OpenConsole.exe, WindowsTerminal.exe. Returns
+#   (undef, 'cim-query-failed') if the seam returns undef, (undef,
+#   'cim-parse-failed') on malformed JSON, (undef, 'no-console-host-in-chain')
+#   if the walk exhausts (chain end or hop bound) without a match. NEVER
+#   guesses: an inconclusive walk watches nothing.
+sub console_host_winpid {
+    my ($self_winpid, %seams) = @_;
+
+    my $raw = $seams{cim_ancestry}->();
+    return (undef, 'cim-query-failed') unless defined $raw && $raw =~ /\S/;
+
+    my $data = eval { JSON::PP->new->utf8(0)->decode($raw) };
+    return (undef, 'cim-parse-failed') unless ref $data;
+    $data = [$data] if ref $data eq 'HASH';
+    return (undef, 'cim-parse-failed') unless ref $data eq 'ARRAY';
+
+    my %by_pid;
+    for my $p (@$data) {
+        next unless ref $p eq 'HASH';
+        next unless defined $p->{ProcessId};
+        $by_pid{ $p->{ProcessId} } = $p;
+    }
+
+    my $console_re = qr/^(?:conhost\.exe|OpenConsole\.exe|WindowsTerminal\.exe)$/i;
+    my $current = $self_winpid;
+    my $guard   = 0;
+    while ($guard++ < 64) {
+        my $row = $by_pid{$current};
+        return (undef, 'no-console-host-in-chain') unless ref $row eq 'HASH';
+        my $parent = $row->{ParentProcessId};
+        return (undef, 'no-console-host-in-chain') unless defined $parent;
+        my $parent_row = $by_pid{$parent};
+        if (ref $parent_row eq 'HASH' && defined $parent_row->{Name} && $parent_row->{Name} =~ $console_re) {
+            return ($parent, 'ok');
+        }
+        $current = $parent;
+    }
+    return (undef, 'no-console-host-in-chain');
+}
+
+# winpid_alive($winpid, %seams) -> 'alive' | 'gone' | 'unknown'
+#   seams (required): cim_probe => sub { returns ($raw_json_text_or_undef,
+#     $exec_ok_boolean) for Get-CimInstance Win32_Process -Filter
+#     "ProcessId=$winpid" (see spec sec 2.2 for the pinned command) }
+#   'unknown' whenever the query could not be trusted (exec_ok false, raw
+#   undef, or malformed JSON) -- NEVER collapsed into 'gone'. 'gone' only
+#   when the query executed cleanly (exec_ok true, raw defined) and decoded
+#   to zero matching processes. 'alive' when it decoded to exactly one
+#   process bearing that ProcessId. This asymmetry is what makes criterion 3
+#   (never falsely reap) hold: every failure mode degrades toward "do
+#   nothing", never toward "gone".
+sub winpid_alive {
+    my ($winpid, %seams) = @_;
+
+    my ($raw, $exec_ok) = $seams{cim_probe}->();
+    return 'unknown' unless $exec_ok;
+    return 'unknown' unless defined $raw;
+
+    unless ($raw =~ /\S/) {
+        return 'gone';
+    }
+
+    my $data = eval { JSON::PP->new->utf8(0)->decode($raw) };
+    return 'unknown' unless ref $data;
+    $data = [$data] if ref $data eq 'HASH';
+    return 'unknown' unless ref $data eq 'ARRAY';
+
+    my @matches = grep { ref $_ eq 'HASH' && defined $_->{ProcessId} && $_->{ProcessId} == $winpid } @$data;
+    return @matches ? 'alive' : 'gone';
+}
+# <<< console-liveness:END
 
 # _spawn_session — the dashboard's launch-claude hotkey: open a NEW Windows
 # Terminal window running the internal connector entry

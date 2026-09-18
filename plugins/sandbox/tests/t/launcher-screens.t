@@ -2100,6 +2100,15 @@ sub extract_sub_body {
 # from there. Returns undef rather than guessing if any of the three is missing,
 # so a shape this does not understand fails the located-check loudly instead of
 # silently yielding a body that happens to parse.
+#
+# sandbox-launcher-lifecycle package 01 (AC-2) collapsed the previously-inline
+# teardown into one named sub, _teardown_and_exit, called identically by both
+# handlers. So a handler body that is now just `_teardown_and_exit(...)`
+# carries none of the calls this file's assertions look for directly -- they
+# moved into what it calls. If the extracted body is a bare call to a single
+# other top-level sub, follow it and return the UNION of the handler's own
+# text and that sub's body, so "what the handler body contains" still means
+# "what runs when the handler fires" rather than only its literal text.
 sub extract_sig_handler {
     my ($src, $sig) = @_;
     my $lit = "\$SIG{$sig}";
@@ -2109,7 +2118,15 @@ sub extract_sig_handler {
     return undef if $eq < 0;
     my $sub = index($src, 'sub', $eq);
     return undef if $sub < 0;
-    return _balanced_braces($src, $sub);
+    my $body = _balanced_braces($src, $sub);
+    return $body unless defined $body;
+
+    if (bstr($body) =~ /^\s*\{\s*(\w+)\s*\(/) {
+        my $called = $1;
+        my $called_body = extract_sub_body($src, "sub $called");
+        $body .= "\n" . $called_body if defined $called_body;
+    }
+    return $body;
 }
 # region_between($src, $tag) -- the text between a launch-emit style sentinel
 # pair, or undef when either sentinel is missing / out of order.

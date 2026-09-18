@@ -386,6 +386,19 @@ for my $cols (40, 80, 120) {
             or diag("  cannot locate \$SIG{$label}/END -- the assertion below did not run");
         SKIP: {
             skip("$label handler not found", 1) unless defined $line;
+            # sandbox-launcher-lifecycle package 01 (AC-2) collapsed the
+            # $SIG{INT}/$SIG{TERM} teardown into one call to the shared
+            # _teardown_and_exit(), which is where the STDERR drain now
+            # actually lives -- the handler line itself is just the call. So
+            # when the matched line calls out to a named sub instead of
+            # doing the work inline, follow that call and check the UNION of
+            # the handler line and the called sub's body: what runs when the
+            # handler fires, not only its own literal text.
+            if ($line =~ /(\w+)\s*\(/) {
+                my $called = $1;
+                my $called_body = extract_sub_body($LAUNCHER_SRC_TEXT, "sub $called");
+                $line .= "\n" . $called_body if defined $called_body;
+            }
             # Accepts either the inline STDERR manipulation this originally
             # matched, or a call to _stderr_capture_drain(), which is where that
             # work moved on 2026-08-14. The intent is unchanged and the bar is
