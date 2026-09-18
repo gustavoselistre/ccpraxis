@@ -201,6 +201,73 @@ sub verdict_decision {
 # _read_creds($path) — I/O half: read + parse creds file.
 # Returns { ok, expires_ms, detail, tok } (tok is INTERNAL only — never emitted).
 # ---------------------------------------------------------------------------
+# --- the shared-endpoint cache (report 20260917-015851-1d58). Both halves are
+# best-effort by construction: a cache that cannot be read or written must
+# degrade to today's behaviour (one request per call), never to an error. A gate
+# that fails because its optimisation failed is worse than no optimisation.
+#
+# STRICT ON READ. The file lives in the user's own ~/.claude, but a usage reading
+# decides whether a fleet keeps launching work, so a malformed or
+# future-stamped entry is discarded rather than trusted: the failure direction
+# that matters is serving a stale "plenty of headroom" to a caller that would
+# otherwise have stopped.
+sub _cache_read {
+    my ($path, $url, $now, $ttl) = @_;
+    return undef unless defined $path && defined $url;
+    open my $fh, '<', $path or return undef;
+    my $raw = do { local $/; <$fh> };
+    close $fh;
+    my $doc = eval { JSON::PP->new->decode($raw // '') };
+    return undef unless ref $doc eq 'HASH';
+    my $e = $doc->{$url};
+    return undef unless ref $e eq 'HASH';
+    my $at = $e->{at};
+    return undef unless defined $at && !ref $at && $at =~ /\A\d+(?:\.\d+)?\z/;
+    return undef if $at > $now;                 # stamped in the future: not trustworthy
+    return undef if ($now - $at) >= $ttl;
+    return undef unless defined $e->{content} && !ref $e->{content};
+    return { status => 200, content => $e->{content}, cached => 1, cached_age => $now - $at };
+}
+
+sub _cache_write {
+    my ($path, $url, $now, $res) = @_;
+    return 0 unless defined $path && defined $url && ref $res eq 'HASH';
+    return 0 unless defined $res->{content} && !ref $res->{content};
+
+    # Never let the cache grow without bound, and never let a write failure
+    # propagate: everything below is wrapped and its result discarded.
+    eval {
+        my $dir = $path; $dir =~ s{/[^/]+\z}{};
+        return 0 unless -d $dir;                 # no ~/.claude here: nothing to do
+
+        my $doc = {};
+        if (open my $r, '<', $path) {
+            my $raw = do { local $/; <$r> };
+            close $r;
+            my $d = eval { JSON::PP->new->decode($raw // '') };
+            $doc = $d if ref $d eq 'HASH';
+        }
+        $doc->{$url} = { at => $now, content => $res->{content} };
+        # One entry per URL, and this gate only ever reads one URL, so the file
+        # cannot accumulate -- but drop anything ancient anyway so a renamed
+        # endpoint does not leave a permanent row behind.
+        for my $k (keys %$doc) {
+            my $a = (ref $doc->{$k} eq 'HASH') ? $doc->{$k}{at} : undef;
+            delete $doc->{$k} unless defined $a && !ref $a && $a =~ /\A\d+(?:\.\d+)?\z/
+                                     && ($now - $a) < 86_400;
+        }
+
+        my $tmp = "$path.tmp.$$";
+        open my $w, '>', $tmp or return 0;
+        print {$w} JSON::PP->new->canonical->encode($doc);
+        close $w;
+        chmod 0600, $tmp;                        # best effort; Windows may widen it
+        rename($tmp, $path) or do { unlink $tmp; return 0 };
+        1;
+    } or return 0;
+    return 1;
+}
+
 sub _read_creds {
     my ($path) = @_;
     my $raw = do {
@@ -268,14 +335,100 @@ END_HELP
 
     # --- seam injection ---
     my $now_fn    = $opts->{now}      // sub { time };
-    my $http_get  = $opts->{http_get} // sub {
-        my ($url, $hdrs) = @_;
-        return BpHttp::request('GET', $url, $hdrs);
-    };
+    # --- SHARED-ENDPOINT CACHE (report 20260917-015851-1d58) -----------------
+    #
+    # The usage endpoint is a SHARED, RATE-LIMITED resource that a live
+    # orchestrator depends on every ~63 seconds. On 2026-09-16 a reporter ran
+    # this gate four times in about ten seconds to sanity-check a surprising
+    # reading; the fourth returned 429. The orchestrator's next three polls --
+    # 23:50:14, 23:51:17, 23:52:18 -- all got 429, and it wrote
+    # runs/.paused {"reason":"telemetry"} at 23:52:18, halting every new package
+    # launch for about three minutes.
+    #
+    # The sharp part of that report is that two pieces of existing guidance
+    # ACTIVELY CONFLICT: a package's own Inputs section says usage.pl "has been
+    # seen to return inconsistent readings (40 -> 44 -> 40 -> 51 -> 40 on one
+    # steady run), so read it more than once before deciding" -- and doing
+    # exactly that is what tripped the limit and paused the fleet.
+    #
+    # So repeated reads stop costing anything. A successful reading is cached
+    # for slightly less than the orchestrator's own poll interval; a caller
+    # reading four times in ten seconds now makes ONE request. Correctness is
+    # unaffected: the gate compares percentages against soft ceilings inside a
+    # five-hour and a seven-day window, where a sub-minute-old sample and a
+    # fresh one cannot differ enough to change a verdict.
+    #
+    # NOT the orchestrator's poll. bp-orchestrator.pl::fetch_usage is a separate
+    # code path and is deliberately left alone -- it is the process entitled to a
+    # fresh sample on its own cadence, and this cache exists to protect it from
+    # everyone else.
+    #
+    # ONLY 200s are cached. A 429 or a 5xx must never become sticky: caching a
+    # failure would turn one bad second into a minute of manufactured outage,
+    # which is a worse version of the bug being fixed.
+    my $cache_ttl = defined $ENV{BP_USAGE_CACHE_TTL} ? $ENV{BP_USAGE_CACHE_TTL} + 0 : 55;
+
+    # THE CACHE LIVES BESIDE THE CREDENTIALS IT BELONGS TO, not at a fixed path
+    # under $HOME. A usage reading is an attribute of one ACCOUNT, so a different
+    # credentials file is a different account and must never share a cached
+    # reading with it.
+    #
+    # It is also what keeps the cache out of the way. Written against $HOME it
+    # wrote a live sample into the operator's real ~/.claude while the suite ran,
+    # because every test that drives this script as a SUBPROCESS takes the
+    # production path from inside that process -- no injected seam to notice.
+    # Those tests already redirect BP_CREDS_PATH to a temp file, so deriving from
+    # it puts the cache in their temp dir with no test change at all, and the
+    # derivation is the more correct rule on its own terms.
     my $home       = $ENV{HOME} // $ENV{USERPROFILE} // '';
     my $creds_path = $opts->{creds_path}
                   // $ENV{BP_CREDS_PATH}
                   // "$home/.claude/.credentials.json";
+
+    my $cache_path = $opts->{cache_path} // $ENV{BP_USAGE_CACHE_PATH};
+    unless (defined $cache_path) {
+        my $dir = $creds_path;
+        $dir =~ s{[^/\\]+\z}{};
+        $cache_path = length($dir) ? "${dir}.bp-usage-cache.json" : undef;
+    }
+
+    my $http_get  = $opts->{http_get} // sub {
+        my ($url, $hdrs) = @_;
+        return BpHttp::request('GET', $url, $hdrs);
+    };
+
+    # Wrap the seam rather than each of its three call sites, so a future fourth
+    # caller cannot forget the cache.
+    #
+    # ONLY THE REAL TRANSPORT IS CACHED, unless a caller passes an explicit
+    # cache_path. The cache exists to protect a SHARED, RATE-LIMITED endpoint; an
+    # injected http_get is not one -- the caller already supplied the response.
+    #
+    # This rule is not tidiness. Written the other way round it cached stubbed
+    # responses into the real ~/.claude/.bp-usage-cache.json, and t/usage-governor.t
+    # went red in four places: every later case in the file was served the FIRST
+    # case's fixture, so an expected pause-usage came back 'ok' and an expected
+    # http-500 'unavailable' came back 'ok' too. A process-global cache path plus
+    # a stubbed transport is a cross-test channel, and it wrote a test fixture
+    # into the operator's actual home directory on the way.
+    my $cache_enabled = (defined $cache_path && $cache_ttl > 0)
+                     && (!$opts->{http_get} || defined $opts->{cache_path});
+    if ($cache_enabled) {
+        my $raw = $http_get;
+        $http_get = sub {
+            my ($url, $hdrs) = @_;
+            my $nowt = $now_fn->();
+            my $hit  = _cache_read($cache_path, $url, $nowt, $cache_ttl);
+            return $hit if $hit;
+            my $res = $raw->($url, $hdrs);
+            _cache_write($cache_path, $url, $nowt, $res)
+                if ref $res eq 'HASH' && ($res->{status} // 0) == 200;
+            return $res;
+        };
+    }
+
+    # $home / $creds_path are resolved above, before the cache, because the cache
+    # path is derived from the credentials path.
     my $rand_fn   = $opts->{rand} // sub { rand() };
     my $samples5  = $opts->{samples5} // [];
     my $samples7  = $opts->{samples7} // [];

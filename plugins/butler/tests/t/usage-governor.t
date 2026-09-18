@@ -473,6 +473,13 @@ sub decode_verdict {
 
         # Shell out to the real script so we don't inject seams — this is a true
         # smoke that exercises the full live path including BpHttp::request.
+        #
+        # The shared-endpoint cache (report 20260917-015851-1d58) would serve a
+        # reading less than ~55s old and this smoke would stop reaching the
+        # network at all on a re-run — quietly turning the one live assertion in
+        # the file into another hermetic one. Disabled explicitly here, which is
+        # the only place in the suite that wants a guaranteed real request.
+        local $ENV{BP_USAGE_CACHE_TTL} = 0;
         my $perl = $^X;
         my $out  = `"$perl" "$GATE" verdict 2>/dev/null`;
         my $exit = $? >> 8;
