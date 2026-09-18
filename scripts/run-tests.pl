@@ -648,8 +648,20 @@ sub run_sweep {
         elsif ($d->{lane} eq 'host-parallel') { push @host_parallel,$f }
         else                                  { push @container,    $f }
     }
-    @host_serial = () if $fast;   # UNCHANGED semantics -- @container is NEVER
-                                   # emptied by --fast (spec section 2.8).
+    # --fast empties the host-serial lane. Keep what it dropped so the summary
+    # can SAY so: reporting "0 serial" for a run that skipped sixteen files
+    # reads as "there were none", and a baseline whose coverage is invisible is
+    # exactly the untrustworthy signal report 20260916-162952-5ae3 is about
+    # (filed as 20260918-042312-02db).
+    #
+    # Worth knowing while reading the count: the serial lane is a TEXT MATCH on
+    # TestSandbox|podman_run_capture|podman_bin|probe_image, not "starts a real
+    # container", so a file that merely discusses the container lane is dropped
+    # with the ones that use it. Splitting those two properties is the other
+    # half of 02db and is NOT done here.
+    my @fast_skipped;
+    if ($fast) { @fast_skipped = @host_serial; @host_serial = () }
+    # UNCHANGED semantics -- @container is NEVER emptied by --fast (spec 2.8).
 
     # LANE-AVAILABILITY CAPABILITY GATE (Decision 18: a lane-availability
     # switch, never a routing switch -- classify_file() itself is pure of any
@@ -838,6 +850,15 @@ sub run_sweep {
     # this is always accurate, never a phantom nonzero count.
     printf "\n%d files  %ds wall  (%d parallel at -j%d, %d serial, %d container)\n",
         scalar(@results), $wall, scalar(@host_parallel), $jobs, scalar(@host_serial), scalar(@container);
+
+    # Say what --fast dropped. "0 serial" on a run that skipped sixteen files is
+    # a true statement that reads as a false one, and this line is the baseline
+    # CLAUDE.md instructs every agent to record before changing anything.
+    if (@fast_skipped) {
+        printf "  --fast skipped %d host-serial file(s); this run did NOT cover them:\n",
+            scalar(@fast_skipped);
+        printf "    %s\n", basename($_) for sort @fast_skipped;
+    }
 
     if (@red) {
         print "\nRED:\n";

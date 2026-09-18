@@ -1235,9 +1235,22 @@ CHILD
         env     => { CCPRAXIS_TEST_STATE_DIR => $state_dir2 },
         timeout => 20,
     );
-    unlike($res_fast->{out}, qr/\Q$serial_base\E/,
+    # The claim is that the file was not RUN, and the evidence is that it is not
+    # in the RED report -- a forced-failure fixture that executed would be there.
+    #
+    # It used to be asserted as "the basename appears nowhere in the output",
+    # which stopped being the same claim when --fast started NAMING what it
+    # skipped (report 20260918-042312-02db: reporting `0 serial` for a run that
+    # dropped sixteen files reads as "there were none"). The basename now appears
+    # in the skip notice, which is the very fact this assertion wants to be true.
+    # Split so the two cannot be confused again.
+    my ($red_section) = $res_fast->{out} =~ /^RED:\n(.*?)(?=\n\n|\z)/ms;
+    $red_section //= '';
+    unlike($red_section, qr/\Q$serial_base\E/,
         'A4-E (mutation E, "inverting --fast"): with --fast, the serial-classified red file is '
-      . 'EXCLUDED -- --fast still empties only @host_serial');
+      . 'EXCLUDED -- it is absent from the RED report, so it did not run');
+    like($res_fast->{out}, qr/--fast skipped .*\n(?:.*\n)*?\s+\Q$serial_base\E/,
+        'A4-E: and --fast SAYS it skipped that file rather than dropping it silently');
     like($res_fast->{out}, qr/\Q$any_base\E/,
         'A4-E: with --fast, the plain any-marked red file STILL runs -- --fast never touches the '
       . 'container-classified set (folded into host-parallel with the lane off), only @host_serial');
