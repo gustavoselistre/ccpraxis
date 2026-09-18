@@ -825,6 +825,69 @@ sub terminal_verdict {
     return \%v;
 }
 
+# --- SUSPEND DETECTION (report 20260917-155603-b83e).
+#
+# The orchestrator log stamps a usage_poll roughly every 60s. On 2026-09-17 it
+# contained two gaps -- 186.2 and 203.9 minutes -- with NO events of any kind,
+# and `grep -ic suspend` over the whole log returned 0. Six and a half hours of
+# wall time passed, in a log with a sixty-second heartbeat, and nothing recorded
+# that anything had happened.
+#
+# The absence was then read as evidence by two other consumers. The token keeper
+# woke four seconds after the first gap, found the OAuth token under its refresh
+# floor, got HTTP 400, and paused the fleet with manual=1 while alerting that the
+# host and sandbox token GRANTS MAY HAVE DIVERGED -- a pause that never
+# self-clears. One second later an authenticated usage poll returned 200. The
+# credentials were fine; the machine had simply been asleep through the refresh
+# window. A human was told to go and revisit the copy-token architecture over a
+# fault that did not exist (filed separately as 20260917-110321-ff63).
+#
+# THE REPORT'S OWN DIAGNOSIS IS WRONG, and the correction matters for anyone
+# reading it: it blames `fleet-govern.pl`'s `suspend_gap()` for never firing.
+# That file belongs to the FILING PROJECT's own fleet, not to ccpraxis, and
+# `fleet-orchestrator.pl:405` does call it. ccpraxis has no `fleet-govern.pl`
+# and no `suspend_gap` anywhere; `bp-govern.pl` has no suspend detection at all.
+# So the defect is not a wired-up detector failing to fire -- it is that butler's
+# orchestrator, alone among the long-lived loops on this machine, never had one.
+#
+# The idiom is NOT invented here. `plugins/sandbox/container/heartbeat.sh:31`
+# already carries `SUSPEND_SLACK=120` -- "a tick overshooting TICK by this much
+# means the world was suspended, not that the manager died" -- and uses it to
+# stop reaping a container whose host merely slept. Same rule, same threshold,
+# second caller. No monotonic clock is needed and none is portable here: the
+# INTENDED sleep is the reference, and a tick that took three hours when it asked
+# for ten seconds did not take three hours of work.
+use constant SUSPEND_SLACK_SECS => 120;
+
+# suspend_gap PREV_TICK_EPOCH, NOW, INTENDED_INTERVAL_S [, SLACK_S]
+#   -> { suspended => 0|1, gap_secs => N, overshoot_secs => N }
+# PURE: no I/O, no clock, no exit. Total over undef/garbage inputs.
+#
+# A BACKWARD clock is never a suspend. NTP stepping the clock back would
+# otherwise produce a negative gap that compares however the reader's numeric
+# coercion happens to fall; it is reported as gap 0, not suspended.
+sub suspend_gap {
+    my ($prev, $now, $interval, $slack) = @_;
+    my %v = (suspended => 0, gap_secs => 0, overshoot_secs => 0);
+    # Numeric-STRICT, not merely non-fatal. A bare `$now - $prev` over a
+    # non-numeric value is only a warning, and a warning from the orchestrator's
+    # hot loop is noise in the one log a reader turns to when they already
+    # suspect the clock -- which is the exact situation this function exists for.
+    my $NUM = qr/\A\s*[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?\s*\z/;
+    return \%v unless defined $prev && defined $now;
+    return \%v if ref $prev || ref $now;
+    return \%v unless $prev =~ $NUM && $now =~ $NUM;
+    my $gap = $now - $prev;
+    return \%v unless $gap > 0;
+    $interval = 0 unless defined $interval && !ref $interval && $interval =~ $NUM && $interval > 0;
+    $slack    = SUSPEND_SLACK_SECS unless defined $slack && !ref $slack && $slack =~ $NUM && $slack >= 0;
+    my $overshoot = $gap - $interval;
+    $v{gap_secs}       = $gap;
+    $v{overshoot_secs} = $overshoot > 0 ? $overshoot : 0;
+    $v{suspended}      = ($overshoot >= $slack) ? 1 : 0;
+    return \%v;
+}
+
 # --- did the package make SEMANTIC progress since the snapshot taken at launch?
 # Deliberately NOT jsonl growth (a max-turns run always appends lines, so growth
 # would make every exhaustion look productive) and NOT a ledger mtime bump (a
@@ -2740,10 +2803,47 @@ sub run {
     # the flag goes away so a recurrence (ledger deleted again) is reported again.
     my %awaiting;
 
+    # Previous tick's wall clock, for suspend detection. LOOP-SCOPE, mirroring
+    # %seen/%ckpt/%awaiting: a fresh process cannot infer a gap it did not
+    # observe, so the first tick of every run is never a suspend.
+    my $prev_tick;
+
     my $err;
     eval {
         while (!$STOP) {
             my $now = $now_fn->();
+
+            # ---- SUSPEND GAP (b83e) ----
+            # Before anything else in the tick, because every consumer that read
+            # the 2026-09-17 gaps as evidence read them from THIS log, and the
+            # token keeper's 400 arrived four seconds after a wake. The marker
+            # file is what lets it ask, cheaply, whether the machine just came
+            # back rather than inferring an architectural fault. Never fatal:
+            # failing to record a suspend must not stop the fleet.
+            {
+                my $sg = suspend_gap($prev_tick, $now, $t->{watch_tick}, SUSPEND_SLACK_SECS);
+                if ($sg->{suspended}) {
+                    _log($log, 'suspend_gap', {
+                        gap_secs       => $sg->{gap_secs},
+                        overshoot_secs => $sg->{overshoot_secs},
+                        intended_s     => $t->{watch_tick},
+                        slack_s        => SUSPEND_SLACK_SECS,
+                        detail         => 'wall clock jumped far past the intended tick interval; '
+                                        . 'the host was almost certainly suspended. Work did not stop '
+                                        . 'because of a fault here.',
+                    });
+                    eval {
+                        _write_json_atomic("$runs/.last-suspend.json", {
+                            at_epoch       => $now,
+                            gap_secs       => $sg->{gap_secs},
+                            overshoot_secs => $sg->{overshoot_secs},
+                        });
+                        1;
+                    } or 1;
+                }
+                $prev_tick = $now;
+            }
+
             my $shutdown = -e "$runs/.shutdown" ? 1 : 0;
             %exec_counted = ();       # the exec-failure dedupe is per tick
 
