@@ -73,6 +73,13 @@ BEGIN { $ENV{MSYS2_ARG_CONV_EXCL} = '*' if $^O =~ /^(MSWin32|cygwin|msys)$/; }
 # How many verdict attempts before degrading (spec §2.5, Decision #14).
 our $VERDICT_RETRY_MAX = 3;
 
+# How far ahead a usage pause may resume and still justify holding the machine
+# awake for it. Six hours: the FIVE-HOUR usage window can never reopen more than
+# five hours out, so this covers it with an hour of slack, while excluding the
+# seven-day window entirely. See the pause branch in run_next() for why that
+# distinction is the whole point.
+our $KEEPAWAKE_PAUSE_HORIZON_SECONDS = 6 * 3600;
+
 # Absolute script dir: lets tests `require` from any working dir.
 my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
 
@@ -466,6 +473,38 @@ sub mark_announced {
 # KEEP-AWAKE ACTUATION (side effect; seam-injectable; never affects action/exit)
 # ===========================================================================
 
+# pause_keepawake_phase($reason, $until_epoch, $now) -> 'pause-pending'|'settled'
+#
+# HOLDING THE WAKE-LOCK ACROSS A PAUSE IS A PROMISE ABOUT RESUMING. A usage pause
+# auto-resumes, and the machine has to still be awake when the window reopens --
+# which is why 'pause-pending' is one of the two phases should_be_on() holds for.
+#
+# That reasoning is sound for the FIVE-HOUR usage window, which cannot reopen
+# more than five hours out. It is not sound for the SEVEN-DAY window. Measured on
+# this host 2026-09-18, the governor returned
+#   {"action":"pause","reason":"usage","until_epoch":1790013600}
+# with seven_day at 86%, resetting 2026-09-21T18:00Z -- 88 hours away.
+# 'pause-pending' would have held a laptop awake from Friday morning until Monday
+# evening waiting for it. Nobody expects that, and nobody would ask for it.
+#
+# Past the horizon the honest phase is 'settled': release the lock, let the
+# machine sleep, and let whoever comes back wake it. The pause ACTION is
+# byte-identical either way -- this decides only whether the machine is held
+# awake, never what any caller sees.
+#
+# An UNDEFINED until_epoch keeps the old behaviour and HOLDS. That is the
+# pre-existing semantics, it is the case no measurement covers, and a short pause
+# wrongly released is a broken auto-resume -- so the change stays scoped to the
+# case actually observed.
+#
+# Strictly greater-than, so a pause landing exactly ON the horizon still holds.
+sub pause_keepawake_phase {
+    my ($reason, $until, $now) = @_;
+    return 'settled' unless defined $reason && $reason eq 'usage';
+    return 'pause-pending' unless defined $until;
+    return (($until - $now) > $KEEPAWAKE_PAUSE_HORIZON_SECONDS) ? 'settled' : 'pause-pending';
+}
+
 sub keepawake_apply {
     my ($phase, $dsdir, $opts) = @_;
     # The seam shape (spawn / kill_pid / powershell_available in %$opts) is
@@ -854,7 +893,14 @@ sub _cmd_next {
         if ($mapped->{action} && $mapped->{action} eq 'pause') {
             my $until = $mapped->{until_epoch};
             my $reason = $mapped->{reason};
-            my $phase  = ($reason eq 'usage') ? 'pause-pending' : 'settled';
+
+            my $phase = pause_keepawake_phase($reason, $until, $now);
+            if ($phase eq 'settled' && $reason eq 'usage' && defined $until) {
+                _append_run_log($dsdir, sprintf(
+                    'PAUSE-BEYOND-HORIZON (%.1fh away, horizon %.1fh) -- releasing the wake-lock; '
+                  . 'the run still resumes at %d, but the machine is free to sleep until then',
+                    ($until - $now) / 3600, $KEEPAWAKE_PAUSE_HORIZON_SECONDS / 3600, $until));
+            }
             my $action = { action => 'pause', reason => $reason, until_epoch => $until };
             print _encode_action($action), "\n";
             keepawake_apply($phase, $dsdir, $opts);
