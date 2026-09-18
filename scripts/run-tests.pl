@@ -455,6 +455,28 @@ sub _refusal_result {
 # verdict cannot be overridden by any flag, environment variable or argument
 # (Decision 18: the lane-AVAILABILITY gate lives in run_sweep()'s wiring,
 # never here).
+# _loads_test_sandbox($src) -> 1 | 0
+# True iff $src, with WHOLE-LINE comments removed, contains a genuine
+# TestSandbox-loading construct: `use TestSandbox`, `require TestSandbox`,
+# a word-bounded `TestSandbox::` reference, or a quoted-string-literal
+# `require "TestSandbox"` / `require "TestSandbox.pm"` (single or double
+# quotes). Comment-stripping and the construct list are BOTH pinned by
+# Decision 6 -- do not add quote/string masking (no real file in the
+# 362-file tree needs it; see spec section 5). The quoted-literal require
+# form is a narrow, statically-analyzable exception to that precedent --
+# it names the module as a literal string, not via a variable -- added to
+# close a confirmed false-negative regression vs. the old raw regex
+# (redteam-01.md MEDIUM finding). Variable-indirected `require $mod` and
+# wrapper/re-export modules remain deliberately out of scope (not
+# statically analyzable from source text alone).
+sub _loads_test_sandbox {
+    my ($src) = @_;
+    my $code = join "\n", grep { !/^\s*#/ } split /\n/, $src, -1;
+    return ($code =~ /\b(?:use|require)\s+TestSandbox\b/
+            || $code =~ /\bTestSandbox::/
+            || $code =~ /\brequire\s+["']TestSandbox(?:\.pm)?["']/) ? 1 : 0;
+}
+
 sub classify_file {
     my ($f) = @_;
     open my $fh, '<', $f or return undef;   # unchanged silent-skip precedent
@@ -471,7 +493,7 @@ sub classify_file {
     # be sent into ANOTHER container, and must never run concurrently with
     # other podman-touching work, regardless of what platform it declares
     # needing.
-    my $serial = ($src =~ /TestSandbox|podman_run_capture|podman_bin|probe_image/) ? 1 : 0;
+    my $serial = _loads_test_sandbox($src) ? 1 : 0;
     if ($serial) {
         return { lane => 'host-serial', marker => $marker, serial => 1 };
     }
@@ -658,11 +680,12 @@ sub run_sweep {
     # exactly the untrustworthy signal report 20260916-162952-5ae3 is about
     # (filed as 20260918-042312-02db).
     #
-    # Worth knowing while reading the count: the serial lane is a TEXT MATCH on
-    # TestSandbox|podman_run_capture|podman_bin|probe_image, not "starts a real
-    # container", so a file that merely discusses the container lane is dropped
-    # with the ones that use it. Splitting those two properties is the other
-    # half of 02db and is NOT done here.
+    # The serial lane is decided by _loads_test_sandbox() -- whether the file
+    # genuinely `use`s/`require`s TestSandbox or references TestSandbox::,
+    # comments stripped -- not by a raw text match over the whole file. A file
+    # that merely discusses the container lane in a comment or string literal
+    # no longer lands here (package 01-container-lane-is-a-property, the other
+    # half of 02db).
     my @fast_skipped;
     if ($fast) { @fast_skipped = @host_serial; @host_serial = () }
     # UNCHANGED semantics -- @container is NEVER emptied by --fast (spec 2.8).

@@ -190,6 +190,19 @@ use RunnerStateHarness ();
 
 my $REPO_ROOT = abs_path("$Bin/../../../..");
 
+# Built at runtime from separate string pieces, deliberately, so THIS FILE'S
+# OWN static source text never contains the contiguous substring
+# "TestSandbox::" (package 01-container-lane-is-a-property's
+# _loads_test_sandbox() text-scans a file's raw bytes with no quote/string
+# masking -- spec section 5 -- so a literal "TestSandbox::" sitting inside
+# one of this oracle's own fixture-body string literals would make
+# classify_file() misclassify lane-routing.t itself as host-serial, which it
+# must never be: it is one of the seven files in spec section 2.3). Fixture
+# bodies below use $TSNS to spell a genuine, load-shaped reference that is
+# real code once WRITTEN TO A SEPARATE FIXTURE FILE on disk, without ever
+# appearing as contiguous trigger text in this file's own source.
+my $TSNS = join('', 'Test', 'Sandbox', '::');
+
 # =============================================================================
 # PART 0 -- helpers
 # =============================================================================
@@ -358,8 +371,13 @@ my $CLASSIFY_BODY = <<'BODY';
     }
 
     # PRECEDENCE (pinned, spec section 0.1): the serial heuristic outranks
-    # the marker value.
-    my $serial = ($src =~ /TestSandbox|podman_run_capture|podman_bin|probe_image/) ? 1 : 0;
+    # the marker value. Serial is decided by _loads_test_sandbox() (package
+    # 01-container-lane-is-a-property, spec section 2.1): whole-line comments
+    # stripped, then a genuine `use`/`require TestSandbox` or word-bounded
+    # `TestSandbox::` reference -- never a raw mention of podman_bin/
+    # podman_run_capture/probe_image alone.
+    my $code = join "\n", grep { !/^\s*#/ } split /\n/, $src, -1;
+    my $serial = ($code =~ /\b(?:use|require)\s+TestSandbox\b/ || $code =~ /\bTestSandbox::/) ? 1 : 0;
     if ($serial) {
         return { lane => 'host-serial', marker => $marker, serial => 1 };
     }
@@ -385,7 +403,8 @@ my $MUTATED_CLASSIFY_BODY = <<'BODY';
         return { lane => 'refused', marker => $marker, serial => undef };
     }
 
-    my $serial = ($src =~ /TestSandbox|podman_run_capture|podman_bin|probe_image/) ? 1 : 0;
+    my $code = join "\n", grep { !/^\s*#/ } split /\n/, $src, -1;
+    my $serial = ($code =~ /\b(?:use|require)\s+TestSandbox\b/ || $code =~ /\bTestSandbox::/) ? 1 : 0;
     if ($marker->{value} eq 'windows') {
         return { lane => 'host-parallel', marker => $marker, serial => $serial };
     }
@@ -437,16 +456,17 @@ my @SELF_CHECK_ROWS = (
       "#!/usr/bin/env perl\n# platform: linux\nprint \"ok 1 - fixture pass\\n\"; exit 0;\n",
       'container' ],
     [ 'row4-any-serial-collision',
-      "#!/usr/bin/env perl\n# platform: any\n# this fixture references TestSandbox to trip the serial "
-    . "heuristic\nprint \"ok 1 - fixture pass\\n\"; exit 0;\n",
+      "#!/usr/bin/env perl\n# platform: any\n${TSNS}podman_run_capture(); # a genuine "
+    . "${TSNS} reference, not a comment mention, trips the serial heuristic\n"
+    . "print \"ok 1 - fixture pass\\n\"; exit 0;\n",
       'host-serial' ],
     [ 'row5-windows-serial',
-      "#!/usr/bin/env perl\n# platform: windows\n# calls podman_bin() directly\n"
-    . "print \"ok 1 - fixture pass\\n\"; exit 0;\n",
+      "#!/usr/bin/env perl\n# platform: windows\n${TSNS}podman_bin(); # calls podman_bin() via "
+    . "${TSNS}, a genuine load-shaped reference\nprint \"ok 1 - fixture pass\\n\"; exit 0;\n",
       'host-serial' ],
     [ 'row6-linux-serial',
-      "#!/usr/bin/env perl\n# platform: linux\n# calls probe_image() directly\n"
-    . "print \"ok 1 - fixture pass\\n\"; exit 0;\n",
+      "#!/usr/bin/env perl\n# platform: linux\n${TSNS}probe_image(); # calls probe_image() via "
+    . "${TSNS}, a genuine load-shaped reference\nprint \"ok 1 - fixture pass\\n\"; exit 0;\n",
       'host-serial' ],
     [ 'row7-unmarked',
       "#!/usr/bin/env perl\nprint \"ok 1 - fixture pass\\n\"; exit 0;\n",
@@ -528,7 +548,8 @@ ok($actually_flipped{'row4-any-serial-collision'},
         close $fh;
         my $m = TestPlatform::parse_marker($src);
         if ($m->{outcome} ne 'legal') { push @expect_refused, $f; next }
-        my $serial = $src =~ /TestSandbox|podman_run_capture|podman_bin|probe_image/;
+        my $code = join "\n", grep { !/^\s*#/ } split /\n/, $src, -1;
+        my $serial = ($code =~ /\b(?:use|require)\s+TestSandbox\b/ || $code =~ /\bTestSandbox::/) ? 1 : 0;
         if    ($serial)                  { push @expect_hs, $f }
         elsif ($m->{value} eq 'windows') { push @expect_hp, $f }
         else                              { push @expect_c,  $f }
@@ -799,7 +820,8 @@ my $FIXDIR = tempdir(CLEANUP => 1);
 # --- row 4 (THE COLLISION, AC-3): any + TestSandbox -> host-serial -----------
 {
     my $f = write_fixture($FIXDIR, 'row4-any-serial-collision.t',
-        "#!/usr/bin/env perl\n# platform: any\n# this fixture references TestSandbox to trip the serial heuristic\n"
+        "#!/usr/bin/env perl\n# platform: any\n${TSNS}podman_run_capture(); # a genuine ${TSNS} "
+      . "reference, not a comment mention, trips the serial heuristic\n"
       . "print \"ok 1 - fixture pass\\n\"; exit 0;\n");
     my $d = classify_file($f);
     is($d->{lane}, 'host-serial',
@@ -811,8 +833,8 @@ my $FIXDIR = tempdir(CLEANUP => 1);
 # --- row 5: windows + podman_bin -> host-serial (no-op relative to today) ----
 {
     my $f = write_fixture($FIXDIR, 'row5-windows-serial.t',
-        "#!/usr/bin/env perl\n# platform: windows\n# calls podman_bin() directly\n"
-      . "print \"ok 1 - fixture pass\\n\"; exit 0;\n");
+        "#!/usr/bin/env perl\n# platform: windows\n${TSNS}podman_bin(); # calls podman_bin() via "
+      . "${TSNS}, a genuine load-shaped reference\nprint \"ok 1 - fixture pass\\n\"; exit 0;\n");
     my $d = classify_file($f);
     is($d->{lane}, 'host-serial', 'Part A row 5: a serial-classified windows file -> host-serial');
 }
@@ -821,8 +843,8 @@ my $FIXDIR = tempdir(CLEANUP => 1);
 # instances today) ------------------------------------------------------------
 {
     my $f = write_fixture($FIXDIR, 'row6-linux-serial.t',
-        "#!/usr/bin/env perl\n# platform: linux\n# calls probe_image() directly\n"
-      . "print \"ok 1 - fixture pass\\n\"; exit 0;\n");
+        "#!/usr/bin/env perl\n# platform: linux\n${TSNS}probe_image(); # calls probe_image() via "
+      . "${TSNS}, a genuine load-shaped reference\nprint \"ok 1 - fixture pass\\n\"; exit 0;\n");
     my $d = classify_file($f);
     is($d->{lane}, 'host-serial', 'Part A row 6: a serial-classified linux file -> host-serial');
 }
@@ -1018,7 +1040,8 @@ my $FIXDIR = tempdir(CLEANUP => 1);
         close $fh;
         my $m = TestPlatform::parse_marker($src);
         if ($m->{outcome} ne 'legal') { push @expect_refused, $f; next }
-        my $serial = $src =~ /TestSandbox|podman_run_capture|podman_bin|probe_image/;
+        my $code = join "\n", grep { !/^\s*#/ } split /\n/, $src, -1;
+        my $serial = ($code =~ /\b(?:use|require)\s+TestSandbox\b/ || $code =~ /\bTestSandbox::/) ? 1 : 0;
         if    ($serial)                  { push @expect_hs, $f }
         elsif ($m->{value} eq 'windows') { push @expect_hp, $f }
         else                              { push @expect_c,  $f }
@@ -1211,8 +1234,9 @@ CHILD
 {
     # A4-E: "--fast empties @container instead of @host_serial".
     my $serial_red = write_fixture($FIXDIR, 'a4e-serial-red.t',
-        "#!/usr/bin/env perl\n# platform: any\n# this fixture references TestSandbox to trip the serial "
-      . "heuristic\nprint \"not ok 1 - forced failure\\n\"; exit 1;\n");
+        "#!/usr/bin/env perl\n# platform: any\n${TSNS}podman_run_capture(); # a genuine ${TSNS} "
+      . "reference, not a comment mention, trips the serial heuristic\n"
+      . "print \"not ok 1 - forced failure\\n\"; exit 1;\n");
     my $any_red = write_fixture($FIXDIR, 'a4e-any-red.t',
         "#!/usr/bin/env perl\n# platform: any\nprint \"not ok 1 - forced failure\\n\"; exit 1;\n");
     my $serial_base = File::Basename::basename($serial_red);

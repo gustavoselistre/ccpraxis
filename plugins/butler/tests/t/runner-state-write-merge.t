@@ -49,8 +49,12 @@ my $BOUND = 20;
     my $fixture = make_fixture_tree(
         'quick-green.t'   => green_source(),
         'quick-red.t'     => red_source('AC-1 the one true red'),
-        # source text containing a classification marker (run-tests.pl:75)
-        # -- classified serial, and dropped entirely under --fast (:78), so
+        # source text that genuinely LOADS TestSandbox (matchers-answer-the-question
+        # package 01, 2026-09-18: classify_file() now decides host-serial from what a
+        # file LOADS, not what it mentions -- a comment naming podman_bin() no longer
+        # triggers serial classification at all). A real `require TestSandbox;` is
+        # the only shape that still reliably classifies serial under the new rule --
+        # classified serial, and dropped entirely under --fast (:78), so
         # it must never appear in @results, @red, or the state file.
         #
         # THE PLATFORM MARKER IS LOAD-BEARING, not decoration (test-platform-split
@@ -62,7 +66,7 @@ my $BOUND = 20;
         # actually observe. The gate is right; this fixture simply predates it.
         # Decision 16 marked RunnerStateHarness's three generators; this literal
         # is hand-rolled here and so was not reached by that fix.
-        'serial-marker.t' => "#!/usr/bin/env perl\n# platform: any\n# would call podman_bin() if ever run\nprint \"not ok 1 - must never run under --fast\\n\";\nexit 1;\n",
+        'serial-marker.t' => "#!/usr/bin/env perl\n# platform: any\nrequire TestSandbox;\nprint \"not ok 1 - must never run under --fast\\n\";\nexit 1;\n",
     );
     my $red_path = File::Spec->catfile($fixture, 'tests', 't', 'quick-red.t');
     my $state_dir = tempdir(CLEANUP => 1);

@@ -40,7 +40,14 @@ ok(-f $RUNNER, 'run-tests.pl is present') or BAIL_OUT("no runner at $RUNNER");
 # Two real files from the tree: one the serial heuristic catches, one it does
 # not. Using real files rather than a fixture tree keeps this honest about the
 # classifier actually in force.
-my $SERIAL   = "plugins/butler/tests/t/lane-routing.t";
+#
+# $SERIAL was `lane-routing.t` until matchers-answer-the-question package 01
+# (2026-09-18): that file only MENTIONED the container-lane identifiers (in a
+# byte-verbatim copy of classify_file()'s own body, for its own self-check) and
+# never LOADED TestSandbox, so under the new loads-not-mentions rule it is one
+# of the seven files that correctly moved to parallel -- it can no longer serve
+# as "the serial sample". Swapped to a file that genuinely loads TestSandbox.
+my $SERIAL   = "plugins/sandbox/tests/t/runtime-detection.t";
 my $PARALLEL = "plugins/butler/tests/t/repeat-guard.t";
 ok(-f "$ROOT/$SERIAL",   'the serial-classified sample exists');
 ok(-f "$ROOT/$PARALLEL", 'the parallel sample exists');
@@ -62,7 +69,7 @@ sub sweep {
          '--fast states how many files it skipped');
     like($out, qr/this run did NOT cover them/,
          'and says plainly that they were not covered');
-    like($out, qr/^\s+lane-routing\.t$/m,
+    like($out, qr/^\s+runtime-detection\.t$/m,
          'and names the file, so the gap is checkable rather than merely admitted');
 
     # The regression that motivated this: the count line alone is not enough.
