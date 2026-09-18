@@ -1640,10 +1640,25 @@ sub _run_body {
     # The two diverge exactly while a probe failure is being held through --
     # the one moment the row is worth reading.
     my $held = defined $state->{keepawake_held} ? $state->{keepawake_held} : $state->{stay_awake};
+    # "(PC stays awake)" WAS AN OUTCOME THIS ROW CANNOT KNOW, and it was false.
+    # Measured 2026-09-18 on the host: the machine spent 9h58m in genuine
+    # low-power sleep across one day (powercfg /sleepstudy, SW/HW DRIPS 99%)
+    # while a wake-lock was asserted and refreshing. Under Modern Standby,
+    # ES_SYSTEM_REQUIRED is a REQUEST against the system idle timer; it does not
+    # decide, and on that regime it demonstrably did not win.
+    #
+    # The row already knows this in its own header two lines up -- "Report what
+    # the lock IS doing, not what this frame would like it to do" -- and then
+    # asserted the consequence anyway. Saying what is asserted is truthful in
+    # every regime; saying the PC stays awake is only true in some, and the
+    # operator has no way to tell which from here.
+    #
+    # `released (PC may sleep)` stays as it is: with nothing asserted, the
+    # machine genuinely may sleep. That one is a permission, not a promise.
     my ($keep_text, $keep_role) =
           (!$held)                     ? ('released (PC may sleep)', 'text.muted')
         : ($pstate eq 'probe-failed')  ? ('holding through an unreadable probe', 'state.warn')
-        :                                ('holding (PC stays awake)', 'state.ok');
+        :                                ('holding (wake-lock asserted)', 'state.ok');
     my $keep_row = row({ label => 'keep-awake', value => [ { text => $keep_text, role => $keep_role } ], force => 1 });
     push @lines, $keep_row if @$keep_row;
 
