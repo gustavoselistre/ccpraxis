@@ -812,8 +812,34 @@ bp_drive_ttl_hours() {
 #
 # Pure stat + rm, no subprocess, over a directory that holds one entry per
 # CONCURRENT driver — single digits in the worst realistic case.
+# bp_drive_session_transcript_mtime MARKER_PATH -> epoch mtime, or 0.
+#
+# A marker's BASENAME is the session id, and Claude Code writes that session's
+# transcript to ~/.claude/projects/<slugged-project-path>/<session-id>.jsonl.
+# The project slug is not derivable here without guessing, so this globs the
+# project dirs for that exact filename -- one stat per project, and only on the
+# path where a marker would otherwise be believed.
+#
+# Returns 0 ("unknown -- keep the marker") for anything uncertain: no HOME, no
+# projects dir, no match. Never prints an error, never fails the caller.
+bp_drive_session_transcript_mtime() {
+  local marker="${1:-}" sid home base t best=0
+  [ -n "$marker" ] || { printf '0'; return 0; }
+  sid=$(basename "$marker" 2>/dev/null) || { printf '0'; return 0; }
+  case "$sid" in ''|*/*|*.*) printf '0'; return 0 ;; esac
+  home="${HOME:-${USERPROFILE:-}}"
+  [ -n "$home" ] && [ -d "$home/.claude/projects" ] || { printf '0'; return 0; }
+  for base in "$home"/.claude/projects/*/; do
+    [ -f "$base$sid.jsonl" ] || continue
+    t=$(bp_mtime "$base$sid.jsonl")
+    if [ "${t:-0}" -gt "$best" ] 2>/dev/null; then best=$t; fi
+  done
+  printf '%s' "$best"
+  return 0
+}
+
 bp_drive_any_active() {
-  local dir now ttl mt f live=1
+  local dir now ttl mt tmt f live=1
   dir=$(bp_drive_active_dir) || return 1
   [ -d "$dir" ] || return 1
 
@@ -835,6 +861,31 @@ bp_drive_any_active() {
     if [ "$now" -gt 0 ]; then
       mt=$(bp_mtime "$f")
       if [ "$mt" -gt 0 ] && [ $(( (now - mt) / 3600 )) -ge "$ttl" ]; then
+        rm -f "$f" 2>/dev/null
+        continue
+      fi
+      # A MARKER'S OWN MTIME IS ITS CREATION TIME -- nothing refreshes it
+      # (grepped: no writer touches this directory after the marker is made). So
+      # the rule above measures AGE SINCE THE DRIVE STARTED, not whether the
+      # drive is alive, and it is wrong in both directions: a genuinely active
+      # drive is reaped at the TTL, while a session that died ten minutes in pins
+      # this predicate -- and every guard consulting it -- for the rest of it.
+      #
+      # Measured 2026-09-18: a marker for a session whose transcript had been
+      # untouched for 9h45m, with zero drive processes anywhere, held this true.
+      # That made guard-run-finish.sh refuse every stop and deadlocked it against
+      # guard-subagent-stall.sh, whose own suggested remedy is the command
+      # guard-run-finish was refusing. Same family as report 20260916-134204-3645,
+      # which fixed the continuity side.
+      #
+      # THE SESSION TRANSCRIPT is the liveness signal the marker is not: Claude
+      # Code appends to it every turn, so a live drive touches it constantly.
+      # Reaping on a transcript older than the SAME ttl can only remove markers
+      # for sessions silent that long; it cannot reap a live drive. Fails SAFE --
+      # if the transcript cannot be located the marker is KEPT, because a guard
+      # going inert during a real run is the failure markers exist to prevent.
+      tmt=$(bp_drive_session_transcript_mtime "$f")
+      if [ "${tmt:-0}" -gt 0 ] && [ $(( (now - tmt) / 3600 )) -ge "$ttl" ]; then
         rm -f "$f" 2>/dev/null
         continue
       fi
