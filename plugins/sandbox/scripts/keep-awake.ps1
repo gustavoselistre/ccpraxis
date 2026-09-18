@@ -100,9 +100,40 @@
 param(
     [string]$PidFile,
     [int]$LeaseSeconds = 0,     # 0 = no lease (hold until killed)
-    [int]$PollSeconds  = 60
+    [int]$PollSeconds  = 60,
+    [string]$LogFile
 )
 $ErrorActionPreference = 'Stop'
+
+# -LogFile: THE QUESTION THIS EXISTS TO ANSWER. When the machine sleeps during an
+# unattended run there are exactly two stories, and they need opposite fixes:
+#
+#   (a) the request WAS held and Windows slept anyway, or
+#   (b) the request was already gone -- the lease reaped this helper first.
+#
+# Neither is recoverable after the fact. run.md carries no timestamps, the pid
+# file's mtime history is overwritten on every heartbeat, and the helper leaves
+# no trace at all once it exits. So on 2026-09-17 we had a Kernel-Power 506 and
+# no way to say which story it belonged to, and a whole conclusion about
+# ES_DISPLAY_REQUIRED was drawn on the assumption of (a) without testing it.
+#
+# Every line is stamped in LOCAL time to match Event Viewer, so a 506 can be
+# correlated directly:
+#   powershell "Get-WinEvent -FilterHashtable @{LogName='System';Id=506,507}"
+# against this file. A HOLD line either brackets that timestamp or it does not.
+#
+# Logging must never be able to kill the wake-lock it is observing, so every
+# write is best-effort and swallowed. No -LogFile means every call is a no-op.
+$script:KA_LOG = $LogFile
+function Write-KaLog {
+    param([string]$Event, [string]$Detail = '')
+    if (-not $script:KA_LOG) { return }
+    try {
+        $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        Add-Content -LiteralPath $script:KA_LOG -Encoding ascii `
+                    -Value "$ts pid=$PID $Event $Detail" -ErrorAction SilentlyContinue
+    } catch {}
+}
 
 if ($PidFile) {
     try { Set-Content -LiteralPath $PidFile -Value $PID -Encoding ascii -ErrorAction SilentlyContinue } catch {}
@@ -138,9 +169,14 @@ $ES_SYSTEM_REQUIRED  = [uint32]'0x00000001'
 # this host is going -- and it costs nothing while S0 is still in force.
 $r = [Win32.Power]::SetThreadExecutionState($ES_CONTINUOUS -bor $ES_SYSTEM_REQUIRED)
 if ($r -eq 0) {
+    Write-KaLog 'ASSERT-FAILED' 'SetThreadExecutionState returned 0'
     Write-Error 'SetThreadExecutionState returned 0 (wake-lock not asserted)'
     exit 1
 }
+# The return value is the PREVIOUS execution state, so it is also the only
+# in-process confirmation that the kernel recorded anything at all. Logged as hex
+# because that is how the ES_* flags are documented and compared.
+Write-KaLog 'ASSERTED' ("flags=ES_CONTINUOUS|ES_SYSTEM_REQUIRED prev=0x{0:X8} lease={1}s poll={2}s pidfile={3}" -f $r, $LeaseSeconds, $PollSeconds, $PidFile)
 
 # Guard against a caller passing nonsense that would disable the lease entirely.
 if ($LeaseSeconds -lt 60)   { $LeaseSeconds = 60 }
@@ -181,6 +217,7 @@ try {
         # suspended interval -- grows without limit across repeated sleeps, which
         # is how an orphan comes to hold a machine awake indefinitely, the exact
         # failure the lease was introduced to end.
+        Write-KaLog 'WATCH' ("effective lease={0}s poll={1}s" -f $LeaseSeconds, $PollSeconds)
         $resumeGraceUntil = $null
         while ($true) {
             $before = Get-Date
@@ -191,28 +228,54 @@ try {
             # loaded host never reach it; a suspend passes it by orders of
             # magnitude (186 and 204 minutes, measured).
             if ($actualSleep -gt (($PollSeconds * 3) + 30)) {
+                # This line is the direct evidence that THIS PROCESS was frozen:
+                # a sleep asked for $PollSeconds that took orders of magnitude
+                # longer. Paired with a Kernel-Power 506/507 it shows the machine
+                # went under WHILE the lock was asserted -- story (a).
+                Write-KaLog 'SUSPEND-DETECTED' ("slept={0:N0}s requested={1}s grace={2}s" -f $actualSleep, $PollSeconds, $LeaseSeconds)
                 $resumeGraceUntil = (Get-Date).AddSeconds($LeaseSeconds)
             }
 
             # Released deliberately: the file is our reason to exist.
-            if (-not (Test-Path -LiteralPath $PidFile)) { break }
+            if (-not (Test-Path -LiteralPath $PidFile)) {
+                Write-KaLog 'RELEASE' 'reason=pidfile-gone (deliberate release)'
+                break
+            }
 
             # Lease expired: nobody has touched it, so nobody still wants the
             # lock. Do not keep the machine awake on behalf of a dead run.
             try {
                 $age = ((Get-Date) - (Get-Item -LiteralPath $PidFile).LastWriteTime).TotalSeconds
                 if ($age -gt $LeaseSeconds) {
-                    if ($resumeGraceUntil -and (Get-Date) -lt $resumeGraceUntil) { continue }
+                    if ($resumeGraceUntil -and (Get-Date) -lt $resumeGraceUntil) {
+                        Write-KaLog 'GRACE' ("lease expired (age={0:N0}s) but a suspend was seen -- holding" -f $age)
+                        continue
+                    }
+                    # THE OTHER STORY, (b): the lock is about to stop being
+                    # asserted because nobody refreshed the heartbeat. A 506 after
+                    # this line is a machine sleeping with NO request held, which
+                    # says nothing about whether ES_SYSTEM_REQUIRED works.
+                    Write-KaLog 'RELEASE' ("reason=lease-expired age={0:N0}s lease={1}s" -f $age, $LeaseSeconds)
                     break
                 }
+                # The steady state, and the line that makes absence meaningful: a
+                # gap in HOLD lines is itself evidence, so they must be emitted
+                # unconditionally rather than only when something changes.
+                Write-KaLog 'HOLD' ("heartbeat_age={0:N0}s slept={1:N0}s" -f $age, $actualSleep)
             }
             catch {
                 # Unreadable/vanished between the two calls -- treat as released.
+                Write-KaLog 'RELEASE' 'reason=pidfile-unreadable'
                 break
             }
         }
     }
 }
 finally {
+    # ES_CONTINUOUS is bound to this thread, so process exit IS the release. This
+    # is the last moment the lock is asserted, and the log has to say so -- an
+    # entry that just stops with no EXIT line means the process was KILLED rather
+    # than having released, which is a third story again.
+    Write-KaLog 'EXIT' 'wake-lock released (process exiting)'
     if ($PidFile) { try { Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue } catch {} }
 }

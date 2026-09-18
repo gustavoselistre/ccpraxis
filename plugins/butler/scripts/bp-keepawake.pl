@@ -212,10 +212,23 @@ sub spawn {
         #
         # The lease is opt-in precisely because launcher.pl's dashboard holder
         # does NOT refresh; it passes no lease and keeps hold-until-killed.
+        # -LogFile: sits beside the pid file, so it lands in .drive-solo/ with the
+        # rest of the run's state and is found by anyone already looking there.
+        #
+        # It answers the one question the previous instrumentation could not. When
+        # the machine sleeps mid-run, either the wake-lock was held and Windows
+        # slept anyway, or the lock had already been reaped and the sleep proves
+        # nothing about ES_SYSTEM_REQUIRED. Nothing on disk distinguished those:
+        # run.md has no timestamps, and the pid file's mtime is overwritten by the
+        # very heartbeat whose history we would need. A RELEASE line now says
+        # which, and a gap in HOLD lines is itself evidence.
+        my $log_f = $pid_f;
+        $log_f =~ s{keepawake\.pid$}{keepawake.log};
         exec('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
              '-WindowStyle', 'Hidden', '-File', winify($ps1),
              '-PidFile', winify_out($pid_f),
-             '-LeaseSeconds', '900')
+             '-LeaseSeconds', '900',
+             '-LogFile', winify_out($log_f))
             or POSIX::_exit(127);
     }
     # The parent writes NOTHING. Writing perl's fork return value here is the
