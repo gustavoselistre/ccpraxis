@@ -55,6 +55,17 @@ HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 0
 RF_MASK_MAX=8192
 RF_RAW_KIND=masked
 
+# _bp_rf_mask LEN -- sets RF_MASK_OUT to LEN 'X' characters. Sets a global
+# rather than printing, same convention as bp_rf_scan_target below: a
+# $(...) capture would fork a subshell per call, which costs more than this
+# loop ever does for a real (short) quoted span. Shared by the SINGLE- and
+# DOUBLE-quote closing branches, which used to duplicate this loop inline.
+_bp_rf_mask() {
+  local len=$1 i=0
+  RF_MASK_OUT=""
+  while [ "$i" -lt "$len" ]; do RF_MASK_OUT+="X"; i=$((i+1)); done
+}
+
 # bp_rf_scan_target -- sets RF_SCAN / RF_RAW_KIND from the global $CMD. Called
 # WITHOUT command substitution (assign via the globals, not $(...)): a
 # subshell would discard the assignments, exactly as git_scan_target's own
@@ -140,9 +151,8 @@ bp_rf_scan_target() {
             if [ "$qhaswhite" -eq 0 ] && [ "$qadjacent" -eq 1 ]; then
               out+="$qbuf"
             else
-              local mask="" j=0 qlen=${#qbuf}
-              while [ "$j" -lt "$qlen" ]; do mask+="X"; j=$((j+1)); done
-              out+="'${mask}'"
+              _bp_rf_mask "${#qbuf}"
+              out+="'${RF_MASK_OUT}'"
             fi
             ;;
           ' '|$'\t'|$'\n') qhaswhite=1; qbuf+="$c" ;;
@@ -155,9 +165,8 @@ bp_rf_scan_target() {
             if [ "$qhaswhite" -eq 0 ] && [ "$qadjacent" -eq 1 ]; then
               out+="$qbuf"
             else
-              local mask="" j=0 qlen=${#qbuf}
-              while [ "$j" -lt "$qlen" ]; do mask+="X"; j=$((j+1)); done
-              out+="\"${mask}\""
+              _bp_rf_mask "${#qbuf}"
+              out+="\"${RF_MASK_OUT}\""
             fi
             ;;
           '`') carrier=1; qbuf+="$c" ;;
@@ -202,6 +211,19 @@ bp_rf_scan_target() {
 # run-ending) or 1.
 bp_rf_is_run_ending() {
   [ $# -gt 0 ] && CMD="$1"
+
+  # Fast pre-check: the per-character masking walk in bp_rf_scan_target is
+  # real work on every call this hook makes (every relevant Bash command),
+  # and every branch below needs one of these two substrings present
+  # somewhere in $CMD -- so a command mentioning neither is never a
+  # candidate at all. Restores the old bare-glob's cheap fast path for the
+  # overwhelming majority of commands, without weakening anything the walk
+  # itself decides for the rare command that DOES mention one.
+  case "$CMD" in
+    *bp-runstate*|*bp-continuity*) ;;
+    *) return 1 ;;
+  esac
+
   bp_rf_scan_target
 
   # Anchor class per RF_RAW_KIND tier, values copied verbatim from

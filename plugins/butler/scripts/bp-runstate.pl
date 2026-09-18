@@ -48,6 +48,14 @@ use File::Basename qw(dirname);
 use Cwd ();
 use File::Spec;
 
+# The pause cap: 50 minutes, ~10 minutes of headroom under the provider's
+# one-hour prompt-cache TTL (see pause()'s own comment for the full
+# reasoning). Exported as a callable constant, not just a lexical inside
+# pause(), so any OTHER file that needs to stay under this same cap (e.g.
+# bp-watch.pl's --self-pause default) derives it from here instead of
+# restating the number as an independent literal that could silently drift.
+use constant MAX_PAUSE_SECONDS => 50 * 60;
+
 # The resumption contract -- process liveness and process IDENTITY -- is shared
 # with the continuity gate. See BpResumption.pm's header for why these two
 # guards keep separate SCOPES but must not keep separate MECHANISMS: both
@@ -256,9 +264,8 @@ sub pause {
     # run has to be re-read before the first useful thing happens, which is the
     # single most expensive way a long run can resume. Operator's call,
     # 2026-09-11, after a driver armed a 58-minute pause -- inside the hour, but
-    # with no margin for the wake-up itself to be late.
-    #
-    # 50 minutes leaves ~10 minutes of headroom against that TTL.
+    # with no margin for the wake-up itself to be late. MAX_PAUSE_SECONDS
+    # (declared above) leaves ~10 minutes of headroom against that TTL.
     #
     # WHY CLAMP RATHER THAN REFUSE. Refusing is the more usual discipline in
     # this file, and every other check above refuses -- but those checks all
@@ -274,7 +281,7 @@ sub pause {
     # It is not a SILENT clamp: the returned message states the deadline
     # actually recorded and says it was shortened, so a caller that reads its
     # own output cannot come away believing it has longer than it does.
-    my $max_pause  = 50 * 60;
+    my $max_pause  = MAX_PAUSE_SECONDS;
     my $cap_until  = time + $max_pause;
     my $asked      = $until;
     $until = $cap_until if $until > $cap_until;

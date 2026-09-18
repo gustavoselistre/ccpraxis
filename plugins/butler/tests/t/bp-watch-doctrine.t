@@ -147,7 +147,8 @@ PAYLOAD_EOF`;
 sub bg_bash_watch_payload {
     my ($cwd, $sid) = @_;
     $sid //= 'sess-watch';
-    my $cmd = 'perl plugins/butler/scripts/bp-watch.pl --arm --package bp/pkg --max-seconds 900 --keepawake';
+    my $cmd = 'perl plugins/butler/scripts/bp-watch.pl --arm --package bp/pkg --max-seconds 900 '
+            . q(--reason 'test fixture, fast resolution expected' --keepawake);
     return qq({"session_id":"$sid","cwd":"$cwd","tool_name":"Bash",)
          . qq("tool_input":{"command":"$cmd","run_in_background":true}});
 }
@@ -170,7 +171,8 @@ sub bg_bash_watch_payload {
     # the backgrounding, not to the command merely mentioning bp-watch.pl.
     my $root = new_drive_solo_root();
     my $ds   = "$root/.ccpraxis-local-data/.drive-solo";
-    my $cmd  = 'perl plugins/butler/scripts/bp-watch.pl --arm --package bp/pkg --max-seconds 900';
+    my $cmd  = 'perl plugins/butler/scripts/bp-watch.pl --arm --package bp/pkg --max-seconds 900 '
+             . q(--reason 'test fixture, fast resolution expected');
     my $payload = qq({"session_id":"sess-fg","cwd":"$root","tool_name":"Bash",)
                 . qq("tool_input":{"command":"$cmd","run_in_background":false}});
     run_mark($payload);
@@ -223,7 +225,7 @@ sub run_watch_env {
     utime($old, $old, $lease);
 
     run_watch_env('--arm', '--package', 'bpx/p1', '--max-seconds', '3', '--poll', '1',
-                  '--keepawake', '--data', $data);
+                  '--keepawake', '--reason', 'test fixture, fast resolution expected', '--data', $data);
 
     my $mtime_after = (stat($lease))[9];
     ok(defined $mtime_after, 'E1: the lease file still exists after the watch (never deleted)');
@@ -250,7 +252,7 @@ sub run_watch_env {
     utime($old, $old, $lease);
 
     run_watch_env('--arm', '--package', 'bpx/p1', '--max-seconds', '3', '--poll', '1',
-                  '--data', $data);   # no --keepawake
+                  '--reason', 'test fixture, fast resolution expected', '--data', $data);   # no --keepawake
 
     my $mtime_after = (stat($lease))[9];
     ok(defined $mtime_after && $mtime_after < $old + 60,
@@ -273,7 +275,8 @@ sub run_watch_env {
     my $old = time - 500;
     utime($old, $old, $lease);
 
-    run_watch_env('--arm', '--blueprint', 'bpx', '--max-seconds', '3', '--poll', '1', '--data', $data);
+    run_watch_env('--arm', '--blueprint', 'bpx', '--max-seconds', '3', '--poll', '1',
+                  '--reason', 'test fixture, fast resolution expected', '--data', $data);
 
     my $mtime_after = (stat($lease))[9];
     ok(defined $mtime_after && $mtime_after < $old + 60,
@@ -322,7 +325,7 @@ sub run_watch_env {
     write_ledger($bp, 'p1', 'status: running');
 
     run_watch_env('--arm', '--package', 'bpx/p1', '--max-seconds', '3', '--poll', '1',
-                  '--data', $data);   # no --self-pause
+                  '--reason', 'test fixture, fast resolution expected', '--data', $data);   # no --self-pause
 
     ok(!-f "$data/.subagent-guard/run-state.json",
        'F6 counter-fixture: WITHOUT --self-pause, no run-state file is written at all');

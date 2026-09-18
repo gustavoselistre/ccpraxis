@@ -471,6 +471,7 @@ sub _refusal_result {
 # statically analyzable from source text alone).
 sub _loads_test_sandbox {
     my ($src) = @_;
+    return 0 unless $src =~ /TestSandbox/;   # every branch below needs this substring
     my $code = join "\n", grep { !/^\s*#/ } split /\n/, $src, -1;
     return ($code =~ /\b(?:use|require)\s+TestSandbox\b/
             || $code =~ /\bTestSandbox::/

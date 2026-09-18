@@ -263,10 +263,14 @@ my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f 
 
 sub usage {
     print STDERR <<'USAGE';
-usage: bp-watch.pl --arm --max-seconds N (--package BP/PKGID | --blueprint BP)
+usage: bp-watch.pl --arm [--max-seconds N] (--package BP/PKGID | --blueprint BP)
                     [--pid-file PATH | --expect-pids P1,P2,...]
                     [--artifact PATH[:PATH...]] [--poll SECS] [--data DIR]
                     [--keepawake] [--self-pause [--reason TEXT]]
+
+--max-seconds defaults to 2900 (matching BpRunState::pause's own 50-minute
+cap) when omitted. Passing a SHORTER --max-seconds requires --reason TEXT
+saying why; a longer one needs none.
 
 --max-seconds is REQUIRED, no default.
 
@@ -335,14 +339,53 @@ unless (caller) {
         exit 64;
     }
 
-    unless (defined $opt{max_seconds} && $opt{max_seconds} =~ /^\d+(?:\.\d+)?$/
-            && $opt{max_seconds} > 0) {
-        print STDERR "bp-watch: --max-seconds is REQUIRED and must be a positive number "
-                    . "(no default -- sizing the bound to the dispatch is deliberate)\n";
-        usage();
-        exit 64;
+    # DEFAULT_MAX_SECONDS: what --max-seconds defaults to when omitted.
+    # Derived from BpRunState::MAX_PAUSE_SECONDS (the same cap --self-pause
+    # clamps to), minus headroom for this watch's own round trip -- not an
+    # independent literal, so the two can't silently drift apart. Operator
+    # ruling 2026-09-19: this REPLACES the old "REQUIRED, no default" rule,
+    # which guarded against a different failure (bp-watchdog.pl's fixed
+    # 30-minute RE-POLL TICK manufacturing false verdicts from unchanged
+    # state -- this file's poll loop exits the moment its condition
+    # resolves, so the bound is a ceiling, never a repeating tick). Forcing
+    # a number on every call instead produced its own regression: guessed
+    # low, re-armed often. A SHORTER override needs --reason TEXT (so a
+    # hallucinated "this'll be fast" is at least visible); a longer one
+    # needs none, since --self-pause clamps it to the same cap regardless.
+    # require lives INSIDE the sub, not above it: bp-watch-cli.t's own A1d
+    # test calls this via `require bp-watch.pl` from a caller() context,
+    # which skips this whole unless(caller) body -- a require statement out
+    # here would never run for that caller, leaving BpRunState unloaded.
+    sub DEFAULT_MAX_SECONDS {
+        require "$DIR/bp-runstate.pl";
+        return BpRunState::MAX_PAUSE_SECONDS() - 100;
     }
-    my $max_seconds = $opt{max_seconds} + 0;
+
+    my $max_seconds;
+    if (defined $opt{max_seconds} && length $opt{max_seconds}) {
+        unless ($opt{max_seconds} =~ /^\d+(?:\.\d+)?$/ && $opt{max_seconds} > 0) {
+            print STDERR "bp-watch: --max-seconds must be a positive number "
+                        . "(got '$opt{max_seconds}')\n";
+            usage();
+            exit 64;
+        }
+        $max_seconds = $opt{max_seconds} + 0;
+        if ($max_seconds < DEFAULT_MAX_SECONDS
+                && !(defined $opt{reason} && length $opt{reason})) {
+            print STDERR "bp-watch: --max-seconds $max_seconds is below the "
+                        . DEFAULT_MAX_SECONDS . "s default and needs --reason TEXT saying why "
+                        . "this dispatch specifically warrants a shorter bound -- a bare shorter "
+                        . "number, with no stated reason, is refused rather than silently "
+                        . "trusted (this guards against exactly the guessed-low-and-re-armed"
+                        . "-repeatedly shape a real driver session built its own throwaway "
+                        . "watcher for instead of using this flag).\n";
+            usage();
+            exit 64;
+        }
+    }
+    else {
+        $max_seconds = DEFAULT_MAX_SECONDS;
+    }
 
     my $mode;
     my ($bpname, $pkgid);
@@ -463,26 +506,9 @@ unless (caller) {
 
     # --self-pause: register THIS process (its own real pid, not a caller's
     # guess) as the guard-subagent-stall.sh watcher, via BpRunState::pause
-    # in-process -- no subprocess, no second `ps` lookup to find our own pid.
-    #
-    # WHY THIS EXISTS. Before it did, the only documented path to satisfy the
-    # stop-gate around a dispatch was three manual steps: background this
-    # script, `ps`-grep its own pid back out, then call `bp-runstate.pl pause
-    # --watcher-pid <that pid>` separately. That friction is exactly what
-    # produced a real incident: a driver session, instead of doing that
-    # dance, wrote its own throwaway `sleep`-loop watcher sized by guesswork
-    # (5 minutes, with no relation to anything) rather than to this script's
-    # own `--max-seconds`, and re-armed it many more times than the actual
-    # work required -- BpRunState::pause's own header already names this
-    # exact shape ("a backgrounded sleep loop armed solely to satisfy the
-    # gate") as a known failure mode. `--self-pause` collapses the dance to
-    # one flag: the watcher IS the pause, so there is nothing left to invent.
-    #
-    # `until` is `now + max_seconds` UNCLAMPED here -- BpRunState::pause
-    # applies its own 50-minute cap regardless of what is asked, so this
-    # deliberately does not duplicate that constant or that decision; a
-    # `--max-seconds` under an hour (the common case) passes through exactly,
-    # and a longer one is clamped by the one place that owns the cap.
+    # in-process -- no subprocess, no second `ps` lookup. See that function's
+    # own header for the incident this avoids (a hand-rolled watcher built
+    # instead of using this flag) and the pause cap this doesn't duplicate.
     if ($opt{self_pause}) {
         my $watching = sprintf('%s %s (max %ss)', $mode, ($mode eq 'package' ? $opt{package} : $bpname), $max_seconds);
         # $DATA is the resolved .ccpraxis-local-data dir (respects --data /

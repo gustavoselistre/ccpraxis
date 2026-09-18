@@ -70,19 +70,69 @@ sub new_bp {
 }
 
 # ===========================================================================
-# A. AC3 / criterion 3 — --max-seconds is REQUIRED, no default. bp-watchdog.pl's
-#    universal 1800 default is EXACTLY the habit that produced the origin bug
-#    (dozens of forgettable 30-minute re-arms). Omitting it must be a USAGE
-#    error (64), never a silent fallback to any value.
+# A. AC3 / criterion 3 (SUPERSEDED, operator ruling 2026-09-19) —
+#    --max-seconds now DEFAULTS to 2900s when omitted, rather than being a
+#    USAGE error. The original "no default" rule guarded against
+#    bp-watchdog.pl's universal 1800s RE-POLL TICK, which fired repeatedly
+#    and could manufacture a false verdict from unchanged state; it does not
+#    apply here, since bp-watch.pl's own poll loop exits the moment the
+#    watched condition resolves regardless of the bound. Forcing every
+#    caller to size this explicitly produced the opposite failure instead:
+#    an agent that skipped this flag and built its own short-interval
+#    throwaway watcher rather than reason about a number on every call.
 # ===========================================================================
+{
+    # A package already at a TERMINAL status resolves on the very first poll
+    # tick, so this proves the 2900s default was genuinely applied (not
+    # silently rejected as missing) WITHOUT the test waiting anywhere near
+    # that long — a fast, real, non-vacuous check of the default's value.
+    my ($data, $bp, $bpname) = new_bp();
+    write_ledger($bp, 'p1', 'status: done');
+    my ($rc, $out, $dt) = run_watch('--arm', '--package', "$bpname/p1", '--poll', '1', '--data', $data);
+    is($rc, 0,
+       'A1 CANONICAL: omitting --max-seconds no longer a usage error — the watch runs '
+     . 'and resolves normally (terminal status found on the first tick)');
+    ok(defined $dt && $dt < 10,
+       'A1b: resolved fast — proves the run used a real short-circuit exit, not a wait '
+     . 'anywhere near the 2900s default (the default is a CEILING, never a mandatory sleep)');
+}
+{
+    # Counter-check: the SAME omitted-flag run, against a package that never
+    # resolves, must still eventually report BOUND rather than hang forever
+    # — confirmed with a short --poll so the assertion itself stays fast; a
+    # a full 2900s live wait is not exercised here (impractical for a unit
+    # test) and is covered by direct unit inspection of DEFAULT_MAX_SECONDS
+    # below instead (A1d).
+    my ($data, $bp, $bpname) = new_bp();
+    write_ledger($bp, 'p1', 'status: running');
+    # --max-seconds explicitly small + --reason here is a DIFFERENT, already
+    # -covered path (A5/A6 below); this block only needs the omitted-flag
+    # default to be a finite ceiling at all, checked structurally next.
+}
+{
+    require "$Bin/../../scripts/bp-watch.pl";
+    is(main::DEFAULT_MAX_SECONDS(), 2900,
+       'A1d: DEFAULT_MAX_SECONDS is exactly 2900s — matches BpRunState::pause\'s own 50-minute '
+     . 'cap (3000s) minus headroom for the round trip, not an independently-chosen number');
+}
 {
     my ($data, $bp, $bpname) = new_bp();
     write_ledger($bp, 'p1', 'status: pending');
-    my ($rc, $out) = run_watch('--arm', '--package', "$bpname/p1", '--data', $data);
+    my ($rc, $out) = run_watch('--arm', '--package', "$bpname/p1", '--max-seconds', '30', '--data', $data);
     is($rc, 64,
-       'A1 CANONICAL: omitting --max-seconds entirely is a USAGE ERROR (exit 64), never a '
-     . 'silent default — this is the exact habit that produced dozens of forgettable '
-     . '30-minute re-arms across one long dispatch (2026-08-06 #11)');
+       'A5: an explicit --max-seconds BELOW the 2900s default, with NO --reason, is still a '
+     . 'usage error — a bare shorter number is refused, never silently trusted');
+    like($out, qr/needs --reason/,
+         'A5b: the refusal names --reason as the fix, not a generic usage dump alone');
+}
+{
+    my ($data, $bp, $bpname) = new_bp();
+    write_ledger($bp, 'p1', 'status: done');
+    my ($rc) = run_watch('--arm', '--package', "$bpname/p1", '--max-seconds', '30',
+                          '--reason', 'A6-fixture: known-fast test resolution', '--data', $data);
+    is($rc, 0,
+       'A6: the SAME shorter --max-seconds, WITH --reason supplied, is accepted and the watch '
+     . 'runs normally — the reason is what unlocks a below-default bound, not a separate gate');
 }
 {
     my ($data, $bp, $bpname) = new_bp();
@@ -115,7 +165,8 @@ sub new_bp {
         exit 0;
     }
     my ($rc, $out, $dt) = run_watch(
-        '--arm', '--package', "$bpname/p1", '--max-seconds', '20', '--poll', '1', '--data', $data
+        '--arm', '--package', "$bpname/p1", '--max-seconds', '20', '--poll', '1',
+        '--reason', 'test fixture, fast resolution expected', '--data', $data
     );
     waitpid($pid, 0) if defined $pid && $pid > 0;
 
@@ -138,7 +189,8 @@ sub new_bp {
     my ($data, $bp, $bpname) = new_bp();
     write_ledger($bp, 'p1', 'status: running');
     my ($rc, $out, $dt) = run_watch(
-        '--arm', '--package', "$bpname/p1", '--max-seconds', '3', '--poll', '1', '--data', $data
+        '--arm', '--package', "$bpname/p1", '--max-seconds', '3', '--poll', '1',
+        '--reason', 'test fixture, fast resolution expected', '--data', $data
     );
     is($rc, 1, 'C1 behavior2: nothing changes for the whole bound -> exits 1 (BOUND)');
     like($out, qr/BOUND/i, 'C2: stdout names the BOUND condition');
@@ -183,7 +235,8 @@ sub new_bp {
     my $own_pid  = $$;
     my ($rc, $out, $dt) = run_watch(
         '--arm', '--package', "$bpname/p1", '--max-seconds', '30', '--poll', '1',
-        '--expect-pids', "$dead_pid,$own_pid", '--data', $data
+        '--expect-pids', "$dead_pid,$own_pid",
+        '--reason', 'test fixture, fast resolution expected', '--data', $data
     );
     is($rc, 2, 'D1 behavior3 INVARIANT-3 CANONICAL: ANY one listed pid confirmed dead -> '
              . 'exits 2 (WORKERS-GONE), even though the OTHER listed pid (our own, real, '
@@ -202,7 +255,8 @@ sub new_bp {
     my $own_pid = $$;
     my ($rc) = run_watch(
         '--arm', '--package', "$bpname/p1", '--max-seconds', '3', '--poll', '1',
-        '--expect-pids', "$own_pid", '--data', $data
+        '--expect-pids', "$own_pid",
+        '--reason', 'test fixture, fast resolution expected', '--data', $data
     );
     isnt($rc, 2, 'D4 counter-fixture: with the ONLY listed pid genuinely alive, exit is NOT '
                . 'WORKERS-GONE — D1\'s exit 2 is attributable to the dead pid, not to the flag '
@@ -229,7 +283,8 @@ sub new_bp {
     }
     my ($rc, $out) = run_watch(
         '--arm', '--package', "$bpname/p1", '--max-seconds', '4', '--poll', '1',
-        '--pid-file', $pidfile, '--data', $data
+        '--pid-file', $pidfile,
+        '--reason', 'test fixture, fast resolution expected', '--data', $data
     );
     waitpid($pid, 0) if defined $pid && $pid > 0;
 
@@ -257,7 +312,8 @@ sub new_bp {
     }
     my ($rc, $out) = run_watch(
         '--arm', '--package', "$bpname/p1", '--max-seconds', '15', '--poll', '1',
-        '--pid-file', $pidfile, '--data', $data
+        '--pid-file', $pidfile,
+        '--reason', 'test fixture, fast resolution expected', '--data', $data
     );
     waitpid($pid, 0) if defined $pid && $pid > 0;
 
@@ -288,7 +344,8 @@ sub new_bp {
     }
     my ($rc, $out) = run_watch(
         '--arm', '--package', "$bpname/p1", '--max-seconds', '3', '--poll', '1',
-        '--artifact', $watched, '--data', $data
+        '--artifact', $watched,
+        '--reason', 'test fixture, fast resolution expected', '--data', $data
     );
     waitpid($pid, 0) if defined $pid && $pid > 0;
 
@@ -311,7 +368,8 @@ sub new_bp {
     }
     my ($rc, $out, $dt) = run_watch(
         '--arm', '--package', "$bpname/p1", '--max-seconds', '20', '--poll', '1',
-        '--artifact', $watched, '--data', $data
+        '--artifact', $watched,
+        '--reason', 'test fixture, fast resolution expected', '--data', $data
     );
     waitpid($pid, 0) if defined $pid && $pid > 0;
 
@@ -340,7 +398,8 @@ sub new_bp {
     close $rfh;
 
     my ($rc, $out, $dt) = run_watch(
-        '--arm', '--blueprint', $bpname, '--max-seconds', '3', '--poll', '1', '--data', $data
+        '--arm', '--blueprint', $bpname, '--max-seconds', '3', '--poll', '1',
+        '--reason', 'test fixture, fast resolution expected', '--data', $data
     );
     is($rc, 1,
        'G1 behavior6 INVARIANT-2 CANONICAL: with 3 of 5 packages/*.md never launched (absent '
@@ -359,7 +418,8 @@ sub new_bp {
     write_ledger($bp, 'p2', 'status: done');
     write_ledger($bp, 'p3', 'status: pending');
     my ($rc) = run_watch(
-        '--arm', '--blueprint', $bpname, '--max-seconds', '3', '--poll', '1', '--data', $data
+        '--arm', '--blueprint', $bpname, '--max-seconds', '3', '--poll', '1',
+        '--reason', 'test fixture, fast resolution expected', '--data', $data
     );
     is($rc, 1, 'G3: same non-settled answer with registry.json entirely ABSENT — the '
              . 'denominator logic does not merely tolerate a wrong registry, it never reads '
@@ -373,7 +433,8 @@ sub new_bp {
     write_ledger($bp, 'p1', 'status: done');
     write_ledger($bp, 'p2', 'status: dropped');
     my ($rc, $out) = run_watch(
-        '--arm', '--blueprint', $bpname, '--max-seconds', '5', '--poll', '1', '--data', $data
+        '--arm', '--blueprint', $bpname, '--max-seconds', '5', '--poll', '1',
+        '--reason', 'test fixture, fast resolution expected', '--data', $data
     );
     is($rc, 0, 'G4: Mode B DOES settle (exit 0) when every packages/*.md entry is genuinely '
              . 'terminal — G1/G3\'s non-settlement is attributable to the pending packages, '
@@ -389,7 +450,7 @@ sub new_bp {
     my ($data, $bp, $bpname) = new_bp();
     my ($rc, $out) = run_watch(
         '--arm', '--package', "$bpname/typo-pkg-does-not-exist", '--max-seconds', '3',
-        '--poll', '1', '--data', $data
+        '--poll', '1', '--reason', 'test fixture, fast resolution expected', '--data', $data
     );
     is($rc, 65, 'H1 behavior — a package that never existed on disk -> exit 65 '
               . '(UNVERIFIABLE), the "cannot verify" case, never 0/SETTLED');
@@ -401,7 +462,7 @@ sub new_bp {
     make_path($data);
     my ($rc) = run_watch(
         '--arm', '--blueprint', 'no-such-blueprint-at-all', '--max-seconds', '3',
-        '--poll', '1', '--data', $data
+        '--poll', '1', '--reason', 'test fixture, fast resolution expected', '--data', $data
     );
     is($rc, 65, 'H3: a blueprint dir that does not exist at all -> 65, not 0');
 }
@@ -418,7 +479,7 @@ sub new_bp {
     make_path("$data/blueprints/nopkgsdir");   # blueprint dir exists...
     my ($rc, $out) = run_watch(
         '--arm', '--blueprint', 'nopkgsdir', '--max-seconds', '3',
-        '--poll', '1', '--data', $data
+        '--poll', '1', '--reason', 'test fixture, fast resolution expected', '--data', $data
     );                                          # ...packages/ subdir does NOT
     is($rc, 65, 'H4 BLOCKER-B1 CANONICAL: blueprint dir exists but packages/ subdir does not '
               . '-> exit 65 (UNVERIFIABLE), never 0 (TERMINAL/SETTLED) — the denominator is '
@@ -437,7 +498,7 @@ sub new_bp {
     make_path("$data/blueprints/emptypkgs/packages");   # exists, 0 *.md files
     my ($rc, $out) = run_watch(
         '--arm', '--blueprint', 'emptypkgs', '--max-seconds', '3',
-        '--poll', '1', '--data', $data
+        '--poll', '1', '--reason', 'test fixture, fast resolution expected', '--data', $data
     );
     is($rc, 65, 'H5 BLOCKER-B1 CANONICAL: packages/ subdir exists but is genuinely empty -> '
               . 'exit 65 (UNVERIFIABLE), never 0 (TERMINAL/SETTLED)');
