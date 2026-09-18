@@ -89,7 +89,12 @@ use Cwd ();
 
 my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
 require "$DIR/bp-keepawake.pl";
-require "$DIR/BpSession.pm";
+# Guarded on the module, not the path -- see bp-continuity.pl's require for the
+# full reasoning. This site and that one computed $DIR differently (Cwd::abs_path
+# here, File::Spec->rel2abs there), which is what produced two %INC keys for one
+# file and redefined every sub in it.
+require "$DIR/BpSession.pm"
+    unless grep { m{(?:^|/)BpSession\.pm$} } keys %INC;
 
 # The refresher's cadence, and the pid-file heartbeat window derived from it.
 # 60s is an order of magnitude inside both leases it refreshes (keep-awake.ps1's

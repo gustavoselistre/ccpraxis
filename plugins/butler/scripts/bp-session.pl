@@ -23,7 +23,9 @@ use File::Basename qw(dirname);
 use File::Spec;
 
 my $SCRIPT_DIR = dirname(File::Spec->rel2abs(__FILE__));
-require "$SCRIPT_DIR/BpSession.pm";
+# Guarded on the module, not the path -- see bp-continuity.pl's require.
+require "$SCRIPT_DIR/BpSession.pm"
+    unless grep { m{(?:^|/)BpSession\.pm$} } keys %INC;
 
 my $cmd = shift @ARGV // '';
 

@@ -59,7 +59,22 @@ use File::Spec;
 # The session-identity resolver. All of "which session am I" lives there, once,
 # for every consumer -- see BpSession.pm's header.
 my $SCRIPT_DIR = dirname(File::Spec->rel2abs(__FILE__));
-require "$SCRIPT_DIR/BpSession.pm";
+# GUARDED ON THE MODULE, NOT THE PATH. `require EXPR` keys %INC by the LITERAL
+# string it was given, and BpSession.pm is required from four places that compute
+# their script directory differently -- this file uses
+# dirname(File::Spec->rel2abs(__FILE__)), BpContinuityLease.pm uses
+# Cwd::abs_path. Two spellings of one directory means two %INC keys, so the file
+# was compiled twice and every sub in it redefined.
+#
+# That printed eight "Subroutine ... redefined" warnings on EVERY invocation --
+# into the same stream /butler:continuity documents as `KEY: value` lines for its
+# own step 2 to parse. Noise in a channel something reads is not cosmetic.
+#
+# Matching any %INC key ending in BpSession.pm rather than testing for a
+# particular sub keeps the guard independent of both the path spelling and the
+# module's API.
+require "$SCRIPT_DIR/BpSession.pm"
+    unless grep { m{(?:^|/)BpSession\.pm$} } keys %INC;
 require "$SCRIPT_DIR/BpResumption.pm";
 # The wake-lock / busy-lease held for as long as anything is armed. See that
 # file's header for why arming needs one at all, and why the two platforms hold
