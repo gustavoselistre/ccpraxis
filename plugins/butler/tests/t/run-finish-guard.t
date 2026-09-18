@@ -206,6 +206,86 @@ sub live_drive_dir {
 }
 
 # ===========================================================================
+# D. THE TWO WAYS THE OPERATOR'S INSTRUCTION WENT UNHEARD. Both measured on
+#    2026-09-18, both in the same session, both silent.
+# ===========================================================================
+{
+    # A transcript with SEVERAL user turns, because both defects here are about
+    # which turn ends up being read as the last one.
+    my $J2 = JSON::PP->new->canonical;
+    my $mk = sub {
+        my @texts = @_;
+        my $dir = tempdir(CLEANUP => 1);
+        my $f   = File::Spec->catfile($dir, 'transcript.jsonl');
+        open my $fh, '>', $f or die "transcript: $!";
+        print {$fh} $J2->encode({ type => 'assistant', message => { role => 'assistant',
+                                  content => [ { type => 'text', text => 'working' } ] } }), "\n";
+        for my $t (@texts) {
+            print {$fh} $J2->encode({ type => 'user', message => { role => 'user',
+                                      content => [ { type => 'text', text => $t } ] } }), "\n";
+        }
+        close $fh;
+        return $f;
+    };
+
+    my $dd  = live_drive_dir();
+    my $fin = 'perl plugins/butler/scripts/bp-runstate.pl finish --reason "operator asked"';
+
+    # D1: /butler:continuity off is THE documented off switch, and this guard
+    # polices the very command it runs. It is recorded structurally, so the whole
+    # instruction is the word "off" inside a tag -- which matched nothing.
+    my $slash = "<command-message>butler:continuity</command-message>\n"
+              . "<command-name>/butler:continuity</command-name>\n"
+              . "<command-args>off</command-args>";
+    my ($c1) = run_guard(command => $fin, root => make_root('pending'),
+                         transcript => $mk->($slash), drive_dir => $dd);
+    is($c1, 0, 'D1: /butler:continuity off authorises the stop it is asking for');
+
+    # C2: the bare form, without the plugin prefix.
+    my $slash2 = "<command-name>/continuity</command-name>\n<command-args>off</command-args>";
+    my ($c2) = run_guard(command => $fin, root => make_root('pending'),
+                         transcript => $mk->($slash2), drive_dir => $dd);
+    is($c2, 0, 'D2: the unprefixed /continuity off is recognised too');
+
+    # C3: COUNTER-FIXTURE, and the reason C1 is matched structurally rather than
+    # by adding "off" to the keyword list. In prose it means nothing of the kind.
+    for my $prose ('turn the display off', 'the screen went off overnight',
+                   'switch off the wake lock') {
+        my ($rcx) = run_guard(command => $fin, root => make_root('pending'),
+                              transcript => $mk->($prose), drive_dir => $dd);
+        is($rcx, 2, "D3: '$prose' is prose, NOT an off switch");
+    }
+
+    # C4: COUNTER-FIXTURE. Arming is the opposite instruction and must not pass.
+    my $arm = "<command-name>/butler:continuity</command-name>\n<command-args>on</command-args>";
+    my ($c4) = run_guard(command => $fin, root => make_root('pending'),
+                         transcript => $mk->($arm), drive_dir => $dd);
+    is($c4, 2, 'D4: /butler:continuity ON does not authorise a stop');
+
+    # C5: THE MASKING BUG. The harness writes interrupt notices on the user role
+    # with isMeta=0, so one becomes the last qualifying record and buries what the
+    # operator actually said. An operator who says "stop" and then interrupts a
+    # tool call had their instruction hidden by their own interruption.
+    my ($c5) = run_guard(command => $fin, root => make_root('pending'),
+                         transcript => $mk->('stop', '[Request interrupted by user for tool use]'),
+                         drive_dir => $dd);
+    is($c5, 0, 'D5: an interrupt notice does not mask the stop instruction before it');
+
+    my ($c5b) = run_guard(command => $fin, root => make_root('pending'),
+                          transcript => $mk->('wind it down', '[Request interrupted by user]'),
+                          drive_dir => $dd);
+    is($c5b, 0, 'D5b: the shorter interrupt variant is skipped as well');
+
+    # C6: COUNTER-FIXTURE, and the one that keeps C5 from becoming a blanket
+    # authorisation. Skipping the notice must not invent an instruction that was
+    # never given -- with nothing but notices, the answer is still UNAUTHORISED.
+    my ($c6) = run_guard(command => $fin, root => make_root('pending'),
+                         transcript => $mk->('carry on', '[Request interrupted by user for tool use]'),
+                         drive_dir => $dd);
+    is($c6, 2, 'D6: skipping the notice reveals the REAL last message, it does not authorise');
+}
+
+# ===========================================================================
 # C. FAIL OPEN. Decision 3: a guard that can wedge a session is worse than the
 #    thing it prevents -- and here "open" means ALLOW THE STOP, because a
 #    session that can never end is the worse wedge.

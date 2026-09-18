@@ -201,6 +201,17 @@ VERDICT="$(perl -e '
       next unless $text =~ /\S/;
       # A tool_result-bearing turn carries no author text; skip those.
       next if $text =~ /^\s*<(?:system-reminder|local-command)/;
+      # INTERRUPT NOTICES ARE NOT AUTHOR TEXT. The harness writes these on the
+      # user role with isMeta=0, so they look exactly like a typed message and
+      # become $last -- burying whatever the operator actually said one turn
+      # earlier. Observed 2026-09-18: "[Request interrupted by user for tool
+      # use]" was the newest qualifying record in this transcript.
+      #
+      # The failure is silent and inverted: an operator who says "stop" and then
+      # interrupts a tool call has their instruction masked by the interrupt
+      # their own action generated, and the guard reports UNAUTHORISED. That is
+      # the same class of bug this guard exists to prevent, pointed the other way.
+      next if $text =~ /^\s*\[Request interrupted by user/;
       $last = $text;
   }
   close $fh;
@@ -219,6 +230,37 @@ VERDICT="$(perl -e '
 
   my $t = lc $last;
   $t =~ s/\s+/ /g;
+
+  # THE OFF SWITCH THIS GUARD POLICES, WHICH IT COULD NOT PREVIOUSLY READ.
+  # `/butler:continuity off` is the documented way an operator disarms, and this
+  # guard treats `bp-continuity.pl disarm` / ` off` as a run-ending command it
+  # must authorise. But a slash-command invocation is recorded in the transcript
+  # structurally, not as prose:
+  #
+  #   <command-message>butler:continuity</command-message>
+  #   <command-name>/butler:continuity</command-name>
+  #   <command-args>off</command-args>
+  #
+  # The whole instruction is the word "off", which appears in none of the
+  # patterns below -- and must not be added to them, because "off" in prose
+  # ("turn the display off") is not a stop instruction. So the guard blocked the
+  # documented off switch and told the operator, wrongly, that they had not
+  # asked. Observed 2026-09-18, on a session that was not even armed.
+  #
+  # NO APOSTROPHES ANYWHERE IN THIS PERL BLOCK. It is inside perl -e '...', so a
+  # single quote in a COMMENT closes the string and bash then parses the rest as
+  # shell. That is why the patterns below spell an apostrophe \x27, and it is why
+  # this file must be checked with `bash -n` and not by eye.
+  #
+  # Matched structurally rather than by keyword: the command name AND the
+  # argument, both inside their tags. Nothing an agent writes into prose can
+  # forge this, because the agent cannot author a user turn at all -- which is
+  # the same property the transcript channel was chosen for.
+  if ($t =~ m{<command-name>\s*/?(?:butler:)?continuity\s*</command-name>}
+      && $t =~ m{<command-args>\s*off\s*</command-args>}) {
+      print "AUTHORISED\n";
+      exit 0;
+  }
 
   # Narrow, imperative stop instructions only. Deliberately NOT matching bare
   # "done", "ok" or "thanks": those end a topic, never a run.
