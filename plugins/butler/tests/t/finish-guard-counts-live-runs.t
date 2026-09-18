@@ -102,8 +102,16 @@ sub verdict {
         print {$m} "armed\n";
         close $m;
     }
+    # The never-launched filter applies ONLY when no drive is live -- a
+    # drive-solo run need not write registry.json, so a live drive must keep the
+    # old behaviour. These cases are about the no-drive path, so point the drive
+    # registry at an EMPTY dir rather than letting the ambient environment decide
+    # (leaving it unset let a real marker leak in and flipped three results).
+    my $ddir = "$proj/.drive-empty";
+    mkdir $ddir unless -d $ddir;
     local %ENV = (%ENV, BP_PROJECT_ROOT => fwd($proj),
                   CCPRAXIS_CONTINUITY_ACTIVE_DIR => fwd($cdir),
+                  CCPRAXIS_DRIVE_ACTIVE_DIR => fwd($ddir),
                   GPATH => fwd($HOOK), PFILE => fwd($pf));
     system('bash', '-c', '"$GPATH" < "$PFILE" >/dev/null 2>&1');
     return $? >> 8;

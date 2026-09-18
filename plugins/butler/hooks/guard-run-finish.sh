@@ -113,6 +113,7 @@ if command -v perl >/dev/null 2>&1; then
   OUTSTANDING="$(perl -e '
     use strict; use warnings;
     my $root = shift @ARGV;
+    my $run_live = shift(@ARGV) ? 1 : 0;
     my $dir  = "$root/.ccpraxis-local-data/blueprints";
     -d $dir or exit 0;
     opendir(my $dh, $dir) or exit 0;
@@ -151,18 +152,27 @@ if command -v perl >/dev/null 2>&1; then
         # own <pkg>.jsonl transcript. Requiring ANY of the three is deliberately
         # generous -- a false "launched" only costs the old behaviour, while a
         # false "never launched" is the failure this guard exists to prevent.
-        my $runs = "$dir/$bp/runs";
-        my $launched = 0;
-        if (-d $runs) {
-            $launched = 1 if -e "$runs/registry.json" || -e "$runs/.orchestrator";
-            unless ($launched) {
-                if (opendir(my $rd, $runs)) {
-                    $launched = 1 if grep { /\.jsonl$/ } readdir $rd;
-                    closedir $rd;
+        # ONLY WHEN NO RUN IS LIVE. If a drive is active right now, every pending
+        # package is potentially its next step and the old behaviour is correct
+        # -- a drive-solo run does not necessarily write registry.json, so
+        # requiring launch evidence would let a LIVE run be stopped. That hole
+        # was caught by the oracle for this hook, run-finish-guard.t case A1,
+        # whose fixture pairs a live drive marker with a blueprint that has no
+        # runs/ dir -- after a first version of this filter applied always.
+        unless ($run_live) {
+            my $runs = "$dir/$bp/runs";
+            my $launched = 0;
+            if (-d $runs) {
+                $launched = 1 if -e "$runs/registry.json" || -e "$runs/.orchestrator";
+                unless ($launched) {
+                    if (opendir(my $rd, $runs)) {
+                        $launched = 1 if grep { /\.jsonl$/ } readdir $rd;
+                        closedir $rd;
+                    }
                 }
             }
+            next unless $launched;
         }
-        next unless $launched;
 
         my $pdir = "$dir/$bp/packages";
         -d $pdir or next;
@@ -183,7 +193,7 @@ if command -v perl >/dev/null 2>&1; then
     }
     print join("\n", @open), "\n" if @open;
     exit 0;
-  ' "${BP_PROJECT_ROOT:-$PWD}" 2>/dev/null)" || OUTSTANDING=""
+  ' "${BP_PROJECT_ROOT:-$PWD}" "$run_live" 2>/dev/null)" || OUTSTANDING=""
 fi
 # Nothing pending or running anywhere: the work is done, let the session stop.
 [ -n "${OUTSTANDING:-}" ] || exit 0
