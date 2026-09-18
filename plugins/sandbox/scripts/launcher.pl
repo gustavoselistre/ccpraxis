@@ -6203,13 +6203,36 @@ sub enter_dashboard {
             # which case this whole block is a permanent no-op.
             if ($CONSOLE_HOST_WINPID && $now - $last_console_check >= $CONSOLE_LIVENESS_POLL_SECONDS) {
                 $last_console_check = $now;
+                # simplify pass, 2026-09-19 (efficiency finding): this fires
+                # every CONSOLE_LIVENESS_POLL_SECONDS on the SAME loop that
+                # renders and handles input -- a synchronous powershell.exe
+                # spawn here cost ~400ms measured on this host (CLR/host
+                # startup dominates a single-filter CIM query), directly
+                # against the idle-CPU goal package 02 just fixed. `tasklist`
+                # via cmd.exe answers the identical "does this WINPID still
+                # exist" question with no CLR to start, measured ~100ms here
+                # -- still a real cost every 5s, but a ~4x cut, and it stays
+                # native rather than moving the probe to a detached sampler
+                # (a bigger redesign this finding did not ask for). Local
+                # MSYS2_ARG_CONV_EXCL scope per CLAUDE.md's documented
+                # pattern -- nothing here is a path, so nothing needs
+                # hand-translation, only the exclusion itself.
                 my $verdict = winpid_alive($CONSOLE_HOST_WINPID,
                     cim_probe => sub {
-                        my $ps = q{powershell.exe -NoProfile -NonInteractive -Command }
-                               . qq{"Get-CimInstance Win32_Process -Filter 'ProcessId=$CONSOLE_HOST_WINPID' -ErrorAction SilentlyContinue | Select-Object ProcessId,Name | ConvertTo-Json -Compress -Depth 3"};
-                        my $r = `$ps 2>/dev/null`;
+                        local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
+                        my $r = `tasklist /FI "PID eq $CONSOLE_HOST_WINPID" /NH /FO CSV 2>/dev/null`;
                         my $exec_ok = ($? != -1);
-                        return ($exec_ok ? $r : undef, $exec_ok);
+                        return (undef, 0) unless $exec_ok;
+                        # tasklist prints one CSV row per match, or an
+                        # "INFO: No tasks..." line for zero matches -- adapt
+                        # both into the minimal JSON shape winpid_alive
+                        # already knows how to decode, so that function's
+                        # own contract and test coverage stay untouched.
+                        my $found = ($r =~ /^"[^"]*","(\d+)"/m) ? $1 : undef;
+                        my $json = (defined $found && $found == $CONSOLE_HOST_WINPID)
+                                 ? qq([{"ProcessId":$found}])
+                                 : '[]';
+                        return ($json, 1);
                     },
                 );
                 if ($verdict eq 'gone') {
