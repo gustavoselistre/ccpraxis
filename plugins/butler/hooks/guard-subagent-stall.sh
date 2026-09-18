@@ -254,6 +254,37 @@ case "$EVENT" in
       *) _clear_pending; exit 0 ;;              # inert / paused / finished -> allow
     esac
 
+    # THE THIRD EXIT: THERE IS NO WORK.
+    #
+    # This gate offers two resolutions -- `finish` (nothing is pending) and
+    # `pause` (something is in flight, watched) -- and assumes one is reachable.
+    # Neither is, when the work is finished AND `finish` is refused by
+    # guard-run-finish.sh: `pause` would have to name work in flight that does
+    # not exist, which is the hollow pause this gate's own siblings reject.
+    # What is left is the one-shot override, every turn, which is a permanent
+    # bypass wearing a one-shot label.
+    #
+    # Measured 2026-09-18: the override was used four times across consecutive
+    # turns with zero dispatches outstanding, zero background processes and zero
+    # open bug reports, because `finish` was refused on a stale drive marker.
+    # Report 20260918-134732-acfd. gate-continuity.sh got this same third exit
+    # in 1dda97d; leaving it off THIS gate left the trap fully intact, which is
+    # what the operator saw when it kept firing after that fix.
+    #
+    # Same predicate, same file, same rules as the other two gates -- ledgers on
+    # disk, nothing the agent asserts, failing toward WORK EXISTS. A gate that
+    # opens on a false "finished" would be worse than the trap, so ignorance
+    # keeps it shut.
+    if [ -z "${CCPRAXIS_STALL_SKIP_IDLE_EXIT:-}" ] && command -v bp_outstanding_work >/dev/null 2>&1; then
+      _sg_rl=1
+      bp_drive_any_active 2>/dev/null || _sg_rl=0
+      if [ -z "$(bp_outstanding_work "$_sg_rl" 2>/dev/null)" ]; then
+        _clear_pending
+        echo "butler subagent-stall gate: allowing this stop -- no outstanding work. Every package of every non-archived blueprint is at a terminal status, so there is nothing a pause could name and nothing a dispatch could still be doing for it." >&2
+        exit 0
+      fi
+    fi
+
     PENDING=""
     [ -s "$STATE" ] && PENDING=$(tr '\n' ';' < "$STATE" 2>/dev/null | sed 's/;$//')
     STALE=""

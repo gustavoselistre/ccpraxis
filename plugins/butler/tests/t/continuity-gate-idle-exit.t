@@ -111,6 +111,26 @@ sub project {
          'guard-run-finish.sh consults the same one -- one rule, two callers');
     unlike($guard, qr/my \@bps = grep/,
          'and no longer carries its own inline copy of the scan');
+
+    # ALL THREE GATES, not two. Fixing gate-continuity.sh and guard-run-finish.sh
+    # and stopping there left the trap fully intact: guard-subagent-stall.sh has
+    # the identical two-exit shape (finish | pause), and kept firing after the
+    # other two were fixed, which is exactly what the operator saw. A gate that
+    # can strand a finished session is a property of the SET, so the set is what
+    # this asserts.
+    my $stall = do { open my $h, '<', "$Bin/../../hooks/guard-subagent-stall.sh" or die; local $/; <$h> };
+    like($stall, qr/bp_outstanding_work/,
+         'guard-subagent-stall.sh consults it too -- all three gates, or the trap survives');
+}
+
+# ---- every gate that can strand a session shares ONE definition of finished --
+# Named individually so a future gate added without it fails here rather than in
+# a session that cannot stop.
+{
+    for my $h (qw(gate-continuity.sh guard-run-finish.sh guard-subagent-stall.sh)) {
+        my $src = do { open my $f, '<', "$Bin/../../hooks/$h" or die "$h: $!"; local $/; <$f> };
+        like($src, qr/bp_outstanding_work/, "$h uses the shared predicate");
+    }
 }
 
 done_testing();
