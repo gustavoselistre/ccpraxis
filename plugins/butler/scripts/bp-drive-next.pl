@@ -138,6 +138,37 @@ sub resolve_scope {
     return @out;
 }
 
+# 1a. blueprint_lifecycle($bpdir) → 'drafting'|'audited'|'archived'|'' (unknown)
+# Reads blueprint.md's OWN `status:` -- the authoring lifecycle. That is a
+# different axis from package status (which lives in ledger frontmatter) and from
+# the run states this file computes; blueprint.md's own comment says so:
+# "drafting | audited | archived -- running/done are computed".
+# Bounded to the first 40 lines because it is frontmatter: a `status:` further
+# down is prose about a package, not the blueprint's declaration.
+sub blueprint_lifecycle {
+    my ($bpdir) = @_;
+    open my $fh, '<', "$bpdir/blueprint.md" or return '';
+    my $out = '';
+    while (my $l = <$fh>) {
+        last if $. > 40;
+        if ($l =~ /^status:\s*(\S+)/) { $out = lc $1; last }
+    }
+    close $fh;
+    return $out;
+}
+
+# 1b. blueprint_drivable($lifecycle) → 0|1
+# FAILS OPEN, deliberately: only a positively-read `drafting` or `archived`
+# excludes. A missing or unrecognised status stays drivable, because the two
+# errors are not symmetric -- wrongly refusing to drive stalls an unattended run
+# with nobody present to notice, while wrongly driving one costs a package that a
+# human can re-scope. Same asymmetry the run-finish guard is built on.
+sub blueprint_drivable {
+    my ($lc) = @_;
+    $lc = defined $lc ? lc $lc : '';
+    return ($lc eq 'drafting' || $lc eq 'archived') ? 0 : 1;
+}
+
 # 2. deps_met($deps, $status) → 0|1
 # Mirrored from BpOrch::deps_met (bp-orchestrator.pl line 87-92).
 sub deps_met {
@@ -556,7 +587,28 @@ sub _cmd_next {
         closedir $dh;
     }
 
-    my @candidates = resolve_scope($spec, \@all_bps);
+    # A blueprint that has not been AUDITED is not drivable, and this is the one
+    # place that enforces it. This file's own USAGE block documents `--scope all`
+    # as "all audited blueprints"; until 2026-09-18 the code simply listed every
+    # directory holding a blueprint.md and never read a lifecycle status at all,
+    # so a blueprint still at `status: drafting` was handed out as work.
+    #
+    # Measured on this host: the director returned run-package for
+    # butler-gate-ergonomics/01-live-watcher-probe while that blueprint was
+    # drafting. The expensive half is second-order -- `next` is called from the
+    # Stop hook on EVERY turn end, so keepawake_apply('active') kept re-spawning
+    # the wake-lock, and the machine was held awake for hours on a run whose
+    # runstate said `finished`. Killing the helper only bought one turn.
+    #
+    # NOT folded into @all_bps. That list answers "does this exist on disk", which
+    # is what the ORDER-PRUNE below keys on; pruning a drafting blueprint there
+    # would log it as "absent from disk -- archived, or not yet fully created",
+    # asserting something false about a blueprint that is present and healthy.
+    my %undrivable = map { $_ => 1 }
+                     grep { !blueprint_drivable(blueprint_lifecycle("$data/blueprints/$_")) }
+                     @all_bps;
+
+    my @candidates = grep { !$undrivable{$_} } resolve_scope($spec, \@all_bps);
 
     # Read all state from disk
     make_path($dsdir) unless -d $dsdir;
@@ -711,8 +763,23 @@ sub _cmd_next {
     # documented at the in-flight branch below.
     my @in_flight;
 
+    # Filtering @candidates above is NOT sufficient on its own: this walk iterates
+    # @$order, not @candidates, so a blueprint already recorded in order.json is
+    # visited whatever the scope resolved to. That is exactly the observed case --
+    # order.json held ["almanac-records","butler-gate-ergonomics"] from when the
+    # second was expected to be audited shortly. Both filters are load-bearing.
+    if (my @nd = grep { $undrivable{$_} } @$order) {
+        _append_run_log($dsdir,
+            'NOT-AUDITED (skipped; blueprint.md status is not `audited`): ' . join(',', @nd));
+    }
+
     # B3: walk recorded order
     for my $bp (@$order) {
+        # Not audited: settled for drive purposes, and skipped exactly like a park
+        # -- never driven, and never ANNOUNCED, because blueprint-done asserts the
+        # blueprint FINISHED, which a drafting one emphatically has not.
+        next if $undrivable{$bp};
+
         my $is_parked   = $parked{$bp} ? 1 : 0;
         my $meta        = $bp_meta{$bp}   // {};
         my $status      = $bp_status{$bp} // {};
@@ -731,7 +798,11 @@ sub _cmd_next {
                         my $b_meta    = $bp_meta{$b}   // {};
                         my $b_status  = $bp_status{$b} // {};
                         my $b_settled = blueprint_settled($b_meta, $b_status, $b_parked);
-                        $done_or_parked{$b} = 1 if $b_settled || $b_parked;
+                        # %done_or_parked is really "not pending work for this
+                        # run", and a non-audited blueprint is not pending work --
+                        # listing it would tell the session to re-evaluate a
+                        # blueprint it cannot legally drive.
+                        $done_or_parked{$b} = 1 if $b_settled || $b_parked || $undrivable{$b};
                     }
                 }
                 # collect blueprints strictly after $bp in the recorded order
