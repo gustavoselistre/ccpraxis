@@ -41,6 +41,191 @@ HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 0
 # shellcheck source=/dev/null
 . "$HOOK_DIR/lib.sh" 2>/dev/null || exit 0
 
+# ---------------------------------------------------------------------------
+# bp_rf_scan_target / bp_rf_is_run_ending -- reimplements the quoted-span-
+# masking TECHNIQUE of guard-git-mutations.sh's git_scan_target() (read, never
+# called or edited) so that section 1 below stops matching a mere MENTION of
+# bp-runstate/bp-continuity + finish/disarm/off (inside a quoted argument, a
+# --text value, a perl -pe replacement string) the same way it matches a real
+# invocation. Defined here, before any payload is read, so both functions are
+# independently callable by sourcing this file alone (see the BASH_SOURCE
+# guard around the main body, below) -- Spec 02-run-finish-guard-reads-
+# invocations section 2.
+# ---------------------------------------------------------------------------
+RF_MASK_MAX=8192
+RF_RAW_KIND=masked
+
+# bp_rf_scan_target -- sets RF_SCAN / RF_RAW_KIND from the global $CMD. Called
+# WITHOUT command substitution (assign via the globals, not $(...)): a
+# subshell would discard the assignments, exactly as git_scan_target's own
+# note explains.
+bp_rf_scan_target() {
+  local cmd="$CMD"
+  local len=${#cmd}
+  # 1. Over-long command: raw fallback without even walking it.
+  if [ "$len" -gt "$RF_MASK_MAX" ]; then
+    RF_RAW_KIND=toolong
+    RF_SCAN="$cmd"
+    return 0
+  fi
+  # 2. A backslash, a '#', or a heredoc marker ('<<') ANYWHERE in the command,
+  #    regardless of quote context: raw fallback. Deliberately does NOT
+  #    reimplement git_scan_target()'s later heredoc-stripping branch (Spec
+  #    section 2's simplification) -- a heredoc marker degrades straight to
+  #    the unmasked scan here, same as a backslash or '#'.
+  case "$cmd" in
+    *'\'*|*'#'*|*'<<'*)
+      RF_RAW_KIND=escape
+      RF_SCAN="$cmd"
+      return 0
+      ;;
+  esac
+
+  # 3. Walk the string character-by-character in a three-state machine
+  #    (NONE/SINGLE/DOUBLE), identical to git_scan_target()'s walk -- EXCEPT
+  #    a quoted span is no longer X-masked unconditionally. Its interior is
+  #    buffered (qbuf) as the walk goes; only when the CLOSING quote is
+  #    reached do we know whether the span is single-word (no internal
+  #    whitespace) or multi-word (prose). Decision 15 / red-team Finding 1:
+  #    quoting a bareword changes nothing about its argv value in bash
+  #    (`finish`, "finish" and 'finish' are byte-identical), so a single-word
+  #    quoted span is the ACTUAL VERB/SCRIPT NAME, not a mention of it, and
+  #    must be scanned unquoted/literal rather than blanked to X. A
+  #    multi-word quoted span (prose, a --text value, a sed replacement --
+  #    F1/F2/F3) still X-masks in full, unchanged from before.
+  #
+  #    Red-team redteam-02 Finding A (MEDIUM): the single-word carve-out above
+  #    had no positional constraint, so a single-word quoted span ANYWHERE
+  #    (e.g. `bp-continuity.pl ask --text "off"`, the guard's own documented
+  #    escape hatch) unmasked to its literal content and false-positived as a
+  #    real invocation. Fix: only treat a single-word quoted span as literal
+  #    when it sits in VERB POSITION -- immediately after one of the two
+  #    script names (optionally interpreter-prefixed / path-prefixed), with
+  #    nothing but whitespace between the script name and the opening quote,
+  #    checked against the UNQUOTED content built so far ($out) at the moment
+  #    the quote opens. Anything else -- a quoted word after a flag like
+  #    `--text`, or after any other token -- stays X-masked, same as a
+  #    multi-word span and same as this guard's behaviour before this
+  #    package's fix-batch.
+  local state=NONE
+  local carrier=0
+  local out="" c next
+  local qbuf="" qhaswhite=0 qadjacent=0
+  local adj_re='(^|[;&|[:space:]`({])((perl|bash|sh)[[:space:]]+)?([[:alnum:]_./-]*/)?bp-(runstate|continuity)\.(pl|sh)[[:space:]]*$'
+  local i=0
+  while [ "$i" -lt "$len" ]; do
+    c=${cmd:$i:1}
+    case "$state" in
+      NONE)
+        case "$c" in
+          "'")
+            state=SINGLE; qbuf=""; qhaswhite=0
+            [[ "$out" =~ $adj_re ]] && qadjacent=1 || qadjacent=0
+            ;;
+          '"')
+            state=DOUBLE; qbuf=""; qhaswhite=0
+            [[ "$out" =~ $adj_re ]] && qadjacent=1 || qadjacent=0
+            ;;
+          '`') carrier=1; out+='`' ;;
+          '$')
+            next=${cmd:$((i+1)):1}
+            [ "$next" = "(" ] && carrier=1
+            out+='$' ;;
+          *) out+="$c" ;;
+        esac ;;
+      SINGLE)
+        case "$c" in
+          "'")
+            state=NONE
+            if [ "$qhaswhite" -eq 0 ] && [ "$qadjacent" -eq 1 ]; then
+              out+="$qbuf"
+            else
+              local mask="" j=0 qlen=${#qbuf}
+              while [ "$j" -lt "$qlen" ]; do mask+="X"; j=$((j+1)); done
+              out+="'${mask}'"
+            fi
+            ;;
+          ' '|$'\t'|$'\n') qhaswhite=1; qbuf+="$c" ;;
+          *) qbuf+="$c" ;;
+        esac ;;
+      DOUBLE)
+        case "$c" in
+          '"')
+            state=NONE
+            if [ "$qhaswhite" -eq 0 ] && [ "$qadjacent" -eq 1 ]; then
+              out+="$qbuf"
+            else
+              local mask="" j=0 qlen=${#qbuf}
+              while [ "$j" -lt "$qlen" ]; do mask+="X"; j=$((j+1)); done
+              out+="\"${mask}\""
+            fi
+            ;;
+          '`') carrier=1; qbuf+="$c" ;;
+          '$')
+            next=${cmd:$((i+1)):1}
+            [ "$next" = "(" ] && carrier=1
+            qbuf+="$c" ;;
+          ' '|$'\t'|$'\n') qhaswhite=1; qbuf+="$c" ;;
+          *) qbuf+="$c" ;;
+        esac ;;
+    esac
+    i=$((i+1))
+  done
+
+  # Walk ends with state != NONE (unbalanced quoting): raw fallback.
+  if [ "$state" != "NONE" ]; then
+    RF_RAW_KIND=unbalanced
+    RF_SCAN="$cmd"
+    return 0
+  fi
+  # carrier == 1 (an unquoted backtick or $( was seen): raw fallback.
+  if [ "$carrier" -eq 1 ]; then
+    RF_RAW_KIND=carrier
+    RF_SCAN="$cmd"
+    return 0
+  fi
+  # 4. A shell/eval word in command position on the MASKED string: it
+  #    re-executes its own quoted argument as code, so what looked like a
+  #    quoted mention must be scanned as real text (e.g.
+  #    `bash -c "bp-runstate.pl finish"`). Raw fallback.
+  if printf '%s' "$out" | grep -Eq '(^|[;&|[:space:]])(bash|sh|zsh|ksh|dash|eval|xargs)([[:space:]]|$)'; then
+    RF_RAW_KIND=shellword
+    RF_SCAN="$cmd"
+    return 0
+  fi
+
+  RF_RAW_KIND=masked
+  RF_SCAN="$out"
+}
+
+# bp_rf_is_run_ending -- args: $1=CMD (or reads global $CMD). Returns 0 (true,
+# run-ending) or 1.
+bp_rf_is_run_ending() {
+  [ $# -gt 0 ] && CMD="$1"
+  bp_rf_scan_target
+
+  # Anchor class per RF_RAW_KIND tier, values copied verbatim from
+  # guard-git-mutations.sh's three tiers -- same technique, same values.
+  local anchor_class
+  case "$RF_RAW_KIND" in
+    shellword) anchor_class='[;&|[:space:]'\''"`({]' ;;
+    carrier)   anchor_class='[;&|[:space:]`({]' ;;
+    *)         anchor_class='[;&|[:space:]({]' ;;
+  esac
+
+  local runstate_re="(^|${anchor_class})((perl|bash|sh)[[:space:]]+)?([[:alnum:]_./-]*/)?bp-runstate\.(pl|sh)\b[^;&|(){}\n]*\bfinish\b"
+  local continuity_re="(^|${anchor_class})((perl|bash|sh)[[:space:]]+)?([[:alnum:]_./-]*/)?bp-continuity\.(pl|sh)\b[^;&|(){}\n]*\b(disarm|off)\b"
+
+  grep -Eq "$runstate_re" <<<"$RF_SCAN" || grep -Eq "$continuity_re" <<<"$RF_SCAN"
+}
+
+# The main body below must not run when this file is merely SOURCED (e.g. by
+# a test harness that wants only the two functions above) -- it must not
+# touch stdin or exit the sourcing shell. Only run it on direct execution.
+if [ "${BASH_SOURCE[0]}" != "${0:-}" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 # bp_read_payload SETS $PAYLOAD; it does not print it. Capturing it in a
 # command substitution runs it in a subshell, so the assignment is lost and the
 # guard silently stands aside on every call -- which is exactly what the first
@@ -65,11 +250,7 @@ CMD="$(bp_json_get "$PAYLOAD" tool_input.command 2>/dev/null)" || exit 0
 #    `ask`. `arm` is untouched too -- arming more is never the failure mode.
 # ---------------------------------------------------------------------------
 is_run_ending=0
-case "$CMD" in
-  *bp-runstate*finish*)   is_run_ending=1 ;;
-  *bp-continuity*disarm*) is_run_ending=1 ;;
-  *bp-continuity*' off'*) is_run_ending=1 ;;
-esac
+bp_rf_is_run_ending "$CMD" && is_run_ending=1
 [ "$is_run_ending" -eq 1 ] || exit 0
 
 # ---------------------------------------------------------------------------
@@ -245,6 +426,15 @@ VERDICT="$(perl -e '
 # Empty verdict == could not determine == FAIL OPEN (allow the stop).
 [ "${VERDICT:-}" = "UNAUTHORISED" ] || exit 0
 
+OUT_COUNT=$(printf '%s\n' "$OUTSTANDING" | grep -c '[^[:space:]]')
+OUT_HEAD=$(printf '%s\n' "$OUTSTANDING" | grep '[^[:space:]]' | head -n 5)
+if [ "$OUT_COUNT" -gt 5 ]; then
+  OUT_BLOCK="${OUT_HEAD}
+... and $((OUT_COUNT - 5)) more."
+else
+  OUT_BLOCK="$OUT_HEAD"
+fi
+
 cat >&2 <<DENIED
 BLOCKED (butler run-finish guard): you are about to end a run the operator did not ask you to end.
 
@@ -260,6 +450,9 @@ instruction, so this is an
 inference, and inferring an instruction is how an unattended run gets abandoned with
 nobody present to notice.
 
+STILL PENDING OR RUNNING ($OUT_COUNT total, showing up to 5 -- this guard stands aside the moment none are)
+$OUT_BLOCK
+
 WHAT TO DO INSTEAD:
   * Re-launch whatever died, record what was lost, and carry on.
   * Genuinely blocked? Queue it -- this does NOT end the turn:
@@ -270,9 +463,6 @@ WHAT TO DO INSTEAD:
 
 THE ASYMMETRY: wrongly continuing costs some tokens. Wrongly stopping abandons the run.
 When the signal is ambiguous, CONTINUE.
-
-STILL PENDING OR RUNNING (this guard stands aside the moment none are):
-$OUTSTANDING
 
 If the operator has in fact told you to stop, they said so in a message -- and this guard
 reads that message and stands aside. It is not standing aside, so they did not.
