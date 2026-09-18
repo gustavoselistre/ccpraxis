@@ -337,6 +337,43 @@ fi
 #
 # .stop-blocks is still counted, because the count is useful evidence in the
 # message; it no longer decides anything.
+# --- THE THIRD EXIT: THERE IS NO WORK ----------------------------------------
+#
+# A gate with only two exits assumes one of them is always reachable. Both of
+# this gate's were "keep going" (hold) and "I am finished" (disarm) -- and when
+# the work IS finished and `disarm` is refused by guard-run-finish.sh, neither
+# is true and neither is available. The session can then do nothing but re-arm a
+# bounded hold, at one full turn per expiry, until whatever is blocking `disarm`
+# resolves itself. Measured 2026-09-18: about fifteen consecutive turns whose
+# entire content was re-arming a 900s hold and reporting "Holding", with zero
+# open bug reports, zero dispatches and zero background processes. The exit
+# condition was a 12-hour TTL elapsing on a stale marker -- not an event any
+# party could cause. Report 20260918-134732-acfd; the operator's words were
+# "holding only makes sense if there is work you are doing".
+#
+# So: if there is genuinely no outstanding work, the turn may end. Not disarmed
+# -- the arm stands, and the next turn is gated exactly as before -- just not
+# forced to manufacture a wait for work that does not exist.
+#
+# THIS CANNOT BE GAMED INTO A FALSE "FINISHED". bp_outstanding_work reads the
+# package ledgers on disk, the same ones guard-run-finish.sh consults, and it is
+# the SAME function so the two can no longer disagree -- their disagreement is
+# what built the trap. Nothing the agent asserts is an input. It fails toward
+# WORK EXISTS when it cannot tell, so ignorance keeps the gate shut.
+#
+# Deliberately AFTER the wake-up checks above: a session with a live hold still
+# takes that path and this never runs.
+if [ -z "${CCPRAXIS_CONTINUITY_SKIP_IDLE_EXIT:-}" ]; then
+  _rl=1
+  bp_drive_any_active 2>/dev/null || _rl=0
+  _out="$(bp_outstanding_work "$_rl" 2>/dev/null)"
+  if [ -z "${_out:-}" ]; then
+    rm -f "$MARK.stop-blocks" 2>/dev/null
+    echo "butler continuity-gate: allowing this stop -- no outstanding work. Every package of every non-archived blueprint is at a terminal status, so there is nothing for a hold to wait on. The session STAYS ARMED: the next turn is gated exactly as before. If you meant to finish for good, disarm; if work appears, hold as usual." >&2
+    exit 0
+  fi
+fi
+
 # ONE-SHOT DIAGNOSTIC (remove once read). Three times now I have explained why
 # the shim is not on this hook's PATH without measuring it. A hook cannot be
 # handed an env var by the agent, so this keys on a file instead: it writes once

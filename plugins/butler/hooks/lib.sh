@@ -1035,3 +1035,110 @@ bp_continuity_any_active() {
   [ "$live" -gt 0 ] || return 1
   return 0
 }
+
+# bp_outstanding_work RUN_LIVE -> echoes "<bp>/<pkg> (<status>)" lines, one per
+# package that still represents work; echoes nothing when the work is finished.
+#
+# ONE RULE, TWO CALLERS. guard-run-finish.sh asks it whether ending a RUN would
+# abandon anything; gate-continuity.sh asks it whether a turn may end at all.
+# They used to compute this separately, and the day they disagreed the session
+# was trapped: the work was finished, so stopping was the honest move, and the
+# only two exits the continuity gate offered were "hold" (I am still working --
+# false) and "disarm" (refused by the sibling guard on stale state). The session
+# then burned one turn per hold expiry, about fifteen of them, waiting for a 12h
+# TTL to elapse. Report 20260918-134732-acfd.
+#
+# Derived from LEDGERS ON DISK, never from anything the agent asserts, so it
+# cannot be talked into a false "finished". Fails toward WORK EXISTS when it
+# cannot tell -- a gate going quiet on ignorance is the failure it exists to
+# prevent.
+bp_outstanding_work() {
+  local run_live="${1:-0}" OUTSTANDING=""
+  command -v perl >/dev/null 2>&1 || { printf "unknown (no perl)"; return 0; }
+  OUTSTANDING="$(perl -e '
+    use strict; use warnings;
+    my $root = shift @ARGV;
+    my $run_live = shift(@ARGV) ? 1 : 0;
+    my $dir  = "$root/.ccpraxis-local-data/blueprints";
+    -d $dir or exit 0;
+    opendir(my $dh, $dir) or exit 0;
+    my @bps = grep { $_ !~ /^\.\.?$/ && $_ ne "_archive" && -d "$dir/$_" } readdir $dh;
+    closedir $dh;
+    my @open;
+    for my $bp (@bps) {
+        my $bpmd = "$dir/$bp/blueprint.md";
+        if (-r $bpmd) {
+            open my $b, "<", $bpmd or next;
+            my $archived = 0;
+            while (my $l = <$b>) {
+                last if $. > 40;
+                if ($l =~ /^status:\s*archived\b/) { $archived = 1; last }
+            }
+            close $b;
+            next if $archived;
+        }
+        # A BLUEPRINT NOBODY HAS LAUNCHED HAS NOTHING IN FLIGHT.
+        #
+        # This scan used to count every `pending` package in every non-archived
+        # blueprint, which made AUTHORING a blueprint permanently prevent
+        # disarming: a drafted package sits at `pending` from birth and only
+        # leaves it when someone drives it, so the more planning existed on disk
+        # the more locked every session became, forever. Measured 2026-09-18 --
+        # 43 packages across six blueprints reported as outstanding with no run
+        # live, no coordinator dispatched, the bug queue empty and the suite
+        # green. The session could not stop, and idling is not the safe side of
+        # this guard: it abandons nothing but never ends.
+        #
+        # The question this guard actually wants answered is "would stopping
+        # ABANDON work that is in flight", and a blueprint that has never been
+        # launched cannot have any. Execution always leaves a trace under runs/:
+        # bp-launch.sh writes registry.json on every launch, the orchestrator
+        # holds a .orchestrator marker while alive, and a coordinator writes its
+        # own <pkg>.jsonl transcript. Requiring ANY of the three is deliberately
+        # generous -- a false "launched" only costs the old behaviour, while a
+        # false "never launched" is the failure this guard exists to prevent.
+        # ONLY WHEN NO RUN IS LIVE. If a drive is active right now, every pending
+        # package is potentially its next step and the old behaviour is correct
+        # -- a drive-solo run does not necessarily write registry.json, so
+        # requiring launch evidence would let a LIVE run be stopped. That hole
+        # was caught by the oracle for this hook, run-finish-guard.t case A1,
+        # whose fixture pairs a live drive marker with a blueprint that has no
+        # runs/ dir -- after a first version of this filter applied always.
+        unless ($run_live) {
+            my $runs = "$dir/$bp/runs";
+            my $launched = 0;
+            if (-d $runs) {
+                $launched = 1 if -e "$runs/registry.json" || -e "$runs/.orchestrator";
+                unless ($launched) {
+                    if (opendir(my $rd, $runs)) {
+                        $launched = 1 if grep { /\.jsonl$/ } readdir $rd;
+                        closedir $rd;
+                    }
+                }
+            }
+            next unless $launched;
+        }
+
+        my $pdir = "$dir/$bp/packages";
+        -d $pdir or next;
+        opendir(my $pd, $pdir) or next;
+        my @l = grep { /\.md$/ } readdir $pd;
+        closedir $pd;
+        for my $f (sort @l) {
+            open my $h, "<", "$pdir/$f" or next;
+            my $st = "";
+            while (my $l = <$h>) {
+                last if $. > 30;
+                if ($l =~ /^status:\s*(\S+)/) { $st = lc $1; last }
+            }
+            close $h;
+            next unless $st eq "pending" || $st eq "running";
+            push @open, "$bp/" . ($f =~ s/\.md$//r) . " ($st)";
+        }
+    }
+    print join("\n", @open), "\n" if @open;
+    exit 0;
+  ' "${BP_PROJECT_ROOT:-$PWD}" "$run_live" 2>/dev/null)" || OUTSTANDING=""
+  printf "%s" "${OUTSTANDING:-}"
+  return 0
+}
