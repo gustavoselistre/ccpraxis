@@ -63,6 +63,22 @@ esac
 ABS=$(realpath -m "$ABS" 2>/dev/null || printf '%s' "$ABS")
 
 case "$ABS" in
+  # THE TEMPLATE IS NOT AN INITIATIVE. `plugins/<plugin>/templates/blueprint.md`
+  # is the file `bp-blueprint.pl init --template` READS to create a blueprint; it
+  # has no packages, no decisions and no DAG, and none of the typed verbs can
+  # maintain it -- `init` REFUSES to overwrite an existing file (by design: an
+  # existing blueprint is somebody's initiative), and `add-package` would splice
+  # a real package row into a template. Matching it under `*/blueprint.md` left
+  # the template editable through NO sanctioned path at all, which surfaced while
+  # fixing report 20260917-063908-db14: the template still instructs the author
+  # to emit a `depends_on:` key that bp-ledger.pl now rejects, and the correction
+  # could not be applied.
+  #
+  # Kept deliberately narrow. A real blueprint lives at
+  # `<data>/blueprints/<name>/blueprint.md` and never under `plugins/*/templates/`,
+  # so this cannot exempt one. The looser `*/templates/blueprint.md` would have
+  # exempted a blueprint someone named "templates".
+  */plugins/*/templates/blueprint.md) exit 0 ;;
   */blueprint.md)
     printf '%s\n' "BLUEPRINT-GUARD: BLOCKED — a direct $TOOL to $ABS is not permitted; blueprint.md must be mutated only through plugins/butler/scripts/bp-blueprint.pl (add-package, set-deps, add-decision, set-field), which validates and writes atomically under flock. Use bp-blueprint.pl via Bash instead, then retry." >&2
     exit 2

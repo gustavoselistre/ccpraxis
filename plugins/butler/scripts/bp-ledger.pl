@@ -1529,11 +1529,142 @@ sub op_validate {
 }
 
 # =====================================================================================
+# `migrate-depends-on` — the repair path for a ledger the V-checks now refuse.
+#
+# Report 20260917-063908-db14. `blueprint/templates/blueprint.md` told the author
+# that every listed package field is copied into the ledger's frontmatter, and
+# listed `depends_on:` among them, while this script rejects that key on EVERY
+# write. The two plugins disagreed and the authoring side won at create time, so
+# blueprints authored before the rule landed carry the key in every ledger.
+#
+# That is worse than a normal refusal. The rejection covers `set-status`, which
+# is the only sanctioned way a coordinator reaches a terminal state, so such a
+# package cannot be finished, blocked OR parked -- and `gate-stop.sh` will not
+# let the session end until it is. The prescribed remedy was an edit to the very
+# frontmatter the protocol tells coordinators never to hand-edit: the escape
+# hatch was also the thing the doctrine forbids. Measured blast radius: all five
+# ledgers of one blueprint, with the rule activating MID-RUN after package 01
+# had already reached done.
+#
+# WHY THIS CANNOT USE run_op. run_op validates the ORIGINAL bytes before calling
+# the splice callback (:782) and rejects on failure -- which is the whole point
+# of it, and exactly what makes it unable to repair a file whose stored form is
+# already invalid. This op therefore owns its own lock/read/write, and its
+# safety comes from the other end: it REFUSES unless removing `depends_on:` is
+# sufficient to make the file valid. A ledger that is broken in some further way
+# is left alone and reported, rather than half-repaired into a shape whose
+# remaining fault is now harder to see.
+# =====================================================================================
+
+sub op_migrate_depends_on {
+    my @args = @_;
+    my %opt;
+    my $ok;
+    { local $SIG{__WARN__} = sub { };
+      $ok = GetOptionsFromArray(\@args, \%opt, 'ledger=s', 'dry-run'); }
+    arg_error('migrate-depends-on', 'unrecognised option') unless $ok;
+    arg_error('migrate-depends-on', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
+    arg_error('migrate-depends-on', 'missing required --ledger') unless defined $opt{ledger};
+
+    my $path = $opt{ledger};
+    my $lockpath = "$path.lock";
+    open(my $lk, '>', $lockpath)
+        or io_error('migrate-depends-on', $path, "cannot open lock file $lockpath: $!");
+    flock($lk, LOCK_EX)
+        or io_error('migrate-depends-on', $path, "cannot acquire lock on $lockpath: $!");
+
+    my $orig;
+    {
+        open(my $fh, '<:raw', $path)
+            or io_error('migrate-depends-on', $path, "cannot read: $!");
+        local $/;
+        $orig = <$fh>;
+        close $fh;
+        $orig = '' unless defined $orig;
+    }
+
+    my ($FM) = $orig =~ /\A---\s*\n(.*?)\n---/s;
+    unless (defined $FM) {
+        reject_error('migrate-depends-on', $path,
+            'has no parseable frontmatter block, so there is no `depends_on:` line to move. '
+          . 'This op repairs exactly one fault; fix the frontmatter first.');
+    }
+
+    # Collect the edges being moved, in file order, before removing anything.
+    my @edges;
+    for my $l (split(/\n/, $FM, -1)) {
+        next unless $l =~ /^depends_on:\s*(.*?)\s*$/;
+        push @edges, $1;
+    }
+    unless (@edges) {
+        emit_err("bp-ledger: migrate-depends-on: $path: no frontmatter depends_on: line; nothing to do.");
+        exit 0;
+    }
+
+    # Remove the key from the frontmatter block ONLY. A `depends_on:` written in
+    # the body -- inside a Dependency edges section, say, or quoted in an attempt
+    # log entry -- is prose and must survive untouched, so the substitution is
+    # scoped to the matched block rather than run over the whole file.
+    my $new_fm = join("\n", grep { !/^depends_on:/ } split(/\n/, $FM, -1));
+    my $new = $orig;
+    substr($new, 0, length($FM) + 8) =~ s/\A---\s*\n\Q$FM\E\n---/---\n$new_fm\n---/
+        or reject_error('migrate-depends-on', $path, 'could not rewrite the frontmatter block');
+
+    # Record the edge where it belongs. Appended, never merged into an existing
+    # section body, so a hand-written Dependency edges section keeps its prose and
+    # the migrated value sits beside it plainly marked as migrated.
+    my $edge_txt = join(', ', map { length($_) ? $_ : '(empty)' } @edges);
+    my $note = "\n## Dependency edges\n\n"
+             . "- Migrated from frontmatter `depends_on:` by `bp-ledger.pl migrate-depends-on`: $edge_txt\n"
+             . "  The scheduler builds its DAG from blueprint.md's package-status table; this is the\n"
+             . "  record of what the ledger used to claim, kept so the edge and its reason are not lost.\n";
+    if ($new =~ /^##\s+Dependency edges\b/m) {
+        $new =~ s/(^##\s+Dependency edges\b[^\n]*\n)/$1\n- Migrated from frontmatter `depends_on:` by `bp-ledger.pl migrate-depends-on`: $edge_txt\n/m;
+    }
+    else {
+        $new =~ s/\s*\z//;
+        $new .= "\n$note";
+    }
+
+    # THE SAFETY PROPERTY. Removing the key must be SUFFICIENT. If the file is
+    # still invalid afterwards it was broken in some further way, and a partial
+    # repair would leave a harder problem wearing a "migrated" label.
+    my $detail = validate_bytes($new);
+    if (defined $detail) {
+        reject_error('migrate-depends-on', $path,
+            "removing depends_on: is not sufficient -- the ledger is still invalid: $detail "
+          . 'Nothing was written. Fix the remaining fault, then re-run.');
+    }
+    my $lu_detail = last_updated_check($orig, $new);
+    reject_error('migrate-depends-on', $path, $lu_detail) if defined $lu_detail;
+
+    if ($opt{'dry-run'}) {
+        print "bp-ledger: migrate-depends-on: $path: would move depends_on: $edge_txt\n";
+        exit 0;
+    }
+
+    my $tmp = "$path.tmp.$$";
+    open(my $w, '>:raw', $tmp)
+        or io_error('migrate-depends-on', $path, "cannot open temp file $tmp: $!");
+    print {$w} $new
+        or do { close $w; unlink $tmp; io_error('migrate-depends-on', $path, "write to $tmp failed: $!") };
+    close($w)
+        or do { unlink $tmp; io_error('migrate-depends-on', $path, "close $tmp failed: $!") };
+    unless ($RENAME_FN->($tmp, $path)) {
+        unlink $tmp;
+        io_error('migrate-depends-on', $path, "rename $tmp -> $path failed: $!");
+    }
+    print "bp-ledger: migrate-depends-on: $path: moved depends_on: $edge_txt\n";
+    exit 0;
+}
+
+# =====================================================================================
 # Main
 # =====================================================================================
 
 my %DISPATCH = (
     'set-status'      => \&op_set_status,
+    'migrate-depends-on' => \&op_migrate_depends_on,
     'append-attempt'   => \&op_append_attempt,
     'tick-step'        => \&op_tick_step,
     'set-next-action'  => \&op_set_next_action,

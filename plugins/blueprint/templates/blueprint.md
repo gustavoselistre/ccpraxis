@@ -37,13 +37,15 @@ Locked answers from the user. Coordinators treat these as constraints, not sugge
 
 ## Packages
 
-One subsection per package. These fields are copied into each package ledger's frontmatter by `/blueprint:create` — the ledger copy is what scripts and hooks read at launch time.
+
+One subsection per package. `write_set`, `test_paths`, `model` and `max_turns` are copied into each package ledger's **frontmatter** by `/blueprint:create` — the ledger copy is what scripts and hooks read at launch time. `scope`, `done_criteria`, `inputs` and `out_of_scope` are copied into the ledger's **body** sections.
+
+**`depends_on` is not among them, and must never be written into a ledger.** The DAG lives in the package-status table above and nowhere else. `bp-ledger.pl` refuses *every* write to a ledger whose frontmatter carries `depends_on:` — including `set-status`, the only sanctioned way a coordinator reaches a terminal state, so such a ledger cannot be finished, blocked or parked and its coordinator burns its turn budget on a write that can never succeed (reports `20260916-185610-8ee1`, `20260917-063908-db14`). A ledger that already carries the key is repaired with `bp-ledger.pl migrate-depends-on --ledger <path>`, which moves the edge into a `## Dependency edges` section.
 
 ### 01-<slug> — <title>
 
 - **scope:** <what this package builds; 2–4 sentences>
 - **done_criteria:** <testable; e.g. "callable X returns 403 for role Y; suite test/x_test.dart green; screenshot of state Z reviewed">
-- **depends_on:** <— | pkg ids>
 - **write_set:** `lib/<area>/:functions/src/<area>/`        <!-- colon-separated; trailing / = prefix; * crosses / -->
 - **test_paths:** `test/<area>/:integration_test/`
 - **model:** sonnet                                          <!-- coordinator model; opus for gnarly packages -->
