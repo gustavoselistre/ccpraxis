@@ -964,12 +964,22 @@ my $LOG_RETENTION_LAUNCHES   = ($ENV{CCPRAXIS_LOG_RETENTION} && $ENV{CCPRAXIS_LO
                                 && $ENV{CCPRAXIS_LOG_RETENTION} >= 1)
                              ? $ENV{CCPRAXIS_LOG_RETENTION} + 0 : 10;
 my $LAUNCHER_DIR              = "$CLAUDE_DATA/.launcher";
+# 02-idle-footprint: the 9 sampler/keepawake files below are written on a ~23s
+# cadence but have zero container-side readers (every reader is launcher.pl
+# itself, reading back what it wrote) -- so they don't need to live on host
+# NTFS inside the project tree, and moving them off it removes them from the
+# $LAUNCHER_DIR whole-directory RO bind's churn. The hash of $LAUNCHER_DIR
+# keeps this project-unique, same idiom as $LAUNCHER_DIR's own creation below.
+my $SAMPLER_TMPDIR = File::Spec->catdir(
+    File::Spec->tmpdir(), 'ccpraxis-sampler-' . md5_of_string($LAUNCHER_DIR)
+);
+make_path($SAMPLER_TMPDIR) unless -d $SAMPLER_TMPDIR;
 # Where a forked sampler's STDERR lands. Its validation exits 2 after printing
 # exactly one line saying what was wrong; that line used to go to /dev/null, so
 # "FAILED - sampler exited before writing a reading" was the end of the trail.
-my $SAMPLER_ERR_RESOURCES     = "$LAUNCHER_DIR/resources-sampler.err";
-my $SAMPLER_ERR_SPEND         = "$LAUNCHER_DIR/spend-sampler.err";
-my $SAMPLER_ERR_CONTAINER     = "$LAUNCHER_DIR/container-sampler.err";
+my $SAMPLER_ERR_RESOURCES     = "$SAMPLER_TMPDIR/resources-sampler.err";
+my $SAMPLER_ERR_SPEND         = "$SAMPLER_TMPDIR/spend-sampler.err";
+my $SAMPLER_ERR_CONTAINER     = "$SAMPLER_TMPDIR/container-sampler.err";
 my $SELECTION_FILE            = "$LAUNCHER_DIR/selected-skills.json";
 my $MANIFEST_FILE             = "$LAUNCHER_DIR/container-manifest.json";
 my $SNAPSHOT_FILE             = "$LAUNCHER_DIR/.discovery-snapshot.json";
@@ -980,8 +990,8 @@ my $MCP_SNAPSHOT_FILE         = "$LAUNCHER_DIR/.mcp-snapshot.json";
 # other snapshot above. Deliberately never unlinked by the reaper on launch
 # (see _resources_sampler_reap_orphan) -- a leftover snapshot simply ages
 # past Resources::max_age() and reads 'stale', which IS the mechanism.
-my $RESOURCES_SNAPSHOT_FILE   = "$LAUNCHER_DIR/.resources-snapshot.json";
-my $RESOURCES_SAMPLER_PID     = "$LAUNCHER_DIR/resources-sampler.pid";
+my $RESOURCES_SNAPSHOT_FILE   = "$SAMPLER_TMPDIR/.resources-snapshot.json";
+my $RESOURCES_SAMPLER_PID     = "$SAMPLER_TMPDIR/resources-sampler.pid";
 # t02-spend-persistence, blueprint Decision 11: the run-independent home for
 # the spend snapshot. bp-spend.pl writes `spend.json` INSIDE this directory, so
 # the directory is what we hand it and the filename is its business.
@@ -993,9 +1003,9 @@ my $RESOURCES_SAMPLER_PID     = "$LAUNCHER_DIR/resources-sampler.pid";
 # describe the account, not the run that polled for it -- to a run, and so made
 # it unreadable in exactly the state the operator is normally in.
 my $SPEND_GLOBAL_DIR          = $LAUNCHER_DIR;
-my $SPEND_SAMPLER_PID         = "$LAUNCHER_DIR/spend-sampler.pid";
-my $CONTAINER_SAMPLER_PID     = "$LAUNCHER_DIR/container-sampler.pid";
-my $CONTAINER_SNAPSHOT_FILE   = "$LAUNCHER_DIR/.container-snapshot.json";
+my $SPEND_SAMPLER_PID         = "$SAMPLER_TMPDIR/spend-sampler.pid";
+my $CONTAINER_SAMPLER_PID     = "$SAMPLER_TMPDIR/container-sampler.pid";
+my $CONTAINER_SNAPSHOT_FILE   = "$SAMPLER_TMPDIR/.container-snapshot.json";
 # The two CONTAINER-SIDE paths, named once so every podman-exec call site spells
 # them identically -- which is what the "asked for X, got Y" guard in
 # _busy_lease_probe compares against. Both are absolute POSIX paths INSIDE the
@@ -5848,7 +5858,7 @@ sub enter_dashboard {
     my $BUSY_STALE   = ($ENV{BUSY_STALE_SECS} && $ENV{BUSY_STALE_SECS} =~ /^\d+$/)
                        ? $ENV{BUSY_STALE_SECS} : 600;
     my $ka_helper    = "$SANDBOX_PLUGIN/scripts/keep-awake.ps1";
-    my $ka_pidfile   = "$LAUNCHER_DIR/keepawake.pid";
+    my $ka_pidfile   = "$SAMPLER_TMPDIR/keepawake.pid";
     _keepawake_reap_orphan($ka_pidfile);
     $KEEPAWAKE = KeepAwake->new(
         start => sub { _keepawake_start($ka_helper, $ka_pidfile) },
@@ -7282,9 +7292,9 @@ sub _gnu_timeout_bin {
 # _probe_err_path($key) -> where THIS probe's stderr goes for this round.
 #
 # Per-probe, so a reason can be attributed to the probe that produced it. The
-# files live beside the sampler's own .err and are overwritten each round, so
-# they never grow.
-sub _probe_err_path { my ($k) = @_; return "$LAUNCHER_DIR/probe-$k.err" }
+# files live beside the sampler's own .err (in $SAMPLER_TMPDIR, off host NTFS
+# inside the project tree) and are overwritten each round, so they never grow.
+sub _probe_err_path { my ($k) = @_; return "$SAMPLER_TMPDIR/probe-$k.err" }
 
 # _probe_reason($key) -> the first meaningful stderr line from this probe's last
 # run, or undef. Read only when a probe produced nothing, so a healthy round

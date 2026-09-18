@@ -915,7 +915,16 @@ use constant HOT_RELOAD_REPORT_SECS => 20;
 # painting in full. Sized to cover a terminal that reflows AFTER reporting its
 # new size (a maximize does this; a drag-resize hides it by reporting many
 # times). Long enough to outlast that reflow, short enough that the extra full
-# repaints are invisible: at the production tick five ticks is about a second.
+# repaints are invisible. COUNTED IN TICKS, NOT SECONDS (deliberately -- see
+# below), so this scales with $tick_int: at the production default (1.0s,
+# was 0.2s) five ticks is now ~5s of wall clock, not ~1s. Left at 5 rather
+# than reduced: the settle window exists to survive a reflow that keeps
+# re-reporting geometry for some real, tick_int-independent stretch of wall
+# time, and the poll granularity is now 5x coarser, so shrinking the tick
+# count would shrink the safety margin against exactly the reflow lag this
+# was sized for. The cost of leaving it at 5 is bounded and cosmetic (a few
+# extra full repaints, all during/just after an active resize -- see
+# Dashboard.pm:3145-3150 below for why ticks and not seconds).
 use constant RESIZE_SETTLE_TICKS       => 5;
 use constant SPINNER_PERIOD_SECS       => 0.5;
 # Was 2.0, on the reasoning that a title is glanced at rather than watched and
@@ -2921,7 +2930,7 @@ sub run {
     my $color      = exists $o{color} ? $o{color} : 1;
     my $beat_int   = defined $o{beat_interval}  ? $o{beat_interval}  : 120;
     my $state_int  = defined $o{state_interval} ? $o{state_interval} : 2;
-    my $tick_int   = defined $o{tick_interval}  ? $o{tick_interval}  : 0.2;
+    my $tick_int   = defined $o{tick_interval}  ? $o{tick_interval}  : 1.0;
     # MINOR-1 (red-team step 6): a wall-clock cooldown on the recover ACTION.
     # "ly" is one of the commonest digraphs in English (only/really/finally), so
     # pasting an ordinary paragraph into the dashboard otherwise fires one full
@@ -3098,7 +3107,8 @@ sub run {
                 # frame signature, so it forced the recompose the resize should
                 # have forced. Reading the terminal size is an ioctl, not a
                 # subprocess; there is no reason for it to ride a throttle meant
-                # for probes. At $tick_int it is now noticed within ~200ms.
+                # for probes. It is noticed and repainted within at most one
+                # tick -- $tick_int now defaults to 1.0s (was 0.2s).
                 #
                 # $rows/$cols are in the frame-cache signature, so updating them
                 # here is by itself enough to force a recompose on the same tick.

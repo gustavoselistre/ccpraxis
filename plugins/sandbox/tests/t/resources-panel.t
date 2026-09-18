@@ -2188,10 +2188,10 @@ FAKE_MODULE
 
 # --- AC-12 -> DC-1: declared snapshot/pidfile paths under the state dir. --
 {
-    like($launcher_src, qr/\$RESOURCES_SNAPSHOT_FILE\s*=\s*"\$LAUNCHER_DIR\/\.resources-snapshot\.json"/,
-        'AC-12: launcher.pl declares $RESOURCES_SNAPSHOT_FILE = "$LAUNCHER_DIR/.resources-snapshot.json"');
-    like($launcher_src, qr/\$RESOURCES_SAMPLER_PID\s*=\s*"\$LAUNCHER_DIR\/resources-sampler\.pid"/,
-        'AC-12: launcher.pl declares $RESOURCES_SAMPLER_PID = "$LAUNCHER_DIR/resources-sampler.pid"');
+    like($launcher_src, qr/\$RESOURCES_SNAPSHOT_FILE\s*=\s*"\$SAMPLER_TMPDIR\/\.resources-snapshot\.json"/,
+        'AC-12: launcher.pl declares $RESOURCES_SNAPSHOT_FILE = "$SAMPLER_TMPDIR/.resources-snapshot.json"');
+    like($launcher_src, qr/\$RESOURCES_SAMPLER_PID\s*=\s*"\$SAMPLER_TMPDIR\/resources-sampler\.pid"/,
+        'AC-12: launcher.pl declares $RESOURCES_SAMPLER_PID = "$SAMPLER_TMPDIR/resources-sampler.pid"');
 }
 
 # --- AC-13 -> DC-5: sampler writes go through _write_file_atomic only. ----
