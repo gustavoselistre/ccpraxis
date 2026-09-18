@@ -194,9 +194,33 @@ sub _real_http_post {
     return BpHttp::request('POST', $url, $headers, $body);
 }
 
+# _creds_changed_since PATH, MTIME_AT_READ -> 0 | 1
+#   Did the credentials file change on disk since we read it? This is the only
+#   fact available in-process that OBSERVES divergence rather than guessing at
+#   it: if another holder rotated the grant, it rewrote this file, and the
+#   refresh token we just presented is stale.
+#
+#   Conservative in the safe direction. An unknown (no mtime recorded, or the
+#   file has since vanished) answers 0 -- "not observed" -- because a false 1
+#   would assert an architectural fault on no evidence, which is the exact
+#   failure this whole change exists to stop.
+sub _creds_changed_since {
+    my ($path, $mtime_at_read) = @_;
+    return 0 unless defined $mtime_at_read && $mtime_at_read =~ /\A\d+(?:\.\d+)?\z/;
+    my @st = stat($path);
+    return 0 unless @st;
+    return ($st[9] != $mtime_at_read) ? 1 : 0;
+}
+
 sub keeper_tick {
     my ($args) = @_;
     my $path = $args->{creds_path} or die "keeper_tick: creds_path required";
+    # Stamp the file's mtime BEFORE reading it, so a rewrite that lands during
+    # our own refresh round is detectable afterwards. Tests may inject it.
+    unless (exists $args->{creds_mtime_at_read}) {
+        my @st0 = stat($path);
+        $args->{creds_mtime_at_read} = @st0 ? $st0[9] : undef;
+    }
     my $now  = $args->{now_ms}     // (time * 1000);
     my $log  = $args->{log_path};
     my $post = $args->{http_post}  || \&_real_http_post;
@@ -280,12 +304,84 @@ sub keeper_tick {
         # high-visibility event (token_unauthorized + alert=1) — never let this
         # blend into a quiet pause — and return the detail up to the
         # orchestrator so the queued escalations decision can name it unmistakably.
-        my $alert = "ALERT: the sandbox's OWN OAuth refresh was REJECTED (HTTP $status). "
-                  . "The copied token may be invalid OR the host/sandbox token grants have "
-                  . "DIVERGED -- this is NOT a routine /login expiry. Revisit the copy-token "
-                  . "architecture before resuming.";
-        _log($log,'token_unauthorized',{result=>$status, action=>'pause-auth', alert=>1, detail=>$alert});
-        return {action=>'pause-auth', alert=>1, status=>$status, detail=>$alert};
+        #
+        # REPORT 20260917-110321-ff63: the alert named two causes and carried
+        # NOTHING to tell them apart, and the pause is manual=1 so it never
+        # self-clears — a human is fetched, and the message they are fetched with
+        # is a question rather than a finding.
+        #
+        # It was also WRONG the one time it fired. On 2026-09-17 the host had
+        # been in Modern Standby for over three hours; the keeper woke four
+        # seconds later, refreshed under the floor, got 400, and reported a
+        # possible architectural fault. One second afterwards an authenticated
+        # usage poll returned 200. The credentials were fine.
+        #
+        # So the alert now carries the three facts that actually discriminate,
+        # and stops asserting divergence when a wake explains it:
+        #
+        #   creds_rewritten  — did .credentials.json change on disk between our
+        #                      read and this failure? If so ANOTHER party rotated
+        #                      the grant while we held a now-stale refresh token.
+        #                      That is what divergence IS, observed rather than
+        #                      guessed.
+        #   expired_by_s     — was the token already past its own expiry when we
+        #                      called? An expired grant being refused is ordinary,
+        #                      not architectural.
+        #   suspend_gap_s    — did this machine just come back from a suspend?
+        #                      (runs/.last-suspend.json, written by the
+        #                      orchestrator — report 20260917-155603-b83e.)
+        my $diag = {
+            http_status   => $status,
+            below_floor   => ($below_floor ? 1 : 0),
+            expires_at    => $o->{expiresAt},
+            expired_by_s  => (defined $o->{expiresAt} && $o->{expiresAt} =~ /\A\d+\z/)
+                             ? int(($now - $o->{expiresAt}) / 1000) : undef,
+            creds_rewritten => _creds_changed_since($path, $args->{creds_mtime_at_read}),
+            suspend_gap_s   => (ref $args->{recent_suspend} eq 'HASH')
+                             ? $args->{recent_suspend}{gap_secs} : undef,
+            suspend_age_s   => (ref $args->{recent_suspend} eq 'HASH'
+                                && defined $args->{recent_suspend}{at_epoch})
+                             ? int($now / 1000) - $args->{recent_suspend}{at_epoch} : undef,
+        };
+
+        # A wake within this window explains a rejected refresh without any
+        # architectural fault. Wide on purpose: being wrong here costs one extra
+        # sentence, while being wrong the other way sends a human to redesign the
+        # token architecture over a machine that was asleep.
+        my $WAKE_WINDOW_S = 900;
+        my $just_woke = (defined $diag->{suspend_age_s}
+                         && $diag->{suspend_age_s} >= 0
+                         && $diag->{suspend_age_s} <= $WAKE_WINDOW_S) ? 1 : 0;
+
+        my $alert;
+        if ($just_woke && !$diag->{creds_rewritten}) {
+            $alert = "The sandbox's OAuth refresh was REJECTED (HTTP $status) "
+                   . "$diag->{suspend_age_s}s after this host resumed from a "
+                   . "$diag->{suspend_gap_s}s suspend, and the credentials file was NOT "
+                   . "rewritten by anyone else meanwhile. The likeliest cause is the sleep, "
+                   . "not the copy-token architecture: a grant that expires while the machine "
+                   . "is suspended is refused on the first call after the wake. Try "
+                   . "re-authenticating with /login before concluding anything about "
+                   . "divergence.";
+        }
+        elsif ($diag->{creds_rewritten}) {
+            $alert = "ALERT: the sandbox's OWN OAuth refresh was REJECTED (HTTP $status), and "
+                   . ".credentials.json WAS REWRITTEN by another party between our read and "
+                   . "this call. That is the divergence case observed rather than guessed: two "
+                   . "holders are refreshing the same grant and ours is now stale. Revisit the "
+                   . "copy-token architecture before resuming.";
+        }
+        else {
+            $alert = "ALERT: the sandbox's OWN OAuth refresh was REJECTED (HTTP $status). "
+                   . "The credentials file was not rewritten underneath us and no recent host "
+                   . "suspend explains it, so the copied token is invalid on its own terms -- "
+                   . "this is NOT a routine /login expiry. Revisit the copy-token architecture "
+                   . "before resuming.";
+        }
+
+        _log($log,'token_unauthorized',
+             {result=>$status, action=>'pause-auth', alert=>1, detail=>$alert, diag=>$diag});
+        return {action=>'pause-auth', alert=>1, status=>$status, detail=>$alert, diag=>$diag};
     }
     # 5xx / network / 0 -> transient, back off and retry within the runway.
     # Same reasoning as the 429 arm: under the floor there is no runway, so a

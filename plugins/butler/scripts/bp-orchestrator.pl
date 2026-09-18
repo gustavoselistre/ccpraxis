@@ -2901,8 +2901,26 @@ sub run {
 
             # ---- TOKEN-KEEPER (runs even while paused, to keep the token alive) ----
             if ($now >= $next_keeper) {
+                # Hand the keeper the suspend fact we recorded above. Without it
+                # a 4xx four seconds after a three-hour sleep reads as a possible
+                # architectural fault, which is exactly what happened on
+                # 2026-09-17 (reports 20260917-110321-ff63, 20260917-155603-b83e).
+                # Best-effort: a missing or unreadable marker means "not observed",
+                # never an error.
+                my $last_suspend = eval {
+                    my $p = "$runs/.last-suspend.json";
+                    return undef unless -f $p;
+                    open my $r, '<', $p or return undef;
+                    local $/;
+                    my $b = <$r>;
+                    close $r;
+                    my $d = JSON::PP->new->decode($b // '');
+                    (ref $d eq 'HASH') ? $d : undef;
+                } || undef;
+
                 my $k = BpKeeper::keeper_tick({ creds_path => $creds, now_ms => $now * 1000, log_path => $log,
-                                                 http_post => $http_post, quiet_creds_error => $creds_gate{armed} });
+                                                 http_post => $http_post, quiet_creds_error => $creds_gate{armed},
+                                                 recent_suspend => $last_suspend });
                 my $act = $k->{action} // 'ok';
                 $next_keeper = $now + ($act eq 'backoff' ? $t->{keeper_bo} : $t->{keeper_int});
                 $creds_ok->($now, 'keeper') if $act ne 'pause-creds';
