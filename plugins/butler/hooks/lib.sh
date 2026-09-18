@@ -1108,7 +1108,45 @@ bp_outstanding_work() {
             my $runs = "$dir/$bp/runs";
             my $launched = 0;
             if (-d $runs) {
-                $launched = 1 if -e "$runs/registry.json" || -e "$runs/.orchestrator";
+                # A REGISTRY IS NOT A LAUNCH; A LAUNCHED ROW IS.
+                #
+                # `-e registry.json` was too weak. bp-answer-decision.pl creates
+                # that file to record a package RESET, so a blueprint nobody has
+                # ever run acquires one the moment somebody repairs a stale
+                # status. Measured 2026-09-18: resetting one package in a parked,
+                # never-driven blueprint wrote
+                #   {"packages":{"03-store":{"attempt":0,"session_id":null,
+                #                            "status":"pending"}}}
+                # and that alone made all 17 of its pending packages count as
+                # work in flight, blocking every stop in an unrelated session.
+                # attempt 0 with a null session id is the file SAYING it never
+                # ran; reading it as a launch inverts its own evidence.
+                #
+                # So: a row must carry a real attempt or a real session id. The
+                # orchestrator marker and a coordinator transcript are unchanged
+                # -- both are produced only by execution.
+                $launched = 1 if -e "$runs/.orchestrator";
+                if (!$launched && -f "$runs/registry.json") {
+                    my $raw = do {
+                        local $/;
+                        if (open my $rh, "<", "$runs/registry.json") { my $c = <$rh>; close $rh; $c } else { undef }
+                    };
+                    if (defined $raw) {
+                        my $doc = eval { require JSON::PP; JSON::PP->new->decode($raw) };
+                        my $pk  = (ref $doc eq "HASH") ? $doc->{packages} : undef;
+                        if (ref $pk eq "HASH") {
+                            for my $row (values %$pk) {
+                                next unless ref $row eq "HASH";
+                                my $a = $row->{attempt};
+                                if (defined $a && !ref $a && $a =~ /\A\d+\z/ && $a > 0) { $launched = 1; last }
+                                my $s = $row->{session_id};
+                                if (defined $s && !ref $s && $s =~ /\S/)               { $launched = 1; last }
+                            }
+                        }
+                        # Undecodable registry: cannot tell, so assume launched.
+                        $launched = 1 unless defined $doc;
+                    }
+                }
                 unless ($launched) {
                     if (opendir(my $rd, $runs)) {
                         $launched = 1 if grep { /\.jsonl$/ } readdir $rd;

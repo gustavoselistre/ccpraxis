@@ -59,7 +59,14 @@ sub project {
     }
 
     my $l = $o{launched} // '';
-    if    ($l eq 'registry')     { open my $r,'>',"$bp/runs/registry.json" or die; print {$r} "{}"; close $r }
+    # A REAL launch row, not an empty object: bp-answer-decision.pl writes a
+    # registry to record a package RESET, so `{}` (or a row with attempt 0 and a
+    # null session id) is the file saying nothing ever ran. This fixture means
+    # "this blueprint was launched", so it has to say so.
+    if    ($l eq 'registry')     { open my $r,'>',"$bp/runs/registry.json" or die;
+                                   print {$r} $J->encode({ packages => { seed => {
+                                       attempt => 1, session_id => 'fixture-sid' } } });
+                                   close $r }
     elsif ($l eq 'orchestrator') { open my $r,'>',"$bp/runs/.orchestrator" or die; print {$r} "1"; close $r }
     elsif ($l eq 'jsonl')        { open my $r,'>',"$bp/runs/01-thing.jsonl" or die; print {$r} "{}\n"; close $r }
 

@@ -59,7 +59,12 @@ sub project {
         close $h;
     }
     # Launch evidence, so the never-launched filter is not what decides here.
-    open my $r, '>', "$bp/runs/registry.json" or die; print {$r} '{}'; close $r;
+    # It must be a REAL launch: an empty registry is a file, not a run, and an
+    # earlier version of this fixture wrote `{}` and therefore tested nothing
+    # once the rule was corrected.
+    open my $r, '>', "$bp/runs/registry.json" or die;
+    print {$r} $J->encode({ packages => { seed => { attempt => 1, session_id => 'fixture-sid' } } });
+    close $r;
     return $proj;
 }
 
@@ -80,6 +85,52 @@ sub project {
 {
     my $p = project(pkgs => { '01-a' => 'running' });
     like(outstanding($p, 0), qr/01-a \(running\)/, 'a running package is outstanding');
+}
+
+# ---- A REGISTRY IS NOT A LAUNCH -------------------------------------------
+# bp-answer-decision.pl writes registry.json to record a package RESET, so a
+# blueprint nobody has ever run acquires one the moment somebody repairs a stale
+# status. Measured 2026-09-18: resetting one package in a parked, never-driven
+# blueprint made all 17 of its pending packages count as work in flight and
+# blocked every stop in an unrelated session. attempt 0 with a null session id
+# is the file saying it never ran.
+{
+    my $p = project(pkgs => { '01-a' => 'pending' });
+    my $reg = "$p/.ccpraxis-local-data/blueprints/demo/runs/registry.json";
+    open my $r, '>', $reg or die;
+    print {$r} $J->encode({ packages => { '01-a' => {
+        attempt => 0, session_id => undef, status => 'pending' } } });
+    close $r;
+    is(outstanding($p, 0), '',
+       'a registry whose only row is attempt 0 / session_id null is NOT a launch');
+}
+{
+    my $p = project(pkgs => { '01-a' => 'pending' });
+    my $reg = "$p/.ccpraxis-local-data/blueprints/demo/runs/registry.json";
+    open my $r, '>', $reg or die;
+    print {$r} $J->encode({ packages => { '01-a' => {
+        attempt => 1, session_id => undef, status => 'running' } } });
+    close $r;
+    like(outstanding($p, 0), qr/01-a \(pending\)/,
+         'a real attempt IS a launch -- work still counts');
+}
+{
+    my $p = project(pkgs => { '01-a' => 'pending' });
+    my $reg = "$p/.ccpraxis-local-data/blueprints/demo/runs/registry.json";
+    open my $r, '>', $reg or die;
+    print {$r} $J->encode({ packages => { '01-a' => {
+        attempt => 0, session_id => 'abc-123', status => 'pending' } } });
+    close $r;
+    like(outstanding($p, 0), qr/01-a \(pending\)/,
+         'a recorded session id IS a launch');
+}
+{
+    # Cannot tell -> assume launched. Ignorance must never erase work.
+    my $p = project(pkgs => { '01-a' => 'pending' });
+    my $reg = "$p/.ccpraxis-local-data/blueprints/demo/runs/registry.json";
+    open my $r, '>', $reg or die; print {$r} 'not json at all'; close $r;
+    like(outstanding($p, 0), qr/01-a \(pending\)/,
+         'an undecodable registry counts as launched -- ignorance keeps work visible');
 }
 
 # ---- archived is not work ---------------------------------------------------
