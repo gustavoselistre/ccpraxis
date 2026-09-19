@@ -558,9 +558,14 @@ follow on your own initiative.
   abandon it half-done), write a concrete `## Next action` describing exactly what to resume, leave
   `status:` at `running`/`converging` (never `parked`/`done` for this reason alone), refresh
   `last_updated`, and stop. Do **not** write `runs/.paused` — that file is the orchestrator's own
-  signal for its trigger; this trigger needs no signal file because the orchestrator's existing
-  warm/cold relaunch rule (gap>60m OR no session id = cold) already handles you correctly whichever
-  way you stop.
+  signal for a usage pause specifically, unrelated to this trigger. You write no signal file at all:
+  this checkpoint exits cleanly (structurally identical to an ordinary turn-end), and the
+  orchestrator independently re-derives the same ceiling check from your own transcript at relaunch
+  time — if your last usage record was at/over ceiling, it forces a COLD relaunch regardless of how
+  fresh the cache looks, exactly like its existing `max_turns` override
+  (`bp-orchestrator.pl`, the `watchdog_relaunch` site). Without that check, a same-session,
+  seconds-old checkpoint would otherwise resume WARM — cache-fresh, `--resume`d back into the exact
+  context you just tried to discard — which is the bug this package's own follow-up fix closed.
 - **Below the ceiling**: do nothing different — proceed to the next pipeline step normally. This
   check must be cheap and silent when it doesn't fire; it must never itself become a source of extra
   tool calls or state writes.

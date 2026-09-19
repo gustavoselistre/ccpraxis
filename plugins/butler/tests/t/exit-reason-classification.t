@@ -263,6 +263,8 @@ my @pkgs_main = (
     ['unknown_warm',  '-', 'running', 'p/unknown_warm/'],
     ['unknown_cold',  '-', 'running', 'p/unknown_cold/'],
     ['ratelimit_mt',  '-', 'running', 'p/ratelimit_mt/'], # C6
+    ['ctx_over_warm', '-', 'running', 'p/ctx_over_warm/'],  # C8
+    ['ctx_under_warm','-', 'running', 'p/ctx_under_warm/'], # C8
 );
 my $mt_subtype_age  = $WARM_AGE;
 my $crash_age       = $WARM_AGE;
@@ -275,6 +277,8 @@ my %reg_main = (
     unknown_warm => warm_registry('sid-unk-warm'),
     unknown_cold => cold_registry('sid-unk-cold'),
     ratelimit_mt => warm_registry('sid-ratelimit', attempt => 2, rate_limit_discounted_attempt => 0),
+    ctx_over_warm  => warm_registry('sid-ctx-over'),
+    ctx_under_warm => warm_registry('sid-ctx-under'),
 );
 my $dir_main = mk_bp(\@pkgs_main, \%reg_main);
 
@@ -297,6 +301,18 @@ spit(transcript_path($dir_main, 'unknown_cold'),
 spit(transcript_path($dir_main, 'ratelimit_mt'),
     jline(rate_limit_line())
   . jline(result_line(reason => 'max_turns_subtype', epoch => $NOW - $WARM_AGE*60, sid => 'sid-ratelimit')));
+# C8 fixtures: a self-checkpoint on context growth is STRUCTURALLY a clean success --
+# the coordinator finishes its step and ends its turn normally, so the CLI's own
+# terminal record is subtype='success', identical in shape to an ordinary finish.
+# The only thing distinguishing it is the coordinator's own last usage record, which
+# these fixtures carry BEFORE the terminal result line (exactly production's shape:
+# runs/<pkg>.jsonl's last assistant turn, then the CLI-synthesized result object).
+spit(transcript_path($dir_main, 'ctx_over_warm'),
+    jline(assistant_line(epoch => $NOW - $WARM_AGE*60, sid => 'sid-ctx-over', cache_read => 1500))
+  . jline(result_line(reason => 'success', epoch => $NOW - $WARM_AGE*60, sid => 'sid-ctx-over')));
+spit(transcript_path($dir_main, 'ctx_under_warm'),
+    jline(assistant_line(epoch => $NOW - $WARM_AGE*60, sid => 'sid-ctx-under', cache_read => 500))
+  . jline(result_line(reason => 'success', epoch => $NOW - $WARM_AGE*60, sid => 'sid-ctx-under')));
 
 # ---- ground-truth cache verdicts, proven BEFORE the orchestrator ever runs a tick ----
 is(ground_truth_verdict($dir_main, 'mt_subtype'),  'warm',
@@ -313,8 +329,16 @@ is(ground_truth_verdict($dir_main, 'unknown_cold'),'cold',
     'GROUND TRUTH: unknown_cold\'s BpCacheState verdict really is cold (C5 positive gate, cold side)');
 is(ground_truth_verdict($dir_main, 'ratelimit_mt'),'warm',
     'GROUND TRUTH: ratelimit_mt\'s BpCacheState verdict really is warm (C6 fixture sanity)');
+is(ground_truth_verdict($dir_main, 'ctx_over_warm'), 'warm',
+    'GROUND TRUTH: ctx_over_warm\'s BpCacheState verdict really is warm (C8 positive gate -- not a '
+  . 'trivially-cold fixture)');
+is(ground_truth_verdict($dir_main, 'ctx_under_warm'), 'warm',
+    'GROUND TRUTH: ctx_under_warm\'s BpCacheState verdict really is warm (C8 negative-control fixture)');
 
-my ($L_main, $err_main) = go(dir => $dir_main, tunables => tun());
+# ctx_ceiling => 1000: small on purpose, so the fixtures above (1500/500 cache-read
+# tokens) stay readable, and so C1/C3/C5/C6's own assistant-line usage (2-20 tokens)
+# is nowhere near it and cannot accidentally trip the new C8 rule.
+my ($L_main, $err_main) = go(dir => $dir_main, tunables => tun(ctx_ceiling => 1000));
 is($err_main, '', 'dir_main: go() ran without a Perl exception') or diag($err_main);
 
 sub relaunch_of { my ($pkg) = @_; my @e = log_of_pkg($dir_main, 'watchdog_relaunch', $pkg); return $e[0] }
@@ -429,6 +453,50 @@ is(kind_of('unknown_cold'), 'cold',
     is($ev && $ev->{attempts}, $reg_main{ratelimit_mt}{attempt},
         'C6: the attempts figure logged on watchdog_relaunch is the pre-tick registry attempt count, '
       . 'unchanged by the cold-escalation fork (mirrors mt_subtype\'s own unforced attempts figure)');
+}
+
+# =====================================================================================
+# C8 — b-fca/pkg02 FOLLOW-UP BUG FIX: a self-checkpoint on context growth exits with a
+# STRUCTURALLY CLEAN success (identical shape to an ordinary turn-end), so b41's cache
+# verdict alone would call it warm and --resume would hand the FULL over-ceiling
+# context straight back, defeating the checkpoint entirely. The watchdog site must
+# independently re-derive the ceiling check from the coordinator's own last usage
+# record and force cold, mirroring C2's max_turns override exactly. ctx_under_warm is
+# the vacuity-gate negative control: same shape, same warm cache, usage under the
+# ceiling -- must NOT be forced cold, or this would just be "always cold on success".
+# =====================================================================================
+is(kind_of('ctx_over_warm'), 'cold',
+    'C8: ctx_over_warm (last coordinator usage over ctx_ceiling, warm cache, clean success exit) is '
+  . 'relaunched COLD despite the warm cache -- the bug this section fixes: without the watchdog-side '
+  . 'check, this fixture is indistinguishable from success_warm and stays warm');
+{
+    my $ev = relaunch_of('ctx_over_warm');
+    is($ev && $ev->{mode}, 'cold', 'C8: watchdog_relaunch log records mode=cold for ctx_over_warm');
+    is($ev && $ev->{exit_reason}, 'success',
+        'C8: exit_reason is STILL logged as success (the CLI record genuinely says success -- this '
+      . 'is not a new exit_reason value, only a mode override) -- the ctx_ceiling_forced_cold field is '
+      . 'what distinguishes this from an ordinary warm success');
+    is($ev && $ev->{ctx_ceiling_forced_cold}, 1,
+        'C8: watchdog_relaunch carries an explicit ctx_ceiling_forced_cold marker, so an operator '
+      . 'reading the log can tell this apart from an ordinary cold relaunch (e.g. max_turns)');
+}
+is(kind_of('ctx_under_warm'), 'warm',
+    'C8 (vacuity negative control): ctx_under_warm (usage under ctx_ceiling, warm cache, clean success '
+  . 'exit) STILL resumes warm -- proves the new rule checks the ceiling, not just "success exit"');
+{
+    my $ev = relaunch_of('ctx_under_warm');
+    is($ev && $ev->{mode}, 'warm', 'C8: watchdog_relaunch log records mode=warm for ctx_under_warm');
+    ok(!$ev->{ctx_ceiling_forced_cold},
+        'C8: ctx_ceiling_forced_cold is absent/false for ctx_under_warm -- the marker is not set '
+      . 'unconditionally on every C8 fixture');
+}
+{
+    my $mode_over  = kind_of('ctx_over_warm');
+    my $mode_under = kind_of('ctx_under_warm');
+    isnt($mode_over, $mode_under,
+        'C8 VACUITY CROSS-CHECK: the SAME warm cache and the SAME clean-success exit_reason produce '
+      . "DIFFERENT modes depending solely on whether usage crossed ctx_ceiling (over => $mode_over vs "
+      . "under => $mode_under) -- a constant-returning mode selector cannot produce this divergence");
 }
 
 sub explain_log { my ($dir) = @_; return join("\n", map { $J->encode($_) } log_events($dir)) }

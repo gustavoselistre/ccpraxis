@@ -4464,10 +4464,33 @@ sub run {
                             # correct for a genuine crash and actively harmful here. b41's
                             # cache-warmth verdict answers "can we resume cheaply?"; this
                             # answers "should we resume at all?" and overrides it ONLY on
-                            # max_turns. An unknown/unparseable exit reason must never force
-                            # cold -- that would invent new uncertainty this package doesn't
-                            # own (b41's verdict stands untouched for success/error/unknown).
+                            # max_turns and (below) a breached context-growth ceiling. An
+                            # unknown/unparseable exit reason must never force cold -- that
+                            # would invent new uncertainty this package doesn't own (b41's
+                            # verdict stands untouched for success/error/unknown).
                             $mode = 'cold' if $tv->{verdict} eq 'max_turns';
+                            # b-fca/pkg02 FOLLOW-UP FIX: a coordinator that self-checkpointed
+                            # on context growth exits cleanly (subtype 'success', structurally
+                            # indistinguishable from an ordinary clean turn-end) and does so
+                            # almost immediately -- exactly the shape b41's cache-warmth
+                            # verdict calls warm. --resume then restores the FULL accumulated
+                            # context, defeating the entire point of checkpointing. The
+                            # coordinator writes no signal file for this (by the checkpoint's
+                            # own design -- see coordinator-protocol/SKILL.md), so this
+                            # re-derives the SAME ceiling check from the transcript directly,
+                            # reusing the pure functions b-fca/pkg02 built but never wired to
+                            # any caller: if the last coordinator-owned usage record was at or
+                            # over ctx_ceiling, force cold, exactly like the max_turns override.
+                            # Only bothers reading the tail when the generic verdict already
+                            # said warm -- an already-cold relaunch needs no second check.
+                            my $ctx_forced_cold = 0;
+                            if ($mode eq 'warm') {
+                                my $usage = eval { last_coordinator_usage(_tail_jsonl_objs("$runs/$pkg.jsonl")) };
+                                if (defined $usage && context_growth_ceiling_breached($usage, $t)) {
+                                    $mode = 'cold';
+                                    $ctx_forced_cold = 1;
+                                }
+                            }
                             my @args = ($mode eq 'warm') ? ('--resume-session', $sid->{$pkg}) : ();
                             # The widened budget rides on the relaunch. Only ever set
                             # after a continuation, so an ordinary run's @cmd is
@@ -4484,6 +4507,7 @@ sub run {
                                       ? coordinator_death_evidence($runs, $pkg) : undef;
                             _log($log, 'watchdog_relaunch', { package => $pkg, mode => $mode, age_min => $age,
                                 attempts => $att->{$pkg}, exit_reason => $tv->{verdict},
+                                ($ctx_forced_cold ? (ctx_ceiling_forced_cold => 1) : ()),
                                 ($death ? (death_evidence => $death) : ()),
                                 ($death_exit_status ? (
                                     exit_status  => $death_exit_status->{classification},
