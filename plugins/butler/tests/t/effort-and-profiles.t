@@ -14,9 +14,9 @@
 #   3. raised max_turns authoring defaults, documented in authoring-protocol/SKILL.md (today:
 #      "backstop (default 80)").
 #   4. the always-ask, no-default quality-profile question at authoring time (operator ruling R-03).
-#      SUPERSEDED 2026-09-19 by operator ruling R-04: the profile now defaults to `normal` silently
-#      and is never asked; `higher` is opt-in, only on an explicit request. C7 below was rewritten to
-#      assert the NEW ruling, not the old one -- see its own header comment for what changed.
+#      SUPERSEDED twice 2026-09-19: R-04 made it a silent `normal` default with an opt-in `higher`
+#      tier; R-05 then removed the profile system entirely -- one rule, no named tiers, `sonnet` +
+#      `effort: medium` by default. C7 below asserts the CURRENT (R-05) state.
 #
 # WRITTEN BLIND TO THE FIX. Every assertion below is expected to fail on ABSENCE OF THE FEATURE
 # (a missing flag, a stale default, missing doc prose), never on a Perl exception, a missing module,
@@ -514,45 +514,39 @@ MD
 }
 
 # ===========================================================================
-# C7 — REWRITTEN 2026-09-19 for operator ruling R-04 (supersedes R-03, see
-# this file's own header note item 4). Authoring now defaults SILENTLY to
-# `normal` and never asks; `higher` is opt-in, only on an explicit request in
-# the user's own words. The assertions below test the NEW ruling directly —
-# they are not a loosening of the old ones, they assert the opposite claim on
-# purpose, because the claim itself changed.
+# C7 — REWRITTEN 2026-09-19, second time (operator ruling R-05, supersedes
+# R-04, which itself superseded R-03 — see this file's own header note item
+# 4). R-04 replaced "always ask normal-vs-higher" with a two-profile
+# normal/higher system defaulting silently to normal. R-05 removes the
+# profile system entirely: there is exactly one rule, no named profiles, no
+# opt-in "higher" tier. `sonnet` + `effort: medium` on every package's
+# coordinator is simply the default, deviated from only with a recorded
+# per-package reason. These assertions test THAT claim, not the R-04 one.
 # ===========================================================================
 {
     my $auth_txt   = read_file($AUTH_SKILL)   // '';
     my $create_txt = read_file($CREATE_SKILL) // '';
     my $combined   = "$auth_txt\n$create_txt";
 
-    # ---- positive: the concept and both options are still documented.
-    like($combined, qr/quality[\s-]?profile/i,
-        "C7 (positive): a 'quality profile' concept is documented in the authoring skills");
-    like($combined, qr/\bnormal\b/i, "C7 (positive): the 'normal' profile option is named");
-    like($combined, qr/\bhigher\b/i, "C7 (positive): the 'higher' profile option is named");
+    # ---- positive: the actual default is documented plainly.
+    like($combined, qr/\bsonnet\b/i, "C7 (positive): sonnet is named as the package coordinator default");
+    like($combined, qr/effort:\s*medium/i, "C7 (positive): effort: medium is named as the default");
+    like($combined, qr/(recorded reason|package-specific reason|one-line Decision)/i,
+        "C7 (positive): a deviation from the default requires a recorded reason");
 
-    # ---- positive: the doc now frames `normal` as the silent default.
-    like($combined, qr/default(?:s|ed|ing)?\s+(?:to|is|of)\s+["'`*]*normal\b/i,
-        "C7 (positive): prose defaults the quality profile to 'normal'");
-    like($combined, qr/(never ask|not part of|no longer asked|defaults? to .{0,20}normal.{0,20}silently|silently)/i,
-        "C7 (positive): the doc frames the profile question as no longer asked / silent");
-    like($combined, qr/\bhigher\b[^.\n]{0,80}(explicit|opt-in|only when|only on)/i,
-        "C7 (positive): 'higher' is framed as opt-in / explicit-request-only");
-
-    # ---- negative: nothing still claims the question is mandatory/undefaulted
-    #      (asserted UNCONDITIONALLY, never behind a skip — see vacuity-gate
-    #      note above). A stray leftover "must ask" / "no default" sentence
-    #      would mean the old and new rulings are both present and
-    #      contradicting each other.
-    unlike($combined, qr/\bmust ask the user\b.{0,60}quality[\s-]?profile/is,
-        "C7 (negative): no prose still says the author must ask about the quality profile");
-    unlike($combined, qr/quality[\s-]?profile.{0,60}\b(?:has |carries )?no default\b/is,
-        "C7 (negative): no prose still claims the quality profile has no default");
+    # ---- negative: the profile system is gone. No named "normal"/"higher"
+    #      tiers, no "quality profile" concept, nothing asking about it.
+    #      Asserted UNCONDITIONALLY, never behind a skip.
+    unlike($combined, qr/quality[\s-]?profile/i,
+        "C7 (negative): no 'quality profile' concept remains in the authoring skills");
+    unlike($combined, qr/\bhigher\s+quality\b|\bhigher\s+profile\b/i,
+        "C7 (negative): no 'higher' profile/tier remains");
+    unlike($combined, qr/operator ruling R-0[34]\b/,
+        "C7 (negative): no stale reference to the superseded R-03/R-04 rulings");
 
     # ---- defensive: neither script hardcodes a silent quality-profile default
-    #      either — this is purely an authoring-time (skill-prose) decision,
-    #      unchanged by R-04, since bp-orchestrator.pl/bp-launch.sh only ever
+    #      either — this was, and remains, purely an authoring-time
+    #      (skill-prose) decision; bp-orchestrator.pl/bp-launch.sh only ever
     #      execute whatever model/effort a package's own ledger already says.
     my $orch_src   = read_file($ORCH)   // '';
     my $launch_src = read_file($LAUNCH) // '';
