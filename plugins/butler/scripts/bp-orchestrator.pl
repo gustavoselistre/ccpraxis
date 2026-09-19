@@ -2927,6 +2927,27 @@ sub run {
                 $prev_tick = $now;
             }
 
+            # ---- BUSY-LEASE OBSERVED MTIME (package 03, host-wake-and-suspend) ----
+            # Read-only: records what is ALREADY on disk from a PRIOR tick's touch_busy,
+            # before this tick's own touch_busy call (below, gated by should_touch_busy,
+            # unchanged) can update it. Never fatal -- a missing/unreadable lease file
+            # records as "not observed", mirroring the suspend marker's own eval{}||undef
+            # idiom immediately above. This does not change WHEN touch_busy runs or what
+            # should_touch_busy gates -- purely additive.
+            {
+                my @st = eval { stat($t->{busy_path}) };
+                my $observed_mtime = (!$@ && @st) ? $st[9] : undef;
+                # eval-wrapped (mirroring :4371-4394 / :629-634): BpLog::event DIES on
+                # an unwritable runs/, and this call fires every tick unconditionally
+                # (unlike its sibling event-gated _log calls), so a transient log-write
+                # failure must degrade this tick rather than kill the whole loop.
+                eval { _log($log, 'busy_lease_tick', {
+                    path           => $t->{busy_path},
+                    observed_mtime => $observed_mtime,
+                    age_s          => defined($observed_mtime) ? ($now - $observed_mtime) : undef,
+                }); 1 } or 1;
+            }
+
             my $shutdown = -e "$runs/.shutdown" ? 1 : 0;
             %exec_counted = ();       # the exec-failure dedupe is per tick
 
@@ -3013,20 +3034,19 @@ sub run {
                           question => 'OAuth token crossed the refresh floor unrefreshed — re-authenticate with /login.',
                           context => 'token-keeper hit the pause-floor', created_at => $now, category => 'operator-action' });
                 } elsif ($act eq 'pause-auth') {
-                    # LOUD divergence alert (hard requirement): a 4xx on the
-                    # sandbox's OWN refresh is distinct from a routine expiry —
-                    # it means the copied token was rejected / the host & sandbox
-                    # grants diverged, the signal to revisit the copy-token
-                    # architecture. Wording is deliberately DIFFERENT from the
-                    # pause-floor re-login case so it stands out in the
-                    # reporter/dashboard. The graceful pause underneath is
-                    # unchanged (nothing collapses silently).
+                    # question now surfaces the keeper's own discriminated diagnosis instead of a
+                    # static sentence that always asserted divergence. Report 20260917-110321-ff63:
+                    # the old static question was wrong the one time it fired (2026-09-17) because
+                    # the machine had simply been asleep. context is unchanged.
+                    my $question = (defined $k->{detail} && length $k->{detail})
+                        ? $k->{detail}
+                        : "!! ALERT: the sandbox's OWN OAuth refresh was REJECTED (4xx). "
+                        . "The copied token may be invalid OR the host/sandbox token grants have "
+                        . "DIVERGED -- REVISIT the copy-token architecture. This is NOT a routine "
+                        . "/login expiry.";
                     _enter_pause_manual($runs, $log, 'token-auth',
                         { package => '_fleet', blueprint => $bp, kind => 'reauth', alert => 1,
-                          question => "!! ALERT: the sandbox's OWN OAuth refresh was REJECTED (4xx). "
-                                    . "The copied token may be invalid OR the host/sandbox token grants have "
-                                    . "DIVERGED -- REVISIT the copy-token architecture. This is NOT a routine "
-                                    . "/login expiry.",
+                          question => $question,
                           context => ($k->{detail} // 'the sandbox refresh returned a 4xx'), created_at => $now, category => 'operator-action' });
                 } elsif ($act eq 'pause-contract' || $act eq 'pause-creds') {
                     my $is_creds = ($act eq 'pause-creds');

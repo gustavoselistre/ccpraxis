@@ -529,6 +529,15 @@ my %BUTLER_KIND_STYLE = (
     review            => [ 'warn',   'warn' ],
     acquire           => [ 'good',   'ok' ],
     release           => [ 'muted',  'idle' ],
+    # host-wake-and-suspend package 03: suspend_gap is the un-synthesizable
+    # fallback style (a real suspend/resume pair never reaches it); suspend/
+    # resume are the row-synthesis styles consumed by recent_events below;
+    # busy_lease_tick is a per-tick forensic record, deliberately 'muted' so
+    # it never floods the operator-facing panel.
+    suspend_gap       => [ 'warn',   'warn' ],
+    suspend           => [ 'warn',   'warn' ],
+    resume            => [ 'good',   'ok' ],
+    busy_lease_tick   => [ 'muted',  'idle' ],
 );
 
 # @SPINNER DELETED (2026-08-25). It listed the ten spinner glyphs in order so
@@ -1540,6 +1549,30 @@ sub recent_events {
         # kind's, generically -- the field isn't pause-specific) must reach
         # the rendered row, same as exit/state already do.
         my $reason = _ev_scalar($rec->{reason});
+
+        # host-wake-and-suspend package 03: synthesize a suspend row and a
+        # resume row from ONE suspend_gap event, rather than rendering the
+        # raw event unstyled. See spec 03-suspend-reaches-the-operator 2a.
+        if ($type eq 'suspend_gap' && defined $epoch) {
+            my $gap = _ev_scalar($rec->{gap_secs});
+            if (defined $gap && $gap =~ /^\d+(?:\.\d+)?$/ && $gap > 0) {
+                my $overshoot = _ev_scalar($rec->{overshoot_secs});
+                my $sr_extra = " gap_secs=$gap";
+                $sr_extra .= " overshoot_secs=$overshoot" if defined $overshoot;
+
+                my ($srole, $sglyph) = event_style('suspend', undef, undef);
+                my $sbody = "suspend$sr_extra";
+                $sbody = substr($sbody, 0, $EVENT_FIELD_MAX_LEN) if length($sbody) > $EVENT_FIELD_MAX_LEN;
+                push @records, { epoch => $epoch - $gap, body => $sbody, role => $srole, glyph => $sglyph };
+
+                my ($rrole, $rglyph) = event_style('resume', undef, undef);
+                my $rbody = "resume$sr_extra";
+                $rbody = substr($rbody, 0, $EVENT_FIELD_MAX_LEN) if length($rbody) > $EVENT_FIELD_MAX_LEN;
+                push @records, { epoch => $epoch, body => $rbody, role => $rrole, glyph => $rglyph };
+                next;   # do NOT also push the raw suspend_gap record below
+            }
+        }
+
         $extra .= " exit=$exit"     if defined $exit;
         $extra .= " state=$state"   if defined $state;
         $extra .= " reason=$reason" if defined $reason;
