@@ -35,6 +35,11 @@ Locked answers from the user. Coordinators treat these as constraints, not sugge
 |-----|-------------|------------|-------|
 | 01-<slug> | <one line> | — | sonnet |
 
+_All packages default to `sonnet` in the `model` column above -- coordinators measured 84-95% of
+blueprint cost across 4 blueprints, Opus runs 4.7x Sonnet's per-call cost, and a coordinator's own
+work is overwhelmingly non-reasoning shell activity. Override a single package's cell only when
+that package's own coordinator work needs deeper reasoning. Basis: report 20260917-172750-285a._
+
 ## Packages
 
 
@@ -48,7 +53,10 @@ One subsection per package. `write_set`, `test_paths`, `model` and `max_turns` a
 - **done_criteria:** <testable; e.g. "callable X returns 403 for role Y; suite test/x_test.dart green; screenshot of state Z reviewed">
 - **write_set:** `lib/<area>/:functions/src/<area>/`        <!-- colon-separated; trailing / = prefix; * crosses / -->
 - **test_paths:** `test/<area>/:integration_test/`
-- **model:** sonnet                                          <!-- coordinator model; opus for gnarly packages -->
+- **model:** sonnet    <!-- coordinator model; opus for gnarly packages. Deliberate default:
+  coordinators are 84-95% of measured blueprint cost (4 blueprints), Opus is 4.7x Sonnet's per-call
+  cost, and a coordinator's own work is overwhelmingly non-reasoning shell activity (one sampled
+  coordinator: 704 of 1,561 calls were Bash, 473 `cd`). Basis: report 20260917-172750-285a. -->
 - **max_turns:** 800
 
 <!-- OPTIONAL: this project's check vocabulary. Delete the block if you have none —
