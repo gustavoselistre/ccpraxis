@@ -142,12 +142,12 @@ is(sc(sub { BpOrch::last_coordinator_usage('not-an-arrayref') }), undef,
     local $ENV{BP_CONTEXT_CEILING_TOKENS};
     delete $ENV{BP_CONTEXT_CEILING_TOKENS};
 
-    my $at_ceiling   = { input_tokens => 200_000, cache_creation_input_tokens => 0, cache_read_input_tokens => 0 };
-    my $below        = { input_tokens => 199_999, cache_creation_input_tokens => 0, cache_read_input_tokens => 0 };
-    my $above        = { input_tokens => 200_001, cache_creation_input_tokens => 0, cache_read_input_tokens => 0 };
+    my $at_ceiling   = { input_tokens => 300_000, cache_creation_input_tokens => 0, cache_read_input_tokens => 0 };
+    my $below        = { input_tokens => 299_999, cache_creation_input_tokens => 0, cache_read_input_tokens => 0 };
+    my $above        = { input_tokens => 300_001, cache_creation_input_tokens => 0, cache_read_input_tokens => 0 };
 
     is(sc(sub { BpOrch::context_growth_ceiling_breached($at_ceiling, undef) }), 1,
-       'sum exactly AT the default 200_000 ceiling breaches (>=, not >) -- Observable behavior 6');
+       'sum exactly AT the default 300_000 ceiling breaches (>=, not >) -- Observable behavior 6');
     is(sc(sub { BpOrch::context_growth_ceiling_breached($below, undef) }), 0,
        'ceiling - 1 does not breach -- Observable behavior 6, and the literal AC4 "unaffected below ceiling" assertion');
     is(sc(sub { BpOrch::context_growth_ceiling_breached($above, undef) }), 1,
@@ -173,7 +173,7 @@ is(sc(sub { BpOrch::last_coordinator_usage('not-an-arrayref') }), undef,
     is(sc(sub { BpOrch::context_growth_ceiling_breached($at, undef) }), 1,
        'BP_CONTEXT_CEILING_TOKENS env override is honored when no tunables hashref is passed');
     is(sc(sub { BpOrch::context_growth_ceiling_breached($under, {}) }), 0,
-       'and an empty tunables hashref (no ctx_ceiling key) still falls through to the env override, not straight to 200_000');
+       'and an empty tunables hashref (no ctx_ceiling key) still falls through to the env override, not straight to 300_000');
 }
 
 {
@@ -200,16 +200,16 @@ is(sc(sub { BpOrch::last_coordinator_usage('not-an-arrayref') }), undef,
     # fix-batch step7 MEDIUM #2: a malformed BP_CONTEXT_CEILING_TOKENS override
     # must NOT silently degrade to an effective ceiling of 0 (which would
     # breach on every check, causing constant checkpoint thrashing). It must
-    # fall back to the documented 200_000 default instead, mirroring
+    # fall back to the documented 300_000 default instead, mirroring
     # _min_relaunch_secs()'s own validation convention for exactly this risk
     # class.
     local $ENV{BP_CONTEXT_CEILING_TOKENS} = 'abc';
-    my $below_default = { input_tokens => 199_999, cache_creation_input_tokens => 0, cache_read_input_tokens => 0 };
-    my $above_default = { input_tokens => 200_001, cache_creation_input_tokens => 0, cache_read_input_tokens => 0 };
+    my $below_default = { input_tokens => 299_999, cache_creation_input_tokens => 0, cache_read_input_tokens => 0 };
+    my $above_default = { input_tokens => 300_001, cache_creation_input_tokens => 0, cache_read_input_tokens => 0 };
     is(sc(sub { BpOrch::context_growth_ceiling_breached($below_default, undef) }), 0,
-       'a non-numeric BP_CONTEXT_CEILING_TOKENS falls back to the 200_000 default, not to 0 -- below-default usage does not breach');
+       'a non-numeric BP_CONTEXT_CEILING_TOKENS falls back to the 300_000 default, not to 0 -- below-default usage does not breach');
     is(sc(sub { BpOrch::context_growth_ceiling_breached($above_default, undef) }), 1,
-       'and above-default usage still breaches normally once fallen back to 200_000, confirming it is not stuck open either');
+       'and above-default usage still breaches normally once fallen back to 300_000, confirming it is not stuck open either');
 }
 
 {
@@ -217,7 +217,7 @@ is(sc(sub { BpOrch::last_coordinator_usage('not-an-arrayref') }), undef,
     local $ENV{BP_CONTEXT_CEILING_TOKENS} = '0';
     my $tiny = { input_tokens => 1, cache_creation_input_tokens => 0, cache_read_input_tokens => 0 };
     is(sc(sub { BpOrch::context_growth_ceiling_breached($tiny, undef) }), 0,
-       'BP_CONTEXT_CEILING_TOKENS="0" is rejected as non-positive and falls back to 200_000, not an effective ceiling of 0');
+       'BP_CONTEXT_CEILING_TOKENS="0" is rejected as non-positive and falls back to 300_000, not an effective ceiling of 0');
 }
 
 {
@@ -225,8 +225,8 @@ is(sc(sub { BpOrch::last_coordinator_usage('not-an-arrayref') }), undef,
     local $ENV{BP_CONTEXT_CEILING_TOKENS} = 'not-a-number';
     my $t = sc(sub { BpOrch::_tunables_base() });
     is(ref $t, 'HASH', '_tunables_base() still returns a hashref under a malformed env override');
-    is($t->{ctx_ceiling}, 200_000,
-       'a malformed BP_CONTEXT_CEILING_TOKENS falls back to the 200_000 default in _tunables_base() too, not 0')
+    is($t->{ctx_ceiling}, 300_000,
+       'a malformed BP_CONTEXT_CEILING_TOKENS falls back to the 300_000 default in _tunables_base() too, not 0')
         if ref $t eq 'HASH';
 }
 
@@ -248,7 +248,7 @@ is(sc(sub { BpOrch::last_coordinator_usage('not-an-arrayref') }), undef,
     delete $ENV{BP_CONTEXT_CEILING_TOKENS};
     my $t = sc(sub { BpOrch::_tunables_base() });
     is(ref $t, 'HASH', '_tunables_base() still returns a hashref with the new key present') or diag(explain($t));
-    is($t->{ctx_ceiling}, 200_000, 'ctx_ceiling defaults to 200_000 when BP_CONTEXT_CEILING_TOKENS is unset')
+    is($t->{ctx_ceiling}, 300_000, 'ctx_ceiling defaults to 300_000 when BP_CONTEXT_CEILING_TOKENS is unset')
         if ref $t eq 'HASH';
 }
 
@@ -274,7 +274,7 @@ is(sc(sub { BpOrch::last_coordinator_usage('not-an-arrayref') }), undef,
     close $fh;
     my $t = sc(sub { BpOrch::_tunables($dir, "$dir/.tunables") });
     is(ref $t, 'HASH', '_tunables() with an overlay file still returns a hashref');
-    is($t->{ctx_ceiling}, 200_000,
+    is($t->{ctx_ceiling}, 300_000,
        'ctx_ceiling is NOT in the live-overlay whitelist -- a runs/.tunables value for it is silently ignored, base default stands')
         if ref $t eq 'HASH';
 }

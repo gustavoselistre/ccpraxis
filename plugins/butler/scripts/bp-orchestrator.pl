@@ -1199,7 +1199,7 @@ sub context_tokens_from_usage {
 # True if the given usage total is at/over ceiling. $t is an optional tunables
 # hashref (same shape _tunables_base() returns); falls back to
 # _ctx_ceiling_env() (validated BP_CONTEXT_CEILING_TOKENS, else the pinned
-# 200_000 default), same resolution order as creds_backoff_secs() (:1141-1150).
+# 300_000 default), same resolution order as creds_backoff_secs() (:1141-1150).
 # NOTE: an explicit $t->{ctx_ceiling} is intentionally NOT validated here --
 # a caller-supplied tunables hashref (including a deliberate 0, per spec §5's
 # documented degenerate case) is trusted as-is; only the raw env string, which
@@ -2710,17 +2710,24 @@ sub _min_relaunch_secs {
 # breaches on every single check -- constant checkpoint thrashing, the same
 # failure shape _min_relaunch_secs() was written to prevent for its own
 # tunable. Only a strictly-positive integer is honoured; anything else falls
-# back to the documented default (200_000) and warns, naming the rejected
+# back to the documented default (300_000) and warns, naming the rejected
 # value.
+#
+# 300_000, not the package's originally-measured 200_000 "knee": raised
+# 2026-09-19 by operator request, trading some of 200K's better cache-read
+# efficiency (37% of uncheckpointed cost, vs. 300K's 51%, per the table this
+# package measured) for fewer handovers -- each relaunch re-reads the ledger
+# and blueprint.md cold, a real cost the original table did not price in, and
+# the operator judged fewer, larger checkpoints the better trade in practice.
 sub _ctx_ceiling_env {
-    return 200_000 unless exists $ENV{BP_CONTEXT_CEILING_TOKENS};  # truly unset -> quiet default, no warning
+    return 300_000 unless exists $ENV{BP_CONTEXT_CEILING_TOKENS};  # truly unset -> quiet default, no warning
     my $raw = $ENV{BP_CONTEXT_CEILING_TOKENS};
     $raw = '' unless defined $raw;
     if ($raw =~ /^[0-9]+$/ && $raw > 0) { return $raw + 0; }
     warn "bp-orchestrator: BP_CONTEXT_CEILING_TOKENS='$raw' is not a positive integer -- "
-       . "falling back to the default (200000 tokens). A malformed value here "
+       . "falling back to the default (300000 tokens). A malformed value here "
        . "silently degrades to ceiling=0, causing constant checkpoint thrashing.\n";
-    return 200_000;
+    return 300_000;
 }
 
 # Build { pkg => {deps, write_set} } and { pkg => status } from disk.

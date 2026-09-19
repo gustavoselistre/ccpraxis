@@ -531,33 +531,29 @@ follow on your own initiative.
   execute yourself, a long investigation) — at least every 20 of your own tool calls, or before
   starting any `Bash`-heavy investigation expected to produce a lot of output, whichever comes
   first. Never mid-tool-call, never inside a single worker's turn.
-- **How to check**: `runs/<pkg>.jsonl` (the same file `bp-spend.pl` reads for cost accounting) is a
-  transcript that only grows, and a plain `Read` with no offset returns the file's **START**, not
-  its end — on any transcript past ~2000 lines that is stale data and a false all-clear. Do not use
-  a bare `Read` here. Instead, use `Bash`:
-  1. `wc -l "runs/<pkg>.jsonl"` to get the current total line count `N`.
+- **How to check**: `runs/<pkg>.jsonl` (also read by `bp-spend.pl` for cost accounting) is a
+  transcript that only grows. A bare `Read` returns the file's **START**, not its end, so on any
+  transcript past ~2000 lines that's stale data and a false all-clear — use `Bash` instead:
+  1. `wc -l "runs/<pkg>.jsonl"` for the current total line count `N`.
   2. `tail -c 200000 "runs/<pkg>.jsonl"` (last ~200KB is comfortably enough for the newest few
-     records; increase the byte count only if that slice doesn't contain a complete JSON line) —
-     or equivalently `Read` the file with `offset` set near `N` (e.g. `N - 50`) and `limit` unset,
-     if you prefer the Read tool once you know the tail offset.
-  3. From that tail slice, parse each line as JSON (skip any partial first line — `tail -c` can cut
+     records; widen only if that slice doesn't contain a complete JSON line) — or equivalently
+     `Read` the file with `offset` near `N` (e.g. `N - 50`) and `limit` unset.
+  3. Parse each line of that tail slice as JSON (skip any partial first line — `tail -c` can cut
      mid-line) and find the LAST record where `type == "assistant"` AND `parent_tool_use_id` is
-     absent/null — that condition, not merely "last assistant record," because subagent turns are
-     interleaved into the same file and are tagged with a non-null `parent_tool_use_id`. From that
-     record's `message.usage`, sum exactly three fields: `input_tokens +
-     cache_creation_input_tokens + cache_read_input_tokens` (do **not** include `output_tokens` —
-     that is what you produced this turn, not what was resent as context).
-  Never read the whole file to find the tail — that is itself expensive context burn, ironic for a
-  context-growth check. `tail -c` on a bounded byte window is cheap and correct; a bare `Read` or a
-  full-file slurp are both wrong here for different reasons (wrong end vs. too much).
-- **Ceiling**: compare that sum to the ceiling. The default is **200,000 tokens** — the measured
-  knee in the modelled cache-read-cost table ($463 at 150K / $522 at 200K / $712 at 300K / $927 at
-  400K, against $1,399.88 actual with zero checkpointing): past 200K, each further 100K buys
-  diminishing additional savings. An operator overriding it sets `BP_CONTEXT_CEILING_TOKENS` for the
-  orchestrator process (mirrored in `bp-orchestrator.pl`'s `_tunables_base()` as `ctx_ceiling`) and
-  communicates the value to running coordinators the same way any other tunable is communicated
-  today — there is no live-push channel, so treat this section's stated default as authoritative
-  unless told otherwise by the ledger or the operator.
+     absent/null — not merely "last assistant record," because interleaved subagent turns carry a
+     non-null `parent_tool_use_id`. Sum `input_tokens + cache_creation_input_tokens +
+     cache_read_input_tokens` from that record's `message.usage` (excluding `output_tokens`, which
+     is what you produced this turn, not what was resent as context).
+- **Ceiling**: compare that sum to the ceiling. Default: **300,000 tokens** — raised from the
+  package's originally-measured 200K "knee" (2026-09-19, operator request). Modelled cache-read
+  cost is $712 at 300K vs. $522 at 200K (against $1,399.88 with zero checkpointing): 300K trades
+  some of 200K's better read efficiency for meaningfully fewer handovers, since each handover means
+  a fresh coordinator re-reading `blueprint.md` and its own ledger cold before it can do anything
+  else. An operator overriding it sets `BP_CONTEXT_CEILING_TOKENS` for the orchestrator process
+  (mirrored in `bp-orchestrator.pl`'s `_tunables_base()` as `ctx_ceiling`) and communicates the
+  value to running coordinators the same way any other tunable is communicated today — there is no
+  live-push channel, so treat this section's stated default as authoritative unless told otherwise
+  by the ledger or the operator.
 - **At or above the ceiling**: checkpoint now. Finish the step you were mid-way through (do not
   abandon it half-done), write a concrete `## Next action` describing exactly what to resume, leave
   `status:` at `running`/`converging` (never `parked`/`done` for this reason alone), refresh
