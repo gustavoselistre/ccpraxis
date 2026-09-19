@@ -14,6 +14,9 @@
 #   3. raised max_turns authoring defaults, documented in authoring-protocol/SKILL.md (today:
 #      "backstop (default 80)").
 #   4. the always-ask, no-default quality-profile question at authoring time (operator ruling R-03).
+#      SUPERSEDED 2026-09-19 by operator ruling R-04: the profile now defaults to `normal` silently
+#      and is never asked; `higher` is opt-in, only on an explicit request. C7 below was rewritten to
+#      assert the NEW ruling, not the old one -- see its own header comment for what changed.
 #
 # WRITTEN BLIND TO THE FIX. Every assertion below is expected to fail on ABSENCE OF THE FEATURE
 # (a missing flag, a stale default, missing doc prose), never on a Perl exception, a missing module,
@@ -511,31 +514,46 @@ MD
 }
 
 # ===========================================================================
-# C7 — authoring ALWAYS asks normal-vs-higher; there is NO DEFAULT.
+# C7 — REWRITTEN 2026-09-19 for operator ruling R-04 (supersedes R-03, see
+# this file's own header note item 4). Authoring now defaults SILENTLY to
+# `normal` and never asks; `higher` is opt-in, only on an explicit request in
+# the user's own words. The assertions below test the NEW ruling directly —
+# they are not a loosening of the old ones, they assert the opposite claim on
+# purpose, because the claim itself changed.
 # ===========================================================================
 {
     my $auth_txt   = read_file($AUTH_SKILL)   // '';
     my $create_txt = read_file($CREATE_SKILL) // '';
     my $combined   = "$auth_txt\n$create_txt";
 
-    # ---- positive: the question is actually reachable, and framed as mandatory.
+    # ---- positive: the concept and both options are still documented.
     like($combined, qr/quality[\s-]?profile/i,
         "C7 (positive): a 'quality profile' concept is documented in the authoring skills");
     like($combined, qr/\bnormal\b/i, "C7 (positive): the 'normal' profile option is named");
     like($combined, qr/\bhigher\b/i, "C7 (positive): the 'higher' profile option is named");
-    like($combined, qr/(always ask|must ask|asks? the user|no default|never default)/i,
-        "C7 (positive): the doc frames the profile question as mandatory / undefaulted");
 
-    # ---- negative: no phrasing anywhere establishes a default (asserted
-    #      UNCONDITIONALLY, never behind a skip — see vacuity-gate note above).
-    unlike($combined, qr/default(?:s|ed|ing)?\s+(?:to|is|of)\s+["']?normal\b/i,
-        "C7 (negative): no prose defaults the quality profile to 'normal'");
-    unlike($combined, qr/default(?:s|ed|ing)?\s+(?:to|is|of)\s+["']?higher\b/i,
-        "C7 (negative): no prose defaults the quality profile to 'higher'");
-    unlike($combined, qr/if\s+(?:not|un)(?:specified|stated|given|answered)[^.\n]{0,40}(?:normal|higher)/i,
-        "C7 (negative): no fallback phrasing silently picks a profile when the user doesn't answer");
+    # ---- positive: the doc now frames `normal` as the silent default.
+    like($combined, qr/default(?:s|ed|ing)?\s+(?:to|is|of)\s+["'`*]*normal\b/i,
+        "C7 (positive): prose defaults the quality profile to 'normal'");
+    like($combined, qr/(never ask|not part of|no longer asked|defaults? to .{0,20}normal.{0,20}silently|silently)/i,
+        "C7 (positive): the doc frames the profile question as no longer asked / silent");
+    like($combined, qr/\bhigher\b[^.\n]{0,80}(explicit|opt-in|only when|only on)/i,
+        "C7 (positive): 'higher' is framed as opt-in / explicit-request-only");
 
-    # ---- defensive: neither script hardcodes a silent quality-profile default either.
+    # ---- negative: nothing still claims the question is mandatory/undefaulted
+    #      (asserted UNCONDITIONALLY, never behind a skip — see vacuity-gate
+    #      note above). A stray leftover "must ask" / "no default" sentence
+    #      would mean the old and new rulings are both present and
+    #      contradicting each other.
+    unlike($combined, qr/\bmust ask the user\b.{0,60}quality[\s-]?profile/is,
+        "C7 (negative): no prose still says the author must ask about the quality profile");
+    unlike($combined, qr/quality[\s-]?profile.{0,60}\b(?:has |carries )?no default\b/is,
+        "C7 (negative): no prose still claims the quality profile has no default");
+
+    # ---- defensive: neither script hardcodes a silent quality-profile default
+    #      either — this is purely an authoring-time (skill-prose) decision,
+    #      unchanged by R-04, since bp-orchestrator.pl/bp-launch.sh only ever
+    #      execute whatever model/effort a package's own ledger already says.
     my $orch_src   = read_file($ORCH)   // '';
     my $launch_src = read_file($LAUNCH) // '';
     unlike("$orch_src\n$launch_src",
