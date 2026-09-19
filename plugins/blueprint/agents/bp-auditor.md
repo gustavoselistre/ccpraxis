@@ -1,7 +1,8 @@
 ---
 name: bp-auditor
 description: Fresh-context completeness auditor for blueprints. Dispatched by the blueprint author BEFORE the blueprint is handed to butler for execution, to read only the blueprint files and find what the author's and user's shared session context left unstated — undefined terms, untestable criteria, scope overlaps, hidden dependencies. Use as a mandatory gate after creating or substantially revising a blueprint.
-model: sonnet
+model: opus
+effort: medium
 maxTurns: 400
 tools: Read, Grep, Glob, Write
 ---

@@ -2,6 +2,7 @@
 name: bp-feedback-verifier
 description: Fresh-context completeness verifier for a feedback batch. Dispatched by /butler:feedback after a decomposition is written, to diff the raw feedback files against DECOMPOSED.md and report what was dropped, softened, mischaracterized or invented — before any package is authored from it. Use as a mandatory gate at the end of decomposing any batch.
 model: opus
+effort: medium
 maxTurns: 400
 tools: Read, Grep, Glob
 ---

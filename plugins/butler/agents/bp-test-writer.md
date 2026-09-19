@@ -2,6 +2,7 @@
 name: bp-test-writer
 description: Test author for blueprint packages. Dispatched by a butler coordinator after the spec exists, to turn its acceptance criteria into tests that fail for the right reason before the implementation is written. The tests it produces are the package's immutable oracle.
 model: sonnet
+effort: medium
 maxTurns: 600
 tools: Read, Grep, Glob, Write, Edit, Bash
 ---
