@@ -421,11 +421,12 @@ sub fmt_offsets { my ($a) = @_; return join(',', @$a) }
       . 'measures from the LAST LAUNCH, not from a fixed schedule');
 
     my @deferred = log_of_pkg($dir, 'relaunch_deferred', $pkg);
-    my @min_interval_deferred = grep { ($_->{reason} // '') eq 'min_interval' } @deferred;
+    my @min_interval_deferred = grep { ($_->{reason} // '') eq 'death_backoff' } @deferred;
     is(scalar(@min_interval_deferred), 5,
         'AC-5: the 5 ticks that did NOT launch (t=8,16,24,40,48) are explicitly logged as deferred with '
-      . "reason 'min_interval' (the contract's own promised reason string, §2.2) -- not silently "
-      . 'dropped and not conflated with the pre-existing "parallel cap full" deferral reason')
+      . "reason 'death_backoff' (package 03's AC10 promised reason string once death_streak>0, which "
+      . 'this every-tick-dies fixture legitimately accrues) -- not silently dropped and not conflated '
+      . 'with the pre-existing "parallel cap full" deferral reason')
         or diag(explain_log($dir));
 
 }

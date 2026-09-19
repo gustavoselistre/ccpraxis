@@ -1149,6 +1149,40 @@ sub creds_backoff_secs {
     return $s > $max ? $max : $s;
 }
 
+# --- 03-deaths-are-diagnosable: death_backoff_secs(n) = min(base * mult^(n-1), max);
+# n<=0/undef treated as 1. Byte-for-byte the same shape as creds_backoff_secs
+# above, but a DISTINCT sequence (own tunable keys, own default base) -- gates
+# the relaunch interval for a package with an active consecutive-death streak,
+# in place of the flat min_relaunch floor (spec §2.3, Done criterion 5).
+sub death_backoff_secs {
+    my ($n, $t) = @_;
+    $t ||= {};
+    my $base = $t->{death_bo_base} // $ENV{BP_DEATH_BACKOFF_BASE_SECS} // 30;
+    my $mult = $t->{death_bo_mult} // $ENV{BP_DEATH_BACKOFF_MULT}      // 2;
+    my $max  = $t->{death_bo_max}  // $ENV{BP_DEATH_BACKOFF_MAX_SECS}  // 1800;
+    $n = 1 if !defined $n || $n < 1;
+    my $s = $base; $s *= $mult for 2 .. $n;
+    return $s > $max ? $max : $s;
+}
+
+# --- 03-deaths-are-diagnosable: total reader of the JSON exit-status record
+# bp-watch-child.pl writes (runs/<pkg>.exit-status). Returns undef, never
+# dies, for: a missing file, malformed JSON, or a file whose `attempt` field
+# does not equal $expected_attempt -- the last case guards the race where a
+# stale watcher (killed-wedged, then immediately relaunched) writes its
+# STATUSFILE AFTER the new attempt's `rm -f` (spec §5 edge case 1): a
+# mismatched file reads as "no status yet", never as a wrong one.
+sub _read_exit_status {
+    my ($runs, $pkg, $expected_attempt) = @_;
+    return undef unless defined $runs && defined $pkg && length $pkg;
+    return undef unless defined $expected_attempt;
+    my $obj = eval { _read_json("$runs/$pkg.exit-status") };
+    return undef unless ref $obj eq 'HASH';
+    return undef unless defined $obj->{attempt} && !ref $obj->{attempt} && $obj->{attempt} =~ /\A-?\d+\z/;
+    return undef unless $obj->{attempt} == $expected_attempt;
+    return $obj;
+}
+
 # --- b-fca/pkg02: context-growth checkpoint helpers (spec §2.3). Pure, no I/O.
 # Sum the three context-carrying usage fields from one assistant usage hashref.
 # Missing/non-numeric fields count as 0 (mirrors bp-spend.pl's _safe_usage_num
@@ -2640,6 +2674,10 @@ sub _tunables_base {
         min_relaunch => _min_relaunch_secs(),  # r01: floor between two watchdog
                                                 # relaunches of the SAME package
         ctx_ceiling => _ctx_ceiling_env(),  # b-fca/pkg02: context-growth checkpoint ceiling, validated
+        death_thresh  => $ENV{BP_DEATH_THRESH}            // 5,     # 03-deaths-are-diagnosable, Decision 10
+        death_bo_base => $ENV{BP_DEATH_BACKOFF_BASE_SECS} // 30,    # matches today's min_relaunch default
+        death_bo_mult => $ENV{BP_DEATH_BACKOFF_MULT}      // 2,
+        death_bo_max  => $ENV{BP_DEATH_BACKOFF_MAX_SECS}  // 1800,  # matches creds_bo_max
     };
 }
 
@@ -4206,6 +4244,7 @@ sub run {
                         _upd_pkg($runs, $log, $pkg, { turn_exhaust_streak => 0 });   # B9b
                         $reg->{$pkg}{turn_exhaust_streak} = 0;
                     }
+
                     # b29-rate-limit-attempt-isolation: classify THIS death before the
                     # cap is evaluated. Gated on the attempt number already discounted
                     # (rate_limit_discounted_attempt) so a package that sits dead across
@@ -4225,16 +4264,77 @@ sub run {
                                 { package => $pkg, evidence => $rl_evidence, attempts => $att->{$pkg} });
                         }
                     }
+                    # A death whose attempt was (this tick or a previous tick) discounted as
+                    # a rate-limit rejection is isolated from the ATTEMPT cap above -- the
+                    # SAME evidence/reasoning extends to the DEATH cap below: a rejecting API
+                    # is not the coordinator's own health, so it must not count against
+                    # either axis (b29's isolation, not a new rule invented here).
+                    my $rl_discounted_this_death = $cur_att > 0
+                        && (_reg_int($reg->{$pkg}{rate_limit_discounted_attempt}) // 0) == $cur_att;
+
+                    # --- 03-deaths-are-diagnosable: death_streak, a THIRD, independent
+                    # axis from turn_exhaust_streak/attempt (spec §1/§3). unknown|error
+                    # verdicts (never rate-limit-discounted ones -- same isolation as the
+                    # ATTEMPT cap above) feed the death-cap escalation (Decision 10: 5
+                    # consecutive deaths); a max_turns exhaustion is handled by its own
+                    # B7/B8 fork below (reset-on-progress / unchanged-on-fruitless); a
+                    # success verdict (the "died mid-stream but never marked terminal"
+                    # contract-violation shape) resets it, same as turn_exhaust_streak's
+                    # own reset-on-success precedent just above. The counter is only
+                    # ever INCREMENTED at the point a relaunch is actually attempted (or
+                    # would be, but for the death cap itself) -- never merely because a
+                    # still-unresolved death was re-observed on a tick that deferred
+                    # (min-interval/death-backoff/parallel-cap-full) without acting, so a
+                    # package that sits dead across several deferred ticks before its
+                    # next real launch attempt is counted once per actual death, not once
+                    # per tick (spec §5 edge case 6's own constraint).
+                    my $death_streak_before = _reg_int($reg->{$pkg}{death_streak}) // 0;
+                    my $is_death_verdict = ($tv->{verdict} eq 'unknown' || $tv->{verdict} eq 'error')
+                                         && !$rl_discounted_this_death;
+                    if ($tv->{verdict} eq 'success' && $death_streak_before) {
+                        _upd_pkg($runs, $log, $pkg, { death_streak => 0 });
+                        $reg->{$pkg}{death_streak} = 0;
+                        $death_streak_before = 0;
+                    }
                     my $v = watchdog_verdict({ alive => 0,
                         attempts => effective_attempts($att->{$pkg}, _reg_int($reg->{$pkg}{turn_continuations}) // 0,
                                                         _reg_int($reg->{$pkg}{rate_limit_discounts}) // 0),
                         cap => $t->{cap} });
                     if ($v eq 'relaunch') {
                         my $last = $last_relaunch_at{$pkg};
-                        if (_min_interval_gate($last, $now, $t->{min_relaunch})) {
-                            _log($log, 'relaunch_deferred', { package => $pkg, reason => 'min_interval',
-                                since_last => $now - $last, min_relaunch => $t->{min_relaunch} });
+                        # 03-deaths-are-diagnosable: a package with an active death
+                        # streak backs off geometrically instead of the flat
+                        # min_relaunch floor (spec §2.3/§3 behavior 12) -- ONLY when
+                        # death_streak > 0; a package with no death history is gated
+                        # by the unchanged flat floor exactly as today.
+                        my $use_death_bo = $death_streak_before > 0;
+                        my $min_gap = $use_death_bo ? death_backoff_secs($death_streak_before, $t) : $t->{min_relaunch};
+                        if (_min_interval_gate($last, $now, $min_gap)) {
+                            _log($log, 'relaunch_deferred', { package => $pkg,
+                                reason => ($use_death_bo ? 'death_backoff' : 'min_interval'),
+                                since_last => $now - $last, min_relaunch => $min_gap });
                         } elsif (@live < $t->{max_par}) {
+                            # This tick is genuinely about to attempt a relaunch (or, for
+                            # a death past the cap, escalate INSTEAD of one) -- the one
+                            # point where a death is actually counted.
+                            my $death_exit_status;
+                            if ($is_death_verdict) {
+                                $death_exit_status = _read_exit_status($runs, $pkg, $att->{$pkg});
+                                my $death_streak_new = $death_streak_before + 1;
+                                if ($death_streak_new >= ($t->{death_thresh} // 5)) {
+                                    _upd_pkg($runs, $log, $pkg, { death_streak => $death_streak_new, last_death_at => $now,
+                                        ($death_exit_status ? (last_death_classification => $death_exit_status->{classification}) : ()) });
+                                    $reg->{$pkg}{death_streak} = $death_streak_new;
+                                    _log($log, 'coordinator_death', { package => $pkg, death_streak => $death_streak_new,
+                                        exit_status => ($death_exit_status ? $death_exit_status->{classification} : undef) });
+                                    _log($log, 'watchdog_block', { package => $pkg,
+                                        reason => 'consecutive coordinator deaths past death cap', death_streak => $death_streak_new });
+                                    $status->{$pkg} = _escalate_stuck({ bpdir=>$bpdir, runs=>$runs, log=>$log, bp=>$bp, pkg=>$pkg,
+                                        why=>"$death_streak_new consecutive coordinator deaths (death cap)", now=>$now, reg=>$reg, t=>$t,
+                                        spawn_judge=>$spawn_judge, shutdown=>$shutdown });
+                                    next;
+                                }
+                            }
                             # Continuation bookkeeping is COMPUTED here (the widened
                             # budget has to be known before @args is built) but only
                             # PERSISTED after a successful launch — a relaunch that
@@ -4245,6 +4345,13 @@ sub run {
                             # effective_attempts is pinned and the give-up cap can
                             # never be reached (§3 B7/B8).
                             my %pending_reg;
+                            if ($is_death_verdict) {
+                                $pending_reg{death_streak} = $death_streak_before + 1;
+                                $pending_reg{last_death_at} = $now;
+                                $pending_reg{last_death_classification} = $death_exit_status->{classification} if $death_exit_status;
+                                _log($log, 'coordinator_death', { package => $pkg, death_streak => $pending_reg{death_streak},
+                                    exit_status => ($death_exit_status ? $death_exit_status->{classification} : undef) });
+                            }
                             my $reg_rollback;      # in-memory max_turns to restore on failure
                             # Turn-exhaustion fork (only with a free slot: a deferred
                             # relaunch must not widen or count a continuation).
@@ -4260,7 +4367,7 @@ sub run {
                                     my $next = widen_max_turns($current, $initial);
                                     my $tc   = (_reg_int($reg->{$pkg}{turn_continuations}) // 0) + 1;
                                     %pending_reg = (max_turns => $next, turn_continuations => $tc,
-                                                    turn_exhaust_streak => 0);
+                                                    turn_exhaust_streak => 0, death_streak => 0);
                                     $reg_rollback = $current;
                                     # the widened budget must ride @args below, so the
                                     # in-memory mirror is set now and rolled back if the
@@ -4370,7 +4477,12 @@ sub run {
                                       ? coordinator_death_evidence($runs, $pkg) : undef;
                             _log($log, 'watchdog_relaunch', { package => $pkg, mode => $mode, age_min => $age,
                                 attempts => $att->{$pkg}, exit_reason => $tv->{verdict},
-                                ($death ? (death_evidence => $death) : ()) });
+                                ($death ? (death_evidence => $death) : ()),
+                                ($death_exit_status ? (
+                                    exit_status  => $death_exit_status->{classification},
+                                    exit_code    => $death_exit_status->{exit_code},
+                                    signal_name  => $death_exit_status->{signal_name},
+                                ) : ()) });
                             my $snap = launch_snapshot($bpdir, $runs, $pkg, $now);
                             my $rc = $launch->({ pkg => $pkg, args => \@args, kind => $mode });
                             $note_exec->($pkg, $rc);
