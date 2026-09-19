@@ -109,4 +109,51 @@ sub recorded_until {
     unlike($out, qr/^paused until/m, 'and no pause is granted for it');
 }
 
+# ---------------------- D. --seconds / no-duration-flag-at-all ergonomics
+# A caller that has nothing shorter to say than "the default" must never have
+# to compute time()+1800 by hand — that was the exact friction observed live:
+# the hook's own denial text told a caller to write `--until $(( $(date +%s) +
+# 1800 ))`. Neither --seconds nor --until given now defaults to the full cap.
+{
+    my $before = time;
+    my $out = rs('pause', '--root', $root, '--watcher-pid', $$,
+                 '--watching', 'a fixture dispatch', '--reason', 'default duration');
+    like($out, qr/paused until/, 'D1: pause is granted with neither --seconds nor --until given');
+
+    my $got = recorded_until();
+    ok(defined $got, 'D1: a deadline was recorded');
+    cmp_ok($got, '>=', $before + $CAP_SECONDS - 2,
+           'D1: the default deadline lands at (approximately) the full 50-minute cap, not a short fallback');
+    cmp_ok($got, '<=', $before + $CAP_SECONDS + 2,
+           'D1: ...and not longer than the cap either (within a 2s scheduling margin)');
+}
+
+{
+    my $before = time;
+    my $out = rs('pause', '--root', $root, '--watcher-pid', $$, '--seconds', 120,
+                 '--watching', 'a fixture dispatch', '--reason', 'explicit short duration');
+    like($out, qr/paused until/, 'D2: --seconds is accepted as a duration-from-now');
+
+    my $got = recorded_until();
+    is($got, $before + 120, 'D2: the recorded deadline is exactly now + --seconds, no manual date math needed');
+}
+
+{
+    # --until wins if both are given -- the lower-level, more explicit form.
+    my $explicit_until = time + 300;
+    my $out = rs('pause', '--root', $root, '--watcher-pid', $$,
+                 '--seconds', 9999, '--until', $explicit_until,
+                 '--watching', 'a fixture dispatch', '--reason', 'both given');
+    like($out, qr/paused until/, 'D3: pause is granted when both --seconds and --until are given');
+    is(recorded_until(), $explicit_until, 'D3: --until wins over --seconds when both are present');
+}
+
+{
+    my $out = rs('pause', '--root', $root, '--watcher-pid', $$, '--seconds', 'not-a-number',
+                 '--watching', 'a fixture dispatch', '--reason', 'bad seconds');
+    like($out, qr/--seconds must be a non-negative integer/,
+        'D4: a non-numeric --seconds is refused with a clear message, not silently coerced');
+    unlike($out, qr/^paused until/m, 'D4: and no pause is granted for it');
+}
+
 done_testing();

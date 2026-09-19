@@ -102,8 +102,14 @@ sub newroot { my $r = tempdir(CLEANUP => 1); mkdir "$r/.ccpraxis-local-data"; re
     my ($rc2) = rs($r, 'pause', '--watcher-pid', $$, '--until', time - 5);
     isnt($rc2, 0, 'pause REFUSED when the deadline is already past');
 
+    # b-fca ergonomics fix: omitting BOTH --seconds and --until no longer
+    # refuses — it defaults to the full 50-minute cap (bp-runstate.pl's own
+    # MAX_PAUSE_SECONDS), so a caller with nothing shorter to say never has to
+    # compute time()+N by hand. Still bounded, never unbounded: this is a
+    # documented default, not the removal of the "must resolve" requirement.
     my ($rc3) = rs($r, 'pause', '--watcher-pid', $$);
-    isnt($rc3, 0, 'pause REFUSED with no deadline — an unbounded pause never resumes');
+    is($rc3, 0, 'pause with no deadline flag at all now GRANTS, defaulting to the 50-minute cap');
+    is(state_of($r), 'paused', '...and the state is paused, exactly as an explicit --seconds/--until would leave it');
 
     my ($rc4) = rs($r, 'pause', '--watcher-pid', $$, '--until', time + 600);
     is($rc4, 0, 'pause ACCEPTED with a live pid and a future deadline');

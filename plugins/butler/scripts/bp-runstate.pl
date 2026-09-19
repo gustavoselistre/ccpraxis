@@ -424,6 +424,7 @@ unless (caller) {
         if    ($a eq '--reason')      { $o{reason}      = shift @ARGV }
         elsif ($a eq '--watcher-pid') { $o{watcher_pid} = shift @ARGV }
         elsif ($a eq '--until')       { $o{until}       = shift @ARGV }
+        elsif ($a eq '--seconds')     { $o{seconds}     = shift @ARGV }
         # t10: what the watcher is waiting FOR. Never gates anything; its
         # absence produces a warning, never a refusal (see BpRunState::pause).
         elsif ($a eq '--watching')    { $o{watching}    = shift @ARGV }
@@ -471,6 +472,19 @@ unless (caller) {
         exit 0;
     }
     elsif ($cmd eq 'pause') {
+        # --until is the explicit, lower-level form (an exact epoch); --seconds
+        # is the ergonomic one (a duration from now); omitting BOTH defaults to
+        # the full 50-minute cap -- a caller with nothing shorter to say should
+        # never have to compute time()+1800 by hand to get the common case.
+        # --until wins if both are given.
+        if (!defined $o{until}) {
+            my $secs = defined $o{seconds} ? $o{seconds} : BpRunState::MAX_PAUSE_SECONDS();
+            if ($secs !~ /^\d+$/) {
+                print STDERR "bp-runstate: --seconds must be a non-negative integer\n";
+                exit 3;
+            }
+            $o{until} = time + $secs;
+        }
         my ($ok, $msg) = BpRunState::pause($root, %o);
         print STDERR "bp-runstate: pause refused: $msg\n" unless $ok;
         print "$msg\n" if $ok;
@@ -489,11 +503,15 @@ bp-runstate.pl — the run-state behind the stop gate.
   status                                   print the effective state as JSON
   activate [--reason R]                    mark a run underway (the hook does
                                            this automatically; rarely manual)
-  pause --watcher-pid N --until EPOCH [--reason R]
+  pause --watcher-pid N [--seconds S | --until EPOCH] [--watching W] [--reason R]
                                            resolve THIS turn: something live
-                                           will wake the session. Refused if
-                                           the pid is not running or the
-                                           deadline is not in the future.
+                                           will wake the session. Neither
+                                           --seconds nor --until given defaults
+                                           to the full 50-minute cap; --seconds
+                                           is a duration from now, --until an
+                                           exact epoch (wins if both given).
+                                           Refused if the pid is not running or
+                                           the deadline is not in the future.
   finish [--reason R]                      resolve permanently: nothing pending
 
   --surface NAME       (all verbs, optional, default 'driver') scopes the

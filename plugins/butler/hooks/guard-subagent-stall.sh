@@ -320,15 +320,12 @@ Pick one, then stop:
 
   perl $RS finish --reason "<why>"          # nothing is pending
 
-  perl $RS pause --watcher-pid <pid> --until \$(( \$(date +%s) + 1800 )) \\
-       --watching "<work in flight>" --reason "<what wakes us>"
+  perl $RS pause --watcher-pid <pid> --watching "<work in flight>" --reason "<what wakes us>"
+                                             # defaults to a 50-minute pause; add --seconds N for shorter
 
-The pause needs a watcher that is RUNNING and OUTLIVES the work -- arm
-bp-watch.pl around the dispatch; never pass the work's own pid.
-Doing the work now, in this turn, also resolves it.
-Why: this file's header.
-Override (ONE-SHOT -- consumed on use, allows exactly this stop):
-  touch $STATE_DIR/force-stop
+The watcher pid must be a process that is RUNNING and OUTLIVES the work -- arm bp-watch.pl around the dispatch, and never pass the work's own pid. Doing the work now, in this turn, also resolves it. Why: this file's header.
+
+Override (ONE-SHOT -- consumed on use, allows exactly this stop): touch $STATE_DIR/force-stop
 EOF
     exit 2
     ;;
