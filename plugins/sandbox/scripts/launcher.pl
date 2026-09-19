@@ -5827,8 +5827,9 @@ sub enter_dashboard {
     # are effectively immutable for this dashboard's lifetime, and an opendir + up to
     # five file reads per frame would be a real regression in the hot path. Reading it
     # once also keeps the boundary marker's position stable (no flicker).
-    my ($hist_groups_ref, $hist_last_epoch) = _history_events("$CLAUDE_DATA/sandbox-logs", "launch-$LAUNCH_ID.log");
+    my ($hist_groups_ref, $hist_epochs_ref) = _history_events("$CLAUDE_DATA/sandbox-logs", "launch-$LAUNCH_ID.log");
     my @hist_groups = @{ $hist_groups_ref || [] };
+    my @hist_epochs = @{ $hist_epochs_ref || [] };
     my $cached_status           = 'unknown';
     my $cached_machine_state    = 'unknown';   # s12: _machine_state, refreshed on the 10s inspect round
     my $cached_busy_age         = undef;   # B5: age (s) of /tmp/.butler-busy in CONTAINER time, or undef
@@ -6320,6 +6321,12 @@ sub enter_dashboard {
             $cur = LaunchLog::merge_by_key([ $cur, $orch_ev ],
                        key => \&_row_time_key, max => $ACTIVITY_EVENT_MAX)
                 if ref $orch_ev eq 'ARRAY' && @$orch_ev;
+            # spec 03-activity-feed-ordering S2c: one divider PER prior
+            # session, embedded into a flat list before handing it to the
+            # unchanged, 2-source/single-outer-marker merge_sessions below --
+            # not a change to that function's signature or semantics.
+            my $hist_flat       = Dashboard::stitch_history_dividers(\@hist_groups, \@hist_epochs, undef);
+            my $hist_last_epoch = @hist_epochs ? $hist_epochs[-1] : undef;
             return {
                 project_name    => $PROJECT_NAME,
                 container       => $CONTAINER_NAME,
@@ -6332,7 +6339,7 @@ sub enter_dashboard {
                 # skipped off a reading that may be up to 10s out of date.
                 status_stale    => ($probed_now ? 0 : 1),
                 events          => LaunchLog::merge_sessions(
-                                        [ @hist_groups, $cur ],
+                                        [ $hist_flat, $cur ],
                                         max    => $ACTIVITY_EVENT_MAX,
                                         marker => Dashboard::session_boundary_row($hist_last_epoch),
                                     ),
@@ -8608,7 +8615,7 @@ sub _tail_lines {
 sub _history_events {
     my ($dir, $exclude) = @_;
     my @groups;
-    my $newest_hist_epoch;
+    my @group_epochs;
     eval {
         my @paths = LaunchLog::recent_logs($dir, $HISTORY_LOG_FILES, $exclude);  # newest-first
         for my $p (reverse @paths) {                                # -> oldest-first
@@ -8636,23 +8643,24 @@ sub _history_events {
             }
             if (ref $ev eq 'ARRAY' && @$ev) {
                 push @groups, $ev;
-                # The newest timestamp in this group. Only the LAST group's
-                # value survives the loop, which is the one wanted: it dates the
-                # "previous session" divider that sits directly above the
-                # current session's events. Needed because activity rows show a
-                # wall clock now instead of an age, and a bare "23:41" on the
-                # far side of a session boundary says nothing about WHICH day.
+                # The newest timestamp in THIS group -- one entry per group now
+                # (spec 03-activity-feed-ordering S2c), rather than collapsed
+                # across the whole loop, so Dashboard::stitch_history_dividers
+                # can date a divider per prior session instead of just one
+                # divider for the whole history.
+                my $group_newest;
                 for my $ln (@lines) {
                     my $e = Dashboard::_event_epoch_of_line($ln);
                     next unless defined $e;
-                    $newest_hist_epoch = $e
-                        if !defined($newest_hist_epoch) || $e > $newest_hist_epoch;
+                    $group_newest = $e
+                        if !defined($group_newest) || $e > $group_newest;
                 }
+                push @group_epochs, $group_newest;
             }
         }
         1;
-    } or do { @groups = (); $newest_hist_epoch = undef };   # any failure -> no history, dashboard behaves exactly as today
-    return (\@groups, $newest_hist_epoch);
+    } or do { @groups = (); @group_epochs = () };   # any failure -> no history, dashboard behaves exactly as today
+    return (\@groups, \@group_epochs);
 }
 
 # _gather_orchestrator_events($runs) -> ARRAYREF of span-rows -- spec S2

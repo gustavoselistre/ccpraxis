@@ -337,7 +337,36 @@ sub collapse_records {
             push @out, { %$rec };
         }
     }
-    return \@out;
+    # Stable reorder: restore non-decreasing displayed-epoch order after the
+    # merge decisions above are finalized. Records with an undefined epoch
+    # stay anchored at their own original array slot -- they are never
+    # relocated -- while the defined-epoch records are sorted amongst
+    # themselves (ascending epoch, original index as tiebreak) and dropped
+    # into the remaining slots in that sorted order. This is a two-pass
+    # construction, not a single comparator that switches its comparison key
+    # per pair (that shape is non-transitive: Perl's sort has no consistency
+    # guarantee for it, and it can -- and did -- leave two DEFINED epochs out
+    # of order relative to each other whenever an undefined-epoch record fell
+    # between them; see spec 03-activity-feed-ordering S2a redteam-01
+    # finding). This construction guarantees the pinned postcondition (for
+    # any i < j with both epochs defined, out[i]{epoch} <= out[j]{epoch}) by
+    # construction, for every input, and keeps every undefined-epoch record
+    # transparent to the reorder as a group.
+    my @idx = (0 .. $#out);
+    my @defined_idx = grep { defined $out[$_]{epoch} } @idx;
+    my @sorted_defined = sort {
+        $out[$a]{epoch} <=> $out[$b]{epoch} || $a <=> $b
+    } @defined_idx;
+    my @new_idx;
+    my $di = 0;
+    for my $i (@idx) {
+        if (defined $out[$i]{epoch}) {
+            push @new_idx, $sorted_defined[$di++];
+        } else {
+            push @new_idx, $i;
+        }
+    }
+    return [ @out[@new_idx] ];
 }
 
 # ===========================================================================

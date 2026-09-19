@@ -821,6 +821,33 @@ sub session_boundary_row {
                                       : '-- previous session --'), role => 'muted' } ];
 }
 
+# stitch_history_dividers(\@hist_groups, \@hist_epochs, $localtime_fn) -> \@flat
+# spec S2b (03-activity-feed-ordering). PURE, TOTAL -- never dies/warns.
+# Embeds one session_boundary_row() per prior-session group BEFORE handing a
+# flat list off to the unchanged LaunchLog::merge_sessions. \@hist_groups is
+# oldest-first, one element per prior launch-log file (exactly the shape
+# _history_events already produces); \@hist_epochs is the parallel per-group
+# newest-member epoch. The very first non-empty group gets no divider (nothing
+# older sits beneath it); every subsequent non-empty group is preceded by
+# exactly one divider dated from that group's own epoch. Empty groups
+# contribute nothing and consume no divider slot. Non-ARRAY inputs degrade to
+# the best-effort usable pairs -- never dies.
+sub stitch_history_dividers {
+    my ($hist_groups, $hist_epochs, $localtime_fn) = @_;
+    my @g = (ref $hist_groups eq 'ARRAY') ? @$hist_groups : ();
+    my @e = (ref $hist_epochs eq 'ARRAY') ? @$hist_epochs : ();
+    my @out;
+    my $seen = 0;
+    for my $i (0 .. $#g) {
+        my $grp = (ref $g[$i] eq 'ARRAY') ? $g[$i] : [];
+        next unless @$grp;
+        push @out, session_boundary_row($e[$i], $localtime_fn) if $seen;
+        push @out, @$grp;
+        $seen = 1;
+    }
+    return \@out;
+}
+
 # _local_parts($epoch, $localtime_fn) -> (hh, mm, ymd, "Www DD Mon") | ()
 # The one place an epoch becomes local wall-clock text. $localtime_fn is
 # injectable so every caller stays testable without touching the machine clock.
