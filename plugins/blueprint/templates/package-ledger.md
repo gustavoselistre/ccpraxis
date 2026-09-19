@@ -3,7 +3,8 @@ package: <NN-slug>
 blueprint: <blueprint-name>
 status: pending
 model: sonnet
-# coordinator model -- deliberate default, not accidental.
+effort: medium
+# coordinator model/effort -- deliberate defaults, not accidental.
 # Basis: coordinators are 84-95% of measured blueprint cost
 # across 4 blueprints (jrm-ux-correctness $1014.56/95%,
 # sourcing-hardening $515.91/94%, fleet-tick-harness
@@ -11,9 +12,10 @@ model: sonnet
 # $0.218/call vs Sonnet's $0.046 (4.7x); a coordinator's own
 # work is overwhelmingly non-reasoning shell activity (one
 # sampled coordinator: 704 of 1,561 calls were Bash, 473 `cd`).
-# Override per-package here when THIS package's coordinator
-# work itself is reasoning-heavy. Basis: report
-# 20260917-172750-285a (fleet-cost-accounting b04).
+# Override per-package here (model: opus and/or effort: high|xhigh)
+# ONLY when THIS package's coordinator work itself is
+# reasoning-heavy, with the reason recorded as a Decision.
+# Basis: report 20260917-172750-285a (fleet-cost-accounting b04).
 max_turns: 800
 # worker_backend: claude              <!-- optional; claude (default) | opencode -- b32, coordinator's
 #   Task-vs-Bash dispatch choice. Read by bp-worker.pl. -->
