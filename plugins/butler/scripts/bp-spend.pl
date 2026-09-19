@@ -581,7 +581,357 @@ sub _gate_diagnostic {
     return length($d) ? "$d (gate exit $exit)" : "gate exit $exit";
 }
 
+package BpSpend::Derive;
+# ===========================================================================
+# BpSpend::Derive -- derive-from-transcripts mode (blueprint
+# fleet-cost-accounting, package 01-spend-is-recorded). Reads a package's
+# EXISTING runs/<pkg>.jsonl coordinator transcript directly -- no external
+# provider, no network, no credential -- and produces a token/cost figure
+# split coordinator-vs-subagent, plus a named cache-write anomaly report.
+# Spec: .ccpraxis-local-data/blueprints/fleet-cost-accounting/specs/
+# 01-spend-is-recorded-spec.md. Pure functions; the CLI verbs at the bottom
+# of this file are the only I/O-performing callers.
+#
+# NO CONSUMER YET (fix-batch, reviewer should-fix #1). Nothing reads the
+# runs/spend-derived.json this package writes -- not launcher.pl's
+# _gather_spend, not SpendPanel.pm, not the reporter/harvest log. Both files
+# are outside this package's write set (spec §4's explicit gap flag); wiring
+# either of them up is a separate, not-yet-scheduled package.
+# ===========================================================================
+use strict;
+use warnings;
+use JSON::PP;
+use Fcntl ();
+
+# ---------------------------------------------------------------------------
+# _empty_package_result($pkg) -> the zero-valued shape every derive_package()
+# call starts from and, for 'no-file'/'empty' status, returns unmodified.
+# ---------------------------------------------------------------------------
+sub _empty_package_result {
+    my ($pkg) = @_;
+    return {
+        pkg    => $pkg,
+        status => 'ok',
+        tokens => {
+            coordinator => { input => 0, output => 0, cache_creation => 0, cache_read => 0 },
+            subagent    => { input => 0, output => 0, cache_creation => 0, cache_read => 0 },
+        },
+        by_model      => {},
+        record_counts => {
+            assistant_total       => 0,
+            coordinator           => 0,
+            subagent              => 0,
+            skipped_unparseable   => 0,
+            result_usage_seen     => 0,
+            system_usage_seen     => 0,
+            malformed_usage_field => 0,
+        },
+        anomaly => {
+            name         => 'consecutive-same-size-cache-write',
+            count        => 0,
+            total_tokens => 0,
+            pairs        => [],
+        },
+        cross_check => {
+            seen            => 0,
+            total_cost_usd  => undef,
+            model_usage     => {},
+        },
+        derived => 1,
+    };
+}
+
+# ---------------------------------------------------------------------------
+# _safe_usage_num($val, \%record_counts) -> a non-negative number, NEVER a
+# silent corruption of the total (fix-batch M3). A usage sub-field that is
+# undef is legitimately absent and becomes 0 with no diagnostic (spec's own
+# "missing sub-field" edge case). Anything else that is not a bare
+# non-negative integer -- a negative figure, a string, a boolean, a hashref --
+# is NOT summed in (a negative value would silently REDUCE the reported total,
+# which is the one failure mode this package exists to avoid being fooled by)
+# and is instead counted in record_counts.malformed_usage_field so a caller
+# has a real signal that some input was suspect, mirroring how a JSON-decode
+# failure is counted in skipped_unparseable rather than silently ignored.
+# ---------------------------------------------------------------------------
+sub _safe_usage_num {
+    my ($val, $counts) = @_;
+    return 0 unless defined $val;
+    if (!ref($val) && $val =~ /^\d+\z/) {
+        return $val + 0;
+    }
+    $counts->{malformed_usage_field}++;
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# derive_package(%opts) -> \%package_result. See spec §2.1-2.4.
+#   opts: jsonl_path => PATH (required), pkg => STR (required)
+# A missing file is status=>'no-file'. A file with zero assistant/usage
+# records is status=>'empty'. A line that fails JSON decode is SKIPPED, not
+# fatal, and counted in record_counts.skipped_unparseable.
+# ---------------------------------------------------------------------------
+sub derive_package {
+    my (%opts) = @_;
+    my $jsonl_path = $opts{jsonl_path};
+    my $pkg        = $opts{pkg};
+
+    my $result = _empty_package_result($pkg);
+
+    unless (defined $jsonl_path && -f $jsonl_path) {
+        $result->{status} = 'no-file';
+        return $result;
+    }
+
+    open(my $fh, '<:raw', $jsonl_path) or do {
+        $result->{status} = 'no-file';
+        return $result;
+    };
+    my @lines = <$fh>;
+    close $fh;
+
+    my $saw_assistant = 0;
+    my %prev_by_session;   # session_id => { role => { size => N, uuid => STR } }
+    my @pairs;
+
+    for my $line (@lines) {
+        $line =~ s/\r?\n\z//;
+        next unless length $line;
+
+        my $rec = eval { JSON::PP->new->decode($line) };
+        if ($@ || ref($rec) ne 'HASH') {
+            $result->{record_counts}{skipped_unparseable}++;
+            next;
+        }
+
+        my $type = defined($rec->{type}) ? $rec->{type} : '';
+
+        if ($type eq 'assistant'
+            && ref($rec->{message}) eq 'HASH'
+            && ref($rec->{message}{usage}) eq 'HASH') {
+
+            $saw_assistant = 1;
+            my $role  = defined($rec->{parent_tool_use_id}) ? 'subagent' : 'coordinator';
+            my $model = defined($rec->{message}{model}) && length($rec->{message}{model})
+                      ? $rec->{message}{model} : 'unknown';
+            my $u = $rec->{message}{usage};
+            my $input  = _safe_usage_num($u->{input_tokens},                $result->{record_counts});
+            my $output = _safe_usage_num($u->{output_tokens},               $result->{record_counts});
+            my $cc     = _safe_usage_num($u->{cache_creation_input_tokens}, $result->{record_counts});
+            my $cr     = _safe_usage_num($u->{cache_read_input_tokens},     $result->{record_counts});
+
+            $result->{tokens}{$role}{input}          += $input;
+            $result->{tokens}{$role}{output}         += $output;
+            $result->{tokens}{$role}{cache_creation} += $cc;
+            $result->{tokens}{$role}{cache_read}     += $cr;
+
+            my $bm = ($result->{by_model}{$model} //= {
+                role => $role, input => 0, output => 0, cache_creation => 0, cache_read => 0,
+            });
+            $bm->{role} = 'mixed' if $bm->{role} ne $role;
+            $bm->{input}          += $input;
+            $bm->{output}         += $output;
+            $bm->{cache_creation} += $cc;
+            $bm->{cache_read}     += $cr;
+
+            $result->{record_counts}{assistant_total}++;
+            $result->{record_counts}{$role}++;
+
+            # Decision 5 -- consecutive same-size (>0) cache-write anomaly,
+            # per (session_id, role), in file order. A 0-size write is
+            # skipped: it participates as neither half of a pair and never
+            # resets the tracked previous value (spec §2.4).
+            #
+            # SCOPED BY ROLE TOO, not session_id alone (fix-batch M2 --
+            # red-team headline finding). Subagent (Task-tool) turns share the
+            # coordinator's session_id and interleave with it in file order as
+            # NORMAL operation, not an edge case. Tracking "previous" per
+            # session_id alone lets an interleaved subagent write both hide a
+            # real same-role duplicate (the subagent's differently-sized write
+            # overwrites the tracked pointer between two identical coordinator
+            # writes, so the real dup is never compared) and false-positive
+            # across roles (an unrelated coordinator/subagent pair that
+            # coincidentally share a cache-write size gets reported as a
+            # duplicate). Keying by (session_id, role) means only writes from
+            # the SAME branch of the conversation are ever compared.
+            my $session = $rec->{session_id};
+            if (defined $session && $cc > 0) {
+                my $uuid = defined($rec->{uuid}) ? $rec->{uuid} : '';
+                my $prev = $prev_by_session{$session}{$role};
+                if (defined $prev && $prev->{size} == $cc) {
+                    push @pairs, {
+                        session_id  => $session,
+                        role        => $role,
+                        size        => $cc,
+                        first_uuid  => $prev->{uuid},
+                        second_uuid => $uuid,
+                    };
+                }
+                $prev_by_session{$session}{$role} = { size => $cc, uuid => $uuid };
+            }
+        }
+        elsif ($type eq 'system'
+            && (ref($rec->{usage}) eq 'HASH'
+                || (defined($rec->{subtype}) && $rec->{subtype} eq 'task_progress'))) {
+            # A cumulative running counter -- counted, never summed in.
+            $result->{record_counts}{system_usage_seen}++;
+        }
+        elsif ($type eq 'result') {
+            # A whole-session summary -- captured verbatim into cross_check
+            # for audit only, never blended into tokens/by_model.
+            $result->{record_counts}{result_usage_seen}++;
+            $result->{cross_check}{seen} = 1;
+            $result->{cross_check}{total_cost_usd} = $rec->{total_cost_usd}
+                if defined $rec->{total_cost_usd};
+            if (ref($rec->{usage}) eq 'HASH' && ref($rec->{usage}{modelUsage}) eq 'HASH') {
+                for my $m (keys %{ $rec->{usage}{modelUsage} }) {
+                    my $mu = $rec->{usage}{modelUsage}{$m};
+                    next unless ref($mu) eq 'HASH';
+                    $result->{cross_check}{model_usage}{$m} = {
+                        input_tokens                => $mu->{inputTokens}               // 0,
+                        output_tokens               => $mu->{outputTokens}              // 0,
+                        cache_read_input_tokens     => $mu->{cacheReadInputTokens}      // 0,
+                        cache_creation_input_tokens => $mu->{cacheCreationInputTokens}  // 0,
+                        cost_usd                    => $mu->{costUSD}                   // 0,
+                    };
+                }
+            }
+        }
+        # else: system/init, user, or any other record type -- ignored, no
+        # usage to account for (spec §2.2, last bullet).
+    }
+
+    $result->{anomaly}{pairs} = \@pairs;
+    $result->{anomaly}{count} = scalar(@pairs);
+    my $total = 0;
+    $total += $_->{size} for @pairs;
+    $result->{anomaly}{total_tokens} = $total;
+
+    $result->{status} = $saw_assistant ? 'ok' : 'empty';
+    return $result;
+}
+
+# ---------------------------------------------------------------------------
+# derive_blueprint(%opts) -> \%blueprint_result. See spec §2.1.
+#   opts: runs_dir => PATH (required), pkgs => \@ARRAY (optional -- if
+#         omitted, scans runs_dir for *.jsonl files, basename minus .jsonl is
+#         the pkg id, excluding spend.json/spend-derived.json/non-.jsonl and
+#         a file literally named spend.jsonl).
+# Sums each independently-derived package result additively -- never by
+# re-scanning a combined stream.
+# ---------------------------------------------------------------------------
+sub derive_blueprint {
+    my (%opts) = @_;
+    my $runs_dir = $opts{runs_dir};
+
+    my @pkgs;
+    if (ref($opts{pkgs}) eq 'ARRAY') {
+        @pkgs = @{ $opts{pkgs} };
+    }
+    elsif (defined $runs_dir && -d $runs_dir) {
+        opendir(my $dh, $runs_dir) or @pkgs = ();
+        if ($dh) {
+            for my $f (sort readdir($dh)) {
+                next unless $f =~ /\.jsonl\z/;
+                next if $f eq 'spend.jsonl';   # reserved (§4)
+                (my $pkg = $f) =~ s/\.jsonl\z//;
+                push @pkgs, $pkg;
+            }
+            closedir $dh;
+        }
+    }
+
+    my $result = {
+        status => 'ok',
+        tokens => {
+            coordinator => { input => 0, output => 0, cache_creation => 0, cache_read => 0 },
+            subagent    => { input => 0, output => 0, cache_creation => 0, cache_read => 0 },
+        },
+        by_model => {},
+        packages => [],
+        anomaly  => {
+            name         => 'consecutive-same-size-cache-write',
+            count        => 0,
+            total_tokens => 0,
+            by_package   => {},
+        },
+        derived => 1,
+    };
+
+    for my $pkg (@pkgs) {
+        my $jsonl_path = defined($runs_dir) ? "$runs_dir/$pkg.jsonl" : undef;
+        my $pr = derive_package(jsonl_path => $jsonl_path, pkg => $pkg);
+        push @{ $result->{packages} }, $pr;
+
+        for my $role (qw(coordinator subagent)) {
+            for my $f (qw(input output cache_creation cache_read)) {
+                $result->{tokens}{$role}{$f} += $pr->{tokens}{$role}{$f};
+            }
+        }
+
+        for my $model (keys %{ $pr->{by_model} }) {
+            my $src = $pr->{by_model}{$model};
+            my $bm = ($result->{by_model}{$model} //= {
+                role => $src->{role}, input => 0, output => 0, cache_creation => 0, cache_read => 0,
+            });
+            $bm->{role} = 'mixed' if $bm->{role} ne $src->{role};
+            for my $f (qw(input output cache_creation cache_read)) {
+                $bm->{$f} += $src->{$f};
+            }
+        }
+
+        if ($pr->{anomaly}{count} > 0) {
+            $result->{anomaly}{count}        += $pr->{anomaly}{count};
+            $result->{anomaly}{total_tokens} += $pr->{anomaly}{total_tokens};
+            $result->{anomaly}{by_package}{$pkg} = {
+                count        => $pr->{anomaly}{count},
+                total_tokens => $pr->{anomaly}{total_tokens},
+            };
+        }
+    }
+
+    return $result;
+}
+
+# ---------------------------------------------------------------------------
+# write_derived(%opts) -> writes the spend-derived.json shape (spec §4)
+# atomically (temp file in the same directory + rename()), mirroring
+# BpSpend::write_snapshot's pattern without calling it -- the two files'
+# shapes are unrelated and this must never touch spend.json (AC8).
+#   opts: path => PATH, doc => \%hashref (already shaped -- see CLI below)
+# ---------------------------------------------------------------------------
+sub write_derived {
+    my (%opts) = @_;
+    my $path = $opts{path};
+    my $doc  = $opts{doc};
+
+    die "write_derived: path is required\n" unless defined $path && length $path;
+
+    my $json = JSON::PP->new->canonical->encode($doc);
+
+    (my $dir = $path) =~ s{[/\\][^/\\]+$}{};
+    $dir = '.' unless length $dir;
+    if (length $dir && !-d $dir) { require File::Path; File::Path::make_path($dir); }
+
+    my $tmp_path = "$path.tmp.$$." . int(rand(1_000_000));
+    sysopen(my $fh, $tmp_path, Fcntl::O_WRONLY() | Fcntl::O_CREAT() | Fcntl::O_TRUNC(), 0600)
+        or die "write_derived: sysopen $tmp_path: $!";
+    print {$fh} $json or die "write_derived: write $tmp_path: $!";
+    close $fh or die "write_derived: close $tmp_path: $!";
+
+    rename($tmp_path, $path) or die "write_derived: rename $tmp_path -> $path: $!";
+    return $path;
+}
+
 package main;
+
+# Same allow-list bp-blueprint.pl enforces on --pkg before using it to build a
+# path ($PKG_ID_RE there, bp-blueprint.pl:73) -- reused here rather than
+# re-derived, so the two files' notion of "a valid package id" cannot drift
+# apart. Applied below (fix-batch M1) before --pkg is used to build
+# $jsonl_path: an unsanitized value could otherwise traverse (`../`) outside
+# the intended blueprint's runs/ directory and pull another blueprint's
+# transcript into this one's derived figure.
+my $PKG_ID_RE = qr/^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 
 # ===========================================================================
 # CLI (b47). THIS BLOCK'S ABSENCE WAS THE DEFECT.
@@ -624,6 +974,8 @@ unless (caller) {
         elsif ($a eq '--log')               { $opt{log}        = shift @ARGV }
         elsif ($a =~ /^--gate-cmd=(.*)$/)   { $opt{gate_cmd}   = $1 }
         elsif ($a eq '--gate-cmd')          { $opt{gate_cmd}   = shift @ARGV }
+        elsif ($a =~ /^--pkg=(.*)$/)        { $opt{pkg}        = $1 }
+        elsif ($a eq '--pkg')               { $opt{pkg}        = shift @ARGV }
         # --no-opencode fetches claude ONLY. Like --gate-cmd it exists for the
         # test suite: without it, exercising the claude mapping would reach out
         # to the real OpenCode providers on every case, which is both slow and
@@ -635,9 +987,76 @@ unless (caller) {
         else { print STDERR "bp-spend: unrecognised argument '$a'\n"; exit 2 }
     }
 
+    # ---------------------------------------------------------------------
+    # derive-package / derive-blueprint (blueprint fleet-cost-accounting,
+    # package 01-spend-is-recorded). No external provider, no network, no
+    # credential -- reads runs/<pkg>.jsonl directly. See spec §2.6.
+    # ---------------------------------------------------------------------
+    if ($verb eq 'derive-package' || $verb eq 'derive-blueprint') {
+        my $run_dir = $opt{run_dir};
+        unless (defined $run_dir && length $run_dir) {
+            print STDERR "bp-spend: $verb requires --run-dir DIR\n";
+            exit 2;
+        }
+        if ($verb eq 'derive-package' && !(defined $opt{pkg} && length $opt{pkg})) {
+            print STDERR "bp-spend: derive-package requires --pkg PKG\n";
+            exit 2;
+        }
+        # M1 (fix-batch): reject a --pkg that cannot form a bare filename
+        # component BEFORE it is used to build $jsonl_path below -- an
+        # unvalidated value (e.g. containing `../`) could otherwise read a
+        # transcript outside this blueprint's own runs/ directory, silently
+        # contaminating the derived figure with another blueprint's spend.
+        if ($verb eq 'derive-package' && $opt{pkg} !~ $PKG_ID_RE) {
+            print STDERR "bp-spend: --pkg '$opt{pkg}' is not a valid package id (must match $PKG_ID_RE)\n";
+            exit 2;
+        }
+
+        my $now      = defined $opt{now} && $opt{now} =~ /^\d+$/ ? $opt{now} + 0 : time;
+        my $runs_dir = "$run_dir/runs";
+        my $out_path = "$runs_dir/spend-derived.json";
+
+        my $bp_result;
+        if ($verb eq 'derive-package') {
+            my $jsonl_path = "$runs_dir/$opt{pkg}.jsonl";
+            # A specifically-requested missing package is a CALLER ERROR
+            # (spec §2.6): exit 4, write nothing -- an existing
+            # spend-derived.json from a prior successful call is untouched.
+            unless (-f $jsonl_path) {
+                print STDERR "bp-spend: no such file $jsonl_path\n";
+                exit 4;
+            }
+            $bp_result = BpSpend::Derive::derive_blueprint(
+                runs_dir => $runs_dir, pkgs => [ $opt{pkg} ],
+            );
+        }
+        else {
+            $bp_result = BpSpend::Derive::derive_blueprint(runs_dir => $runs_dir);
+        }
+
+        my $doc = {
+            generated_at => BpLog::_iso_now($now),
+            derived      => 1,
+            tokens       => $bp_result->{tokens},
+            by_model     => $bp_result->{by_model},
+            anomaly      => $bp_result->{anomaly},
+            packages     => $bp_result->{packages},
+        };
+
+        eval { BpSpend::Derive::write_derived(path => $out_path, doc => $doc) };
+        if ($@) {
+            print STDERR "bp-spend: could not write $out_path: $@";
+            exit 4;
+        }
+        print "$out_path\n";
+        exit 0;
+    }
+
     if ($verb ne 'snapshot') {
         print STDERR "usage: bp-spend.pl snapshot [--run-dir DIR] [--global-dir DIR] [--offline]\n"
-                   . "                            [--force] [--now EPOCH] [--log PATH]\n";
+                   . "                            [--force] [--now EPOCH] [--log PATH]\n"
+                   . "       bp-spend.pl derive-package --run-dir DIR --pkg PKG [--now EPOCH]\n"
+                   . "       bp-spend.pl derive-blueprint --run-dir DIR [--now EPOCH]\n";
         exit 2;
     }
 
