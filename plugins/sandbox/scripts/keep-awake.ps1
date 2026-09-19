@@ -101,7 +101,9 @@ param(
     [string]$PidFile,
     [int]$LeaseSeconds = 0,     # 0 = no lease (hold until killed)
     [int]$PollSeconds  = 60,
-    [string]$LogFile
+    [string]$LogFile,
+    [switch]$SimulatePowerRequestFailure,
+    [switch]$SimulatePowerRequestException
 )
 $ErrorActionPreference = 'Stop'
 
@@ -142,6 +144,28 @@ if ($PidFile) {
 Add-Type -Namespace Win32 -Name Power -MemberDefinition @'
 [DllImport("kernel32.dll", SetLastError = true)]
 public static extern uint SetThreadExecutionState(uint esFlags);
+
+[StructLayout(LayoutKind.Sequential)]
+public struct POWER_REQUEST_CONTEXT {
+    public uint Version;
+    public uint Flags;
+    [MarshalAs(UnmanagedType.LPWStr)] public string SimpleReasonString;
+}
+
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern IntPtr PowerCreateRequest(ref POWER_REQUEST_CONTEXT Context);
+
+[DllImport("kernel32.dll", SetLastError = true)]
+[return: MarshalAs(UnmanagedType.Bool)]
+public static extern bool PowerSetRequest(IntPtr PowerRequest, int RequestType);
+
+[DllImport("kernel32.dll", SetLastError = true)]
+[return: MarshalAs(UnmanagedType.Bool)]
+public static extern bool PowerClearRequest(IntPtr PowerRequest, int RequestType);
+
+[DllImport("kernel32.dll", SetLastError = true)]
+[return: MarshalAs(UnmanagedType.Bool)]
+public static extern bool CloseHandle(IntPtr hObject);
 '@
 
 # String->uint32 casts avoid PowerShell parsing 0x80000000 as a (signed) int.
@@ -177,6 +201,82 @@ if ($r -eq 0) {
 # in-process confirmation that the kernel recorded anything at all. Logged as hex
 # because that is how the ES_* flags are documented and compared.
 Write-KaLog 'ASSERTED' ("flags=ES_CONTINUOUS|ES_SYSTEM_REQUIRED prev=0x{0:X8} lease={1}s poll={2}s pidfile={3}" -f $r, $LeaseSeconds, $PollSeconds, $PidFile)
+
+# EXECUTION POWER REQUEST -- see the header at the top of this file for why
+# SetThreadExecutionState alone leaves the EXECUTION row in `powercfg
+# /requests` as None. Acquired here, immediately after the existing
+# SetThreadExecutionState success, and released from the finally block below.
+#
+# Invariant: $script:PowerRequestHandle is truthy IFF a Power Request was
+# both successfully CREATED and successfully SET. Any other outcome (create
+# failed, set failed, exception, simulated failure) leaves it $null, and a
+# handle obtained but not fully set is closed immediately at the point of
+# failure -- never left for the finally block to find.
+$script:PowerRequestHandle = $null
+
+$POWER_REQUEST_CONTEXT_VERSION       = 0        # Version field
+$POWER_REQUEST_CONTEXT_SIMPLE_STRING = 1        # Flags field (uint)
+$PowerRequestExecutionRequired       = 3        # POWER_REQUEST_TYPE enum value; passed as plain int, NOT OR'd with anything (not a bitmask)
+
+if ($SimulatePowerRequestFailure) {
+    # Test-only seam (-SimulatePowerRequestFailure). No real Win32 call is
+    # made -- goes straight to the degrade branch as if the real API failed.
+    Write-KaLog 'POWER-REQUEST-DEGRADED' 'reason=simulated-failure -- continuing on ES_SYSTEM_REQUIRED alone'
+} else {
+    # $handle is initialized here, OUTSIDE the try block, specifically so the
+    # catch block below (same scope -- try/catch is not a scope boundary in
+    # PowerShell) can still see whatever PowerCreateRequest last assigned to
+    # it even when the exception is thrown by a LATER statement (PowerSetRequest).
+    # Without this, a handle successfully created by PowerCreateRequest but
+    # then orphaned by an exception from PowerSetRequest (interop failure,
+    # not the ordinary boolean-false return -- see redteam-01.md MEDIUM
+    # finding) would never be closed: $script:PowerRequestHandle stays $null,
+    # so the `finally` block's own guard skips it too, and the real OS handle
+    # leaks for the life of the process.
+    $handle = [IntPtr]::Zero
+    try {
+        $context = New-Object Win32.Power+POWER_REQUEST_CONTEXT
+        $context.Version = $POWER_REQUEST_CONTEXT_VERSION
+        $context.Flags = $POWER_REQUEST_CONTEXT_SIMPLE_STRING
+        $context.SimpleReasonString = 'ccpraxis keep-awake: execution required'
+
+        $handle = [Win32.Power]::PowerCreateRequest([ref]$context)
+        if ($handle -eq [IntPtr]::Zero -or $handle.ToInt64() -eq -1) {
+            Write-KaLog 'POWER-REQUEST-DEGRADED' 'reason=create-invalid-handle -- continuing on ES_SYSTEM_REQUIRED alone'
+        } else {
+            if ($SimulatePowerRequestException) {
+                # Test-only seam (-SimulatePowerRequestException). Unlike
+                # -SimulatePowerRequestFailure (which skips the real Win32
+                # calls entirely), this seam makes a REAL PowerCreateRequest
+                # call above (so $handle is a real, live OS handle) and then
+                # simulates PowerSetRequest raising a CLR/interop exception
+                # instead of returning $false, without making the real
+                # PowerSetRequest call. This exercises the catch block's
+                # handle-close path against a genuine handle.
+                throw 'simulated PowerSetRequest exception (test seam)'
+            }
+            $ok = [Win32.Power]::PowerSetRequest($handle, $PowerRequestExecutionRequired)
+            if (-not $ok) {
+                [Win32.Power]::CloseHandle($handle) | Out-Null
+                Write-KaLog 'POWER-REQUEST-DEGRADED' 'reason=set-request-failed -- continuing on ES_SYSTEM_REQUIRED alone'
+            } else {
+                $script:PowerRequestHandle = $handle
+                Write-KaLog 'POWER-REQUEST-CREATED' ("handle=0x{0:X} type=PowerRequestExecutionRequired" -f $handle.ToInt64())
+            }
+        }
+    } catch {
+        if ($handle -ne [IntPtr]::Zero -and $handle.ToInt64() -ne -1) {
+            # A real handle was created before the exception hit (thrown by
+            # PowerSetRequest, or by the test seam above) -- close it here so
+            # it is never left dangling; the `finally` block cannot reach it
+            # because $script:PowerRequestHandle was never set.
+            [Win32.Power]::CloseHandle($handle) | Out-Null
+            Write-KaLog 'POWER-REQUEST-DEGRADED' ("reason=exception:{0} handle-closed=true -- continuing on ES_SYSTEM_REQUIRED alone" -f $_.Exception.Message)
+        } else {
+            Write-KaLog 'POWER-REQUEST-DEGRADED' ("reason=exception:{0} -- continuing on ES_SYSTEM_REQUIRED alone" -f $_.Exception.Message)
+        }
+    }
+}
 
 # Guard against a caller passing nonsense that would disable the lease entirely.
 if ($LeaseSeconds -lt 60)   { $LeaseSeconds = 60 }
@@ -276,6 +376,13 @@ finally {
     # is the last moment the lock is asserted, and the log has to say so -- an
     # entry that just stops with no EXIT line means the process was KILLED rather
     # than having released, which is a third story again.
+    if ($script:PowerRequestHandle) {
+        try {
+            [Win32.Power]::PowerClearRequest($script:PowerRequestHandle, $PowerRequestExecutionRequired) | Out-Null
+            [Win32.Power]::CloseHandle($script:PowerRequestHandle) | Out-Null
+            Write-KaLog 'POWER-REQUEST-RELEASED' 'handle cleared and closed'
+        } catch {}
+    }
     Write-KaLog 'EXIT' 'wake-lock released (process exiting)'
     if ($PidFile) { try { Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue } catch {} }
 }
