@@ -512,3 +512,66 @@ The deterministic orchestrator can stop the fleet mid-package without killing yo
 - **Per-package force-stop** (`runs/<pkg>.force-stop`) — this package is being stopped individually. Record a concrete `## Next action`, then stop.
 
 In all three, `## Next action` must be concrete enough for a fresh coordinator (or your warm-resumed self) to pick up — the Stop gate enforces it. **Don't fight the gate**: keep trying denied work and you just burn the budget the pause exists to protect.
+
+## Context-growth checkpoint (self-initiated)
+
+This is the same stop ritual as the usage/telemetry pause above (`## Graceful stop
+(orchestrator-initiated)`, "Usage / telemetry pause" bullet) — finish the step, write `## Next
+action`, leave `status:` non-terminal, stop — triggered on a different condition: your own context
+size, not an external quota. Unlike that pause, nothing external polls or gates you here: there is
+no `PreToolUse` deny, no `runs/.paused` signal file, no cheaper or more accurate observer of "how
+much context does this turn's request actually carry" than you. This is convention-level prose you
+follow on your own initiative.
+
+- **When to check**: at every natural pipeline-step boundary — after a dispatched worker (`Task` or
+  `bp-worker.pl`) returns, and before starting the next pipeline step or dispatching the next
+  worker; a ledger checkbox transition (`## Pipeline` step ticked) counts as a boundary even when no
+  worker was involved. **Also check during extended direct work** — a stretch of your own
+  Read/Grep/Bash tool calls with no worker dispatch in between (e.g. a review or fix-batch pass you
+  execute yourself, a long investigation) — at least every 20 of your own tool calls, or before
+  starting any `Bash`-heavy investigation expected to produce a lot of output, whichever comes
+  first. Never mid-tool-call, never inside a single worker's turn.
+- **How to check**: `runs/<pkg>.jsonl` (the same file `bp-spend.pl` reads for cost accounting) is a
+  transcript that only grows, and a plain `Read` with no offset returns the file's **START**, not
+  its end — on any transcript past ~2000 lines that is stale data and a false all-clear. Do not use
+  a bare `Read` here. Instead, use `Bash`:
+  1. `wc -l "runs/<pkg>.jsonl"` to get the current total line count `N`.
+  2. `tail -c 200000 "runs/<pkg>.jsonl"` (last ~200KB is comfortably enough for the newest few
+     records; increase the byte count only if that slice doesn't contain a complete JSON line) —
+     or equivalently `Read` the file with `offset` set near `N` (e.g. `N - 50`) and `limit` unset,
+     if you prefer the Read tool once you know the tail offset.
+  3. From that tail slice, parse each line as JSON (skip any partial first line — `tail -c` can cut
+     mid-line) and find the LAST record where `type == "assistant"` AND `parent_tool_use_id` is
+     absent/null — that condition, not merely "last assistant record," because subagent turns are
+     interleaved into the same file and are tagged with a non-null `parent_tool_use_id`. From that
+     record's `message.usage`, sum exactly three fields: `input_tokens +
+     cache_creation_input_tokens + cache_read_input_tokens` (do **not** include `output_tokens` —
+     that is what you produced this turn, not what was resent as context).
+  Never read the whole file to find the tail — that is itself expensive context burn, ironic for a
+  context-growth check. `tail -c` on a bounded byte window is cheap and correct; a bare `Read` or a
+  full-file slurp are both wrong here for different reasons (wrong end vs. too much).
+- **Ceiling**: compare that sum to the ceiling. The default is **200,000 tokens** — the measured
+  knee in the modelled cache-read-cost table ($463 at 150K / $522 at 200K / $712 at 300K / $927 at
+  400K, against $1,399.88 actual with zero checkpointing): past 200K, each further 100K buys
+  diminishing additional savings. An operator overriding it sets `BP_CONTEXT_CEILING_TOKENS` for the
+  orchestrator process (mirrored in `bp-orchestrator.pl`'s `_tunables_base()` as `ctx_ceiling`) and
+  communicates the value to running coordinators the same way any other tunable is communicated
+  today — there is no live-push channel, so treat this section's stated default as authoritative
+  unless told otherwise by the ledger or the operator.
+- **At or above the ceiling**: checkpoint now. Finish the step you were mid-way through (do not
+  abandon it half-done), write a concrete `## Next action` describing exactly what to resume, leave
+  `status:` at `running`/`converging` (never `parked`/`done` for this reason alone), refresh
+  `last_updated`, and stop. Do **not** write `runs/.paused` — that file is the orchestrator's own
+  signal for its trigger; this trigger needs no signal file because the orchestrator's existing
+  warm/cold relaunch rule (gap>60m OR no session id = cold) already handles you correctly whichever
+  way you stop.
+- **Below the ceiling**: do nothing different — proceed to the next pipeline step normally. This
+  check must be cheap and silent when it doesn't fire; it must never itself become a source of extra
+  tool calls or state writes.
+- **If a worker turn itself grows context past the ceiling before returning**: the check happens
+  only after that worker returns, same as above — you cannot interrupt an in-flight worker (matching
+  the usage-pause ritual's own "in-flight workers can't be cancelled" stance). You may therefore stop
+  noticeably above the ceiling in this case; that's expected, not a defect.
+- **If this trigger and the usage/telemetry pause condition are both true at the same boundary**: no
+  ordering is prescribed — either one produces the identical stop mechanics, so firing "both"
+  collapses to firing the ritual once. Don't try to satisfy two separate stop procedures.

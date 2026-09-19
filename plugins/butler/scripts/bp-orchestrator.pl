@@ -1149,6 +1149,53 @@ sub creds_backoff_secs {
     return $s > $max ? $max : $s;
 }
 
+# --- b-fca/pkg02: context-growth checkpoint helpers (spec §2.3). Pure, no I/O.
+# Sum the three context-carrying usage fields from one assistant usage hashref.
+# Missing/non-numeric fields count as 0 (mirrors bp-spend.pl's _safe_usage_num
+# tolerance for malformed transcript lines - never dies on bad input).
+sub context_tokens_from_usage {
+    my ($usage) = @_;                      # hashref: message.usage from one jsonl record
+    return 0 unless ref $usage eq 'HASH';
+    my $n = sub { my $v = shift; (defined $v && $v =~ /^\d+$/) ? $v + 0 : 0 };
+    return $n->($usage->{input_tokens})
+         + $n->($usage->{cache_creation_input_tokens})
+         + $n->($usage->{cache_read_input_tokens});
+}
+
+# True if the given usage total is at/over ceiling. $t is an optional tunables
+# hashref (same shape _tunables_base() returns); falls back to
+# _ctx_ceiling_env() (validated BP_CONTEXT_CEILING_TOKENS, else the pinned
+# 200_000 default), same resolution order as creds_backoff_secs() (:1141-1150).
+# NOTE: an explicit $t->{ctx_ceiling} is intentionally NOT validated here --
+# a caller-supplied tunables hashref (including a deliberate 0, per spec §5's
+# documented degenerate case) is trusted as-is; only the raw env string, which
+# an operator can fat-finger, is validated (fix-batch step7 MEDIUM #2).
+sub context_growth_ceiling_breached {
+    my ($usage, $t) = @_;
+    my $ceiling = (ref $t eq 'HASH' ? $t->{ctx_ceiling} : undef)
+                // _ctx_ceiling_env();
+    return context_tokens_from_usage($usage) >= $ceiling ? 1 : 0;
+}
+
+# Given the parsed lines of a runs/<pkg>.jsonl (array of decoded hashrefs, already
+# JSON-decoded by the caller - this sub does no I/O), return the usage hashref of
+# the LAST record that is the coordinator's own assistant turn: type eq
+# 'assistant' AND parent_tool_use_id absent/undef (subagent turns are tagged with
+# a defined parent_tool_use_id, same split bp-spend.pl:713 makes). Returns undef
+# if no such record exists.
+sub last_coordinator_usage {
+    my ($records) = @_;
+    return undef unless ref $records eq 'ARRAY';
+    for my $rec (reverse @$records) {
+        next unless ref $rec eq 'HASH';
+        next unless defined($rec->{type}) && $rec->{type} eq 'assistant';
+        next if defined $rec->{parent_tool_use_id};
+        next unless ref $rec->{message} eq 'HASH' && ref $rec->{message}{usage} eq 'HASH';
+        return $rec->{message}{usage};
+    }
+    return undef;
+}
+
 # --- pause payload (Decision #12 contract: epoch resets_at + jittered relaunch).
 sub choose_jitter {
     my ($lo, $hi, $rand) = @_;          # $rand in [0,1); injected for determinism
@@ -2592,6 +2639,7 @@ sub _tunables_base {
         remediation_cap    => $ENV{BP_REMEDIATION_CAP}    // 6,    # b07: global rounds opened per run (SYN-7)
         min_relaunch => _min_relaunch_secs(),  # r01: floor between two watchdog
                                                 # relaunches of the SAME package
+        ctx_ceiling => _ctx_ceiling_env(),  # b-fca/pkg02: context-growth checkpoint ceiling, validated
     };
 }
 
@@ -2615,6 +2663,26 @@ sub _min_relaunch_secs {
        . "falling back to the default (30s). A malformed value here silently "
        . "disables the watchdog relaunch-storm floor.\n";
     return 30;
+}
+
+# b-fca/pkg02 fix-batch step7 MEDIUM #2: same validation convention as
+# _min_relaunch_secs() above, applied to BP_CONTEXT_CEILING_TOKENS. Unvalidated,
+# a non-numeric or non-positive override silently coerces to 0 in numeric
+# comparison (`"abc" >= $tokens` warns but evaluates as 0 >= $tokens), which
+# breaches on every single check -- constant checkpoint thrashing, the same
+# failure shape _min_relaunch_secs() was written to prevent for its own
+# tunable. Only a strictly-positive integer is honoured; anything else falls
+# back to the documented default (200_000) and warns, naming the rejected
+# value.
+sub _ctx_ceiling_env {
+    return 200_000 unless exists $ENV{BP_CONTEXT_CEILING_TOKENS};  # truly unset -> quiet default, no warning
+    my $raw = $ENV{BP_CONTEXT_CEILING_TOKENS};
+    $raw = '' unless defined $raw;
+    if ($raw =~ /^[0-9]+$/ && $raw > 0) { return $raw + 0; }
+    warn "bp-orchestrator: BP_CONTEXT_CEILING_TOKENS='$raw' is not a positive integer -- "
+       . "falling back to the default (200000 tokens). A malformed value here "
+       . "silently degrades to ceiling=0, causing constant checkpoint thrashing.\n";
+    return 200_000;
 }
 
 # Build { pkg => {deps, write_set} } and { pkg => status } from disk.
