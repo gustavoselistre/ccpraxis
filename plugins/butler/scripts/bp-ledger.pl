@@ -15,8 +15,9 @@
 # file), 3 usage/argument error (nothing read), 4 I/O/lock/atomicity failure
 # (byte-identical), 5 target region not found (byte-identical).
 #
-# stdout is ALWAYS empty, EXCEPT `rotate --dry-run`, which is a report-only op by
-# spec (b45 §3) and prints its report to stdout while touching nothing. stderr on any
+# stdout is ALWAYS empty, EXCEPT `rotate --dry-run` and `claim-check`, both of which
+# are report-only ops (b45 §3; 08-completion-claims-checked-spec.md §2.6) that print
+# their report to stdout while touching nothing. stderr on any
 # non-zero exit is EXACTLY ONE line. `append-attempt` may ALSO print one budget-notice
 # line to stderr on an otherwise-successful (exit 0) run — see DEFAULT_BUDGET_BYTES
 # below; that is not a rejection, just visibility, and the append still happens.
@@ -41,6 +42,71 @@ my $EMDASH = "\xE2\x80\x94";
 # `append-attempt`'s warning always measures against this default (no CLI override
 # there — the warning is visibility, not policy).
 use constant DEFAULT_BUDGET_BYTES => 40000;
+
+# =====================================================================================
+# Oracle identity (08-completion-claims-checked) — constants (spec §2.1, exact names).
+# =====================================================================================
+use constant ORACLE_SECTION_HEADING   => '## Oracle identity';
+use constant ORACLE_LINE_PREFIX       => '- oracle ';   # note the single trailing space
+use constant ORACLE_DESCRIPTION_CAP   => 300;           # descriptions[] omitted above this
+use constant ORACLE_DEFAULT_TIMEOUT_S => 300;
+our @ORACLE_RECORDED_STEPS = (3, 5);
+our @PIPELINE_CONDITIONAL_STEPS = (8);
+
+# The default test-run implementation (spec §2.2). Test-only in-process seam: a caller
+# may override $main::ORACLE_RUN_FN entirely (e.g. to `die`, simulating an unrecoverable
+# derivation failure — AC-12). Never loaded/used outside tick-step --step 3|5.
+#
+# Uses a real fork ('-|' open with no LIST — MSYS2/Git-for-Windows perl supports genuine
+# fork/exec, unlike native Win32 perl) plus a select()-based polling read loop for the
+# timeout, deliberately NOT alarm(): measured on this host, alarm's SIGALRM does not
+# reliably interrupt a blocking read on a forked pipe here, so a select() with an
+# explicit per-iteration timeout (which needs no signal delivery at all) is what
+# actually bounds the wait. On timeout the child is killed outright (best-effort; see
+# spec §5's named residual risk).
+our $ORACLE_RUN_FN = sub {
+    my ($test_path, $timeout_s) = @_;
+    $timeout_s = ORACLE_DEFAULT_TIMEOUT_S unless defined $timeout_s && $timeout_s > 0;
+    my $interp = (defined $ENV{BP_ORACLE_RUN_CMD} && length $ENV{BP_ORACLE_RUN_CMD})
+        ? $ENV{BP_ORACLE_RUN_CMD} : $^X;
+
+    my $pid = open(my $fh, '-|');
+    die "ORACLE_SPAWN_FAIL\n" unless defined $pid;
+    if ($pid == 0) {
+        open(STDERR, '>&STDOUT');
+        exec($interp, $test_path) or exit(126);
+    }
+
+    my $out = '';
+    my $deadline = time() + $timeout_s;
+    my $timed_out = 0;
+    while (1) {
+        my $remaining = $deadline - time();
+        if ($remaining <= 0) { $timed_out = 1; last }
+        my $rin = '';
+        vec($rin, fileno($fh), 1) = 1;
+        my $wait = $remaining > 1 ? 1 : $remaining;
+        my $nfound = select($rin, undef, undef, $wait);
+        if ($nfound && $nfound > 0) {
+            my $buf;
+            my $n = sysread($fh, $buf, 65536);
+            last unless defined $n && $n > 0;   # EOF or read error -> child is done
+            $out .= $buf;
+        }
+    }
+
+    if ($timed_out) {
+        eval { kill('KILL', $pid) };
+        eval { waitpid($pid, 0) };
+        eval { close($fh) };
+        die "ORACLE_TIMEOUT\n";
+    }
+
+    close($fh);
+    waitpid($pid, 0);
+    my $exit_code = defined $? ? ($? >> 8) : undef;
+    return ($out, $exit_code);
+};
 
 # The injected-rename seam (bp-token-keeper.pl's `rename_fn` shape). When
 # BP_LEDGER_FAIL_RENAME is set and non-empty, simulate a mid-write rename failure
@@ -760,6 +826,322 @@ sub splice_set_next_action {
 }
 
 # =====================================================================================
+# Oracle identity — derivation, records, sections, pipeline/claim-check (spec §2.3-2.9).
+# =====================================================================================
+
+# Pure. Strips a trailing TAP directive, truncates at the first "(", squeezes
+# whitespace, trims. Returns '' for a description that normalizes to nothing.
+sub normalize_description {
+    my ($desc) = @_;
+    return '' unless defined $desc;
+    my $d = $desc;
+    $d =~ s/\s+#\s*(?:SKIP|TODO)\b.*\z//i;
+    $d =~ s/\(.*\z//s;
+    $d =~ s/\s+/ /g;
+    $d =~ s/^\s+|\s+\z//g;
+    return $d;
+}
+
+# Pure. $tap is the combined stdout+stderr of a run. Returns ($assertion_count,
+# \@normalized_descriptions_sorted_unique).
+sub parse_tap {
+    my ($tap) = @_;
+    $tap = '' unless defined $tap;
+    my $count = 0;
+    my %descset;
+    for my $line (split(/\n/, $tap, -1)) {
+        next if $line =~ /^\s/;   # indented (subtest) lines are never top-level
+        next unless $line =~ /^(?:not )?ok(?:\s+(\d+))?(?:\s*-?\s*(.*))?$/;
+        $count++;
+        my $norm = normalize_description(defined $2 ? $2 : '');
+        $descset{$norm} = 1 if length $norm;
+    }
+    my @descs = sort keys %descset;
+    return ($count, \@descs);
+}
+
+# Impure but TOTAL: never dies, never warns, never writes to stderr, never exits.
+# Returns a hashref, always (spec §2.3).
+sub derive_oracle_identity {
+    my ($test_path) = @_;
+    my $result;
+    local $SIG{__DIE__} = sub { };
+    local $SIG{__WARN__} = sub { };
+    eval {
+        unless (defined $test_path && length $test_path && -f $test_path && -r $test_path) {
+            $result = { status => 'unavailable', reason => 'not a readable file' };
+            return;
+        }
+        my $sha_ok = eval { require Digest::SHA; 1 };
+        unless ($sha_ok) {
+            $result = { status => 'unavailable', reason => 'Digest::SHA unavailable' };
+            return;
+        }
+        my $bytes;
+        {
+            open(my $fh, '<:raw', $test_path) or die "ORACLE_UNREADABLE\n";
+            local $/;
+            $bytes = <$fh>;
+            close $fh;
+            $bytes = '' unless defined $bytes;
+        }
+        my $sha = Digest::SHA::sha256_hex($bytes);
+
+        my $timeout_s = ORACLE_DEFAULT_TIMEOUT_S;
+        if (defined $ENV{BP_ORACLE_TIMEOUT_S} && $ENV{BP_ORACLE_TIMEOUT_S} =~ /^\d+$/) {
+            $timeout_s = $ENV{BP_ORACLE_TIMEOUT_S};
+        }
+
+        my ($tap, $exit_code) = $ORACLE_RUN_FN->($test_path, $timeout_s);
+
+        unless (defined $exit_code) {
+            $result = { status => 'unavailable', reason => 'run failed' };
+            return;
+        }
+        unless (defined $tap && length $tap) {
+            $result = { status => 'unavailable', reason => 'no TAP output' };
+            return;
+        }
+
+        my ($count, $descs) = parse_tap($tap);
+        unless ($count) {
+            $result = { status => 'unavailable', reason => 'no TAP output' };
+            return;
+        }
+
+        my %rec = (status => 'ok', sha256 => $sha, assertions => $count + 0);
+        $rec{descriptions_sha256} = Digest::SHA::sha256_hex(join("\n", @$descs));
+        $rec{descriptions} = $descs if scalar(@$descs) <= ORACLE_DESCRIPTION_CAP;
+        $result = \%rec;
+    };
+    if (my $err = $@) {
+        if ($err =~ /ORACLE_TIMEOUT/) {
+            $result = { status => 'unavailable', reason => 'timed out' };
+        }
+        else {
+            $result = { status => 'unavailable', reason => 'internal error' };
+        }
+    }
+    return $result // { status => 'unavailable', reason => 'internal error' };
+}
+
+# Replace every ref-address-shaped substring with a fixed elision token (spec §2.4),
+# so a recorded description can never trip validate_no_new_ref_addr.
+sub sanitize_ref_addrs_str {
+    my ($s) = @_;
+    return $s unless defined $s;
+    $s =~ s/$REF_ADDR_RE/<ref-address-elided>/g;
+    return $s;
+}
+
+sub encode_oracle_record {
+    my ($rec) = @_;
+    return ORACLE_LINE_PREFIX . JSON::PP->new->canonical(1)->ascii(1)->encode($rec);
+}
+
+sub oracle_records_equal_ignoring_time {
+    my ($a, $b) = @_;
+    my %a2 = %$a; delete $a2{recorded_at};
+    my %b2 = %$b; delete $b2{recorded_at};
+    return JSON::PP->new->canonical(1)->ascii(1)->encode(\%a2)
+        eq JSON::PP->new->canonical(1)->ascii(1)->encode(\%b2);
+}
+
+# Build the JSON-ready record hash (spec §2.4). $identity is derive_oracle_identity's
+# return; $reaccept, if given, is {reason=>..., delta=>...} already computed.
+sub build_oracle_record {
+    my (%p) = @_;
+    my %rec = (
+        step        => $p{step} + 0,
+        path        => $p{path},
+        recorded_at => $p{recorded_at},
+        status      => $p{identity}{status},
+    );
+    if ($rec{status} eq 'ok') {
+        $rec{sha256}     = $p{identity}{sha256};
+        $rec{assertions} = $p{identity}{assertions} + 0;
+        $rec{descriptions_sha256} = $p{identity}{descriptions_sha256};
+        if (exists $p{identity}{descriptions}) {
+            $rec{descriptions} = [ map { sanitize_ref_addrs_str($_) } @{ $p{identity}{descriptions} } ];
+        }
+    }
+    else {
+        $rec{reason} = sanitize_ref_addrs_str($p{identity}{reason});
+    }
+    if (exists $p{reaccept}) {
+        my %ra = %{ $p{reaccept} };
+        $ra{reason} = sanitize_ref_addrs_str($ra{reason}) if defined $ra{reason};
+        $rec{reaccept} = \%ra;
+    }
+    return \%rec;
+}
+
+# Fence-aware, scoped to the ORACLE_SECTION_HEADING section. Silently skips any line
+# that is not `- oracle <json-object>` or whose JSON fails to decode (spec §2.4).
+sub parse_oracle_records {
+    my ($bytes) = @_;
+    my $loc = locate_section($bytes, qr/^\Q@{[ORACLE_SECTION_HEADING]}\E\b/m);
+    return () unless $loc;
+    my $prefix_re = qr/^\Q@{[ORACLE_LINE_PREFIX]}\E(\{.*\})\s*$/;
+    my @records;
+    my $infence = 0;
+    each_line_with_offset($bytes, $loc->{body_start}, $loc->{body_end}, sub {
+        my ($line, $off, $len, $has_nl) = @_;
+        if (is_fence_line($line)) { $infence = !$infence; return undef }
+        return undef if $infence;
+        if ($line =~ $prefix_re) {
+            my $rec = eval { JSON::PP->new->decode($1) };
+            push @records, $rec if ref $rec eq 'HASH';
+        }
+        return undef;
+    });
+    return @records;
+}
+
+# Fence-aware search for a heading's LINE START offset (not locate_section's body
+# start, which is after the heading line).
+sub locate_heading_start {
+    my ($B, $head_re) = @_;
+    my $infence = 0;
+    my $found;
+    each_line_with_offset($B, 0, length($B), sub {
+        my ($line, $off, $len, $has_nl) = @_;
+        if (is_fence_line($line)) { $infence = !$infence; return undef }
+        return undef if $infence;
+        if ($line =~ /$head_re/) { $found = $off; return 1 }
+        return undef;
+    });
+    return $found;
+}
+
+sub render_oracle_section {
+    my (@lines) = @_;
+    my $body = join('', map { $_ . "\n" } @lines);
+    return "\n" . ORACLE_SECTION_HEADING . "\n\n"
+         . "Machine-written by `bp-ledger.pl tick-step` at steps 3 and 5. One JSON record per line.\n"
+         . "Never hand-edit: `bp-ledger.pl claim-check` reads these to verify the completion claim.\n\n"
+         . $body . "\n";
+}
+
+sub insert_oracle_section {
+    my ($B, @lines) = @_;
+    my $section_text = render_oracle_section(@lines);
+    my $pos = locate_heading_start($B, qr/^##\s+Decisions & attempt log\b/m);
+    if (defined $pos) {
+        return substr($B, 0, $pos) . substr($section_text, 1) . substr($B, $pos);
+    }
+    return $B . $section_text;
+}
+
+sub replace_oracle_section {
+    my ($B, @lines) = @_;
+    my $head_re = qr/^\Q@{[ORACLE_SECTION_HEADING]}\E\b/m;
+    my $heading_start = locate_heading_start($B, $head_re);
+    return insert_oracle_section($B, @lines) unless defined $heading_start;
+    my $loc = locate_section($B, $head_re);
+    return insert_oracle_section($B, @lines) unless $loc;
+    my $section_text = render_oracle_section(@lines);
+    return substr($B, 0, $heading_start) . substr($section_text, 1) . substr($B, $loc->{body_end});
+}
+
+sub insert_or_replace_oracle_section {
+    my ($B, @lines) = @_;
+    my $head_re = qr/^\Q@{[ORACLE_SECTION_HEADING]}\E\b/m;
+    if (defined locate_heading_start($B, $head_re)) {
+        return replace_oracle_section($B, @lines);
+    }
+    return insert_oracle_section($B, @lines);
+}
+
+# Merge @new_records (each already carrying step/path) into whatever the ledger
+# currently has, replacing a (step,path) pair in place, keeping an unchanged record
+# byte-stable (ignoring recorded_at) for idempotency (AC-6/AC-7), and rendering the
+# whole section fresh via the canonical/ascii encoder (deterministic -> stable bytes).
+sub merge_and_render_oracle_section {
+    my ($B, @new_records) = @_;
+    my @existing = parse_oracle_records($B);
+    my %new_by_key = map { (($_->{step} // '') . '|' . ($_->{path} // '')) => $_ } @new_records;
+    my %used;
+    my @final;
+    for my $rec (@existing) {
+        my $key = ($rec->{step} // '') . '|' . ($rec->{path} // '');
+        if (exists $new_by_key{$key} && !$used{$key}) {
+            my $cand = $new_by_key{$key};
+            push @final, oracle_records_equal_ignoring_time($rec, $cand) ? $rec : $cand;
+            $used{$key} = 1;
+        }
+        else {
+            push @final, $rec;
+        }
+    }
+    for my $cand (@new_records) {
+        my $key = ($cand->{step} // '') . '|' . ($cand->{path} // '');
+        next if $used{$key};
+        push @final, $cand;
+        $used{$key} = 1;
+    }
+    my @lines = map { encode_oracle_record($_) } @final;
+    return insert_or_replace_oracle_section($B, @lines);
+}
+
+# Both legal frontmatter forms (colon-delimited scalar AND the YAML-ish list), mirroring
+# the existing $field_segments closure inside validate_bytes (spec §2.9).
+sub ledger_field_segments {
+    my ($B, $field) = @_;
+    return () unless $B =~ /\A---\s*\n(.*?)\n---/s;
+    my @FML = split(/\n/, $1, -1);
+    my ($i, $scalar) = (-1, undef);
+    for my $n (0 .. $#FML) {
+        if ($FML[$n] =~ /^\Q$field\E:\s*(.*?)\s*$/) { $i = $n; $scalar = $1; last }
+    }
+    return () if $i < 0;
+    my @items;
+    for my $n ($i + 1 .. $#FML) {
+        last unless $FML[$n] =~ /^\s+-\s*(.*?)\s*$/;
+        push @items, $1 if length $1;
+    }
+    my @segs;
+    push @segs, split(/:/, $scalar, -1) if defined $scalar && length $scalar;
+    push @segs, @items;
+    return @segs;
+}
+
+# An oracle path is a test_paths segment ending in ".t" (spec §2.9). Scope-prefix
+# segments (e.g. "t/") are skipped entirely.
+sub ledger_test_paths {
+    my ($B) = @_;
+    return grep { length($_) && /\.t\z/ } ledger_field_segments($B, 'test_paths');
+}
+
+# Pipeline satisfaction rules (spec §2.8), scoped to ## Pipeline via locate_section /
+# is_fence_line so a fenced lookalike never counts. Conditionality is decided by step
+# NUMBER, never by prose.
+sub ledger_pipeline_items {
+    my ($B) = @_;
+    my $loc = locate_section($B, qr/^##\s+Pipeline\b/m);
+    return () unless $loc;
+    my $item_re = qr/^\s*-\s*\[([ xX])\]\s*(\d+)\.\s*(.*?)\s*$/;
+    my @items;
+    my $infence = 0;
+    each_line_with_offset($B, $loc->{body_start}, $loc->{body_end}, sub {
+        my ($line, $off, $len, $has_nl) = @_;
+        if (is_fence_line($line)) { $infence = !$infence; return undef }
+        return undef if $infence;
+        if ($line =~ $item_re) {
+            my ($box, $n, $text) = ($1, $2 + 0, $3);
+            my $ticked      = ($box eq 'x' || $box eq 'X') ? 1 : 0;
+            my $conditional = (grep { $_ == $n } @PIPELINE_CONDITIONAL_STEPS) ? 1 : 0;
+            my $na          = ($text =~ /(?<![A-Za-z0-9])N\/A(?![A-Za-z0-9])/i) ? 1 : 0;
+            my $satisfied   = ($ticked || ($conditional && $na)) ? 1 : 0;
+            push @items, { step => $n, ticked => $ticked, conditional => $conditional,
+                           na => $na, satisfied => $satisfied, text => $text };
+        }
+        return undef;
+    });
+    return @items;
+}
+
+# =====================================================================================
 # The shared five-op algorithm (spec §2.3, steps 1..10).
 # =====================================================================================
 
@@ -945,11 +1327,43 @@ sub op_append_attempt {
         $budget_check);
 }
 
+# Recompute a delta between a step-3 and step-5 record (both must exist and be
+# considered), for the `reaccept` object the caller's --reaccept-oracle names (spec
+# §2.4) as well as for claim-check's own report (spec §2.6/§2.7). Booleans use
+# JSON::PP::true/false so they encode as JSON booleans, not 0/1.
+sub oracle_delta {
+    my ($step3, $step5) = @_;
+    my $before = ($step3 && $step3->{status} eq 'ok') ? $step3->{assertions} + 0 : undef;
+    my $after  = ($step5 && $step5->{status} eq 'ok') ? $step5->{assertions} + 0 : undef;
+    my $comparable = ($step3 && $step5 && exists $step3->{descriptions} && exists $step5->{descriptions}) ? 1 : 0;
+    my (@added, @removed);
+    if ($comparable) {
+        # Comparison is always by NORMALIZED description (spec §2.3/AC-25/AC-26):
+        # a stored record's descriptions may themselves be un-normalized (e.g. a
+        # hand-authored fixture record), so normalize here defensively -- idempotent
+        # against an already-normalized live derivation.
+        my %s3 = map { (normalize_description($_) => 1) } @{ $step3->{descriptions} || [] };
+        my %s5 = map { (normalize_description($_) => 1) } @{ $step5->{descriptions} || [] };
+        delete $s3{''}; delete $s5{''};
+        @added   = sort grep { !$s3{$_} } keys %s5;
+        @removed = sort grep { !$s5{$_} } keys %s3;
+    }
+    return {
+        assertions_before      => $before,
+        assertions_after       => $after,
+        descriptions_added     => \@added,
+        descriptions_removed   => \@removed,
+        descriptions_comparable=> $comparable ? JSON::PP::true : JSON::PP::false,
+    };
+}
+
 sub op_tick_step {
     my @args = @_;
     my %opt;
     my $ok;
-    { local $SIG{__WARN__} = sub { }; $ok = GetOptionsFromArray(\@args, \%opt, 'ledger=s', 'step=s'); }
+    { local $SIG{__WARN__} = sub { };
+      $ok = GetOptionsFromArray(\@args, \%opt, 'ledger=s', 'step=s',
+                                 'reaccept-oracle=s@', 'reaccept-reason=s'); }
     arg_error('tick-step', 'unrecognised option') unless $ok;
     arg_error('tick-step', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
     arg_error('tick-step', 'missing required --ledger') unless defined $opt{ledger};
@@ -957,7 +1371,67 @@ sub op_tick_step {
     unless ($opt{step} =~ /^[1-9][0-9]*$/) {
         arg_error('tick-step', "'--step $opt{step}' is not a positive integer without a leading zero");
     }
-    run_op('tick-step', $opt{ledger}, sub { return splice_tick_step($_[0], $opt{step}) });
+    my @reaccept_paths = @{ $opt{'reaccept-oracle'} || [] };
+    if (@reaccept_paths && $opt{step} != 5) {
+        arg_error('tick-step', '--reaccept-oracle is only valid with --step 5');
+    }
+    if (@reaccept_paths && !defined $opt{'reaccept-reason'}) {
+        arg_error('tick-step', '--reaccept-oracle requires --reaccept-reason');
+    }
+    if (!@reaccept_paths && defined $opt{'reaccept-reason'}) {
+        arg_error('tick-step', '--reaccept-reason requires at least one --reaccept-oracle');
+    }
+
+    run_op('tick-step', $opt{ledger}, sub {
+        my ($B) = @_;
+        my ($ticked, $notfound) = splice_tick_step($B, $opt{step});
+        return (undef, $notfound) unless defined $ticked;
+
+        # Fail-silent mandate (spec §5): recording may never subtract availability.
+        # Any exception/undef/validation failure anywhere below -> plain tick only.
+        my $step_n = $opt{step} + 0;
+        return ($ticked, undef)
+            if defined $ENV{BP_ORACLE_RECORD} && $ENV{BP_ORACLE_RECORD} eq '0';
+        return ($ticked, undef) unless grep { $_ == $step_n } @ORACLE_RECORDED_STEPS;
+
+        my $final = eval {
+            local $SIG{__DIE__} = sub { };
+            local $SIG{__WARN__} = sub { };
+            my @paths = ledger_test_paths($B);
+            return $ticked unless @paths;
+
+            my $now = iso_now();
+            my %reaccept_wanted = map { ($_ => 1) } @reaccept_paths;
+            my @existing = parse_oracle_records($B);
+            my %step3_by_path;
+            for my $r (@existing) {
+                next unless defined $r->{step} && $r->{step} == 3;
+                $step3_by_path{ $r->{path} } = $r if defined $r->{path};
+            }
+
+            my @new_records;
+            for my $path (@paths) {
+                my $identity = derive_oracle_identity($path);
+                my %args = (step => $step_n, path => $path, recorded_at => $now, identity => $identity);
+                if ($step_n == 5 && $reaccept_wanted{$path}) {
+                    my $step3 = $step3_by_path{$path};
+                    my $delta = oracle_delta($step3, $identity);
+                    $args{reaccept} = { reason => $opt{'reaccept-reason'}, delta => $delta };
+                }
+                push @new_records, build_oracle_record(%args);
+            }
+
+            my $merged = merge_and_render_oracle_section($ticked, @new_records);
+
+            # Self-validate BEFORE returning: never let run_op's own re-validation
+            # be the thing that discovers a problem (that path exits 2, forbidden here).
+            return $ticked if defined validate_bytes($merged);
+            return $ticked if defined validate_no_new_ref_addr($B, $merged);
+            return $merged;
+        };
+        $final = $ticked if $@ || !defined $final;
+        return ($final, undef);
+    });
 }
 
 sub op_set_next_action {
@@ -1009,6 +1483,170 @@ sub op_add_output {
     $text =~ s/[\r\n]+/ /g;
     my $entry = "- ${text}";
     run_op('add-output', $opt{ledger}, sub { return splice_insert_entry($_[0], qr/^##\s+Outputs\b/m, $entry) });
+}
+
+# =====================================================================================
+# `claim-check` (08-completion-claims-checked spec §2.6/§2.7) — READ-ONLY report. Never
+# mutates, never refuses on pipeline/oracle state; always exits 0 when it can produce a
+# report. Exit 3 usage, exit 4 I/O.
+# =====================================================================================
+
+sub extract_frontmatter_value {
+    my ($B, $key) = @_;
+    return undef unless $B =~ /\A---\s*\n(.*?)\n---/s;
+    for my $l (split(/\n/, $1, -1)) {
+        if ($l =~ /^\Q$key\E:\s*(.*?)\s*$/) { return $1 }
+    }
+    return undef;
+}
+
+sub op_claim_check {
+    my @args = @_;
+    my %opt;
+    my $ok;
+    { local $SIG{__WARN__} = sub { }; $ok = GetOptionsFromArray(\@args, \%opt, 'ledger=s'); }
+    arg_error('claim-check', 'unrecognised option') unless $ok;
+    arg_error('claim-check', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
+    arg_error('claim-check', 'missing required --ledger') unless defined $opt{ledger};
+
+    my $B;
+    {
+        open(my $fh, '<:raw', $opt{ledger}) or io_error('claim-check', $opt{ledger}, "cannot read: $!");
+        local $/;
+        $B = <$fh>;
+        close $fh;
+        $B = '' unless defined $B;
+    }
+
+    my $status  = extract_frontmatter_value($B, 'status');
+    my $package = extract_frontmatter_value($B, 'package');
+    my $gated   = (defined $status && $status eq 'done') ? 1 : 0;
+
+    my @items = ledger_pipeline_items($B);
+    my @unsatisfied = map { $_->{step} } grep { !$_->{satisfied} } @items;
+
+    my @test_paths = ledger_test_paths($B);
+    my @records    = parse_oracle_records($B);
+    my %latest;   # "$step|$path" => rec (last one wins if somehow duplicated)
+    $latest{ ($_->{step} // '') . '|' . ($_->{path} // '') } = $_ for @records;
+
+    my %all_paths = map { ($_ => 1) } @test_paths;
+    $all_paths{ $_->{path} } = 1 for grep { defined $_->{path} } @records;
+
+    my @oracle_paths;
+    my @findings;
+
+    for my $path (sort keys %all_paths) {
+        my $r3 = $latest{"3|$path"};
+        my $r5 = $latest{"5|$path"};
+        my $step3_ticked = grep { $_->{step} == 3 && $_->{satisfied} } @items;
+        my $step5_ticked = grep { $_->{step} == 5 && $_->{satisfied} } @items;
+
+        my $verdict = 'unknown';
+        my $delta;
+
+        if ($gated) {
+            if ($step3_ticked && !$r3) {
+                push @findings, { code => 'ORACLE_NOT_RECORDED',
+                                   path => $path, step => undef,
+                                   detail => "step 3 is ticked but no oracle record exists for $path" };
+            }
+            if ($r3 && $r3->{status} eq 'unavailable') {
+                push @findings, { code => 'ORACLE_UNDERIVABLE', path => $path, step => 3,
+                                   detail => "step-3 record for $path is unavailable: " . ($r3->{reason} // '') };
+            }
+            if ($r5 && $r5->{status} eq 'unavailable') {
+                push @findings, { code => 'ORACLE_UNDERIVABLE', path => $path, step => 5,
+                                   detail => "step-5 record for $path is unavailable: " . ($r5->{reason} // '') };
+            }
+            if ($step5_ticked && $r3 && !$r5) {
+                push @findings, { code => 'ORACLE_NOT_REVALIDATED', path => $path, step => undef,
+                                   detail => "step 5 is ticked and $path has a step-3 record but no step-5 record" };
+            }
+
+            if ($r3 && $r5 && $r3->{status} eq 'ok' && $r5->{status} eq 'ok') {
+                $delta = oracle_delta($r3, $r5);
+                my $comparable = (exists $r3->{descriptions} && exists $r5->{descriptions}) ? 1 : 0;
+
+                # "differ" (sha256, assertion count, or description SET) is judged on
+                # NORMALIZED descriptions (AC-25/AC-26: a parenthetical-only or
+                # whitespace/TODO-only difference is not a real change), never on the
+                # raw descriptions_sha256, which is a surface hash over unnormalized text.
+                my $desc_changed = $comparable
+                    ? (scalar(@{ $delta->{descriptions_added} }) > 0 || scalar(@{ $delta->{descriptions_removed} }) > 0)
+                    : (($r3->{descriptions_sha256} // '') ne ($r5->{descriptions_sha256} // ''));
+                my $sha_changed        = (($r3->{sha256} // '') ne ($r5->{sha256} // ''));
+                my $assertions_changed = ($r3->{assertions} != $r5->{assertions});
+                my $identical = !$desc_changed && !$sha_changed && !$assertions_changed;
+
+                my $shrank = ($r5->{assertions} < $r3->{assertions})
+                          || ($comparable && scalar(@{ $delta->{descriptions_removed} }) > 0);
+
+                if ($shrank) {
+                    $verdict = 'shrunk';
+                    push @findings, { code => 'ORACLE_SHRANK', path => $path, step => undef, delta => $delta,
+                        detail => sprintf('%s: assertions %d -> %d (or a description vanished)',
+                                           $path, $r3->{assertions}, $r5->{assertions}) };
+                }
+                elsif (!$identical) {
+                    $verdict = 'drifted';
+                    if (!exists $r5->{reaccept}) {
+                        my @added = @{ $delta->{descriptions_added} };
+                        push @findings, { code => 'ORACLE_DRIFT_UNACCEPTED', path => $path, step => undef, delta => $delta,
+                            detail => "$path: oracle changed without a reaccept (added: "
+                                    . join(', ', @added) . ')' };
+                    }
+                    else {
+                        $verdict = 'reaccepted';
+                    }
+                }
+                else {
+                    $verdict = 'ok';
+                }
+            }
+            elsif ($r3 && !$r5) { $verdict = 'not-revalidated' }
+            elsif (!$r3)        { $verdict = 'not-recorded' }
+        }
+
+        push @oracle_paths, {
+            path    => $path,
+            verdict => $verdict,
+            step3   => $r3 ? $r3->{status} : undef,
+            step5   => $r5 ? $r5->{status} : undef,
+            (defined $delta ? (delta => $delta) : ()),
+            reaccept => ($r5 && exists $r5->{reaccept}) ? $r5->{reaccept} : undef,
+        };
+    }
+
+    if ($gated) {
+        for my $it (sort { $a->{step} <=> $b->{step} } grep { !$_->{satisfied} } @items) {
+            push @findings, { code => 'PIPELINE_STEP_UNTICKED', path => undef, step => $it->{step},
+                               detail => $it->{text} };
+        }
+    }
+    @findings = () unless $gated;
+
+    my $report = {
+        ledger   => $opt{ledger},
+        package  => $package,
+        status   => $status,
+        gated    => $gated ? JSON::PP::true : JSON::PP::false,
+        pipeline => {
+            items => [ map {
+                { step => $_->{step} + 0, ticked => ($_->{ticked} ? JSON::PP::true : JSON::PP::false),
+                  conditional => ($_->{conditional} ? JSON::PP::true : JSON::PP::false),
+                  na => ($_->{na} ? JSON::PP::true : JSON::PP::false),
+                  satisfied => ($_->{satisfied} ? JSON::PP::true : JSON::PP::false),
+                  text => $_->{text} }
+            } @items ],
+            unsatisfied => [ sort { $a <=> $b } @unsatisfied ],
+        },
+        oracle   => { paths => \@oracle_paths },
+        findings => \@findings,
+    };
+
+    print JSON::PP->new->canonical(1)->ascii(1)->encode($report) . "\n";
+    exit 0;
 }
 
 # =====================================================================================
@@ -1671,6 +2309,7 @@ my %DISPATCH = (
     'add-output'       => \&op_add_output,
     'rotate'           => \&op_rotate,
     'validate'         => \&op_validate,
+    'claim-check'      => \&op_claim_check,
 );
 
 # Guarded so ledger-guard.sh's embedded validator (b19) can `require` this file for
