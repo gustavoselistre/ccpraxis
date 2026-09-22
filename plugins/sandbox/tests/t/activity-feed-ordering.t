@@ -478,4 +478,77 @@ pass('AC5: construction site is tui::DashboardScreen::collapse_records '
     }
 }
 
+# ===========================================================================
+# almanac 20260919-000106-2bdd -- launcher.pl's _row_time_key(), the key
+# extractor s16's merge_by_key(key => \&_row_time_key) call actually uses,
+# required "HH:MM:SS" but Dashboard.pm's current wall-clock renderer
+# (activity_time_text(_local_hhmm(...))) only ever emits "HH:MM". Every row
+# therefore keyed to undef, and the cross-source interleave silently
+# degraded to source-order fallback for every pair, always -- confirmed by
+# direct reading of both call sites, not merely asserted here.
+#
+# launcher.pl is NEVER require'd/do'ne by this suite (real side effects: raw
+# terminal, live subprocess, blocking keypress). Per the house technique
+# (precedent: container-health-detect.t, wt-profile-spawn.t), the function is
+# slurped as source text from its sentinel-delimited region and eval'd into a
+# fresh package, so the tested code and the production code are the same sub.
+# ===========================================================================
+{
+    my $LAUNCHER = "$Bin/../../scripts/launcher.pl";
+    my $src = do {
+        open my $fh, '<:raw', $LAUNCHER or die "cannot read $LAUNCHER: $!";
+        local $/;
+        <$fh>;
+    };
+
+    my $BEGIN = '# >>> s-rowtimekey:BEGIN';
+    my $END   = '# <<< s-rowtimekey:END';
+    my ($region) = $src =~ /\Q$BEGIN\E\n(.*?)\Q$END\E/s;
+
+    my $KEY;
+    if (!defined $region) {
+        ok(0, 'extraction: the s-rowtimekey region evals cleanly into a fresh package (region not found in launcher.pl)');
+        ok(0, "extraction: the resulting package ->can('_row_time_key') (region not found)");
+    } else {
+        my $harness = "package RowTimeKey;\nuse strict;\nuse warnings;\n" . $region . "\n1;\n";
+        my $eval_ok = eval $harness;   ## no critic
+        ok($eval_ok, 'extraction: the s-rowtimekey region evals cleanly into a fresh package under use strict/warnings')
+            or diag("eval error: $@");
+        if ($eval_ok) {
+            $KEY = RowTimeKey->can('_row_time_key');
+            ok(defined $KEY, "extraction: the resulting package ->can('_row_time_key')");
+        } else {
+            ok(0, "extraction: the resulting package ->can('_row_time_key') (region failed to eval)");
+        }
+    }
+
+    SKIP: {
+        skip '_row_time_key not extractable -- see extraction failure above', 6 unless $KEY;
+
+        # THE REPORTED BUG, pinned as a regression: the actual rendered shape
+        # ("HH:MM " -- activity_time_text pads with a trailing space) must
+        # produce a DEFINED key, not undef. Before the fix this returned
+        # undef for every row shaped like this, because the regex demanded a
+        # ":SS" that this renderer has never emitted.
+        is($KEY->([ { text => '17:43 ' } ]), 17 * 3600 + 43 * 60,
+            'AC: "HH:MM " (the real renderer shape, no seconds) now yields a defined, correct key');
+        is($KEY->([ { text => '00:00 ' } ]), 0,
+            'AC: "00:00 " yields key 0');
+        is($KEY->([ { text => '23:59 ' } ]), 23 * 3600 + 59 * 60,
+            'AC: "23:59 " yields the expected end-of-day key');
+
+        # Back-compat: an "HH:MM:SS"-shaped input (should this renderer ever
+        # regain seconds) still parses, seconds included.
+        is($KEY->([ { text => '09:05:07 muted event text' } ]), 9 * 3600 + 5 * 60 + 7,
+            'AC (back-compat): "HH:MM:SS" text still yields a seconds-precise key');
+
+        # Genuinely unparseable/malformed input still degrades to undef, not
+        # a crash or a fabricated key -- merge_by_key's documented contract.
+        is($KEY->([ { text => 'not a time' } ]), undef,
+            'AC: unparseable text still yields undef (merge_by_key source-order fallback)');
+        is($KEY->([]), undef,
+            'AC: a malformed row (no elements) still yields undef, no crash');
+    }
+}
+
 done_testing();

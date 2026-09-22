@@ -8761,16 +8761,23 @@ sub _gather_spend {
 }
 
 # _row_time_key($row) -> seconds-since-local-midnight | undef (private helper
-# for the s16 cross-source interleave). recent_events rows don't carry a raw
-# epoch, only the already-rendered "HH:MM:SS  " muted span (Dashboard.pm's
-# _event_time), so that is the best-effort comparable key LaunchLog::merge_by_key
-# needs. Unparseable -> undef, which merge_by_key treats as "keep this source's
-# own append order" rather than as an error.
-# _row_time_key($row) -> seconds-since-midnight, or undef.
+# for the s16 cross-source interleave). The caller-supplied key extractor for
+# LaunchLog::merge_by_key (s16 spec S1.1). Best-effort by construction:
+# rendered rows carry no raw epoch, only the muted timestamp span, so this
+# recovers what is there. Unparseable -> undef, which merge_by_key treats as
+# "keep this source's own append order" rather than as an error.
 #
-# The caller-supplied key extractor for LaunchLog::merge_by_key (s16 spec S1.1).
-# Best-effort by construction: rendered rows carry no raw epoch, only the muted
-# HH:MM:SS span, so this recovers what is there.
+# almanac 20260919-000106-2bdd: Limitation 2 below warned that a rendering
+# change would silently degrade this to always-undef with nothing failing
+# loudly -- and that is exactly what had already happened. The regex required
+# "HH:MM:SS" (seconds included), but the wall-clock renderer this key reads
+# from (Dashboard.pm's activity_time_text(_local_hhmm(...))) emits only
+# "HH:MM" -- it never had a seconds field to begin with. Every row this
+# function was asked to key returned undef, so the cross-source interleave
+# below silently fell back to source-order for every pair, always. Fixed by
+# making the seconds group optional and defaulting it to 0; a merge key that
+# is only ever minute-precision is still strictly better than a merge key
+# that never existed.
 #
 # TWO KNOWN LIMITATIONS, recorded rather than left for the next reader to
 # rediscover. Both are bounded by the spec's ordering ruling (S1): within a
@@ -8790,17 +8797,20 @@ sub _gather_spend {
 #      deliberate escalation, not a silent widening.
 #
 #   2. COUPLING TO RENDERED TEXT. This parses display output to recover a sort
-#      key. s17 is next on this same panel; if it changes the leading timestamp
-#      span, this returns undef, the merge degrades to source-order fallback,
-#      and NOTHING FAILS LOUDLY. Whoever touches that rendering must re-check
-#      here.
+#      key. If the leading timestamp span's shape changes again, this returns
+#      undef, the merge degrades to source-order fallback, and NOTHING FAILS
+#      LOUDLY -- exactly the failure mode that produced this bug. Whoever
+#      touches that rendering must re-check here, and ideally add an assertion
+#      that pins the format this function expects.
+# >>> s-rowtimekey:BEGIN
 sub _row_time_key {
     my ($row) = @_;
     return undef unless ref $row eq 'ARRAY' && @$row && ref $row->[0] eq 'HASH';
     my $t = $row->[0]{text};
-    return undef unless defined $t && $t =~ /^(\d\d):(\d\d):(\d\d)/;
-    return $1 * 3600 + $2 * 60 + $3;
+    return undef unless defined $t && $t =~ /^(\d\d):(\d\d)(?::(\d\d))?/;
+    return $1 * 3600 + $2 * 60 + (defined $3 ? $3 : 0);
 }
+# <<< s-rowtimekey:END
 
 # >>> wt-profile:BEGIN
 # wt_profile_plan(%seams) -> { profile => $name_or_undef, event => $event_or_undef }
