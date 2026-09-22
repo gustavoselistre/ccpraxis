@@ -227,6 +227,82 @@ bp_wakeup_arm_check() {
   fi
 }
 
+# bp_watch_arm_subject -- reads a raw (already-extracted) Bash command on
+# stdin, prints the §2.2 subject vocabulary ("package:BP/PKG",
+# "blueprint:BP", or "-") it arms. Mirrors BpWatch::watcher_subject
+# (scripts/bp-watch.pl) but works off SHELL TEXT (a bare word, or a single-
+# or double-quoted value) rather than a parsed /proc argv -- this hook never
+# sees the armed process's real argv, only the command line that will spawn
+# it. \x27/\x22 stand in for the literal quote characters so this can stay a
+# single-quoted `perl -e '...'` without an escaping fight. A record with
+# subject "-" is still written (for traceability) but never matches
+# anything (package 01-live-watcher-probe spec §2.5).
+bp_watch_arm_subject() {
+  perl -e '
+      my $cmd = do { local $/; <STDIN> };
+      $cmd = "" unless defined $cmd;
+      my ($p1, $p2, $p3) =
+        $cmd =~ /--package\s+(?:\x27([^\x27]*)\x27|\x22([^\x22]*)\x22|(\S+))/;
+      my $pkg = defined $p1 ? $p1 : defined $p2 ? $p2 : $p3;
+      my ($b1, $b2, $b3) =
+        $cmd =~ /--blueprint\s+(?:\x27([^\x27]*)\x27|\x22([^\x22]*)\x22|(\S+))/;
+      my $bp = defined $b1 ? $b1 : defined $b2 ? $b2 : $b3;
+      my $subj = "-";
+      if    (defined $pkg && defined $bp)       { $subj = "-" }
+      elsif (defined $pkg && length $pkg)       { $subj = "package:$pkg" }
+      elsif (defined $bp  && length $bp)        { $subj = "blueprint:$bp" }
+      print $subj;
+    ' 2>/dev/null
+}
+
+# bp_watch_arm_segment -- MAJOR-3 (redteam-step6.md). bp_watch_arm_subject
+# used to regex the RAW, unstripped command, first-match-wins across the
+# WHOLE string -- so a comment/echo/heredoc mentioning --package before the
+# real invocation, or two chained arms in one Bash call, recorded the wrong
+# (or only the first) subject. This reads a raw command on stdin and prints
+# ONLY the segment that actually contains the executing "bp-watch.pl ...
+# --arm" invocation, using the exact same strip -> unquote -> segment-split
+# -> reader-veto pipeline bp_wakeup_arm_check itself uses to decide ARMED=1
+# (duplicated rather than factored out of bp_wakeup_arm_check: that function
+# is the single most heavily-load-bearing/commented piece of this file, and
+# re-deriving the identical text here is lower risk than restructuring it to
+# expose an internal). Empty stdin, or no matching non-reader segment ->
+# prints nothing, and the caller falls back to "-" (a "-" subject record is
+# written for traceability but never matches anything -- safe).
+bp_watch_arm_segment() {
+  cmd=$(cat)
+  text="$cmd"
+  : "${BP_WAKEUP_MAX_STRIP_BYTES:=8000}"
+  if [ -n "$cmd" ] && [ "${#cmd}" -le "$BP_WAKEUP_MAX_STRIP_BYTES" ] \
+     && command -v perl >/dev/null 2>&1; then
+    unquoted=$(printf '%s' "$cmd" | bp_unquote_script_paths)
+    [ -n "$unquoted" ] && cmd="$unquoted" && text="$cmd"
+  fi
+  if [ -n "$cmd" ] && [ "${#cmd}" -le "$BP_WAKEUP_MAX_STRIP_BYTES" ] \
+     && command -v bp_strip_shell_noise >/dev/null 2>&1; then
+    stripped=$(printf '%s' "$cmd" | bp_strip_shell_noise)
+    [ -n "$stripped" ] && text="$stripped"
+  fi
+  [ -n "$text" ] || return 0
+  if command -v perl >/dev/null 2>&1; then
+    printf '%s' "$text" | perl -0777 -e '
+        my $filtered = do { local $/; <STDIN> };
+        my @segs = split /(?:[;&|\n]|\$\(|`|<\(|>\()/, $filtered;
+        SEG: for my $seg (@segs) {
+          next SEG unless $seg =~ /bp-watch\.pl[^"]*--arm/;
+          my $pre = substr($seg, 0, $-[0]);
+          $pre =~ s/^[ \t]+//;
+          my ($first) = $pre =~ /^(\S+)/;
+          $first = defined($first) ? $first : "";
+          $first =~ s{.*/}{};
+          next SEG if $first =~ /^(?:echo|printf|grep|rg|cat|sed|awk)$/;
+          print $seg;
+          last SEG;
+        }
+      ' 2>/dev/null
+  fi
+}
+
 # Coordinator sessions are gate-stop.sh's business, not ours. BP_LEDGER is
 # exported only into coordinator processes, so its ABSENCE is what identifies
 # an interactive driver.
@@ -338,6 +414,247 @@ if [ "$TOOL" = "Bash" ] && [ -n "$DATA" ]; then
   fi
 fi
 # --- end reporter registration block ----------------------------------------
+
+# ---------------------------------------------------------------------------
+# WATCHER ARMING RECORD + REAP (Decision 10, package 01-live-watcher-probe
+# blueprint butler-gate-ergonomics spec §2.5). This is DIFFERENT from the
+# ARMING block below: that one registers a session as a drive-solo DRIVER
+# (consumed by gate-drive-loop.sh's Stop gate). This one tracks bp-watch.pl
+# --arm invocations THIS session made, so a live bounded watcher this
+# session armed is TERM-then-KILLed the moment the session wakes again --
+# a stray watcher must never read as "work is in flight" once nothing is.
+#
+# Registry: <DATA>/.watchers/<SID>, one "<epoch> <subject>" record per line,
+# append-only. Reap runs on EVERY invocation that reaches here (any tool),
+# BEFORE this invocation's own arming record (if any) is written; the
+# arming record write itself is restricted to TOOL=Bash, mirroring the
+# blocks above.
+#
+# Own, STRICTER session-id sanitisation than the two patterns already in
+# this file (reporter's `*\**`, driver's `*\*`) -- spec §6 explicitly
+# declines touching either of those; this is a third, independent pattern
+# for a third, independent registry.
+if [ -n "$DATA" ]; then
+  WSID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
+  case "$WSID" in
+    '') WSID="" ;;
+    .|..) WSID="" ;;
+    *[!A-Za-z0-9._-]*) WSID="" ;;
+  esac
+
+  if [ -n "$WSID" ]; then
+    REGFILE="$DATA/.watchers/$WSID"
+
+    # _bp_watch_reap -- every step 2>/dev/null || true, and this function
+    # always returns 0, so a missing probe script, a failing kill, or an
+    # unwritable registry dir can never flip this hook's own exit status.
+    _bp_watch_reap() {
+      # Fast path (behaviour 25a): no registry, or an empty one -> one
+      # stat, then return. This is the cost this reap adds for the (near-
+      # universal) session that never armed a watcher.
+      [ -s "$REGFILE" ] || return 0
+
+      PROBE_OUT=$(perl "$HOOK_DIR/../scripts/bp-watch.pl" probe --data "$DATA" 2>/dev/null)
+      PROBE_RC=$?
+
+      # Decision 3, applied to the reaper (behaviour AC19/26): an
+      # unreadable answer reaps nothing AND leaves the registry intact --
+      # return before the one-shot-consumption rm below ever runs.
+      [ "$PROBE_RC" = "2" ] && return 0
+
+      if [ "$PROBE_RC" = "0" ]; then
+        # Subject-match + ambiguity resolution lives in perl, not bash text
+        # processing -- the matching rules (exact subject equality, a >=5s
+        # skew allowance, "claimed by more than one session's registry"
+        # ambiguity) are exactly the kind of thing bash string comparisons
+        # get subtly wrong. One pass produces TWO streams, prefixed so bash
+        # can split them: "K <pid>" (already filtered to "safe to kill" --
+        # the actual TERM/poll/KILL sequence stays in bash, one pid
+        # namespace end to end -- no tasklist, no Get-Process, no WINPIDs,
+        # project CLAUDE.md) and "R <epoch> <subject>" (the ORIGINAL registry
+        # lines that must be KEPT -- see BLOCKER-1 below).
+        #
+        # BLOCKER-1 (redteam-step6.md): the old code unconditionally
+        # `rm -f`'d the WHOLE registry on rc=0, even for a subject the
+        # ambiguity filter had just withheld from being killed. That is only
+        # a one-invocation protection: the FIRST session to wake after two
+        # sessions claim the same subject loses its record (adjudicated:
+        # nothing killed, but consumed anyway), and the SECOND session to
+        # wake then sees claims==1 for that subject and reaps a watcher it
+        # never armed -- inverting "neither reaps" into "whoever wakes
+        # second reaps". Fix: a subject that is ambiguous (claimed by >1
+        # session's registry) AND has a live watcher reported by the probe is
+        # WITHHELD -- its registry line(s) are kept, not deleted -- so the
+        # protection survives across invocations until the ambiguity itself
+        # resolves (the other session's record is consumed/ages out).
+        # Everything else (no live watcher for that subject at all, or a
+        # subject already unambiguous) is genuinely adjudicated and dropped,
+        # exactly as before.
+        #
+        # MAJOR-1 (redteam-step6.md): a registry record from a session that
+        # never wakes again (closed, crashed, superseded) used to leave
+        # %claims >= 2 for its subject FOREVER, permanently blocking reaping
+        # for that subject project-wide. A record older than the largest
+        # plausible --max-seconds bound cannot be authorising anything live,
+        # so both the ambiguity count (%claims) and this session's own match
+        # set (%reg) age out records older than STALE_SECS. 86400 (24h) is
+        # chosen as a fixed, generously-large ceiling well above any
+        # realistic --max-seconds (bp-watch.pl's own default is 2900s, its
+        # documented cap 3000s) -- simpler to justify than importing
+        # bp-watch.pl's own default (which MAJOR-4 elsewhere frees this
+        # package from depending on bp-runstate.pl for).
+        PERL_OUT=$(
+          printf '%s' "$PROBE_OUT" | perl -e '
+              use strict;
+              use warnings;
+              my ($regfile, $watchdir) = @ARGV;
+              my $probe_out = do { local $/; <STDIN> };
+              $probe_out = "" unless defined $probe_out;
+
+              my $now = time();
+              my $STALE_SECS = 86400;   # MAJOR-1: see shell comment above.
+
+              my @records;   # [$epoch, $subj] in file order -- THIS session.
+              my %reg;       # subj => [epoch, ...]  (non-stale only)
+              if (open my $fh, "<", $regfile) {
+                  while (my $line = <$fh>) {
+                      chomp $line;
+                      my ($epoch, $subj) = split " ", $line, 2;
+                      next unless defined $epoch && $epoch =~ /^\d+$/;
+                      next unless defined $subj && length $subj;
+                      push @records, [$epoch + 0, $subj];
+                      next if $epoch + 0 < $now - $STALE_SECS;
+                      push @{ $reg{$subj} }, $epoch + 0;
+                  }
+                  close $fh;
+              }
+
+              # Ambiguity: how many DIFFERENT session registries (files
+              # under $watchdir) claim each subject -- including this one.
+              # Stale records excluded (MAJOR-1).
+              my %claims;
+              if (opendir my $dh, $watchdir) {
+                  for my $f (readdir $dh) {
+                      next if $f eq "." || $f eq "..";
+                      open my $fh, "<", "$watchdir/$f" or next;
+                      my %seen_here;
+                      while (my $line = <$fh>) {
+                          chomp $line;
+                          my ($e, $s) = split " ", $line, 2;
+                          next unless defined $e && $e =~ /^\d+$/;
+                          next unless defined $s && length $s;
+                          next if $e + 0 < $now - $STALE_SECS;
+                          $seen_here{$s} = 1;
+                      }
+                      close $fh;
+                      $claims{$_}++ for keys %seen_here;
+                  }
+                  closedir $dh;
+              }
+
+              my %live_subject;   # subject => 1 iff the probe reported a
+                                   # live watcher carrying it.
+              my @kill_pids;
+              for my $line (split /\n/, $probe_out) {
+                  next unless $line =~ /^(\d+)\s/;
+                  my $pid = $1;
+                  my ($subj)    = $line =~ /\bsubject=(\S+)/;
+                  my ($started) = $line =~ /\bstarted=(\d+)/;
+                  next unless defined $subj && length $subj && $subj ne "-";
+                  next unless defined $started;
+                  $live_subject{$subj} = 1;
+                  next unless $reg{$subj};
+                  next unless ($claims{$subj} // 0) <= 1;
+                  my $ok = 0;
+                  for my $epoch (@{ $reg{$subj} }) {
+                      if ($started >= $epoch - 5) { $ok = 1; last }
+                  }
+                  next unless $ok;
+                  push @kill_pids, $pid;
+              }
+
+              # BLOCKER-1: withhold (keep) exactly the subjects that are
+              # BOTH ambiguous AND have a live watcher right now -- see the
+              # shell comment above for the full rationale.
+              my %withhold;
+              for my $subj (keys %reg) {
+                  next if $subj eq "-";
+                  $withhold{$subj} = 1
+                      if $live_subject{$subj} && (($claims{$subj} // 0) > 1);
+              }
+
+              print "K $_\n" for @kill_pids;
+              for my $r (@records) {
+                  my ($epoch, $subj) = @$r;
+                  print "R $epoch $subj\n" if $withhold{$subj};
+              }
+            ' "$REGFILE" "$DATA/.watchers" 2>/dev/null
+        )
+        KILL_PIDS=$(printf '%s\n' "$PERL_OUT" | sed -n 's/^K //p')
+        KEEP_LINES=$(printf '%s\n' "$PERL_OUT" | sed -n 's/^R //p')
+
+        if [ -n "$KILL_PIDS" ]; then
+          for wpid in $KILL_PIDS; do
+            kill -TERM "$wpid" 2>/dev/null || true
+            _i=0
+            while [ "$_i" -lt 10 ]; do
+              kill -0 "$wpid" 2>/dev/null || break
+              sleep 0.1 2>/dev/null || true
+              _i=$((_i + 1))
+            done
+            # re-checked immediately before -KILL so a pid recycled inside
+            # the poll window is not signalled (spec §2.5 step 5).
+            if kill -0 "$wpid" 2>/dev/null; then
+              kill -KILL "$wpid" 2>/dev/null || true
+            fi
+          done
+        fi
+
+        # One-shot consumption, BLOCKER-1-safe: withheld (ambiguous+live)
+        # subjects' lines are rewritten back rather than dropped; if nothing
+        # was withheld the file is removed exactly as before (behaviour 27).
+        if [ -n "$KEEP_LINES" ]; then
+          printf '%s\n' "$KEEP_LINES" > "$REGFILE.tmp.$$" 2>/dev/null \
+            && mv -f "$REGFILE.tmp.$$" "$REGFILE" 2>/dev/null \
+            || rm -f "$REGFILE.tmp.$$" 2>/dev/null || true
+        else
+          rm -f "$REGFILE" 2>/dev/null || true
+        fi
+        return 0
+      fi
+
+      # MAJOR-2 (redteam-step6.md): spec §2.5.6 deletes the registry ONLY on
+      # a DEFINITE probe answer (exit 0, handled above and already returned;
+      # or exit 1, here). The old code deleted for every exit code except
+      # the literal "2" checked above -- so a compile error (rc=255), a
+      # missing perl (rc=127), or any other unexpected rc also silently
+      # destroyed reap authority. Explicit allowlist, not a denylist of one.
+      if [ "$PROBE_RC" = "1" ]; then
+        rm -f "$REGFILE" 2>/dev/null || true
+      fi
+      return 0
+    }
+    _bp_watch_reap || true
+
+    if [ "$TOOL" = "Bash" ]; then
+      WCMD=$(bp_json_get "$PAYLOAD" tool_input.command 2>/dev/null || true)
+      WARMED=$(printf '%s' "$WCMD" | bp_wakeup_arm_check 'bp-watch\.pl[^"]*--arm')
+      if [ "$WARMED" = "1" ]; then
+        # MAJOR-3: feed the subject extractor the SEGMENT that actually
+        # contains the executing invocation (stripped/unquoted, anchored),
+        # never the raw whole command -- see bp_watch_arm_segment above.
+        WSEG=$(printf '%s' "$WCMD" | bp_watch_arm_segment)
+        WSUBJ=$(printf '%s' "$WSEG" | bp_watch_arm_subject)
+        [ -n "$WSUBJ" ] || WSUBJ="-"
+        WEPOCH=$(date +%s 2>/dev/null || echo 0)
+        mkdir -p "$DATA/.watchers" 2>/dev/null \
+          && printf '%s %s\n' "$WEPOCH" "$WSUBJ" >> "$REGFILE" 2>/dev/null \
+          || true
+      fi
+    fi
+  fi
+fi
+# --- end watcher arming record + reap block ----------------------------------
 
 # ---------------------------------------------------------------------------
 # ARMING: this hook is what registers a session as a drive-solo DRIVER.

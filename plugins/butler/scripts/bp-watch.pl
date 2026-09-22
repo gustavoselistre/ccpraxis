@@ -92,11 +92,28 @@
 package BpWatch;
 use strict;
 use warnings;
+use File::Basename ();
+use Cwd ();
 
 # The single allowlist. Everything else -- pending, running, reviewing,
 # unknown free text a coordinator wrote -- is LIVE. INVARIANT 1. A POSITIVE
 # allowlist, not a denylist of today's known-bad words (see t/133 B5).
 my %TERMINAL = map { $_ => 1 } qw(done dropped blocked parked);
+
+# MAJOR-4 (redteam-step6.md): the probe's common path (a candidate armed
+# WITHOUT an explicit --max-seconds, which is the default and recommended
+# shape) must not be structurally coupled to bp-runstate.pl -- package 03
+# deletes that file, and main::DEFAULT_MAX_SECONDS()'s `require` would then
+# raise inside the eval that calls it, silently turning every such candidate
+# into a permanent 'undecidable' with no error surfaced anywhere (spec §3.8's
+# laziness addresses COST only, not the structural dependency). Inlined here
+# as a literal, matching bp-watch.pl's own currently-resolved value
+# (BpRunState::MAX_PAUSE_SECONDS() - 100 == 50*60 - 100 == 2900) so the two
+# cannot silently drift without a comment update on both sides. This is the
+# value probe_scan actually uses; main::DEFAULT_MAX_SECONDS remains the
+# derivation the CLI's own --arm path uses (and the one a caller-supplied
+# opts->{default_max_seconds}, i.e. every test in this package, overrides).
+use constant PROBE_DEFAULT_MAX_SECONDS => 2900;
 
 sub is_terminal_status {
     my ($status) = @_;
@@ -253,11 +270,438 @@ sub format_change_line {
     return @diffs ? join('; ', @diffs) : undef;
 }
 
+## ===========================================================================
+## `probe` verb -- package 01-live-watcher-probe (blueprint
+## butler-gate-ergonomics). Answers "is a bounded watcher running for this
+## project?" by reading live processes out of /proc. Pure seams below are
+## driveable from a fixture tree with zero real processes; probe_scan is the
+## sole IMPURE function (reads the filesystem only, spawns nothing). See
+## .ccpraxis-local-data/blueprints/butler-gate-ergonomics/specs/
+## 01-live-watcher-probe-spec.md §2.3 for the full contract.
+## ===========================================================================
+
+# parse_proc_cmdline($raw) -> \@argv.  PURE.
+# NUL-separated /proc cmdline -> argv. Trailing empty element (the file's
+# own trailing NUL) is dropped. undef/empty -> [].
+sub parse_proc_cmdline {
+    my ($raw) = @_;
+    return [] unless defined $raw && length $raw;
+    my @parts = split /\0/, $raw, -1;
+    pop @parts if @parts && $parts[-1] eq '';
+    return \@parts;
+}
+
+# is_armed_watcher(\@argv) -> 0|1.  PURE.
+# TRUE iff SOME element's basename is exactly bp-watch.pl AND SOME element is
+# exactly '--arm'. Structurally excludes `bp-watch.pl probe` itself and every
+# --help/usage invocation (neither carries --arm).
+sub is_armed_watcher {
+    my ($argv) = @_;
+    my ($has_script, $has_arm) = (0, 0);
+    for my $e (@{ $argv || [] }) {
+        next unless defined $e;
+        $has_script = 1 if $e =~ m{(?:^|[\\/])bp-watch\.pl$};
+        $has_arm    = 1 if $e eq '--arm';
+    }
+    return ($has_script && $has_arm) ? 1 : 0;
+}
+
+# watcher_max_seconds(\@argv) -> ($secs, $err).  PURE.
+sub watcher_max_seconds {
+    my ($argv) = @_;
+    my @a = @{ $argv || [] };
+    for my $i (0 .. $#a) {
+        next unless $a[$i] eq '--max-seconds';
+        my $v = $a[$i + 1];
+        if (defined $v && $v =~ /^\d+(?:\.\d+)?$/ && $v + 0 > 0) {
+            return ($v + 0, undef);
+        }
+        return (undef, 'malformed');
+    }
+    return (undef, undef);
+}
+
+# watcher_subject(\@argv) -> $subject.  PURE.
+# BLOCKER-2 (redteam-step6.md): a --package/--blueprint value containing
+# whitespace (in particular a newline) must never reach the stdout line
+# verbatim -- probe_format_lines' one-sprintf-per-watcher line format has no
+# other delimiter protecting "subject=" from a value that itself LOOKS like a
+# second, fully-attacker-controlled line (arbitrary pid, arbitrary started=).
+# Any captured value containing whitespace is therefore treated the same as
+# "could not be determined": '-'.  A record whose subject is '-' is written
+# for traceability elsewhere but never matches anything (spec §2.5), so this
+# is fail-safe, not merely fail-visible.
+sub watcher_subject {
+    my ($argv) = @_;
+    my @a = @{ $argv || [] };
+    my ($pkg, $bp);
+    for my $i (0 .. $#a) {
+        if    ($a[$i] eq '--package')   { $pkg = $a[$i + 1] }
+        elsif ($a[$i] eq '--blueprint') { $bp  = $a[$i + 1] }
+    }
+    return '-' if defined $pkg && $pkg =~ /\s/;
+    return '-' if defined $bp  && $bp  =~ /\s/;
+    return '-' if defined $pkg && defined $bp;
+    return "package:$pkg"   if defined $pkg && length $pkg;
+    return "blueprint:$bp"  if defined $bp  && length $bp;
+    return '-';
+}
+
+# proc_start_ticks($stat_text) -> $ticks | undef.  PURE.
+# BpResumption::pid_fingerprint's /proc/<pid>/stat rule, verbatim: field 20
+# (index 19) after the ")". This is technique REUSE, not a second, divergent
+# liveness mechanism (AC10).
+sub proc_start_ticks {
+    my ($text) = @_;
+    return undef unless defined $text && $text =~ /\)\s*(.*)$/s;
+    my @f = split ' ', $1;
+    return (defined $f[19] && $f[19] =~ /^\d+$/) ? $f[19] : undef;
+}
+
+# proc_ppid($stat_text) -> $ppid | undef.  PURE.
+# Same file, field index 1 after the ")": the parent pid.
+sub proc_ppid {
+    my ($text) = @_;
+    return undef unless defined $text && $text =~ /\)\s*(.*)$/s;
+    my @f = split ' ', $1;
+    return (defined $f[1] && $f[1] =~ /^\d+$/) ? $f[1] : undef;
+}
+
+# _normalize_dir_for_compare -- backslashes to '/', collapse '//', strip a
+# trailing '/', map a leading drive letter to the posix-emulation spelling.
+sub _normalize_dir_for_compare {
+    my ($p) = @_;
+    return undef unless defined $p && length $p;
+    my $n = $p;
+    $n =~ s{\\}{/}g;
+    $n =~ s{/{2,}}{/}g;
+    $n =~ s{/\z}{} unless $n eq '/';
+    $n =~ s{^([A-Za-z]):(/|$)}{'/' . lc($1) . $2}e;
+    # Canonicalise through Cwd::abs_path when the path actually exists, so a
+    # host-local mount/symlink alias (this MSYS host's own /tmp is one) does
+    # not defeat comparison against the same directory reached a different
+    # way (an explicit --data vs. a /proc/<pid>/cwd readlink). Falls back to
+    # the textual form above for a path that no longer exists (already
+    # exited watcher, synthetic fixture) or cannot be resolved.
+    if (-d $n) {
+        my $resolved = eval { Cwd::abs_path($n) };
+        $n = $resolved if defined $resolved && length $resolved;
+    }
+    return $n;
+}
+
+# same_data_dir($a, $b) -> 0|1.  PURE apart from the realpath resolution
+# above. Compared case-insensitively on the Windows/MSYS/Cygwin process
+# family, case-sensitively elsewhere -- the ONLY platform conditional in
+# this package (§5.5).
+sub same_data_dir {
+    my ($a, $b) = @_;
+    my $na = _normalize_dir_for_compare($a);
+    my $nb = _normalize_dir_for_compare($b);
+    return 0 unless defined $na && defined $nb;
+    return ($^O =~ /^(?:MSWin32|msys|cygwin)$/)
+        ? (lc($na) eq lc($nb) ? 1 : 0)
+        : ($na eq $nb ? 1 : 0);
+}
+
+# classify_candidate(\%cand) -> 'live' | 'expired' | 'foreign' | 'undecidable'
+# PURE -- takes only precomputed fields, does no I/O of its own. Ordered
+# rules (spec §3, behaviours 7/9/13/14/15). 'foreign' is checked FIRST: a
+# candidate positively known to belong to a DIFFERENT project is a positive
+# exclusion (9c), so its own stat/--max-seconds health is simply not this
+# project's business -- an otherwise-malformed process belonging to another
+# project must never pollute THIS project's verdict into cannot-tell. Once
+# a candidate is confirmed to belong to THIS project (or its data dir could
+# not be resolved at all), an unreadable/undef start-time (13) or a
+# malformed --max-seconds (14) or an unresolvable data dir (15) is
+# undecidable; otherwise age >= max_seconds is expired (7), else live.
+sub classify_candidate {
+    my ($c) = @_;
+    $c ||= {};
+    return 'foreign'      if ($c->{data_status} // '') eq 'foreign';
+    return 'undecidable' unless $c->{stat_ok};
+    return 'undecidable' if defined $c->{max_seconds_error};
+    return 'undecidable' if ($c->{data_status} // '') eq 'unresolvable';
+    return 'undecidable' unless defined $c->{max_seconds};
+    return 'undecidable' unless defined $c->{age};
+    return ($c->{age} >= $c->{max_seconds}) ? 'expired' : 'live';
+}
+
+# probe_verdict(\@classes) -> 'live' | 'none' | 'cannot-tell'.  PURE.
+# 'live' wins over 'undecidable' (behaviour 4): a positive observation is
+# never invalidated by an unrelated unknown.
+sub probe_verdict {
+    my ($classes) = @_;
+    my @c = @{ $classes || [] };
+    return 'live'        if grep { $_ eq 'live' }        @c;
+    return 'cannot-tell' if grep { $_ eq 'undecidable' } @c;
+    return 'none';
+}
+
+# probe_format_lines(\@watchers) -> \@lines.  PURE. §2.2 format, ascending
+# pid, no trailing newlines.
+# BLOCKER-2 belt-and-braces (redteam-step6.md's own suggested mitigation):
+# even though watcher_subject already refuses to return a whitespace-bearing
+# value, this is the last line of defense before the value is sprintf'd onto
+# stdout -- refuse to emit ANY line whose subject would contain whitespace,
+# falling back to '-' rather than ever emitting a forged second "line".
+sub probe_format_lines {
+    my ($watchers) = @_;
+    my @w = sort { $a->{pid} <=> $b->{pid} } @{ $watchers || [] };
+    my @lines;
+    for my $w (@w) {
+        my $subject = $w->{subject};
+        $subject = '-' if !defined $subject || $subject =~ /\s/;
+        push @lines, sprintf(
+            '%d max=%d remaining=%d started=%d subject=%s data=%s',
+            $w->{pid}, $w->{max}, $w->{remaining}, $w->{started},
+            $subject, $w->{data_dir},
+        );
+    }
+    return \@lines;
+}
+
+sub _probe_read_file {
+    my ($path) = @_;
+    open my $fh, '<', $path or return undef;
+    local $/;
+    my $txt = <$fh>;
+    close $fh;
+    return $txt;
+}
+
+# _probe_candidate_cwd($proc_dir, $pid) -> $dir | undef.  IMPURE.
+# readlink first (the normal /proc/<pid>/cwd shape on this host's MSYS
+# emulation and on real Linux), falling back to Cwd::abs_path for anything
+# that presents cwd as a real directory entry rather than a symlink.
+sub _probe_candidate_cwd {
+    my ($proc_dir, $pid) = @_;
+    my $link   = "$proc_dir/$pid/cwd";
+    my $target = readlink($link);
+    $target = Cwd::abs_path($link) unless defined $target;
+    return (defined $target && -d $target) ? $target : undef;
+}
+
+# _probe_resolve_candidate_data_dir(\@argv, $proc_dir, $pid, $project_dir)
+#   -> ($status, $resolved_dir)   $status: 'match' | 'foreign' | 'unresolvable'
+# IMPURE. Mirrors bp-watch.pl's own two-rung ladder (§3.9): an explicit
+# --data element (resolved against the candidate's cwd if relative), else
+# the candidate's cwd walked up (<=12 levels) for a dir holding
+# .ccpraxis-local-data. No CCPRAXIS_DATA_DIR rung -- cross-process
+# environment is not reliably readable (§5.2), an accepted residual.
+sub _probe_resolve_candidate_data_dir {
+    my ($argv, $proc_dir, $pid, $project_dir) = @_;
+    my @a = @{ $argv || [] };
+    my $data_val;
+    for my $i (0 .. $#a) {
+        if ($a[$i] eq '--data') { $data_val = $a[$i + 1]; last }
+    }
+
+    my $resolved;
+    if (defined $data_val && length $data_val) {
+        if ($data_val =~ m{^(?:[A-Za-z]:[\\/]|[\\/])}) {
+            $resolved = $data_val;
+        }
+        else {
+            my $cwd = _probe_candidate_cwd($proc_dir, $pid);
+            return ('unresolvable', undef) unless defined $cwd;
+            $resolved = "$cwd/$data_val";
+        }
+    }
+    else {
+        my $cwd = _probe_candidate_cwd($proc_dir, $pid);
+        return ('unresolvable', undef) unless defined $cwd;
+        my $d = $cwd;
+        my $found;
+        for (1 .. 12) {
+            if (-d "$d/.ccpraxis-local-data") { $found = "$d/.ccpraxis-local-data"; last }
+            my $parent = File::Basename::dirname($d);
+            last if $parent eq $d;
+            $d = $parent;
+        }
+        return ('unresolvable', undef) unless defined $found;
+        $resolved = $found;
+    }
+
+    return same_data_dir($resolved, $project_dir)
+        ? ('match', $resolved)
+        : ('foreign', $resolved);
+}
+
+# probe_scan(\%opts) -> \%result.  IMPURE (reads the filesystem only, spawns
+# nothing). %opts: proc_dir, self_pid, clk_tck, project_data_dir (required),
+# default_max_seconds, now, max_ancestor_hops. See spec §2.3/§3 for the full
+# contract; every numbered failure path below cites its behaviour number.
+sub probe_scan {
+    my ($opts) = @_;
+    $opts ||= {};
+    my $proc_dir         = $opts->{proc_dir};
+    my $self_pid         = $opts->{self_pid};
+    my $clk_tck          = $opts->{clk_tck};
+    my $project_data_dir = $opts->{project_data_dir};
+    my $now              = defined $opts->{now} ? $opts->{now} : time();
+    my $max_hops         = defined $opts->{max_ancestor_hops} ? $opts->{max_ancestor_hops} : 32;
+
+    # behaviour 11: proc_dir missing/not-a-dir/opendir failure -> 2.
+    unless (defined $proc_dir && -d $proc_dir) {
+        return { verdict => 'cannot-tell', watchers => [],
+                 reason  => 'proc dir not found or not a directory: '
+                          . (defined $proc_dir ? $proc_dir : '(undef)') };
+    }
+    # behaviour 12: project data dir unresolved/not-a-dir -> 2.
+    unless (defined $project_data_dir && -d $project_data_dir) {
+        return { verdict => 'cannot-tell', watchers => [],
+                 reason  => 'project data dir not found or not a directory: '
+                          . (defined $project_data_dir ? $project_data_dir : '(undef)') };
+    }
+    # behaviour 16: clock ticks <= 0 or non-numeric -> 2, before scanning.
+    unless (defined $clk_tck && $clk_tck =~ /^\d+(?:\.\d+)?$/ && $clk_tck > 0) {
+        return { verdict => 'cannot-tell', watchers => [],
+                 reason  => 'clock ticks unresolved (clk_tck='
+                          . (defined $clk_tck ? $clk_tck : '(undef)') . ')' };
+    }
+
+    opendir(my $dh, $proc_dir) or return {
+        verdict => 'cannot-tell', watchers => [],
+        reason  => "cannot open proc dir: $proc_dir",
+    };
+    my @entries = readdir $dh;
+    closedir $dh;
+
+    # behaviour 6: self + ancestor chain excluded, walked via proc_ppid, NOT
+    # getppid() (documented elsewhere in this repo as unreliable here).
+    my %excluded;
+    if (defined $self_pid && $self_pid =~ /^\d+$/) {
+        $excluded{$self_pid} = 1;
+        my %seen = ($self_pid => 1);
+        my $cur  = $self_pid;
+        for (1 .. $max_hops) {
+            my $stat_text = _probe_read_file("$proc_dir/$cur/stat");
+            last unless defined $stat_text;
+            my $ppid = proc_ppid($stat_text);
+            last unless defined $ppid;
+            last if $ppid <= 1;
+            last if $seen{$ppid};
+            $excluded{$ppid} = 1;
+            $seen{$ppid}     = 1;
+            $cur = $ppid;
+        }
+    }
+
+    # The self pid's own start-time tick counter is the age reference
+    # ("now", in ticks): a fresh probe process starts essentially when the
+    # scan runs, so (self_ticks - candidate_ticks)/clk_tck is age in seconds
+    # with no dependency on any wall-clock/uptime file. Resolved lazily --
+    # only the first candidate that actually needs it pays for the read.
+    my ($self_ticks, $self_ticks_done);
+    my $resolve_self_ticks = sub {
+        return $self_ticks if $self_ticks_done;
+        $self_ticks_done = 1;
+        return undef unless defined $self_pid;
+        my $stat_text = _probe_read_file("$proc_dir/$self_pid/stat");
+        return undef unless defined $stat_text;
+        $self_ticks = proc_start_ticks($stat_text);
+        return $self_ticks;
+    };
+
+    # behaviour 8 / MAJOR-4: default resolved lazily -- only when some
+    # candidate actually lacks --max-seconds. A caller-supplied
+    # opts->{default_max_seconds} (every test in this package) is used
+    # directly; otherwise PROBE_DEFAULT_MAX_SECONDS, a literal constant with
+    # NO runtime dependency on bp-runstate.pl (see that constant's own
+    # comment for why: package 03 deletes that file, and the probe's common
+    # path must survive its removal, not degrade to a silent permanent
+    # cannot-tell).
+    my ($lazy_default_max, $default_resolved);
+    my $resolve_default_max = sub {
+        return $lazy_default_max if $default_resolved;
+        $default_resolved = 1;
+        $lazy_default_max = defined $opts->{default_max_seconds}
+            ? $opts->{default_max_seconds}
+            : PROBE_DEFAULT_MAX_SECONDS;
+        return $lazy_default_max;
+    };
+
+    my (@classes, @watchers);
+    for my $ent (@entries) {
+        # behaviour 20: cheap reject first -- numeric readdir entries only.
+        next unless $ent =~ /^\d+$/;
+        next if $excluded{$ent};
+
+        # behaviour 20: cmdline read before stat. behaviour 18: a pid that
+        # vanishes mid-scan (cmdline unreadable) is skipped silently, never
+        # undecidable -- a process exiting during a scan is the normal race.
+        my $raw = _probe_read_file("$proc_dir/$ent/cmdline");
+        next unless defined $raw;
+        my $argv = parse_proc_cmdline($raw);
+        # behaviour 5: --arm is required; this is what structurally excludes
+        # `bp-watch.pl probe` itself and any non-arming invocation.
+        next unless is_armed_watcher($argv);
+
+        # --- matched behaviour 5: this pid is a real candidate now ---
+        my $stat_text = _probe_read_file("$proc_dir/$ent/stat");
+        my $ticks      = defined $stat_text ? proc_start_ticks($stat_text) : undef;
+        my $stat_ok    = defined $ticks ? 1 : 0;
+
+        my ($max_secs, $max_err) = watcher_max_seconds($argv);
+        if (!defined $max_secs && !defined $max_err) {
+            $max_secs = $resolve_default_max->();
+        }
+
+        my ($data_status, $resolved_dir) =
+            _probe_resolve_candidate_data_dir($argv, $proc_dir, $ent, $project_data_dir);
+
+        my $age;
+        if ($stat_ok) {
+            my $ref = $resolve_self_ticks->();
+            if (defined $ref) {
+                $age = ($ref - $ticks) / $clk_tck;
+                $age = 0 if $age < 0;   # behaviour 7: negative age clamped to 0
+            }
+            else {
+                $stat_ok = 0;           # reference unresolvable -> undecidable
+            }
+        }
+
+        my $class = classify_candidate({
+            stat_ok           => $stat_ok,
+            max_seconds        => $max_secs,
+            max_seconds_error  => $max_err,
+            data_status        => $data_status,
+            age                => $age,
+        });
+        push @classes, $class;
+
+        if ($class eq 'live') {
+            my $remaining = $max_secs - $age;
+            $remaining = 0 if $remaining < 0;
+            push @watchers, {
+                pid      => $ent + 0,
+                max      => int($max_secs),
+                remaining => int($remaining),
+                started  => int($now - $age),
+                subject  => watcher_subject($argv),
+                data_dir => $resolved_dir,
+            };
+        }
+    }
+
+    my $verdict = probe_verdict(\@classes);
+    return { verdict => 'live', watchers => \@watchers, reason => undef }
+        if $verdict eq 'live';
+    return { verdict => 'none', watchers => [], reason => undef }
+        if $verdict eq 'none';
+    return { verdict => 'cannot-tell', watchers => [],
+             reason  => 'one or more armed candidates could not be classified '
+                      . '(unreadable stat, malformed --max-seconds, or an unresolvable data dir)' };
+}
+
 package main;
 use strict;
 use warnings;
 use File::Basename qw(dirname);
 use Cwd ();
+use POSIX ();
 
 my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
 
@@ -267,6 +711,7 @@ usage: bp-watch.pl --arm [--max-seconds N] (--package BP/PKGID | --blueprint BP)
                     [--pid-file PATH | --expect-pids P1,P2,...]
                     [--artifact PATH[:PATH...]] [--poll SECS] [--data DIR]
                     [--keepawake] [--self-pause [--reason TEXT]]
+       bp-watch.pl probe [--data DIR]
 
 --max-seconds defaults to 2900 (matching BpRunState::pause's own 50-minute
 cap) when omitted. Passing a SHORTER --max-seconds requires --reason TEXT
@@ -277,7 +722,126 @@ saying why; a longer one needs none.
 Exit codes:
   0 TERMINAL/SETTLED  1 BOUND  2 WORKERS-GONE  3 ARTIFACT  4 STATUS-CHANGE
   64 USAGE ERROR      65 UNVERIFIABLE (data/blueprint/package not found)
+
+probe exit codes:
+  0 LIVE (at least one live bounded watcher)  1 NONE  2 CANNOT-TELL
 USAGE
+}
+
+# _resolve_probe_data_dir($data_opt) -> $dir.  Mirrors this file's own
+# --data/CCPRAXIS_DATA_DIR/walk-up ladder (:450-457) plus the project-root
+# rungs bp-drive-next.pl::_resolve_project_root documents -- never
+# script-relative. behaviour 19: git rev-parse runs ONLY on this last rung,
+# and only when neither --data nor CCPRAXIS_DATA_DIR was given.
+sub _resolve_probe_data_dir {
+    my ($data_opt) = @_;
+    return $data_opt if defined $data_opt && length $data_opt;
+    return $ENV{CCPRAXIS_DATA_DIR}
+        if defined $ENV{CCPRAXIS_DATA_DIR} && length $ENV{CCPRAXIS_DATA_DIR};
+
+    my $root = $ENV{BP_PROJECT_ROOT};
+    if (!defined $root || !length $root) {
+        my $out = `git rev-parse --show-toplevel 2>/dev/null`;
+        if (defined $out) {
+            my $ok = ($? == 0);
+            $out =~ s/\r?\n\z//;
+            $root = $out if $ok && length $out;
+        }
+    }
+    if (!defined $root || !length $root) {
+        my $d = '.';
+        my $found;
+        for (1 .. 12) {
+            if (-d "$d/.ccpraxis-local-data") { $found = $d; last }
+            $d = "$d/..";
+        }
+        $root = defined $found ? $found : '.';
+    }
+    return "$root/.ccpraxis-local-data";
+}
+
+# _cmd_probe(\@argv) -> $exit_code.  The thin CLI wrapper (spec §2.3): build
+# %opts, call probe_scan INSIDE an eval (behaviour 17 -- any exception
+# anywhere becomes 2, never a crash), print, return the exit code.
+sub _cmd_probe {
+    my ($rest) = @_;
+    my @unknown;
+    my $data_opt;
+    my $data_missing_value = 0;
+    while (@$rest) {
+        my $a = shift @$rest;
+        if ($a eq '--data') {
+            # MINOR-5 (redteam-step6.md): a missing or empty --data value
+            # must not silently fall through to the CCPRAXIS_DATA_DIR/
+            # git-toplevel ladder and probe a DIFFERENT directory with a
+            # confident answer -- spec §2.1's "malformed argument -> exit
+            # 64" covers this shape too, not just an unrecognised flag.
+            $data_opt = shift @$rest;
+            $data_missing_value = 1 unless defined $data_opt && length $data_opt;
+        }
+        else { push @unknown, $a }
+    }
+    if (@unknown || $data_missing_value) {
+        print STDERR "bp-watch: unknown option(s): @unknown\n" if @unknown;
+        print STDERR "bp-watch: --data requires a non-empty DIR value\n" if $data_missing_value;
+        usage();
+        return 64;
+    }
+
+    my $result = eval {
+        my $DATA = _resolve_probe_data_dir($data_opt);
+        die "project data dir not found or not a directory: "
+            . (defined $DATA ? $DATA : '(undef)') . "\n"
+            unless defined $DATA && -d $DATA;
+
+        my $proc_dir = $ENV{BP_PROBE_PROC_DIR};
+        $proc_dir = '/proc' unless defined $proc_dir && length $proc_dir;
+
+        my $self_pid = $ENV{BP_PROBE_SELF_PID};
+        $self_pid = $$ unless defined $self_pid && length $self_pid;
+
+        my $clk_tck = $ENV{BP_PROBE_CLK_TCK};
+        unless (defined $clk_tck && length $clk_tck) {
+            $clk_tck = eval { POSIX::sysconf(&POSIX::_SC_CLK_TCK) };
+            $clk_tck = 100 unless defined $clk_tck && $clk_tck > 0;
+        }
+
+        my $r = BpWatch::probe_scan({
+            proc_dir          => $proc_dir,
+            self_pid          => $self_pid,
+            clk_tck           => $clk_tck,
+            project_data_dir  => $DATA,
+            now               => time(),
+            max_ancestor_hops => 32,
+        });
+        $r->{_data} = $DATA;
+        return $r;
+    };
+
+    if (!$result || ref($result) ne 'HASH') {
+        my $msg = defined $@ && length $@ ? $@ : 'unknown error';
+        $msg =~ s/\s+\z//;
+        print "CANNOT-TELL: internal error: $msg\n";
+        return 2;
+    }
+
+    my $verdict = $result->{verdict} || 'cannot-tell';
+    if ($verdict eq 'live') {
+        my $lines = BpWatch::probe_format_lines($result->{watchers} || []);
+        print "$_\n" for @$lines;
+        return 0;
+    }
+    elsif ($verdict eq 'none') {
+        my $data_shown = defined $result->{_data} ? $result->{_data} : '';
+        print "NONE: no live bounded bp-watch.pl watcher for data=$data_shown\n";
+        return 1;
+    }
+    else {
+        my $reason = defined $result->{reason} && length $result->{reason}
+            ? $result->{reason} : 'unspecified';
+        print "CANNOT-TELL: $reason\n";
+        return 2;
+    }
 }
 
 # _split_artifact_paths($csv) -> @paths
@@ -315,6 +879,16 @@ sub _read_pidfile {
 }
 
 unless (caller) {
+    # `probe` is recognised ONLY as $ARGV[0], dispatched before the existing
+    # option loop runs (spec §2.1) -- a guarded early return that does not
+    # reorder, rename or re-message anything the loop below does. Anywhere
+    # else, "probe" remains an unrecognised token -> the existing "any
+    # non-flag token is an unknown option" rule, exit 64, unchanged (AC14).
+    if (@ARGV && $ARGV[0] eq 'probe') {
+        shift @ARGV;
+        exit _cmd_probe(\@ARGV);
+    }
+
     my %opt = (poll => 5);
     my @unknown;
     while (@ARGV) {
