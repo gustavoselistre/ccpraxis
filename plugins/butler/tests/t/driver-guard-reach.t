@@ -499,7 +499,23 @@ BASH
     # override, and a cwd with no .ccpraxis-local-data ancestor anywhere).
     {
         my $fx = build_fixture();
-        my $no_ancestor = tempdir(CLEANUP => 1);
+        # ORACLE FIX (2026-09-22): the file-wide $ENV{TMPDIR} redirect to
+        # $FIXTURE_TMP_BASE (needed so tempdir() fixtures don't land under
+        # /tmp/, which guard-writes.sh always-allows -- see the comment at the
+        # top of this file) nests every OTHER tempdir() call inside this very
+        # repo, which has a REAL .ccpraxis-local-data at its root. bp_find_data_dir
+        # walks up with no depth bound short of 64 levels (lib.sh:556-574), so
+        # it legitimately finds that real ancestor -- making "no ancestor
+        # anywhere" false for a dir built the normal way, and this assertion
+        # failed deterministically (verified directly, not a flake) once
+        # nothing else in the fixture happened to mask it. F13 needs a cwd
+        # with NO .ccpraxis-local-data ancestor, so it must escape the
+        # redirect for this one call.
+        my $no_ancestor = do {
+            local $ENV{TMPDIR};
+            delete local $ENV{TMPDIR};
+            tempdir(CLEANUP => 1);
+        };
         my %env = driver_env($fx, $active);
         delete $env{CCPRAXIS_DATA_DIR};
         # ORACLE FIX (2026-09-22): same run_hook(%env-not-\%env) shape as AC-23 below
