@@ -138,6 +138,20 @@ sub reporter_arm_payload {
     });
 }
 
+# fix-batch B1 (red-team HIGH-1): the SAME arm command, but via the .sh-shim
+# spelling package 04-bp-on-path put on PATH. Before the fix, mark-wakeup.sh's
+# WARMED detector at hooks/mark-wakeup.sh:403 only matched a literal `.pl`
+# extension, so this spelling silently never registered a reporter session.
+sub reporter_arm_payload_sh {
+    my ($cwd, $sid) = @_;
+    my $cmd = q{bp-watch.sh --arm --blueprint bp-x }
+            . q{--pid-file bp-x/runs/.orchestrator --max-seconds 1800};
+    return JSON::PP->new->canonical->encode({
+        session_id => $sid, cwd => $cwd, tool_name => 'Bash',
+        tool_input => { command => $cmd },
+    });
+}
+
 sub stop_payload { my ($cwd, $sid) = @_; return qq({"session_id":"$sid","cwd":"$cwd"}); }
 
 # Register a reporter session THROUGH the real mark-wakeup.sh subprocess
@@ -176,6 +190,21 @@ sub runstate_reporter_path {
     is($rc, 2, 'B1 CANONICAL (-> AC2): a registered reporter session, with NOTHING declared '
              . 'to bp-runstate.pl --surface reporter, is REFUSED on Stop -- exit 2, not a '
              . 'warning');
+}
+
+{   # fix-batch B1 (red-team HIGH-1): SAME as B, but registered via the
+    # .sh-shim spelling -- proves the WARMED detector's broadened regex
+    # (bp-watch(\.(pl|sh))?\b) recognizes it identically to the .pl form.
+    my $root = new_project();
+    my $rdir = tempdir(CLEANUP => 1);
+    my $sid  = 'sess-b1-sh';
+    my ($mrc) = run_mark(reporter_arm_payload_sh($root, $sid), $rdir);
+    is($mrc, 0, 'B1sh setup: .sh-spelled registration call itself never blocks');
+
+    my ($rc, $out) = run_gate(stop_payload($root, $sid), rdir => $rdir);
+    is($rc, 2, 'B1sh: a reporter session registered via the .sh-shim spelling is REFUSED on '
+             . 'Stop identically to the .pl form -- the on-PATH spelling is not silently '
+             . 'invisible to the detector');
 }
 
 # ===========================================================================

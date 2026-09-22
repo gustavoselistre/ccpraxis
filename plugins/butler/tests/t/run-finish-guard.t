@@ -140,6 +140,20 @@ sub live_drive_dir {
                           root => $root, transcript => $tr, drive_dir => $dd);
     is($rc2, 2, 'A2: disarm is blocked on the same terms -- both halves of the wind-down, not just one');
 
+    # fix-batch B1 (red-team HIGH-2): the SAME disarm, but via the .sh-shim
+    # and bare-alias spellings package 04-bp-on-path put on PATH, and the
+    # form gate-continuity.sh's own denial text recommends (`bp-continuity`,
+    # bare). Before the fix, the mandatory `\.(pl|sh)` extension in
+    # continuity_re silently let the bare form bypass this guard entirely.
+    my ($rc2sh) = run_guard(command => 'bp-continuity.sh disarm',
+                            root => $root, transcript => $tr, drive_dir => $dd);
+    is($rc2sh, 2, 'A2b: the .sh-spelled disarm is blocked identically to the .pl form');
+
+    my ($rc2bare) = run_guard(command => 'bp-continuity disarm',
+                              root => $root, transcript => $tr, drive_dir => $dd);
+    is($rc2bare, 2, 'A2c: the bare-spelled disarm is blocked identically to the .pl form '
+                   . '(this is the exact bypass HIGH-2 reported as already live on Linux)');
+
     # THE INCIDENT ITSELF: the last thing on the user ROLE is a task
     # notification. It must not read as an instruction.
     my ($rc3) = run_guard(command => 'perl plugins/butler/scripts/bp-runstate.pl finish --reason "tasks died"',

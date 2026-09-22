@@ -198,9 +198,16 @@ case "$EVENT" in
         # Response AND command, not either: the command says what was asked, the
         # response says what came back, and activation needs both to be true.
         # Keeping the response check is what stops a mere ASK from activating.
+        # Covers all three on-PATH spellings package 04-bp-on-path put into
+        # circulation for this command (fix-batch B1, red-team HIGH-1): the
+        # perl form (bp-drive-next.pl), the .sh shim (bp-drive-next.sh), and
+        # -- non-Windows installs only -- the extensionless alias
+        # (bp-drive-next), which must be matched as a whole word (a trailing
+        # space or end-of-string) so it does not also swallow an unrelated
+        # command that merely starts with the same prefix.
         CMD=$(bp_json_get "$PAYLOAD" tool_input.command) || CMD=""
         case "$CMD" in
-          *bp-drive-next.pl*) ;;
+          *bp-drive-next.pl*|*bp-drive-next.sh*|*bp-drive-next\ *|*bp-drive-next) ;;
           *) exit 0 ;;
         esac
         RESP=$(bp_json_get "$PAYLOAD" tool_response.stdout tool_response) || RESP=""

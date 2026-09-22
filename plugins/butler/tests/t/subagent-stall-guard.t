@@ -272,6 +272,27 @@ sub finish_consumed_path { my ($r) = @_; return "$r/.ccpraxis-local-data/.drive-
              . 'so the turn may not simply end');
 }
 
+{   # fix-batch B1 (red-team HIGH-1): the SAME activation, but via the
+    # .sh-shim spelling package 04-bp-on-path put on PATH -- proves the
+    # case statement's broadening (bp-drive-next.pl|.sh|bare) recognizes
+    # this spelling identically to the .pl form above, not just by name.
+    my $r = newroot();
+    fire($r, bash_ev('bp-drive-next.sh next',
+                     '{"action":"run-package","blueprint":"bp","package":"p1"}'));
+    my ($rc) = fire_with_probe($r, stop(), proc_dir_none());
+    is($rc, 2, 'B1: the .sh-spelled invocation activates identically to the .pl form -- '
+             . 'the turn may not simply end');
+}
+
+{   # fix-batch B1: and the bare/extensionless alias (non-Windows installs).
+    my $r = newroot();
+    fire($r, bash_ev('bp-drive-next next',
+                     '{"action":"run-package","blueprint":"bp","package":"p1"}'));
+    my ($rc) = fire_with_probe($r, stop(), proc_dir_none());
+    is($rc, 2, 'B1: the bare-spelled invocation activates identically to the .pl form -- '
+             . 'the turn may not simply end');
+}
+
 {   # Reading the RESPONSE, not the command: asking is not the same as being
     # handed work. A tick that returns done must not start a run.
     my $r = newroot();

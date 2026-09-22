@@ -289,7 +289,7 @@ bp_watch_arm_segment() {
         my $filtered = do { local $/; <STDIN> };
         my @segs = split /(?:[;&|\n]|\$\(|`|<\(|>\()/, $filtered;
         SEG: for my $seg (@segs) {
-          next SEG unless $seg =~ /bp-watch\.pl[^"]*--arm/;
+          next SEG unless $seg =~ /bp-watch(?:\.(?:pl|sh))?\b[^"]*--arm/;
           my $pre = substr($seg, 0, $-[0]);
           $pre =~ s/^[ \t]+//;
           my ($first) = $pre =~ /^(\S+)/;
@@ -400,7 +400,7 @@ if [ "$TOOL" = "Bash" ] && [ -n "$DATA" ]; then
   # already documented to prefer (spec §1.2 -- "when in doubt, arm" is the
   # driver's bias, this trigger's is the opposite, and this fix does not
   # change that bias, only closes the false-POSITIVE holes redteam found).
-  ARMED=$(printf '%s' "$RCMD" | bp_wakeup_arm_check 'bp-watch\.pl[^"]*--arm[^"]*--blueprint\b')
+  ARMED=$(printf '%s' "$RCMD" | bp_wakeup_arm_check 'bp-watch(\.(pl|sh))?\b[^"]*--arm[^"]*--blueprint\b')
   if [ "$ARMED" = "1" ]; then
     RSID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
     case "$RSID" in ''|*/*|*\**|.|..|*..*) RSID="" ;; esac
@@ -638,7 +638,7 @@ if [ -n "$DATA" ]; then
 
     if [ "$TOOL" = "Bash" ]; then
       WCMD=$(bp_json_get "$PAYLOAD" tool_input.command 2>/dev/null || true)
-      WARMED=$(printf '%s' "$WCMD" | bp_wakeup_arm_check 'bp-watch\.pl[^"]*--arm')
+      WARMED=$(printf '%s' "$WCMD" | bp_wakeup_arm_check 'bp-watch(\.(pl|sh))?\b[^"]*--arm')
       if [ "$WARMED" = "1" ]; then
         # MAJOR-3: feed the subject extractor the SEGMENT that actually
         # contains the executing invocation (stripped/unquoted, anchored),
@@ -757,7 +757,7 @@ if [ -n "$DATA" ] && [ -d "$DATA/.drive-solo" ]; then
     # unioning all "command" values rather than picking one), not a
     # workaround duplicated here.
     DCMD=$(bp_json_get "$PAYLOAD" tool_input.command 2>/dev/null || true)
-    if [ "$(printf '%s' "$DCMD" | bp_wakeup_arm_check 'bp-drive-next\.pl[^"]*(next|record-order|park)')" = "1" ]; then
+    if [ "$(printf '%s' "$DCMD" | bp_wakeup_arm_check 'bp-drive-next(\.(pl|sh))?\b[^"]*(next|record-order|park)')" = "1" ]; then
       # fixbatch step7 / FIX 3 (reviewer-step6.md SF1, driver-reproduced): the
       # SID is validated FIRST, mirroring the reporter site's own structure
       # above (RSID is blanked before the block that would act on it). Before

@@ -249,8 +249,15 @@ bp_rf_is_run_ending() {
     *)         anchor_class='[;&|[:space:]({]' ;;
   esac
 
-  local runstate_re="(^|${anchor_class})((perl|bash|sh)[[:space:]]+)?([[:alnum:]_./-]*/)?bp-runstate\.(pl|sh)\b[^;&|(){}\n]*\bfinish\b"
-  local continuity_re="(^|${anchor_class})((perl|bash|sh)[[:space:]]+)?([[:alnum:]_./-]*/)?bp-continuity\.(pl|sh)\b[^;&|(){}\n]*\b(disarm|off)\b"
+  # fix-batch B1 (red-team HIGH-2): extension made OPTIONAL -- `(\.(pl|sh))?`
+  # rather than the mandatory `\.(pl|sh)` this used to require -- so the
+  # bare/extensionless alias (created unconditionally for every *.sh in
+  # plugins/*/bin/ on non-Windows installs, and the form gate-continuity.sh
+  # itself prefers and recommends in its own denial text) is recognized as
+  # run-ending identically to the .pl and .sh spellings, instead of silently
+  # bypassing this authorization check.
+  local runstate_re="(^|${anchor_class})((perl|bash|sh)[[:space:]]+)?([[:alnum:]_./-]*/)?bp-runstate(\.(pl|sh))?\b[^;&|(){}\n]*\bfinish\b"
+  local continuity_re="(^|${anchor_class})((perl|bash|sh)[[:space:]]+)?([[:alnum:]_./-]*/)?bp-continuity(\.(pl|sh))?\b[^;&|(){}\n]*\b(disarm|off)\b"
   # BLOCKER-2: a command that WRITES to a path matching *.run-finished via
   # touch/cp/mv (verb position, masked/unmasked by adj_re above) or a `>`
   # redirect. Deliberately excludes `.run-finished.consumed` (the archived,
