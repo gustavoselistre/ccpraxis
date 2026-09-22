@@ -3,9 +3,14 @@
 #
 # THE RULE IT ENFORCES
 #
-#   A driver turn may end EITHER because something will wake the session
-#   (a dispatched subagent, a backgrounded Bash call), OR because the
-#   director says the run is settled. Never for any other reason.
+#   A driver turn may end EITHER because package 01's live-process PROBE
+#   (bp-watch.pl probe) finds a genuinely live, armed, unexpired bp-watch.pl
+#   watcher for this project, OR because the OPERATOR's own one-shot
+#   .run-finished marker is present. Never for any other reason. The
+#   director is no longer consulted at all here (package 02, Decision 23):
+#   its `done`/`pause` verdicts were an agent-reachable way to end a run,
+#   computed from ledgers the agent itself writes -- the "second door" that
+#   criterion forbids. See 02-gates-use-the-probe-spec.md §1/§2.6.
 #
 # WHY IT EXISTS
 #
@@ -44,6 +49,120 @@ source "$HOOK_DIR/lib.sh" 2>/dev/null || exit 0
 
 MAX_BLOCKS=3          # never nag more than this many times in a row
 STOP_OK_MAX_CARRY=3   # how many blocked-by-a-sibling stops .stop-ok may survive
+FINISH_GRACE_S=15     # a just-consumed .run-finished stays "fresh" for this long
+
+# --- PACKAGE 02 SIGNALS: the live-process probe and the finish marker -------
+# Local copies (write-set boundary: hooks/lib.sh is outside this package's
+# write set, and this file already duplicates its own bounded-timeout block
+# for the identical reason). Used by BOTH branches below (driver and
+# reporter), each against its own data dir.
+#
+# SIGNAL A -- THE PROBE (spec 02-gates-use-the-probe-spec.md §2.1, package
+# 01's bp-watch.pl probe). Only exit 0/1 are trusted; every other code --
+# missing script, missing perl, a timeout, anything unforeseen -- maps to
+# 2 = cannot tell, and 2 ALLOWS (Decision 3). No code-list special-casing.
+_bp_probe_verdict() {
+    local _pv_data="$1"
+    local _pv_p="$HOOK_DIR/../scripts/bp-watch.pl"
+    [ -r "$_pv_p" ] || return 2
+    command -v perl >/dev/null 2>&1 || return 2
+    local _pv_rc
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 10 perl "$_pv_p" probe --data "$_pv_data" >/dev/null 2>&1
+        _pv_rc=$?
+    elif command -v gtimeout >/dev/null 2>&1; then
+        gtimeout 10 perl "$_pv_p" probe --data "$_pv_data" >/dev/null 2>&1
+        _pv_rc=$?
+    else
+        # ⚠ MUST FORK, NOT EXEC -- see the director-call comment further down
+        # this file for the measured reason (alarm() does not bound an
+        # exec'd child under Git-for-Windows perl).
+        perl -e '
+            my $pid = fork();
+            exit 127 unless defined $pid;
+            if ($pid == 0) { exec @ARGV; exit 127 }
+            my $killed = 0;
+            $SIG{ALRM} = sub { $killed = 1; kill 9, $pid };
+            alarm 10;
+            waitpid($pid, 0);
+            my $rc = $?;
+            alarm 0;
+            exit(124) if $killed;
+            exit($rc == 0 ? 0 : ($rc >> 8));
+          ' perl "$_pv_p" probe --data "$_pv_data" >/dev/null 2>&1
+        _pv_rc=$?
+    fi
+    case "$_pv_rc" in
+        0) return 0 ;;
+        1) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+# SIGNAL B -- THE FINISH MARKER (Decisions 7/16). Neither hook ever CREATES
+# this file (AC19) -- only the operator does, so its presence ends a run
+# unconditionally. ONE-SHOT: consumed by renaming to .consumed with a grace
+# window, so a second Stop hook firing on the SAME Stop event (four Stop
+# hooks fire on one event, from two registration files -- Decision 17) still
+# sees it as fresh.
+_bp_finish_signal() {
+    local _fs_ds="$1"
+    if [ -f "$_fs_ds/.run-finished" ]; then
+        mv -f "$_fs_ds/.run-finished" "$_fs_ds/.run-finished.consumed" 2>/dev/null \
+          || rm -f "$_fs_ds/.run-finished" 2>/dev/null
+        if [ -f "$_fs_ds/.run-finished.consumed" ]; then
+            touch "$_fs_ds/.run-finished.consumed" 2>/dev/null || true
+        else
+            # MAJOR-3: both mv and rm failed -- the one-shot marker was NOT
+            # consumed (a held file handle, a read-only dir, ...). Allow
+            # THIS stop anyway (fail-open, Decision 3), but never again
+            # silently: an un-consumable marker is a project-wide, permanent
+            # bypass if nobody is told.
+            echo "gate-drive-loop: WARNING -- $_fs_ds/.run-finished could not be consumed (rename and delete both failed). The one-shot finish marker was NOT spent; investigate a held file handle or permissions at that path." >&2
+        fi
+        return 0
+    fi
+    if [ -f "$_fs_ds/.run-finished.consumed" ]; then
+        local _fs_now _fs_mt _fs_age
+        _fs_now=$(date +%s 2>/dev/null || echo 0)
+        _fs_mt=$(bp_mtime "$_fs_ds/.run-finished.consumed")
+        if [ "$_fs_now" -gt 0 ] && [ "$_fs_mt" -gt 0 ]; then
+            _fs_age=$(( _fs_now - _fs_mt ))
+            if [ "$_fs_age" -lt 0 ]; then
+                # MAJOR-2: a future mtime (clock skew, or `mv` preserving a
+                # future source mtime) must not become an unbounded grant --
+                # "cannot tell -> no grace", not "always < 15".
+                echo "gate-drive-loop: .run-finished.consumed has a future mtime -- cannot judge the grace window, treating it as expired." >&2
+            elif [ "$_fs_age" -lt "$FINISH_GRACE_S" ]; then
+                return 0
+            fi
+        fi
+    fi
+    return 1
+}
+
+# MINOR-1: a NON-MUTATING variant for PREDICATE use only. _bp_finish_signal
+# above CONSUMES the marker (renames/touches it) as a side effect of merely
+# asking whether it exists -- fine when the caller is about to act on that
+# answer by allowing the stop, wrong when the caller only wants to know
+# whether a finish signal exists in order to decide something ELSE (the
+# .stop-ok carry predicate below). Mirrors _bp_finish_signal's two file
+# tests without ever touching the filesystem.
+_bp_finish_present() {
+    local _fp_ds="$1"
+    [ -f "$_fp_ds/.run-finished" ] && return 0
+    if [ -f "$_fp_ds/.run-finished.consumed" ]; then
+        local _fp_now _fp_mt
+        _fp_now=$(date +%s 2>/dev/null || echo 0)
+        _fp_mt=$(bp_mtime "$_fp_ds/.run-finished.consumed")
+        if [ "$_fp_now" -gt 0 ] && [ "$_fp_mt" -gt 0 ] \
+           && [ $(( _fp_now - _fp_mt )) -ge 0 ] \
+           && [ $(( _fp_now - _fp_mt )) -lt "$FINISH_GRACE_S" ]; then
+            return 0
+        fi
+    fi
+    return 1
+}
 
 # Coordinators are gate-stop.sh's business. BP_LEDGER is exported only into
 # coordinator processes, so its ABSENCE identifies an interactive driver.
@@ -129,70 +248,57 @@ bp_read_payload open
             rm -f "$RDATA/.reporter-stop-ok" "$RDATA/.reporter-stop-blocks" 2>/dev/null
             exit 0
           fi
-          RRUN_DIR=$(dirname "$RDATA" 2>/dev/null || true)
-          RSTATE=""
-          RRS="$HOOK_DIR/../scripts/bp-runstate.pl"
-          if [ -n "$RRUN_DIR" ] && [ -d "$RRUN_DIR" ] && [ -r "$RRS" ] && command -v perl >/dev/null 2>&1; then
-            # SAME bounded fork/timeout pattern as the existing w02 fold below
-            # (copied, not shared, for the identical reason lib.sh cannot hold
-            # it -- write-set).
-            if command -v timeout >/dev/null 2>&1; then
-              RST=$(timeout 10 perl "$RRS" status --root "$RRUN_DIR" --surface reporter 2>/dev/null) || RST=""
-            elif command -v gtimeout >/dev/null 2>&1; then
-              RST=$(gtimeout 10 perl "$RRS" status --root "$RRUN_DIR" --surface reporter 2>/dev/null) || RST=""
-            else
-              RST=$(perl -e '
-                  my $pid = fork();
-                  exit 127 unless defined $pid;
-                  if ($pid == 0) { exec @ARGV; exit 127 }
-                  $SIG{ALRM} = sub { kill 9, $pid };
-                  alarm 10;
-                  waitpid($pid, 0);
-                  my $rc = $?;
-                  alarm 0;
-                  exit($rc == 0 ? 0 : 124);
-                ' perl "$RRS" status --root "$RRUN_DIR" --surface reporter 2>/dev/null) || RST=""
-            fi
-            RSTATE=$(printf '%s' "$RST" | perl -MJSON::PP -0777 -ne '
-                my $j = eval { JSON::PP->new->decode($_) };
-                print(($j && ref($j) eq "HASH" && defined $j->{state}) ? $j->{state} : "");
-              ' 2>/dev/null || true)
+          # PACKAGE 02: the (probe, finish marker) pair replaces the
+          # `bp-runstate.pl status --surface reporter` read entirely (D3).
+          # Finish marker checked FIRST -- it ends a run unconditionally,
+          # regardless of what the probe says (behaviour 5).
+          if _bp_finish_signal "$RDATA/.drive-solo"; then
+            rm -f "$RDATA/.reporter-stop-blocks" 2>/dev/null
+            exit 0
           fi
-          case "$RSTATE" in
-            paused|finished)
+
+          _bp_probe_verdict "$RDATA"
+          RPV=$?
+          case "$RPV" in
+            0)
               rm -f "$RDATA/.reporter-stop-blocks" 2>/dev/null
-              exit 0 ;;
-            *)
-              RBLOCKS=0
-              [ -f "$RDATA/.reporter-stop-blocks" ] && RBLOCKS=$(cat "$RDATA/.reporter-stop-blocks" 2>/dev/null || echo 0)
-              case "$RBLOCKS" in ''|*[!0-9]*) RBLOCKS=0 ;; esac
-              if [ "$RBLOCKS" -ge 3 ]; then
-                rm -f "$RDATA/.reporter-stop-blocks" 2>/dev/null
-                echo "butler reporter-gate: allowing this stop after $RBLOCKS consecutive blocks." >&2
-                exit 0
-              fi
-              echo $((RBLOCKS + 1)) > "$RDATA/.reporter-stop-blocks" 2>/dev/null
-              cat >&2 <<EOF
-BLOCKED (butler reporter-gate): this turn is ending with nothing verified to
-resume observation of this run.
-
-A reporter turn may end only once bp-runstate.pl (--surface reporter) reads
-paused (a live, verified bp-watch.pl/bp-wait-for-decision.pl watcher armed
-and declared) or finished (nothing left to observe). Neither holds now.
-
-Do this NOW, in this turn:
-  * (re-)arm bp-watch.pl in Mode B and declare it:
-      perl plugins/butler/scripts/bp-runstate.pl pause --surface reporter \\
-           --watcher-pid <the armed watcher's own pid> --until <epoch> \\
-           --reason "bp-watch.pl armed"
-  * or, if there is genuinely nothing left to observe:
-      perl plugins/butler/scripts/bp-runstate.pl finish --surface reporter \\
-           --reason "<why>"
-  * or, to stop anyway just this once:
-      touch $RDATA/.reporter-stop-ok
-EOF
-              exit 2 ;;
+              exit 0
+              ;;
+            2)
+              echo "butler reporter-gate: allowing this stop -- probe verdict is CANNOT TELL (fail-open)." >&2
+              exit 0
+              ;;
           esac
+
+          # RPV == 1 (no live watcher, no finish marker): DENY, bounded.
+          RBLOCKS=0
+          [ -f "$RDATA/.reporter-stop-blocks" ] && RBLOCKS=$(cat "$RDATA/.reporter-stop-blocks" 2>/dev/null || echo 0)
+          case "$RBLOCKS" in ''|*[!0-9]*) RBLOCKS=0 ;; esac
+          if [ "$RBLOCKS" -ge 3 ]; then
+            rm -f "$RDATA/.reporter-stop-blocks" 2>/dev/null
+            echo "butler reporter-gate: allowing this stop after $RBLOCKS consecutive blocks." >&2
+            exit 0
+          fi
+          echo $((RBLOCKS + 1)) > "$RDATA/.reporter-stop-blocks" 2>/dev/null
+          cat >&2 <<EOF
+BLOCKED (butler reporter-gate): nothing will resume observation of this run,
+and only the operator can end it.
+
+Two ways to end a turn, and no third:
+
+  1. Arm a bounded watcher around the work, then stop:
+       perl plugins/butler/scripts/bp-watch.pl --arm --max-seconds <N> --package <bp>/<pkg> ...
+     A live bp-watch.pl is what proves something will resume observation.
+
+  2. The OPERATOR ends the run. There is no verb, flag or argument that does it:
+       touch $RDATA/.drive-solo/.run-finished
+
+When the signal is ambiguous, CONTINUE -- wrongly continuing costs some tokens,
+wrongly stopping abandons an unattended run with nobody present to notice.
+
+To stop anyway just this once: touch $RDATA/.reporter-stop-ok
+EOF
+          exit 2
         fi
       fi
     fi
@@ -259,23 +365,37 @@ DS="$DATA/.drive-solo"
 # A drive-solo run is only "in progress" once an order has been recorded.
 [ -f "$DS/order.json" ] || exit 0
 
-touch "$MARK" 2>/dev/null || true
+# MAJOR-5/AC11b: suppress the refresh once a finish has already been
+# consumed for this session. Without this, a session that keeps producing
+# Stops after a genuine finish (an accidental resume, a stray retry) kept
+# $MARK perpetually fresh forever -- the TTL reap above could never fire,
+# because it only ever sees an mtime from moments ago. Once
+# .run-finished.consumed exists, $MARK is left to age on the TTL clock
+# measured from the finish itself, so an unattended, already-finished
+# session is not gated indefinitely.
+[ -f "$DS/.run-finished.consumed" ] || touch "$MARK" 2>/dev/null || true
 
 # --- escape hatch: one-shot, spent on the stop it actually lets through ------
 #
-# THIS HOOK IS NOT THE ONLY STOP GATE. guard-subagent-stall.sh blocks whenever
-# bp-runstate.pl reports "state":"active", and it runs independently of this
-# one. The original branch deleted the marker and exited 0, which is correct
-# only if exiting 0 ends the turn -- and it does not when the sibling blocks.
-# The operator's one-shot token was then spent on a stop that never happened,
-# and the next stop -- the one they touched it for -- blocked HERE again,
-# demanding a marker they had already provided. Observed 2026-08-24, and the
-# loop it creates is closed: consult the director, get reactivated, re-finish,
-# lose the token, block again.
+# THIS HOOK IS NOT THE ONLY STOP GATE. guard-subagent-stall.sh independently
+# blocks whenever it has an unresolved dispatch and neither signal below
+# resolves it. The original branch deleted the marker and exited 0, which is
+# correct only if exiting 0 ends the turn -- and it does not when the sibling
+# blocks. The operator's one-shot token was then spent on a stop that never
+# happened, and the next stop -- the one they touched it for -- blocked HERE
+# again, demanding a marker they had already provided. Observed 2026-08-24,
+# and the loop it creates is closed: consult the director, get reactivated,
+# re-finish, lose the token, block again.
 #
-# So while the run is still active, PASS WITHOUT CONSUMING and let the sibling
-# guard do its job. The token survives to cover the stop that follows
-# resolution, which is the stop the operator meant.
+# So while a sibling gate would still block, PASS WITHOUT CONSUMING and let it
+# do its job. The token survives to cover the stop that follows resolution,
+# which is the stop the operator meant.
+#
+# PACKAGE 02 RE-POINT: the predicate "a sibling gate is about to block this
+# stop", formerly `bp-runstate.pl status` reporting "active", becomes "the
+# probe does not say live AND there is no finish signal" -- which is now
+# literally the predicate the sibling gate (guard-subagent-stall.sh) blocks
+# on, so the carry is more accurate than it was.
 #
 # Bounded, because that reasoning leans on a sibling hook actually being
 # registered: if none is, nothing else will ever block and an unconsumed marker
@@ -283,18 +403,38 @@ touch "$MARK" 2>/dev/null || true
 # STOP_OK_MAX_CARRY carries it is spent regardless, so the degenerate case is
 # the old behaviour, not an open gate.
 if [ -f "$DS/.stop-ok" ]; then
-  _RS="$HOOK_DIR/../scripts/bp-runstate.pl"
-  _ROOT=$(dirname "$DATA" 2>/dev/null || true)
-  _ACTIVE=""
-  if [ -f "$_RS" ] && [ -n "$_ROOT" ] && [ -d "$_ROOT" ] && command -v perl >/dev/null 2>&1; then
-    _ST=$(perl "$_RS" status --root "$_ROOT" 2>/dev/null) || _ST=""
-    case "$_ST" in *'"state":"active"'*) _ACTIVE=1 ;; esac
+  _SIBLING_WOULD_BLOCK=""
+  # MINOR-1: a non-mutating PREDICATE check here -- _bp_finish_signal
+  # consumes the marker, and merely deciding whether to carry a token must
+  # not itself spend the operator's other lever as a side effect.
+  if _bp_finish_present "$DS"; then
+    :   # a finish signal exists -- no sibling would block on this stop
+  else
+    _bp_probe_verdict "$DATA"
+    _pv_rc=$?
+    # MAJOR-4: only a DEFINITE "none" (1) predicts a sibling deny. Verdict 2
+    # (cannot-tell) ALLOWS in both gates (Decision 3), so treating it as "a
+    # sibling would block" carried the token for nothing.
+    if [ "$_pv_rc" -eq 1 ]; then
+      # ...and only when the sibling (guard-subagent-stall.sh) actually HAS
+      # something to block on. An empty/absent pending set is that hook's
+      # own INERT condition -- it exits 0 unconditionally in that case -- so
+      # a carry is never correct when the sibling is inert. Same path
+      # convention as guard-subagent-stall.sh's own STATE_DIR/SESSION
+      # (project-local, sanitised the same way).
+      _sib_sid="$SID"
+      case "$_sib_sid" in
+        ''|*[!A-Za-z0-9._-]*) _sib_sid="nosession" ;;
+      esac
+      _sib_state="$DATA/.subagent-guard/$_sib_sid"
+      [ -s "$_sib_state" ] && _SIBLING_WOULD_BLOCK=1
+    fi
   fi
 
   _CARRY=$(cat "$DS/.stop-ok" 2>/dev/null || echo 0)
   case "$_CARRY" in ''|*[!0-9]*) _CARRY=0 ;; esac
 
-  if [ -n "$_ACTIVE" ] && [ "$_CARRY" -lt "$STOP_OK_MAX_CARRY" ]; then
+  if [ -n "$_SIBLING_WOULD_BLOCK" ] && [ "$_CARRY" -lt "$STOP_OK_MAX_CARRY" ]; then
     # A sibling gate is about to block this stop. Keep the token, count the
     # carry, and clear the nag counter -- this hook is not the one objecting.
     printf '%s\n' "$(( _CARRY + 1 ))" > "$DS/.stop-ok" 2>/dev/null || true
@@ -324,173 +464,70 @@ if [ "$BLOCKS" -ge "$MAX_BLOCKS" ]; then
   exit 0
 fi
 
-# --- ask the director whether anything is still actionable -------------------
-# Any failure here exits 0. A gate that cannot reach its oracle must not trap
-# the session.
-DRIVE="$HOOK_DIR/../scripts/bp-drive-next.pl"
-[ -r "$DRIVE" ] || exit 0
-command -v perl >/dev/null 2>&1 || exit 0
-
-# Run the director in the PROJECT the marker recorded, not in whatever the
-# payload's cwd happens to be. The marker is the authoritative statement of
-# which project this session is driving; a driver that has cd'd into a
-# subdirectory (or anywhere else) must still get its own run's verdict. The
-# payload cwd is kept only as a fallback for a marker written before this
-# field existed.
-RUN_DIR=$(dirname "$DATA" 2>/dev/null || true)
-if [ -z "$RUN_DIR" ] || [ ! -d "$RUN_DIR" ]; then
-  RUN_DIR=$(bp_json_get "$PAYLOAD" cwd 2>/dev/null || true)
+# --- PACKAGE 02: the (probe, finish marker) pair replaces the director -------
+#
+# THE DIRECTOR CALL IS REMOVED (D1, Decision 23). `bp-drive-next.pl next`'s
+# `done` verdict was an AGENT-REACHABLE path that ended a run -- the director
+# computes `done` from ledgers the agent itself writes, so `action:done ->
+# exit 0` was the "second door" Decision 23 forbids. Its `pause` verdict falls
+# with it (same call). The disarm that used to live in the `done` arm moves to
+# the marker path below; a usage/token pause now simply denies up to
+# MAX_BLOCKS and is then allowed by the yield above, same as any other stall.
+#
+# Finish marker checked FIRST -- it ends a run unconditionally, regardless of
+# what the probe says (behaviour 5). Clears the block/wakeup bookkeeping.
+# $MARK (the session's own driver-registry entry) is deliberately NOT removed
+# here, unlike a literal reading of the spec's disarm list: AC9 requires a
+# LATER stop from this same session, once the finish marker's grace window
+# has passed with nothing new, to still be evaluated and DENIED -- which is
+# only possible if the session stays in scope. $MARK still ages out via the
+# existing TTL reap above if the session never returns, so nothing is
+# stranded; a later /butler:drive-solo re-arms it regardless.
+if _bp_finish_signal "$DS"; then
+  rm -f "$DS/.stop-blocks" "$DS/.wakeup-pending" 2>/dev/null
+  echo "butler drive-loop: allowing this stop -- the operator's .run-finished marker ended the run." >&2
+  exit 0
 fi
-[ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] || exit 0
 
-# THE DIRECTOR CALL IS ALWAYS BOUNDED. It used to be `timeout 20` when timeout
-# existed and UNBOUNDED when it did not — and stock macOS ships no `timeout`
-# (only `gtimeout`, via coreutils). An unbounded subprocess inside a Stop hook
-# is precisely the shape that hung this hook in the first place, so it must not
-# be reachable on any platform.
-#
-# The fallback bounds it in perl, which this whole project already requires.
-#
-# ⚠ IT MUST FORK, NOT EXEC. The obvious one-liner —
-#     perl -e 'alarm 20; exec @ARGV' perl "$DRIVE" next
-# — DOES NOT BOUND ANYTHING HERE, despite alarm() being nominally a process
-# property that survives exec. Measured on this host: a 60-second child ran all
-# 60 seconds and exited 0. Git-for-Windows perl emulates exec by spawning and
-# waiting, so the alarm applies to a wrapper that is merely waiting. Forking and
-# killing the child from the parent's SIGALRM handler bounds it correctly (3s,
-# exit 124, verified). Recorded because the exec form LOOKS right and silently
-# does nothing.
-if command -v timeout >/dev/null 2>&1; then
-  OUT=$(cd "$RUN_DIR" 2>/dev/null && timeout 20 perl "$DRIVE" next 2>/dev/null) || exit 0
-elif command -v gtimeout >/dev/null 2>&1; then
-  OUT=$(cd "$RUN_DIR" 2>/dev/null && gtimeout 20 perl "$DRIVE" next 2>/dev/null) || exit 0
-else
-  OUT=$(cd "$RUN_DIR" 2>/dev/null && perl -e '
-      my $pid = fork();
-      exit 127 unless defined $pid;
-      if ($pid == 0) { exec @ARGV; exit 127 }
-      $SIG{ALRM} = sub { kill 9, $pid };
-      alarm 20;
-      waitpid($pid, 0);
-      my $rc = $?;
-      alarm 0;
-      exit($rc == 0 ? 0 : 124);
-    ' perl "$DRIVE" next 2>/dev/null) || exit 0
-fi
-[ -n "$OUT" ] || exit 0
-
-ACTION=$(printf '%s' "$OUT" | perl -ne 'print $1 if /"action"\s*:\s*"([a-z-]+)"/' 2>/dev/null || true)
-[ -n "$ACTION" ] || exit 0
-
-case "$ACTION" in
-  done)
-    # Run settled. DISARM: drop this session's marker as well as the run state.
-    # Leaving it is exactly how the old design rotted — a finished run kept the
-    # gate armed for every later session in the tree, forever, because nothing
-    # ever cleaned up after success. A later /butler:drive-solo re-arms on its
-    # first director call, so re-arming costs nothing and staying armed costs
-    # every unrelated session a director spawn on every stop.
-    rm -f "$DS/.stop-blocks" "$DS/.wakeup-pending" "$MARK" 2>/dev/null
-    exit 0 ;;
-  pause)
-    # A usage pause is waited out with Monitor/ScheduleWakeup (its own wake-up);
-    # a token pause is a terminal relogin park. Both are legitimate stops.
-    #
-    # The marker STAYS: a usage pause is resumed by this same session once the
-    # window rolls over, so disarming here would drop the gate for the rest of
-    # a run that is still very much in progress. The TTL above is what reaps it
-    # if the session never comes back.
-    rm -f "$DS/.stop-blocks" 2>/dev/null
-    exit 0 ;;
-esac
-
-# --- w02 fold: a VERIFIED live pause escapes the BLOCK below -----------------
-# ADDITIVE ONLY. Touches no existing branch above (.stop-ok, .wakeup-pending,
-# MAX_BLOCKS, done, pause) and no other file. bp-runstate.pl's `status`
-# already computes exactly the checkable claim: state is "paused" IFF a
-# specific pid, recorded at the moment someone called
-# `pause --watcher-pid P --until U`, is alive RIGHT NOW and U has not yet
-# passed (effective() re-verifies both and reverts a stale pause to "active"
-# on its own). This adds NO new liveness logic — it only reads that already-
-# verified answer, immediately before the unconditional BLOCK below.
-#
-# PROVABLY INERT against t/drive-loop-gate.t section H's own fixture: that
-# fixture has no .subagent-guard/run-state.json at all, so bp-runstate.pl
-# status returns "inert", never "paused" — the case arm below matches
-# nothing and execution falls through to the unchanged BLOCK.
-#
-# fixbatch step7 / HIGH-1: BOUNDED, the same way the director call four
-# lines above this comment block is bounded, and for the identical reason —
-# `bp-runstate.pl status` does a plain blocking open()/read() with no
-# timeout of its own, and this file has already been bitten once by "this
-# I/O is normally fast" turning into an unbounded hang (see the comment
-# above the director call). A FIFO in place of run-state.json reproduced a
-# genuine indefinite hang here; a timeout expiry falls through to BLOCK,
-# the same safe direction every other failure path in this fold already
-# takes.
-#
-# fixbatch step7 / driver recommendation: PARSED, not substring-matched.
-# JSON::PP escapes embedded quotes, so a crafted --reason containing the
-# literal text `"state":"paused"` does NOT defeat a bash `case` substring
-# match today — verified empirically — but that safety is INCIDENTAL to the
-# encoder's escaping, and no oracle pins it. Decoding the JSON and testing
-# the parsed `state` field removes the dependency on that incidental
-# behaviour entirely, at the cost of one more perl invocation we are
-# already paying for (perl is already required to reach this branch).
-RS="$HOOK_DIR/../scripts/bp-runstate.pl"
-if [ -r "$RS" ] && command -v perl >/dev/null 2>&1; then
-  if command -v timeout >/dev/null 2>&1; then
-    RST=$(timeout 10 perl "$RS" status --root "$RUN_DIR" 2>/dev/null) || RST=""
-  elif command -v gtimeout >/dev/null 2>&1; then
-    RST=$(gtimeout 10 perl "$RS" status --root "$RUN_DIR" 2>/dev/null) || RST=""
-  else
-    RST=$(perl -e '
-        my $pid = fork();
-        exit 127 unless defined $pid;
-        if ($pid == 0) { exec @ARGV; exit 127 }
-        $SIG{ALRM} = sub { kill 9, $pid };
-        alarm 10;
-        waitpid($pid, 0);
-        my $rc = $?;
-        alarm 0;
-        exit($rc == 0 ? 0 : 124);
-      ' perl "$RS" status --root "$RUN_DIR" 2>/dev/null) || RST=""
-  fi
-  RSTATE=$(printf '%s' "$RST" | perl -MJSON::PP -0777 -ne '
-      my $j = eval { JSON::PP->new->decode($_) };
-      print(($j && ref($j) eq "HASH" && defined $j->{state}) ? $j->{state} : "");
-    ' 2>/dev/null || true)
-  if [ "$RSTATE" = "paused" ]; then
-    # A live watcher is CONFIRMED. Allow the stop; do not fall through to
-    # BLOCK. Any failure of the status call itself (perl missing, unreadable
-    # file, malformed JSON, a timeout) leaves RST/RSTATE empty, so this
-    # branch is not taken and execution falls through to BLOCK — the safe
-    # direction: an error in this check must never silently grant an escape
-    # it did not earn.
+_bp_probe_verdict "$DATA"
+PV=$?
+case "$PV" in
+  0)
+    # A live bounded watcher is CONFIRMED. Allow the stop; do not fall
+    # through to BLOCK.
     rm -f "$DS/.stop-blocks" 2>/dev/null
     exit 0
-  fi
-fi
+    ;;
+  2)
+    # Cannot tell -- fail open (Decision 3), but .stop-blocks is NOT reset:
+    # an indeterminate verdict resolves nothing.
+    echo "butler drive-loop: allowing this stop -- probe verdict is CANNOT TELL (fail-open)." >&2
+    exit 0
+    ;;
+esac
 
-# --- still actionable, and nothing will wake us: BLOCK ----------------------
-DETAIL=$(printf '%s' "$OUT" | perl -ne 'my @m; while (/"(?:blueprint|package)"\s*:\s*"([^"]+)"/g) { push @m, $1 } print join " / ", @m' 2>/dev/null || true)
+# --- probe says NONE, and nothing will wake us: BLOCK ------------------------
 echo $((BLOCKS + 1)) > "$DS/.stop-blocks" 2>/dev/null
 
 # KEEP THIS SHORT -- see the matching note in guard-subagent-stall.sh. This
 # fires repeatedly in a long run and the rationale is already in this file's
-# header and in drive-solo/SKILL.md. The pinned essentials (t/drive-loop-gate.t
-# G3 and :322) are the .stop-ok escape hatch and the bp-drive-next.pl verb.
+# header and in drive-solo/SKILL.md.
 cat >&2 <<EOF
-BLOCKED (butler drive-loop): nothing is scheduled to continue the run, and the
-director still returns work:
+BLOCKED (butler drive-loop): nothing will wake this session, and only the operator can end the run.
 
-    action: $ACTION ${DETAIL:+($DETAIL)}
+Two ways to end a turn, and no third:
 
-Do it NOW, in this turn -- dispatch the worker it calls for, or run
-'perl plugins/butler/scripts/bp-drive-next.pl next' and act on the result.
-Describing the next step instead of doing it is what this gate catches.
+  1. Arm a bounded watcher around the work, then stop:
+       perl plugins/butler/scripts/bp-watch.pl --arm --max-seconds <N> --package <bp>/<pkg> ...
+     A live bp-watch.pl is what proves something will wake this session.
 
-If the run really should stop here: touch $DS/.stop-ok and stop again.
+  2. The OPERATOR ends the run. There is no verb, flag or argument that does it:
+       touch $DS/.run-finished
+
+When the signal is ambiguous, CONTINUE -- wrongly continuing costs some tokens,
+wrongly stopping abandons an unattended run with nobody present to notice.
+
+To stop anyway just this once: touch $DS/.stop-ok
 (Blocks at most $MAX_BLOCKS times in a row.)
 EOF
 exit 2

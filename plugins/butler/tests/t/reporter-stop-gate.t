@@ -71,11 +71,58 @@ sub run_gate {
     $env .= "CCPRAXIS_REPORTER_STOP_OK=1 "               if $opt{reporter_stop_ok};
     $env .= "CCPRAXIS_DRIVE_STOP_OK=1 "                  if $opt{drive_stop_ok};
     $env .= "CCPRAXIS_REPORTER_TTL_H=$opt{ttl_h} "       if defined $opt{ttl_h};
+    # PACKAGE 02 — force the probe (Signal A). $RDATA is the project's own
+    # .ccpraxis-local-data (spec §2.1: "already the .ccpraxis-local-data dir").
+    $env .= "BP_PROBE_PROC_DIR='$opt{probe_dir}' "       if defined $opt{probe_dir};
+    $env .= "BP_PROBE_SELF_PID='$opt{probe_self_pid}' "  if defined $opt{probe_self_pid};
+    $env .= "BP_PROBE_CLK_TCK=100 "                       if defined $opt{probe_dir};
     my $out = `${env}bash "$GATE" <<'PAYLOAD_EOF' 2>&1
 $payload
 PAYLOAD_EOF`;
     return ($? >> 8, $out);
 }
+
+# ---------------------------------------------------------------------------
+# PACKAGE 02 fixture helpers — the probe (Signal A) and the finish marker
+# (Signal B), duplicated locally per spec 02-gates-use-the-probe-spec.md §2.1.
+# ---------------------------------------------------------------------------
+sub _pw_cmdline {
+    my ($procdir, $pid, @argv) = @_;
+    make_path("$procdir/$pid");
+    open my $fh, '>', "$procdir/$pid/cmdline" or die "write cmdline($pid): $!";
+    binmode $fh;
+    print {$fh} join("\0", @argv) . "\0";
+    close $fh;
+}
+sub _pw_stat {
+    my ($procdir, $pid, $ticks) = @_;
+    make_path("$procdir/$pid");
+    open my $fh, '>', "$procdir/$pid/stat" or die "write stat($pid): $!";
+    print {$fh} "$pid (perl) S 1 " . join(' ', (0) x 17) . " $ticks\n";
+    close $fh;
+}
+sub proc_dir_none { return tempdir(CLEANUP => 1) }
+sub proc_dir_cannot_tell {
+    my $r = tempdir(CLEANUP => 1);
+    my $f = "$r/not-a-directory-file";
+    open my $fh, '>', $f or die $!; print {$fh} 'x'; close $fh;
+    return $f;
+}
+sub proc_dir_live {
+    my ($data_dir, %opt) = @_;
+    my $procdir  = tempdir(CLEANUP => 1);
+    my $self_pid = 900001;
+    my $pid      = 900002;
+    my $ticks    = 1_000_000;
+    _pw_stat($procdir, $self_pid, $ticks);
+    _pw_cmdline($procdir, $pid, 'bp-watch.pl', '--arm', '--max-seconds',
+                ($opt{max_seconds} // 9999), '--data', $data_dir);
+    _pw_stat($procdir, $pid, $ticks);
+    return ($procdir, $self_pid);
+}
+sub touch_finish_marker { my ($root) = @_; my $ds = "$root/.ccpraxis-local-data/.drive-solo";
+    make_path($ds); open my $fh, '>', "$ds/.run-finished" or die $!; close $fh;
+    return "$ds/.run-finished" }
 
 # Built with a real JSON encoder (not string interpolation) so $cmd's
 # embedded quotes are escaped exactly as the real harness escapes them --
@@ -167,46 +214,38 @@ sub runstate_reporter_path {
 # ===========================================================================
 {
     my ($root, $rdir, $sid) = registered_reporter('sess-d');
-    my $until = time() + 300;
-    my $prc = pause_reporter($root, $$, $until);
-    is($prc, 0, 'D0 setup: a real `pause --surface reporter --watcher-pid $$` call succeeds '
-              . 'against this test process\'s own live pid');
+    # MIGRATED (§4.8): D0's setup ("a real `pause --surface reporter` call
+    # succeeds") no longer applies -- there is no --surface reporter record
+    # left to write (D3/AC23: bp-runstate.pl is not read by either gate at
+    # all). The fixture is now a synthetic armed-watcher /proc entry instead.
+    my ($procdir, $self_pid) = proc_dir_live("$root/.ccpraxis-local-data");
+    ok(-d $procdir, 'D0 (migrated): the fixture\'s synthetic armed-watcher /proc entry is built');
 
-    my ($rc, $out) = run_gate(stop_payload($root, $sid), rdir => $rdir);
-    is($rc, 0, 'D1 CANONICAL (-> AC3): the SAME registered session, after declaring a live '
-             . 'verified pause on the reporter surface, is ALLOWED to stop');
+    my ($rc, $out) = run_gate(stop_payload($root, $sid), rdir => $rdir,
+                               probe_dir => $procdir, probe_self_pid => $self_pid);
+    # MIGRATED (§4.8): D1 (declared live pause -> ALLOWED) becomes probe 0 ->
+    # ALLOWED.
+    is($rc, 0, 'D1 (migrated, -> AC1 reporter): the SAME registered session, with the probe '
+             . 'forced to LIVE (0), is ALLOWED to stop');
 }
 
 # ===========================================================================
-# E. AC3 continued -- staleness reversion. Editing the SAME record to carry a
-#    dead pid (t/112's own technique, chosen there specifically because a
-#    killed child's pid semantics are unreliable on this host) reproduces the
-#    refusal on the NEXT Stop, without re-testing effective()'s internals.
+# E. AC3 continued -- staleness reversion, MIGRATED onto the probe: a watcher
+# that is no longer live reproduces the refusal on the NEXT Stop.
 # ===========================================================================
 {
     my ($root, $rdir, $sid) = registered_reporter('sess-e');
-    my $until = time() + 300;
-    pause_reporter($root, $$, $until);
-    my ($rc0) = run_gate(stop_payload($root, $sid), rdir => $rdir);
-    is($rc0, 0, 'E0 setup: allowed while the pause is live (same shape as D)');
+    my ($procdir, $self_pid) = proc_dir_live("$root/.ccpraxis-local-data");
+    my ($rc0) = run_gate(stop_payload($root, $sid), rdir => $rdir,
+                          probe_dir => $procdir, probe_self_pid => $self_pid);
+    is($rc0, 0, 'E0 (migrated): allowed while the probe says LIVE (same shape as D)');
 
-    my $sp = runstate_reporter_path($root);
-    SKIP: {
-        skip 'reporter surface state file not yet produced (registration/surface not built)', 2
-            unless -f $sp;
-        my $j = JSON::PP->new;
-        my $rec = eval { $j->decode(do { open my $f, '<', $sp or die; local $/; <$f> }) };
-        skip 'reporter surface state file unreadable', 2 unless ref $rec eq 'HASH';
-        $rec->{watcher_pid} = 999999;   # a pid astronomically unlikely to be alive
-        open my $w, '>', $sp or die "rewrite $sp: $!";
-        print {$w} $j->encode($rec);
-        close $w;
-
-        my ($rc, $out) = run_gate(stop_payload($root, $sid), rdir => $rdir);
-        is($rc, 2, 'E1 CANONICAL (-> AC3 stale-pause reversion): once the watcher_pid in the '
-                 . 'reporter-surface record is dead, the SAME session'."'".'s next Stop is '
-                 . 'REFUSED again -- reusing effective() unmodified, not reimplemented here');
-    }
+    # MIGRATED (§4.8): E1 (watcher dead -> REFUSED again) becomes probe 1 ->
+    # REFUSED again. No record to edit any more; simply re-probe with an
+    # empty /proc fixture (the watcher gone).
+    my ($rc, $out) = run_gate(stop_payload($root, $sid), rdir => $rdir, probe_dir => proc_dir_none());
+    is($rc, 2, 'E1 (migrated, -> AC2 reporter): once the probe says NONE (the watcher gone), '
+             . 'the SAME session\'s next Stop is REFUSED again');
 }
 
 # ===========================================================================
@@ -226,10 +265,16 @@ sub runstate_reporter_path {
      . 'driver\'s own remedy verb, meaningless in a reporter\'s vocabulary');
     unlike($out, qr/consult the director/i,
        'F3: the refusal text does NOT tell a reporter to "consult the director" either');
-    like($out, qr/bp-runstate\.pl.*pause.*--surface\s+reporter/s,
-       'F4 CANONICAL: the refusal DOES give the reporter-surface pause command');
-    like($out, qr/bp-runstate\.pl.*finish.*--surface\s+reporter/s,
-       'F5 CANONICAL: the refusal DOES give the reporter-surface finish command');
+    # MIGRATED (§4.8): F4/F5 ("the refusal gives the --surface reporter
+    # pause/finish commands") -> "the refusal gives bp-watch.pl --arm and the
+    # .run-finished path" (ledger: "THE REPORTER DENIAL TEXT IS THIS
+    # PACKAGE'S"; Decision 13).
+    like($out, qr/bp-watch\.pl --arm/,
+       'F4 (migrated): the refusal DOES give the bp-watch.pl --arm remedy');
+    like($out, qr/\.run-finished/,
+       'F5 (migrated): the refusal DOES give the absolute .run-finished path');
+    unlike($out, qr/bp-runstate\.pl/,
+       'AC23 (reporter): the refusal never mentions bp-runstate.pl');
 }
 
 # ===========================================================================
@@ -300,6 +345,74 @@ sub runstate_reporter_path {
     ok(!-e $ghost,
        'I2 CANONICAL: ...and the directory is NOT created as a side effect -- a naive '
      . '"mkdir -p $RDIR" placed before the existence check would fail this specifically');
+}
+
+# =================== PACKAGE 02 — PROBE-BASED ACCEPTANCE CRITERIA ===========
+
+# AC1/AC2/AC3 — the verdict mapping, reporter branch, all three forced outcomes.
+{
+    my ($root, $rdir, $sid) = registered_reporter('sess-ac1');
+    my ($procdir, $self_pid) = proc_dir_live("$root/.ccpraxis-local-data");
+    my ($rc) = run_gate(stop_payload($root, $sid), rdir => $rdir,
+                         probe_dir => $procdir, probe_self_pid => $self_pid);
+    is($rc, 0, 'AC1 (reporter): probe forced to LIVE (0) ALLOWS the stop');
+}
+{
+    my ($root, $rdir, $sid) = registered_reporter('sess-ac2');
+    my ($rc) = run_gate(stop_payload($root, $sid), rdir => $rdir, probe_dir => proc_dir_none());
+    is($rc, 2, 'AC2 (reporter): probe forced to NONE (1) with no marker DENIES');
+}
+{
+    my ($root, $rdir, $sid) = registered_reporter('sess-ac3');
+    my ($rc, $out) = run_gate(stop_payload($root, $sid), rdir => $rdir,
+                               probe_dir => proc_dir_cannot_tell());
+    is($rc, 0, 'AC3 (reporter): probe forced to CANNOT-TELL (2) ALLOWS, asserted separately');
+    like($out, qr/(?i:cannot.?tell|indeterminate|fail.?open)/,
+        'AC3b (reporter): stderr names the verdict as indeterminate');
+}
+
+# AC7/AC8 — the finish marker ends a reporter run unconditionally and is
+# consumed in the same step.
+{
+    my ($root, $rdir, $sid) = registered_reporter('sess-ac7');
+    touch_finish_marker($root);
+    my ($rc) = run_gate(stop_payload($root, $sid), rdir => $rdir, probe_dir => proc_dir_none());
+    is($rc, 0, 'AC7 (reporter): .run-finished ends the run regardless of the probe\'s answer');
+    ok(!-f "$root/.ccpraxis-local-data/.drive-solo/.run-finished",
+       'AC8 (reporter): ...and the marker no longer exists afterwards');
+    ok(-f "$root/.ccpraxis-local-data/.drive-solo/.run-finished.consumed",
+       'AC8b (reporter): ...and .run-finished.consumed now exists');
+}
+
+# AC19/AC20 — Decision 23's attempt suite, reporter surface.
+{
+    my ($root, $rdir, $sid) = registered_reporter('sess-ac19');
+    my $probe_none = proc_dir_none();
+
+    my ($rc_a) = run_gate(stop_payload($root, $sid), rdir => $rdir, probe_dir => $probe_none);
+    is($rc_a, 2, 'AC19 (reporter) precondition: registered, probe NONE, no marker -> DENIED');
+
+    my $prc = pause_reporter($root, $$, time() + 600);
+    my ($rc_b) = run_gate(stop_payload($root, $sid), rdir => $rdir, probe_dir => proc_dir_none());
+    is($rc_b, 2, 'AC19b (reporter): a `pause --surface reporter` call (even a granted one, or '
+              . 'a no-op if --surface is gone) still DENIED -- no longer read at all');
+
+    make_path("$root/.ccpraxis-local-data/.subagent-guard");
+    open my $f1, '>', "$root/.ccpraxis-local-data/.subagent-guard/run-state.reporter.json" or die $!;
+    print {$f1} '{"state":"finished"}';
+    close $f1;
+    my ($rc_c) = run_gate(stop_payload($root, $sid), rdir => $rdir, probe_dir => proc_dir_none());
+    is($rc_c, 2, 'AC19c (reporter): a hand-written run-state.reporter.json claiming '
+              . '"finished" still DENIED');
+
+    ok(!-f "$root/.ccpraxis-local-data/.drive-solo/.run-finished",
+       'AC19 (reporter): after the attempt suite, .run-finished still does not exist');
+
+    touch_finish_marker($root);
+    my ($rc_control) = run_gate(stop_payload($root, $sid), rdir => $rdir,
+                                 probe_dir => proc_dir_none());
+    is($rc_control, 0, 'AC20 (reporter): the operator\'s own touch, on the SAME fixture, IS '
+                      . 'allowed');
 }
 
 done_testing();

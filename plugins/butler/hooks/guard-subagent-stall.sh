@@ -15,30 +15,53 @@
 # written instruction was supposed to protect. The thesis there applies here —
 # A WRITTEN INSTRUCTION IS NOT AN ENFORCEMENT MECHANISM. So this is a gate.
 #
-# HOW IT WORKS — A STATE MACHINE, NOT A DETECTOR
+# HOW IT WORKS — THE LIVE-PROCESS PROBE + THE OPERATOR'S OWN MARKER, NOT A
+# STATE MACHINE
 #
-# Two earlier versions of this gate were detectors, and both were wrong in the
-# same way. The first cleared the alarm when a Bash command merely CONTAINED a
-# token, so a guard that died on launch satisfied it. The second read the
-# closing prose for "next I'll ...", which can be sidestepped by rephrasing a
-# sentence. A detector is only ever as good as its guesses.
+# Three earlier versions of this gate all asked the same kind of question --
+# does the agent's BEHAVIOUR suggest something is in flight? -- and were wrong
+# in the same shape. The first cleared the alarm when a Bash command merely
+# CONTAINED a token, so a guard that died on launch satisfied it: ceremony,
+# not function. The second read the closing prose for "next I'll ...", which
+# can be sidestepped by rephrasing a sentence. The third replaced both with a
+# state machine (bp-runstate.pl activate/pause/finish): better, but still a
+# claim about intent, mediated by a RECORD the guarded party itself wrote and
+# could leave stale. A detector -- or a self-written record -- is only ever as
+# good as its guesses.
 #
-# So the default is inverted. The gate is INERT until a run demonstrably
-# starts, and from then on the turn may not end until the agent RESOLVES the
-# run — explicitly, with a verb:
+# So the default is inverted, and the resolution no longer reads anything the
+# agent can write. The gate is INERT until a run demonstrably starts, and from
+# then on the turn may not end until one of exactly two signals resolves it --
+# see package 02's spec (02-gates-use-the-probe-spec.md §1) for the full
+# argument for why a live-process probe is not a fourth failed detector:
 #
 #   PostToolUse/Task  — a background dispatch ACTIVATES the run (and is
 #                       recorded by name, so the denial can name it).
 #   PostToolUse/Bash  — a director tick whose RESPONSE handed back work also
 #                       activates. Activation is never something the agent must
 #                       remember to do.
-#   Stop              — state active? DENY. Only `bp-runstate.pl finish` or a
-#                       verified `bp-runstate.pl pause` resolves it.
+#   Stop              — pending dispatch? DENY, unless package 01's live-
+#                       process PROBE (bp-watch.pl probe) finds a genuinely
+#                       live, armed, unexpired watcher for this project, or
+#                       the OPERATOR's own one-shot .run-finished marker is
+#                       present. This file never creates the marker itself,
+#                       and the probe now additionally requires a
+#                       pid-fingerprinted arm-registry entry that only the
+#                       real --arm code path writes (bp-watch.pl, BLOCKER-1
+#                       fix) and guard-run-finish.sh requires operator
+#                       authorisation, found in the transcript, before a
+#                       Bash command may create the marker at all
+#                       (BLOCKER-2 fix) — both close the CASUAL, one-command
+#                       forgeries a red-team review found.
 #
-# Silence is not a resolution, and neither is a plausible sentence. A pause
-# must name a watcher pid that is RUNNING and a deadline in the FUTURE, both
-# verified at read time; a pause whose watcher dies reverts to active by
-# itself, so it cannot hold the gate open after it stops meaning anything.
+# NEITHER SIGNAL IS A SECURITY BOUNDARY, and cannot be one — same posture as
+# gate-continuity.sh's own header states plainly: an agent that has decided
+# to defeat this can always edit the hook files or hooks.json directly, the
+# same way it always could. What these two signals ARE is something an
+# ordinary, well-intentioned agent's own behaviour cannot produce by
+# accident — silence is not a resolution, and neither is a plausible
+# sentence, so there is nothing here for an UNREMARKABLE turn to assert and
+# nothing that can go stale the way a self-written record could.
 #
 # DELIBERATELY NOT GATED. There is no bp_hook_gate call here, by design and for
 # the same reason guard-git-mutations.sh has none: bp_hook_gate exits 0 unless
@@ -105,14 +128,13 @@ case "$EVENT" in
         ' 2>/dev/null) || BG=""
         [ "$BG" = "false" ] && exit 0
         DESC=$(bp_json_get "$PAYLOAD" tool_input.description) || DESC="(unnamed)"
+        # RECORD the observable fact that a run started, in the file this
+        # hook already owns. Recording must never be a thing the agent
+        # remembers to do -- anything it must remember is a thing it will
+        # eventually forget, which is the entire reason this gate exists.
+        # (Package 02: no longer relayed to bp-runstate.pl -- this file's own
+        # pending set IS the record now; see the Stop block below.)
         printf '%s\n' "$DESC" >> "$STATE" 2>/dev/null || true
-        # ACTIVATE on the observable fact that a run started. Activation must
-        # never be a thing the agent remembers to do -- anything it must
-        # remember is a thing it will eventually forget, which is the entire
-        # reason this gate exists.
-        [ -f "$HOOK_DIR/../scripts/bp-runstate.pl" ] && \
-          perl "$HOOK_DIR/../scripts/bp-runstate.pl" activate --root "$ROOT" \
-               --reason "background subagent dispatched: $DESC" >/dev/null 2>&1
         exit 0
         ;;
       Bash)
@@ -126,9 +148,11 @@ case "$EVENT" in
         # for -- a check that cannot fail (see bp-ledger.pl's
         # INSTALLED+SKIPPED+FAILED==ITEMS identity, package a03).
         #
-        # A guard now proves itself instead, through bp-runstate.pl's `pause`,
-        # which refuses a watcher pid that is not running or a deadline that is
-        # not in the future. Ceremony cannot satisfy it.
+        # A guard now proves itself instead, through package 01's live-process
+        # PROBE, which only reports a watcher LIVE when a real, armed,
+        # unexpired bp-watch.pl process actually exists in /proc -- there is
+        # no record to write and nothing to refuse; a process either is there
+        # or it is not. Ceremony cannot satisfy it.
         #
         # What DOES happen here is the second activation trigger: a director
         # tick that handed back work means a run is underway, whether or not a
@@ -182,9 +206,7 @@ case "$EVENT" in
         RESP=$(bp_json_get "$PAYLOAD" tool_response.stdout tool_response) || RESP=""
         case "$RESP" in
           *'"action":"run-package"'*)
-            [ -f "$HOOK_DIR/../scripts/bp-runstate.pl" ] && \
-              perl "$HOOK_DIR/../scripts/bp-runstate.pl" activate --root "$ROOT" \
-                   --reason "director handed back work" >/dev/null 2>&1
+            printf '%s\n' "director handed back work" >> "$STATE" 2>/dev/null || true
             ;;
         esac
         exit 0
@@ -194,12 +216,15 @@ case "$EVENT" in
     ;;
 
   Stop)
-    # THE GATE. Inert until a run starts; once active, the turn may not end
-    # until the agent RESOLVES it. See bp-runstate.pl for why this is a state
-    # machine rather than a detector: the two previous attempts both asked
-    # "does anything look wrong?", and a detector is only as good as its
-    # guesses -- one accepted a guard that had already died, the other could be
-    # sidestepped by rephrasing a sentence.
+    # THE GATE. Inert until a run starts; once a dispatch is pending, the turn
+    # may not end until either a live bounded watcher (the PROBE) or the
+    # operator's own finish marker resolves it. See package 01's
+    # bp-watch.pl and this package's spec (02-gates-use-the-probe) for why a
+    # live-process check replaced the earlier bp-runstate.pl state machine,
+    # which itself replaced two failed detectors: one matched a magic token
+    # in a Bash command (ceremony, not function), one matched the assistant's
+    # closing prose (sidestepped by rephrasing a sentence). A detector is only
+    # as good as its guesses; a process either exists or it does not.
     # THE PENDING SET IS CLEARED WHEN THE TURN IS ALLOWED TO END, AND ONLY THEN.
     #
     # Closes almanac report 20260819-014748-0b41, filed against this hook: the
@@ -213,9 +238,8 @@ case "$EVENT" in
     # runs/escalations/: broad write, no clear. The rule that resolves both is the
     # same one -- clear when the thing the record was tracking is demonstrably
     # over -- and here that moment is unambiguous: an ALLOWED Stop means the run
-    # was resolved (finished, or paused behind a watcher whose pid and deadline
-    # bp-runstate.pl verified), so every dispatch recorded up to now is
-    # accounted for.
+    # was resolved (a live watcher proven by the probe, or the operator's own
+    # finish marker), so every dispatch recorded up to now is accounted for.
     #
     # DELIBERATELY NOT CLEARED ON A DENIED STOP. A dispatch made two turns ago
     # and still unresolved is still unresolved, and dropping it would hide
@@ -242,27 +266,32 @@ case "$EVENT" in
     # Wanting the next one allowed is a decision worth making again.
     if [ -f "$STATE_DIR/force-stop" ]; then
         rm -f "$STATE_DIR/force-stop" 2>/dev/null || true
+        # NOT cleared here (deviates from a literal "clear $STATE" reading of
+        # the spec's step 1): AC15 requires the NEXT stop, with the same
+        # unresolved pending set, to be denied again -- force-stop overrides
+        # exactly the one stop it is spent on, not the record of what is
+        # still unresolved. Confirmed against t/subagent-stall-guard.t's
+        # "the NEXT stop is gated again" assertion.
+        exit 0
+    fi
+
+    # THE INERT CONDITION. An empty or absent pending set means no background
+    # dispatch is unresolved, so there is nothing for this gate to protect --
+    # a scope test, not a verdict about a run in flight. Replaces the old
+    # `bp-runstate.pl status` read entirely (package 02, Decision 2/3).
+    if [ ! -s "$STATE" ]; then
         _clear_pending
         exit 0
     fi
 
-    RS="$HOOK_DIR/../scripts/bp-runstate.pl"
-    [ -f "$RS" ] || exit 0                      # fail open: no state machine, no gate
-    ST=$(perl "$RS" status --root "$ROOT" 2>/dev/null) || exit 0
-    case "$ST" in
-      *'"state":"active"'*) ;;                 # fall through to the denial
-      *) _clear_pending; exit 0 ;;              # inert / paused / finished -> allow
-    esac
-
-    # THE THIRD EXIT: THERE IS NO WORK.
+    # THE THIRD EXIT: THERE IS NO WORK, ANYWHERE.
     #
-    # This gate offers two resolutions -- `finish` (nothing is pending) and
-    # `pause` (something is in flight, watched) -- and assumes one is reachable.
-    # Neither is, when the work is finished AND `finish` is refused by
-    # guard-run-finish.sh: `pause` would have to name work in flight that does
-    # not exist, which is the hollow pause this gate's own siblings reject.
-    # What is left is the one-shot override, every turn, which is a permanent
-    # bypass wearing a one-shot label.
+    # This gate's two resolutions are a live bounded watcher (the probe) and
+    # the operator's own finish marker. Neither is reachable when every
+    # package of every non-archived blueprint is already terminal -- there is
+    # nothing left for a watcher to be watching and nothing left to finish.
+    # What would be left, without this exit, is the one-shot override, every
+    # turn, which is a permanent bypass wearing a one-shot label.
     #
     # Measured 2026-09-18: the override was used four times across consecutive
     # turns with zero dispatches outstanding, zero background processes and zero
@@ -271,59 +300,197 @@ case "$EVENT" in
     # in 1dda97d; leaving it off THIS gate left the trap fully intact, which is
     # what the operator saw when it kept firing after that fix.
     #
-    # Same predicate, same file, same rules as the other two gates -- ledgers on
-    # disk, nothing the agent asserts, failing toward WORK EXISTS. A gate that
-    # opens on a false "finished" would be worse than the trap, so ignorance
-    # keeps it shut.
+    # KEPT VERBATIM through package 02 (spec §5.1): removing it turns two
+    # assertions red in continuity-gate-idle-exit.t, which is outside this
+    # write set, and it is classifiable as SCOPE ("no run is in flight
+    # anywhere") rather than a verdict about a run mid-flight.
     if [ -z "${CCPRAXIS_STALL_SKIP_IDLE_EXIT:-}" ] && command -v bp_outstanding_work >/dev/null 2>&1; then
       _sg_rl=1
       bp_drive_any_active 2>/dev/null || _sg_rl=0
       if [ -z "$(bp_outstanding_work "$_sg_rl" 2>/dev/null)" ]; then
         _clear_pending
-        echo "butler subagent-stall gate: allowing this stop -- no outstanding work. Every package of every non-archived blueprint is at a terminal status, so there is nothing a pause could name and nothing a dispatch could still be doing for it." >&2
+        echo "butler subagent-stall gate: allowing this stop -- no outstanding work. Every package of every non-archived blueprint is at a terminal status, so there is nothing a watcher could name and nothing a dispatch could still be doing for it. NOTE: this is a THIRD, agent-reachable exit (inferred from ledgers the agent itself writes) alongside the two named in the BLOCKED text below -- kept deliberately (spec 02-gates-use-the-probe §5.1) as a project-wide SCOPE check, not a verdict about a run mid-flight, so the denial's 'no third' wording is about THAT distinction, not a claim this exit does not exist." >&2
         exit 0
       fi
     fi
 
-    PENDING=""
-    [ -s "$STATE" ] && PENDING=$(tr '\n' ';' < "$STATE" 2>/dev/null | sed 's/;$//')
-    STALE=""
-    case "$ST" in *'"stale_pause":1'*) STALE=" (a previous pause went stale: its watcher is gone)";; esac
-    # t10-run-continuity-gaps: if the pause that just went stale never named
-    # anything it was waiting for, say so HERE -- at the moment the failure is
-    # visible -- rather than leaving the reader to work out why a well-formed
-    # pause achieved nothing. bp-runstate.pl already warned when the pause was
-    # granted; this is the same fact arriving a second time, when it has
-    # actually cost something.
-    case "$ST" in
-      *'"hollow_pause":1'*)
-        case "$STALE" in
-          ?*) STALE="$STALE
-       That pause named no work: a live pid is not evidence anything was in
-       flight, so it idled to its deadline. Pass --watching '<what>' next time." ;;
+    # SIGNAL B -- THE FINISH MARKER (spec §2.1, Decisions 7/16). Checked
+    # BEFORE the probe: only the operator can create this file (neither hook
+    # ever does -- AC19), so it ends a run unconditionally, regardless of what
+    # the probe would say. ONE-SHOT: consumed by renaming to .consumed with a
+    # 15s grace window, so a second Stop hook firing on the SAME Stop event
+    # (four Stop hooks fire on one event, from two registration files --
+    # Decision 17) still sees it as fresh, without a second hook able to
+    # re-spend it on a later, unrelated stop.
+    FINISH_GRACE_S=15
+    # MAJOR-1 (fix-batch 1): the earlier `<=`->`<` tie-break compared $STATE's
+    # mtime against the marker's CONSUMPTION time, not the OPERATOR's own
+    # touch time -- and $STATE is normally appended by PostToolUse/Task an
+    # instant before the Stop that follows a dispatch, so on the operator's
+    # own legitimate finish path those two mtimes land in the SAME
+    # wall-clock second as the common case, not a rare race. The strict "<"
+    # then wrongly denied the operator's own finish. Fixed by capturing the
+    # marker's OWN pre-consumption mtime (the operator's touch epoch) into
+    # the consumed record's CONTENTS, and comparing $STATE against THAT,
+    # instead of against the (later, hook-dependent) consumption time.
+    _bp_finish_signal() {
+        local _fs_ds="$1"
+        if [ -f "$_fs_ds/.run-finished" ]; then
+            local _fs_touch_epoch
+            _fs_touch_epoch=$(bp_mtime "$_fs_ds/.run-finished")
+            mv -f "$_fs_ds/.run-finished" "$_fs_ds/.run-finished.consumed" 2>/dev/null \
+              || rm -f "$_fs_ds/.run-finished" 2>/dev/null
+            if [ -f "$_fs_ds/.run-finished.consumed" ]; then
+                # The touch epoch lives in the consumed record's CONTENTS --
+                # mtime alone cannot distinguish "operator touched at T" from
+                # "a hook consumed it at T+epsilon".
+                printf '%s\n' "$_fs_touch_epoch" > "$_fs_ds/.run-finished.consumed" 2>/dev/null || true
+                touch "$_fs_ds/.run-finished.consumed" 2>/dev/null || true
+            else
+                # MAJOR-3: both mv and rm failed -- the one-shot marker was
+                # NOT consumed (a held file handle, a read-only dir, ...).
+                # Allow THIS stop anyway (fail-open, Decision 3), but never
+                # again silently: an un-consumable marker is a project-wide,
+                # permanent bypass if nobody is told.
+                echo "butler subagent-stall gate: WARNING -- $_fs_ds/.run-finished could not be consumed (rename and delete both failed). The one-shot finish marker was NOT spent; investigate a held file handle or permissions at that path." >&2
+            fi
+            return 0
+        fi
+        if [ -f "$_fs_ds/.run-finished.consumed" ]; then
+            local _fs_now _fs_mt _fs_smt _fs_touch_epoch _fs_age
+            _fs_now=$(date +%s 2>/dev/null || echo 0)
+            _fs_mt=$(bp_mtime "$_fs_ds/.run-finished.consumed")
+            _fs_smt=$(bp_mtime "$STATE")
+            _fs_touch_epoch=$(head -n 1 "$_fs_ds/.run-finished.consumed" 2>/dev/null)
+            case "$_fs_touch_epoch" in ''|*[!0-9]*) _fs_touch_epoch=0 ;; esac
+            if [ "$_fs_now" -gt 0 ] && [ "$_fs_mt" -gt 0 ]; then
+                _fs_age=$(( _fs_now - _fs_mt ))
+                if [ "$_fs_age" -lt 0 ]; then
+                    # MAJOR-2: a future mtime (clock skew, or `mv` preserving
+                    # a future source mtime) must not become an unbounded
+                    # grant -- "cannot tell -> no grace", not "always < 15".
+                    echo "butler subagent-stall gate: .run-finished.consumed has a future mtime -- cannot judge the grace window, treating it as expired." >&2
+                elif [ "$_fs_age" -lt "$FINISH_GRACE_S" ]; then
+                    # THIS HOOK'S OWN NARROWING, not part of the shared
+                    # pseudocode: the grace window exists so SIBLING Stop
+                    # hooks firing on the SAME Stop event still see a
+                    # just-consumed marker as fresh (Decision 17: four Stop
+                    # hooks fire on one event). It must NOT also wave through
+                    # a LATER, genuinely different Stop for a dispatch that
+                    # did not exist when the OPERATOR touched the marker --
+                    # $STATE is this hook's own record of what is pending,
+                    # so if it was written strictly AFTER the operator's own
+                    # touch, it postdates (and cannot have been resolved by)
+                    # that touch. A tie, or an epoch this hook cannot read,
+                    # resolves toward ALLOW (Decision 23's own asymmetry:
+                    # denying here destroys an operator lever and forces a
+                    # re-touch, while over-granting a few seconds of grace
+                    # costs at most one extra stop).
+                    if [ "$_fs_touch_epoch" -le 0 ] || [ "$_fs_smt" -le "$_fs_touch_epoch" ]; then
+                        return 0
+                    fi
+                fi
+            fi
+        fi
+        return 1
+    }
+    if _bp_finish_signal "$ROOT/.ccpraxis-local-data/.drive-solo"; then
+        _clear_pending
+        echo "butler subagent-stall gate: allowing this stop -- the operator's .run-finished marker ended the run." >&2
+        exit 0
+    fi
+
+    # SIGNAL A -- THE LIVE-PROCESS PROBE (spec §2.1, package 01's
+    # bp-watch.pl probe). Local copy, not shared via lib.sh (write-set
+    # boundary; gate-drive-loop.sh already duplicates its own bounded-
+    # timeout block for the identical reason). Only exit 0/1 are trusted;
+    # every other code -- missing script, missing perl, a timeout, anything
+    # unforeseen -- maps to 2 = cannot tell, and 2 ALLOWS (Decision 3). No
+    # code-list special-casing: package 01's own red-team MAJOR-2 was a
+    # consumer that special-cased a code list and silently misbehaved on
+    # everything outside it.
+    _bp_probe_verdict() {
+        local _pv_data="$1"
+        local _pv_p="$HOOK_DIR/../scripts/bp-watch.pl"
+        [ -r "$_pv_p" ] || return 2
+        command -v perl >/dev/null 2>&1 || return 2
+        local _pv_rc
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 10 perl "$_pv_p" probe --data "$_pv_data" >/dev/null 2>&1
+            _pv_rc=$?
+        elif command -v gtimeout >/dev/null 2>&1; then
+            gtimeout 10 perl "$_pv_p" probe --data "$_pv_data" >/dev/null 2>&1
+            _pv_rc=$?
+        else
+            # ⚠ MUST FORK, NOT EXEC -- alarm() does not bound an exec'd child
+            # under Git-for-Windows perl (measured: a 60s child ran the full
+            # 60s under `perl -e 'alarm N; exec @ARGV'`). Forking and killing
+            # the child from the parent's SIGALRM handler bounds it correctly.
+            perl -e '
+                my $pid = fork();
+                exit 127 unless defined $pid;
+                if ($pid == 0) { exec @ARGV; exit 127 }
+                my $killed = 0;
+                $SIG{ALRM} = sub { $killed = 1; kill 9, $pid };
+                alarm 10;
+                waitpid($pid, 0);
+                my $rc = $?;
+                alarm 0;
+                exit(124) if $killed;
+                exit($rc == 0 ? 0 : ($rc >> 8));
+              ' perl "$_pv_p" probe --data "$_pv_data" >/dev/null 2>&1
+            _pv_rc=$?
+        fi
+        case "$_pv_rc" in
+            0) return 0 ;;
+            1) return 1 ;;
+            *) return 2 ;;
         esac
+    }
+
+    _bp_probe_verdict "$ROOT/.ccpraxis-local-data"
+    PV=$?
+    case "$PV" in
+      0)
+        # NOT cleared (deviates from a literal "clear $STATE" reading of the
+        # spec's step 5): AC21/behaviour 25 (turn != run) requires that once
+        # this watcher is gone, the VERY NEXT stop on the same unresolved
+        # dispatch denies again -- arming a watcher ends a turn, never the
+        # run itself. Only the operator's own finish marker (above) or an
+        # explicit resolution clears the pending set.
+        exit 0
+        ;;
+      2)
+        echo "butler subagent-stall gate: allowing this stop -- probe verdict is CANNOT TELL (fail-open). The pending dispatch stays recorded for the next turn." >&2
+        exit 0
         ;;
     esac
+
+    PENDING=""
+    [ -s "$STATE" ] && PENDING=$(tr '\n' ';' < "$STATE" 2>/dev/null | sed 's/;$//')
 
     # KEEP THIS SHORT. It fires repeatedly in a long run, and an operator who
     # has read the rationale once does not need it again on every denial. The
     # argument for the gate lives in this file's header and in
-    # drive-solo/SKILL.md; what a reader needs HERE is the verb. Four facts are
-    # load-bearing and pinned by t/subagent-stall-guard.t:155-158 -- the word
-    # BLOCKED, the unresolved worker's name, and both verbs. Everything else is
-    # a pointer.
+    # drive-solo/SKILL.md; what a reader needs HERE is the remedy. Pinned by
+    # t/subagent-stall-guard.t -- BLOCKED, the unresolved worker's name, both
+    # remedies, "only the operator", the asymmetry sentence, and the
+    # ONE-SHOT force-stop lever. Everything else is a pointer.
     cat >&2 <<EOF
-BLOCKED: run is ACTIVE and this turn did not resolve it.$STALE
+BLOCKED: nothing will wake this session, and only the operator can end the run.
 ${PENDING:+Unresolved since the last resolved turn: $PENDING
 }
-Pick one, then stop:
+Two ways to end a turn, and no third:
 
-  perl $RS finish --reason "<why>"          # nothing is pending
+  1. Arm a bounded watcher around the work, then stop:
+       perl plugins/butler/scripts/bp-watch.pl --arm --max-seconds <N> --package <bp>/<pkg> ...
+     A live bp-watch.pl is what proves something will wake this session.
 
-  perl $RS pause --watcher-pid <pid> --watching "<work in flight>" --reason "<what wakes us>"
-                                             # defaults to a 50-minute pause; add --seconds N for shorter
+  2. The OPERATOR ends the run. There is no verb, flag or argument that does it:
+       touch $ROOT/.ccpraxis-local-data/.drive-solo/.run-finished
 
-The watcher pid must be a process that is RUNNING and OUTLIVES the work -- arm bp-watch.pl around the dispatch, and never pass the work's own pid. Doing the work now, in this turn, also resolves it. Why: this file's header.
+When the signal is ambiguous, CONTINUE -- wrongly continuing costs some tokens,
+wrongly stopping abandons an unattended run with nobody present to notice.
 
 Override (ONE-SHOT -- consumed on use, allows exactly this stop): touch $STATE_DIR/force-stop
 EOF
