@@ -61,6 +61,43 @@ HOOK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib.sh
 source "$HOOK_DIR/lib.sh" 2>/dev/null || exit 0
 
+# --- MAJOR-6 (redteam-step6.md) -------------------------------------------
+#
+# Four Stop hooks fire on one Stop event; only guard-subagent-stall.sh and
+# gate-drive-loop.sh (package 02) read the operator's one-shot
+# .drive-solo/.run-finished marker. On a session that is BOTH continuity-
+# armed AND drive-solo-active, those two consume the marker and allow --
+# and THIS gate, knowing nothing about it, still denies on its own terms.
+# The turn does not end, and the operator's marker is already spent on a
+# stop that never happened -- the same "token spent for nothing" defect
+# gate-drive-loop.sh's own .stop-ok carry exists to fix, reintroduced here
+# for the operator's PRIMARY lever.
+#
+# FINISH_GRACE_S / _bp_continuity_finish_present -- a LOCAL, NON-MUTATING
+# copy of gate-drive-loop.sh's own _bp_finish_present (MINOR-1) plus its
+# lower-bounded grace window (MAJOR-2). Write-set boundary, this whole
+# hook family's own convention (see this file's header on why there is no
+# shared bp_hook_gate call): duplicated rather than sourced from a sibling
+# package's file. NON-MUTATING is deliberate -- the two sibling hooks
+# already consume (rename) the marker on this same Stop event; this gate
+# only needs to recognise a fresh-or-just-consumed one as "the operator is
+# ending this run", never spend it a second time.
+FINISH_GRACE_S=15
+_bp_continuity_finish_present() {
+    local _cfp_ds="$1"
+    [ -f "$_cfp_ds/.run-finished" ] && return 0
+    if [ -f "$_cfp_ds/.run-finished.consumed" ]; then
+        local _cfp_now _cfp_mt
+        _cfp_now=$(date +%s 2>/dev/null || echo 0)
+        _cfp_mt=$(bp_mtime "$_cfp_ds/.run-finished.consumed")
+        if [ "$_cfp_now" -gt 0 ] && [ "$_cfp_mt" -gt 0 ] \
+           && [ $(( _cfp_now - _cfp_mt )) -ge 0 ] \
+           && [ $(( _cfp_now - _cfp_mt )) -lt "$FINISH_GRACE_S" ]; then
+            return 0
+        fi
+    fi
+    return 1
+}
 
 # Coordinators are gate-stop.sh's business, and arm itself already refuses
 # BP_LEDGER at the source (spec SS2.2). This is defense in depth, independent
@@ -209,6 +246,24 @@ fi
 if [ -f "$MARK.stop-ok" ]; then
   rm -f "$MARK.stop-ok" "$MARK.wakeup-pending" "$MARK.stop-blocks" 2>/dev/null
   exit 0
+fi
+
+# --- MAJOR-6: the operator's drive-solo .run-finished marker, for THIS ------
+# session, also ends an armed continuity turn -- see the header comment on
+# _bp_continuity_finish_present above for why this must be checked here and
+# why it is non-mutating. bp_drive_marker resolves this SID's OWN
+# drive-solo marker (never another session's); its content's first line is
+# the data dir a real drive-solo run recorded, same convention
+# gate-drive-loop.sh itself reads.
+_CFM_DRIVE_MARK=$(bp_drive_marker "$SID" 2>/dev/null) || _CFM_DRIVE_MARK=""
+if [ -n "$_CFM_DRIVE_MARK" ] && [ -f "$_CFM_DRIVE_MARK" ]; then
+  _CFM_DATA=$(head -n 1 "$_CFM_DRIVE_MARK" 2>/dev/null || true)
+  if [ -n "$_CFM_DATA" ] && [ -d "$_CFM_DATA/.drive-solo" ] \
+     && _bp_continuity_finish_present "$_CFM_DATA/.drive-solo"; then
+    rm -f "$MARK.stop-blocks" 2>/dev/null
+    echo "butler continuity-gate: allowing this stop -- the operator's .run-finished marker (drive-solo, this session) already ended this run; not spending it a second time." >&2
+    exit 0
+  fi
 fi
 
 # --- a wake-up is already scheduled: this turn end is legitimate -----------

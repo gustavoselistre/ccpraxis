@@ -148,7 +148,62 @@ sub write_stat {
 sub write_stub_sleep {
     my ($path, $secs) = @_;
     open my $fh, '>', $path or die "write stub: $!";
-    print {$fh} "#!/usr/bin/env perl\nsleep($secs);\n";
+    # BLOCKER-1 (redteam-step6.md): classify_candidate now requires a
+    # matching arm-registry entry (pid + start-ticks fingerprint) before a
+    # same-project candidate can classify 'live' -- see bp-watch.pl's own
+    # comment on arm_registry_verified. This stub is meant to present a
+    # GENUINELY armed watcher (AC6's undecidable half and AC8's live-then-
+    # expired half), so it now performs that registration itself, off its
+    # own real pid and its own real /proc/$$/stat, exactly as the real
+    # --arm code path does -- not a new liveness mechanism, the SAME one,
+    # exercised by a stub instead of the genuine script. A caller that
+    # passes no --data (or whose /proc/$$/stat cannot be read) simply skips
+    # this, unchanged from before.
+    print {$fh} <<'PERL_STUB';
+#!/usr/bin/env perl
+use strict;
+use warnings;
+my $data;
+for (my $i = 0; $i < @ARGV; $i++) {
+    if ($ARGV[$i] eq '--data') { $data = $ARGV[$i + 1]; last }
+}
+if (defined $data) {
+    my $stat_text = do {
+        local $/;
+        open my $sfh, '<', "/proc/$$/stat" or undef;
+        $sfh ? <$sfh> : undef;
+    };
+    if (defined $stat_text && $stat_text =~ /\)\s*(.*)$/s) {
+        my @f = split ' ', $1;
+        my $ticks = $f[19];
+        if (defined $ticks && $ticks =~ /^\d+$/) {
+            my $dir = "$data/.watchers/arm-registry";
+            unless (-d $dir) {
+                eval { require File::Path; File::Path::make_path($dir) };
+            }
+            if (open my $rfh, '>', "$dir/$$") {
+                print {$rfh} "$ticks\n";
+                close $rfh;
+            }
+        }
+    }
+}
+PERL_STUB
+    print {$fh} "sleep($secs);\n";
+    close $fh;
+}
+
+# write_arm_registry DATA PID TICKS -- the fixture-side equivalent of the
+# entry a real `bp-watch.pl --arm` invocation writes for itself
+# (arm_registry_path, bp-watch.pl). Used only by fully-synthetic /proc
+# fixtures (no real process) that must still present as a genuinely-armed
+# candidate under BLOCKER-1's new registry check.
+sub write_arm_registry {
+    my ($data, $pid, $ticks) = @_;
+    my $dir = "$data/.watchers/arm-registry";
+    make_path($dir);
+    open my $fh, '>', "$dir/$pid" or die "write arm-registry($pid): $!";
+    print {$fh} "$ticks\n";
     close $fh;
 }
 
@@ -695,7 +750,15 @@ sub run_suite {
     my $pid = 40100;
     my $forged = "x\n99999 max=1 remaining=1 started=2000000000 subject=package:evil/pkg data=/d";
     write_cmdline($procdir, $pid, 'bp-watch.pl', '--arm', '--data', $data, '--package', $forged);
-    write_stat($procdir, $pid, 1, int(time()));
+    my $pid_ticks = int(time());
+    write_stat($procdir, $pid, 1, $pid_ticks);
+    # BLOCKER-1 (redteam-step6.md): this fixture is a purely synthetic
+    # candidate (no real process), so it must present the arm-registry
+    # entry a genuine --arm invocation would have written for itself --
+    # this test is about subject-line sanitisation (BLOCKER-2), not about
+    # BLOCKER-1's forgery question, and must not become a forgery repro by
+    # omission.
+    write_arm_registry($data, $pid, $pid_ticks);
 
     my ($rc, $out) = run_probe_env(
         { BP_PROBE_PROC_DIR => $procdir, BP_PROBE_SELF_PID => $self_pid, BP_PROBE_CLK_TCK => 100 },
@@ -712,6 +775,74 @@ sub run_suite {
     unlike($lines[0], qr/subject=package:evil/,
            'BLOCKER-2c: the forged "subject=package:evil/pkg" text never reaches stdout as a real '
          . 'field -- watcher_subject collapsed the whitespace-bearing value to \'-\'');
+}
+
+# ===========================================================================
+# CROSSCUTTING-DEFECTS -- BLOCKER-1 (redteam-step6.md). The probe's "live
+# bounded watcher" used to be a pure text test over /proc/<pid>/cmdline: any
+# process whose argv contained a bp-watch.pl basename AND '--arm' classified
+# live, for whatever --max-seconds it claimed, with NO check that the pid
+# was actually running this file. Fixed by requiring a matching arm-registry
+# entry (pid + start-ticks fingerprint), written only by the real --arm code
+# path at the moment it actually starts. (a) reproduces red-team's exact
+# repro shape verbatim: a REAL process whose cmdline structurally satisfies
+# is_armed_watcher, but which never executes this script and so never
+# writes the registry entry. (b) is the counter-fixture: a genuine --arm
+# invocation, which the CLI itself now registers, still classifies live.
+# ===========================================================================
+{
+    my ($root, $data) = new_project();
+    new_running_bp($data, 'bpx', 'p1');
+
+    # (a) THE EXACT REPRO: `perl -e 'sleep 99999' ./bp-watch.pl --arm
+    # --max-seconds 99999` -- the trailing tokens are unused arguments to
+    # `perl -e`, never parsed or executed as this script. A real process,
+    # a real /proc/<pid>/cmdline containing exactly those tokens, and (by
+    # construction) no arm-registry entry anywhere, because the code that
+    # would write one never ran.
+    my $forger_pid = spawn(
+        'perl', '-e', 'sleep 99999',
+        'bp-watch.pl', '--arm', '--max-seconds', '99999',
+        '--package', 'bpx/p1', '--data', $data,
+    );
+    wait_proc_visible($forger_pid, 5)
+        or diag('BLOCKER-1a: forger pid not visible in /proc within timeout');
+
+    ok(!-e "$data/.watchers/arm-registry/$forger_pid",
+       'BLOCKER-1a precondition: the forger never wrote an arm-registry entry for its own pid '
+     . '(it never ran bp-watch.pl at all)');
+
+    my ($rc_forged, $out_forged) = run_probe('--data', $data);
+    isnt($rc_forged, 0,
+         'BLOCKER-1a CANONICAL: red-team\'s exact repro (armed-looking cmdline, no arm-registry '
+       . 'entry) no longer classifies live -- probe must NOT exit 0');
+    like($out_forged, qr/^CANNOT-TELL:/m,
+         'BLOCKER-1a2: ...and reads CANNOT-TELL, the same posture as an unreadable stat file or '
+       . 'a malformed --max-seconds, never NONE (which would silently drop the candidate instead '
+       . 'of flagging it as unverifiable)');
+
+    # (b) THE COUNTER-FIXTURE: a genuine `bp-watch.pl --arm` invocation.
+    # bp-watch.pl's own --arm code path now writes its own registry entry at
+    # start, off its own real pid and /proc/$$/stat -- prove BOTH the file
+    # and the resulting verdict.
+    my $real_pid = spawn_watcher(
+        '--arm', '--package', 'bpx/p1', '--max-seconds', '300', '--poll', '1',
+        '--reason', 'BLOCKER-1b fixture: a genuine arm must still classify live', '--data', $data,
+    );
+    wait_proc_visible($real_pid, 5)
+        or diag('BLOCKER-1b: real watcher pid not visible in /proc within timeout');
+
+    my $reg_path = "$data/.watchers/arm-registry/$real_pid";
+    my $reg_deadline = time() + 5;
+    while (!-f $reg_path && time() < $reg_deadline) { select(undef, undef, undef, 0.05) }
+    ok(-f $reg_path,
+       'BLOCKER-1b precondition: a genuine --arm invocation wrote its own arm-registry entry');
+
+    my ($rc_real, $out_real) = run_probe('--data', $data);
+    is($rc_real, 0,
+       'BLOCKER-1b CANONICAL: a genuine --arm invocation, registry entry present and matching, '
+     . 'still classifies live -- the fix closes the forgery without breaking the real thing');
+    like($out_real, qr/\b$real_pid\b/, 'BLOCKER-1b2: the real watcher\'s pid appears on stdout');
 }
 
 # ===========================================================================

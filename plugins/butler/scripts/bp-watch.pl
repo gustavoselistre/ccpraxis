@@ -415,6 +415,19 @@ sub same_data_dir {
 # not be resolved at all), an unreadable/undef start-time (13) or a
 # malformed --max-seconds (14) or an unresolvable data dir (15) is
 # undecidable; otherwise age >= max_seconds is expired (7), else live.
+#
+# BLOCKER-1 (redteam-step6.md): a candidate's cmdline alone is a pure text
+# test over /proc/<pid>/cmdline -- forgeable in one Bash call
+# (`perl -e 'sleep 99999' bp-watch.pl --arm --max-seconds 99999`, argv
+# containing those tokens as UNUSED trailing arguments to `perl -e`, never
+# actually executing this file). So a candidate confirmed to belong to THIS
+# project ('match') must ALSO be vouched for by the arm-time registry entry
+# only the real --arm code path writes (see cmd_arm/probe_scan below) --
+# same pid AND the same pid-reuse-safe start-ticks fingerprint
+# (proc_start_ticks / BpResumption::pid_fingerprint's technique, reused
+# rather than reinvented). No entry, or a mismatched fingerprint (pid
+# reuse), is undecidable -- never live -- same posture as every other
+# "cannot positively confirm" axis above it.
 sub classify_candidate {
     my ($c) = @_;
     $c ||= {};
@@ -424,7 +437,34 @@ sub classify_candidate {
     return 'undecidable' if ($c->{data_status} // '') eq 'unresolvable';
     return 'undecidable' unless defined $c->{max_seconds};
     return 'undecidable' unless defined $c->{age};
-    return ($c->{age} >= $c->{max_seconds}) ? 'expired' : 'live';
+    # BLOCKER-1's registry check gates 'live' only, not 'expired': a forged
+    # candidate has nothing to gain from an EXPIRED classification (it
+    # denies exactly like 'none'/'undecidable' would), so age math -- which
+    # is not the axis a forger can abuse -- is allowed to decide first. Only
+    # a candidate that would otherwise read 'live' (the exploitable branch,
+    # BLOCKER-1's actual repro) is held to the registry requirement.
+    return 'expired' if $c->{age} >= $c->{max_seconds};
+    return 'undecidable' if ($c->{data_status} // '') eq 'match' && !$c->{registry_verified};
+    return 'live';
+}
+
+# arm_registry_path($data_dir, $pid) -> $path.  PURE.
+sub arm_registry_path {
+    my ($data_dir, $pid) = @_;
+    return "$data_dir/.watchers/arm-registry/$pid";
+}
+
+# arm_registry_verified($data_dir, $pid, $ticks) -> 0|1.  IMPURE (one file
+# read). True iff a registry entry exists for $pid under $data_dir AND its
+# recorded start-ticks equal $ticks (the candidate's CURRENT
+# proc_start_ticks reading) -- the pid-reuse-safe check BLOCKER-1 requires.
+sub arm_registry_verified {
+    my ($data_dir, $pid, $ticks) = @_;
+    return 0 unless defined $data_dir && defined $pid && defined $ticks;
+    my $text = _probe_read_file(arm_registry_path($data_dir, $pid));
+    return 0 unless defined $text;
+    $text =~ s/\s+//g;
+    return ($text =~ /^\d+$/ && $text == $ticks) ? 1 : 0;
 }
 
 # probe_verdict(\@classes) -> 'live' | 'none' | 'cannot-tell'.  PURE.
@@ -663,11 +703,22 @@ sub probe_scan {
             }
         }
 
+        # BLOCKER-1: only checked (and only matters) for a candidate already
+        # confirmed to belong to THIS project -- classify_candidate ignores
+        # it for 'foreign'/'unresolvable'. $project_data_dir, not
+        # $resolved_dir: a real arm always registers itself under the data
+        # dir IT resolved, which for a 'match' candidate is the same
+        # directory by definition (same_data_dir already confirmed it).
+        my $registry_verified = ($stat_ok && $data_status eq 'match')
+            ? arm_registry_verified($project_data_dir, $ent, $ticks)
+            : 0;
+
         my $class = classify_candidate({
-            stat_ok           => $stat_ok,
+            stat_ok            => $stat_ok,
             max_seconds        => $max_secs,
             max_seconds_error  => $max_err,
             data_status        => $data_status,
+            registry_verified  => $registry_verified,
             age                => $age,
         });
         push @classes, $class;
@@ -1077,6 +1128,41 @@ unless (caller) {
     # INVARIANT 3: reused, not reimplemented. BpRunState::pid_alive is the
     # ONLY liveness primitive this file calls.
     require "$DIR/bp-runstate.pl";
+
+    # BLOCKER-1 (redteam-step6.md): record THIS process's own pid-reuse-safe
+    # fingerprint NOW, at the moment this file actually starts running
+    # armed -- not merely when some argv happens to contain '--arm'. The
+    # red-team repro (`perl -e 'sleep 99999' bp-watch.pl --arm
+    # --max-seconds 99999`) never executes this file at all, so it can
+    # never reach this line and can never make this registry vouch for its
+    # pid. `probe`'s classify_candidate (above) now refuses to classify a
+    # same-project candidate as 'live' without a matching entry here --
+    # same pid AND the same start-ticks read off /proc/<pid>/stat field 20
+    # (proc_start_ticks, reused verbatim -- the same technique
+    # BpResumption::pid_fingerprint uses elsewhere in this codebase).
+    #
+    # BEST-EFFORT, NEVER FATAL: this must not stop a legitimate watch from
+    # proceeding (the file's own FAIL OPEN posture). Worst case on failure
+    # (no /proc, an unwritable data dir): this pid reads as undecidable
+    # rather than live, which the Stop gates already treat as "cannot tell
+    # -> allow" (Decision 3) -- the safe direction, not a new wedge.
+    eval {
+        my $reg_dir = "$DATA/.watchers/arm-registry";
+        require File::Path;
+        File::Path::make_path($reg_dir);
+        my $stat_text;
+        if (open my $sfh, '<', "/proc/$$/stat") {
+            local $/;
+            $stat_text = <$sfh>;
+            close $sfh;
+        }
+        my $ticks = defined $stat_text ? BpWatch::proc_start_ticks($stat_text) : undef;
+        if (defined $ticks && open(my $rfh, '>', "$reg_dir/$$")) {
+            print {$rfh} "$ticks\n";
+            close $rfh;
+        }
+        1;
+    };
 
     # --self-pause: register THIS process (its own real pid, not a caller's
     # guess) as the guard-subagent-stall.sh watcher, via BpRunState::pause
