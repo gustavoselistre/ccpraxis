@@ -152,7 +152,65 @@ SID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
 # facts agreeing, which is what makes it safe for any number of concurrent
 # sessions sharing one registry.
 if [ "$HAVE_PENDING" -eq 1 ]; then
-  perl "$HOOK_DIR/../scripts/bp-session.pl" claim --session "$SID" >/dev/null 2>&1 || true
+  CLAIM_OUT=$(perl "$HOOK_DIR/../scripts/bp-session.pl" claim --session "$SID" 2>&1)
+  CLAIM_RC=$?
+
+  _NOW_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)
+  _UNBOUND_N=""
+
+  if [ "$CLAIM_RC" -ne 0 ]; then
+    # claim itself failed (bad registry, bad session id, perl error). Today
+    # this is the most silent failure of all: the exit code was discarded.
+    if [ -n "${CONT_DIR:-}" ]; then
+      # MEDIUM-2 (redteam): key the record per session so a second, unrelated
+      # failing claim (any session sharing this registry) cannot clobber or
+      # be misattributed to this one. Fall back to the legacy unkeyed name
+      # only when $SID itself is not safe to use as a filename suffix -- the
+      # same refusal set bp_continuity_marker already applies to a session id.
+      _CE_FILE="$CONT_DIR/.claim-error"
+      case "$SID" in
+        */*|*\\*|*\**|.|..|*..*|*.*) ;;
+        *) _CE_FILE="$CONT_DIR/.claim-error-$SID" ;;
+      esac
+      # LOW-4 (redteam): keep the actual reason, not only the rc -- the
+      # first line of claim's own captured output, newline-collapsed. Pure
+      # shell (no subprocess) to match this file's own doctrine.
+      _CE_LINE1=${CLAIM_OUT%%$'\n'*}
+      _CE_LINE1=${_CE_LINE1%$'\r'}
+      printf '%s %s %s %s\n' "$CLAIM_RC" "$_NOW_ISO" "$SID" "$_CE_LINE1" > "$_CE_FILE" 2>/dev/null || true
+    fi
+    echo "butler continuity-gate: bp-session.pl claim exited $CLAIM_RC for session $SID -- this session is not armed and nothing was gated." >&2
+  fi
+
+  # Each EXPIRED line is a ticket that reached its binding deadline and will
+  # never bind. Record it; this is the state that had no name.
+  while IFS= read -r _cl; do
+    case "$_cl" in
+      "EXPIRED: "*)
+        _n=${_cl#EXPIRED: }
+        case "$_n" in
+          ccpx-sess-*) ;;                      # cheap prefilter
+          *) continue ;;
+        esac
+        # strict validation before using it as a path
+        printf '%s' "$_n" | grep -Eq '^ccpx-sess-[0-9a-f]{24}-[0-9]+$' || continue
+        if [ -n "${CONT_DIR:-}" ]; then
+          mkdir -p "$CONT_DIR/unbound" 2>/dev/null || true
+          printf 'expired %s %s\n' "$_NOW_ISO" "$SID" > "$CONT_DIR/unbound/$_n" 2>/dev/null || true
+        fi
+        _UNBOUND_N="$_n"
+        ;;
+    esac
+  done <<< "$CLAIM_OUT"
+
+  if [ -n "$_UNBOUND_N" ]; then
+    # LOW-2 (redteam): the write above is best-effort and can silently fail
+    # (read-only registry, ENOSPC) -- dropped the "has been recorded as
+    # unbound" claim rather than assert a side effect that may not have
+    # happened (the oracle's required substrings, spec SS2.2.1, never
+    # included that phrase).
+    echo "butler continuity-gate: an arming ticket did NOT bind (nonce $_UNBOUND_N): it passed its binding window before any Stop of the arming session could claim it (CCPRAXIS_CONTINUITY_TICKET_TTL_S, default 3600s -- a SEPARATE and much shorter TTL than the 12h marker TTL). This session is not armed and nothing was gated. Re-arm from the main session." >&2
+  fi
 fi
 
 MARK=$(bp_continuity_marker "$SID" 2>/dev/null) || exit 0
