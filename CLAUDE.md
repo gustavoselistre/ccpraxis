@@ -45,9 +45,14 @@ grep -m1 '^maxTurns:' $M/butler/agents/bp-scout.md
 If it differs from your clone, the change is **not live**, and saying "the machinery now works" is
 false. Say instead: *"fixed in the clone; inert until promoted."*
 
-A skill already loaded this session was read at invocation time, so a fix on disk — even a promoted
-one — may not be what you are currently following. A **new** `skills/<name>/` is not mounted at all
-until a full manager launch.
+**Plugin skill TEXT is snapshotted at session start, not at invocation.** The "promotion alone" row
+above holds for scripts a skill *runs*, never for the `SKILL.md` a session *reads*. Measured
+2026-09-22: a session started at 08:54Z, `beed3b2` was promoted at 09:13Z, and the session's first
+`/blueprint:create`, eleven hours later, injected the pre-promotion `SKILL.md` byte for byte
+(20/20 body lines matched `2e11059`, the live HEAD at session start), with no stale copy anywhere on
+disk. So a promoted skill fix needs a **new session**, even for a skill this session never invoked.
+Stale skill text in an old session is this, not a file bug. A **new** `skills/<name>/` is not
+mounted at all until a full manager launch.
 
 **Promotion is a merge:** `git -C ~/.claude/ccpraxis pull <this-clone> main`. `install.pl` only
 re-wires PATH and plugin registration; it never copies plugin code, so a clean install run does not
