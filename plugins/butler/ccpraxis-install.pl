@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 # ccpraxis-install.pl — butler plugin install hook.
-# Wires plugins/butler/bin/ (bp-continuity) into the user's PATH.
+# Wires plugins/butler/bin/ (the bp-* command shims) into the user's PATH.
 #
 # WHY THERE IS A SHIM AT ALL. gate-continuity.sh blocks a turn and tells the
 # agent what to run instead. Those instructions used to carry the fully
