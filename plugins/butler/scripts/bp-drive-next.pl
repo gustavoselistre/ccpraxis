@@ -55,6 +55,12 @@
 #   order.json      {"order":[…],"recorded_at":<epoch>}
 #   parks.json      [{"blueprint":…,"reason":…,"at":<epoch>}, …]
 #   announced.json  {"announced":[…]}   blueprints whose blueprint-done already fired
+#   current.json    {"blueprint":…,"package":…,"recorded_at":<epoch>}   the CURRENT
+#                   package pointer (07-guards-reach-the-driver): written on
+#                   run-package, removed on done/stop, left alone otherwise
+#                   (including in-flight). This is what lib.sh's
+#                   bp_driver_context reads to let guard-writes.sh/ledger-guard.sh
+#                   reach a driver session; the write is never fatal.
 #   keepawake.pid   PID of the wake-lock process (host only; sandbox = no file)
 #   run.md          append-only structured run log
 
@@ -340,6 +346,35 @@ sub _write_json_atomic {
     print $fh $json;
     close $fh;
     rename $tmp, $path or do { unlink $tmp; die "bp-drive-next: rename $tmp -> $path: $!"; };
+}
+
+# 07-guards-reach-the-driver §2.7: the current-package pointer,
+# <data>/.drive-solo/current.json — the ONE machine-readable record of what a
+# driver session is currently working on, which is what lib.sh's
+# bp_driver_context reads to reach guard-writes.sh / ledger-guard.sh in a
+# driver session. NEVER FATAL: a write failure here (unwritable dir,
+# current.json existing as a directory, rename failure) must never change the
+# emitted action, the exit code, or the keep-awake side effect — the director
+# must still direct even if it cannot record where it is.
+sub _write_current_pointer {
+    my ($dsdir, $bp, $pkg, $now) = @_;
+    eval {
+        make_path($dsdir) unless -d $dsdir;
+        _write_json_atomic("$dsdir/current.json",
+            { blueprint => $bp, package => $pkg, recorded_at => $now });
+    };
+    return;
+}
+
+# Removed only where the run is genuinely OVER (the `done` branch and the
+# token-refresh-failed `stop` branch) — never on `in-flight`, which would
+# switch the driver guards off for exactly the window a write-capable worker
+# is running. Best-effort: an unlink failure (already absent, etc.) is not an
+# error.
+sub _remove_current_pointer {
+    my ($dsdir) = @_;
+    eval { unlink "$dsdir/current.json" };
+    return;
 }
 
 sub _append_run_log {
@@ -746,6 +781,7 @@ sub _cmd_next {
 
     if (!@candidates) {
         _append_run_log($dsdir, 'DONE (nothing in scope: no blueprint matches the scope spec)');
+        _remove_current_pointer($dsdir);
         print _encode_action({ action => 'done' }), "\n";
         keepawake_apply('settled', $dsdir, $opts);
         return 0;
@@ -881,6 +917,7 @@ sub _cmd_next {
                 # achieving nothing. Release it and say why, once.
                 _append_run_log($dsdir,
                     "ERROR token refresh failed — stopping. $detail");
+                _remove_current_pointer($dsdir);
                 my $action = { action => 'stop', reason => 'token-refresh-failed',
                                detail => $detail };
                 print _encode_action($action), "\n";
@@ -912,6 +949,7 @@ sub _cmd_next {
         if (@ready) {
             my $pkg    = $ready[0];  # sorted by key (ready_packages uses sort keys)
             my $action = { action => 'run-package', blueprint => $bp, package => $pkg };
+            _write_current_pointer($dsdir, $bp, $pkg, $now);
             _append_run_log($dsdir, "RUN $bp/$pkg");
             print _encode_action($action), "\n";
             keepawake_apply('active', $dsdir, $opts);
@@ -975,6 +1013,7 @@ sub _cmd_next {
 
     # B6: all blueprints in the order are settled+announced (or parked)
     _append_run_log($dsdir, 'DONE');
+    _remove_current_pointer($dsdir);
 
     # Close the books before announcing done.
     #
@@ -1209,6 +1248,11 @@ STATE  (<data>/.drive-solo/, all director-owned)
   order.json      {"order":[…],"recorded_at":<epoch>}
   parks.json      [{"blueprint":…,"reason":…,"at":<epoch>}, …]
   announced.json  {"announced":[…]}   blueprints whose blueprint-done already fired
+  current.json    {"blueprint":…,"package":…,"recorded_at":<epoch>}   the CURRENT
+                  package pointer: written on run-package, removed on done/stop,
+                  left alone otherwise (including in-flight); read by
+                  lib.sh's bp_driver_context so the write/ledger guards reach a
+                  driver session; the write is never fatal to `next`.
   keepawake.pid   PID of the wake-lock process (host only; sandbox = no file)
   run.md          append-only structured run log
 END_HELP

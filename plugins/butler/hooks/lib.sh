@@ -912,6 +912,257 @@ bp_drive_marker() {
 }
 
 # ---------------------------------------------------------------------------
+# 07-guards-reach-the-driver: bp_driver_context — the ONE definition of "a
+# butler run is in progress, whoever is driving it, and what is its current
+# package context". See specs/07-guards-reach-the-driver-spec.md §2.2 for the
+# normative 15-step resolution order this mirrors exactly. No hook may
+# re-implement any part of it (registry-path-one-rule.t exists because that
+# duplication already happened here once).
+#
+# bp_driver_context [CWD] -> rc 0 with BP_DRIVER_SESSION / BP_DATA_DIR /
+# BP_PROJECT_ROOT / BP_BLUEPRINT / BP_DIR / BP_PACKAGE / BP_WRITE_SET /
+# BP_TEST_PATHS / BP_DRIVER_ROLE set as plain (never exported) shell globals;
+# or rc 1 with every one of those globals left UNTOUCHED (no partial
+# population -- a half-set BP_WRITE_SET would be a live landmine for any
+# later reader). NEVER exits. NEVER writes to stdout or stderr. NEVER sets
+# BP_LEDGER -- that would satisfy bp_hook_gate in any hook that later ran in
+# the same process, exactly the widening done criterion 3 forbids.
+#
+# Mutually exclusive with bp_hook_gate BY CONSTRUCTION (step 1): a worker
+# session (BP_LEDGER set) always rc 1s here, so no session can take both
+# activation paths.
+bp_driver_context() {
+  local cwd="${1:-$PWD}"
+
+  # 1. Worker sessions belong to bp_hook_gate.
+  [ -z "${BP_LEDGER:-}" ] || return 1
+
+  # 2. Session-wide escape hatch (env form).
+  [ "${CCPRAXIS_DRIVER_GUARDS_OFF:-}" != "1" ] || return 1
+
+  # 3. The cheap liveness pre-check -- already reaps stale markers and
+  # consults the session transcript; not re-derived here.
+  bp_drive_any_active 2>/dev/null || return 1
+
+  # 4. Data dir (honours CCPRAXIS_DATA_DIR).
+  local data_dir
+  data_dir=$(bp_find_data_dir "$cwd" 2>/dev/null) || return 1
+  [ -n "$data_dir" ] || return 1
+
+  # 5. Project root, must be absolute.
+  local project_root
+  project_root=$(dirname "$data_dir" 2>/dev/null) || return 1
+  bp_is_absolute_path "$project_root" || return 1
+
+  # 6. File-form escape hatch, TTL-bounded (default 60 min). Past-TTL is
+  # best-effort removed and enforcement resumes. An age that cannot be
+  # determined (clock or stat failure) is treated as within-TTL -- fail
+  # toward the hatch staying honoured, never toward silently re-enforcing.
+  local hatch="$data_dir/.drive-solo/.driver-guards-off"
+  if [ -e "$hatch" ]; then
+    local h_ttl h_now h_mt h_age
+    h_ttl="${CCPRAXIS_DRIVER_GUARDS_OFF_TTL_MIN:-60}"
+    case "$h_ttl" in ''|*[!0-9]*) h_ttl=60 ;; esac
+    # redteam MINOR-2: cap the TTL so it cannot become a de facto permanent
+    # hatch by env var; 1440 = 24h, matching the redteam's own suggestion.
+    [ "$h_ttl" -gt 0 ] 2>/dev/null || h_ttl=60
+    [ "$h_ttl" -le 1440 ] 2>/dev/null || h_ttl=1440
+    h_now=$(date +%s 2>/dev/null || echo 0)
+    h_mt=$(bp_mtime "$hatch")
+    if [ "$h_now" -gt 0 ] && [ "$h_mt" -gt 0 ]; then
+      # redteam MINOR-1: a future-dated mtime (clock skew, or a deliberately
+      # forged forward touch) must be treated as already-expired, not
+      # honoured forever -- a negative age must not satisfy "age < ttl".
+      if [ "$h_mt" -le "$h_now" ]; then
+        h_age=$(( (h_now - h_mt) / 60 ))
+        if [ "$h_age" -lt "$h_ttl" ]; then
+          return 1
+        fi
+      fi
+      rm -f "$hatch" 2>/dev/null
+    else
+      return 1
+    fi
+  fi
+
+  # 7. The current-package pointer. Absent/unreadable -> rc 1. bp_json_get
+  # returns rc 2 (no parser) -> rc 1 here too, which is the correct fail-open.
+  local cj="$data_dir/.drive-solo/current.json"
+  [ -f "$cj" ] || return 1
+  local cj_content
+  cj_content=$(cat "$cj" 2>/dev/null) || return 1
+  local blueprint package jg_rc
+  blueprint=$(bp_json_get "$cj_content" blueprint 2>/dev/null); jg_rc=$?
+  [ "$jg_rc" -eq 0 ] || return 1
+  package=$(bp_json_get "$cj_content" package 2>/dev/null); jg_rc=$?
+  [ "$jg_rc" -eq 0 ] || return 1
+  [ -n "$blueprint" ] && [ -n "$package" ] || return 1
+
+  # 7b. Pointer-freshness TTL (redteam MAJOR-1, driver decision recorded in
+  # the package ledger 2026-09-22: pointer-freshness over session-identity
+  # narrowing, because narrowing depends on an unverified assumption about
+  # whether a Task subagent's PreToolUse payload carries its parent driver's
+  # session_id). The driver rewrites current.json on every run-package, and
+  # this blueprint's own /butler:drive-solo dispatches routinely run
+  # 30-50 minutes per worker -- CCPRAXIS_DRIVER_POINTER_STALE_MIN defaults to
+  # 240 (4h), generously above that, so a legitimately long-running package
+  # is never false-negatived. A pointer older than the TTL, or one whose
+  # recorded_at is missing/non-numeric/in the future, cannot be proven fresh
+  # -> treated exactly like an absent pointer (F1-equivalent): rc 1, inert.
+  # This is the SAFE fail direction throughout this predicate: rc 1 means the
+  # guard does not enforce a stale package's write set on an unrelated
+  # session, never the reverse.
+  local recorded_at p_ttl p_now p_age
+  recorded_at=$(bp_json_get "$cj_content" recorded_at 2>/dev/null); jg_rc=$?
+  [ "$jg_rc" -eq 0 ] || return 1
+  case "$recorded_at" in ''|*[!0-9]*) return 1 ;; esac
+  p_ttl="${CCPRAXIS_DRIVER_POINTER_STALE_MIN:-240}"
+  case "$p_ttl" in ''|*[!0-9]*) p_ttl=240 ;; esac
+  [ "$p_ttl" -gt 0 ] 2>/dev/null || p_ttl=240
+  p_now=$(date +%s 2>/dev/null || echo 0)
+  [ "$p_now" -gt 0 ] || return 1
+  p_age=$(( (p_now - recorded_at) / 60 ))
+  [ "$p_age" -ge 0 ] || return 1
+  [ "$p_age" -lt "$p_ttl" ] || return 1
+
+  # 8. Name validation, BEFORE either value touches a path: reject empty,
+  # anything with '/', '\', a leading '.', '..' anywhere, or any character
+  # outside [A-Za-z0-9._-]. A pointer file is data; it must not address
+  # another directory.
+  local _n
+  for _n in "$blueprint" "$package"; do
+    case "$_n" in
+      ''|*/*|*\\*|.*|*..*) return 1 ;;
+    esac
+    case "$_n" in
+      *[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+  done
+
+  # 9. Blueprint dir + package ledger must exist.
+  local bp_dir="$data_dir/blueprints/$blueprint"
+  local ledger="$bp_dir/packages/$package.md"
+  [ -d "$bp_dir" ] || return 1
+  [ -f "$ledger" ] || return 1
+
+  # 9b. redteam BLOCKER-2(e), defense-in-depth: $bp_dir may be reached via a
+  # symlinked blueprints/<name> pointing outside <data>/blueprints/, which
+  # would source write_set/test_paths from an attacker-controlled tree even
+  # though name validation (step 8) rejected traversal BY NAME, not by
+  # resolved target. Resolve the real path and require it stays a
+  # prefix-child of $data_dir/blueprints/. Not reachable via the Edit/Write
+  # tool surface this predicate governs (creating a symlink needs Bash,
+  # already unconstrained by write-set containment per established
+  # coordinator-protocol doctrine), so no blocking oracle test pins this --
+  # defense in depth only.
+  local bp_dir_real blueprints_real
+  bp_dir_real=$(cd "$bp_dir" 2>/dev/null && pwd -P) || return 1
+  blueprints_real=$(cd "$data_dir/blueprints" 2>/dev/null && pwd -P) || return 1
+  case "$bp_dir_real" in
+    "$blueprints_real"/*) ;;
+    *) return 1 ;;
+  esac
+
+  # 10. Single-pass frontmatter read of $ledger, matching BpOrch::ledger_fm /
+  # BpDrive::ledger_fm exactly: line 1 must be exactly '---' (trailing \r
+  # tolerated); reading stops at the next '---' line or after 200 lines,
+  # whichever comes first; a key matches ^<key>: with the value trimmed of
+  # leading/trailing whitespace; first occurrence wins. No file is read
+  # twice; no subprocess is spawned for this step.
+  local status="" write_set="" test_paths=""
+  local have_status=0 have_ws=0 have_tp=0
+  local lineno=0 line
+  while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno + 1))
+    line="${line%$'\r'}"
+    if [ "$lineno" -eq 1 ]; then
+      [ "$line" = "---" ] || return 1
+      continue
+    fi
+    [ "$line" = "---" ] && break
+    [ "$lineno" -gt 200 ] && break
+    case "$line" in
+      status:*)
+        if [ "$have_status" -eq 0 ]; then
+          status="${line#status:}"
+          status="${status#"${status%%[![:space:]]*}"}"
+          status="${status%"${status##*[![:space:]]}"}"
+          have_status=1
+        fi
+        ;;
+      write_set:*)
+        if [ "$have_ws" -eq 0 ]; then
+          write_set="${line#write_set:}"
+          write_set="${write_set#"${write_set%%[![:space:]]*}"}"
+          write_set="${write_set%"${write_set##*[![:space:]]}"}"
+          have_ws=1
+        fi
+        ;;
+      test_paths:*)
+        if [ "$have_tp" -eq 0 ]; then
+          test_paths="${line#test_paths:}"
+          test_paths="${test_paths#"${test_paths%%[![:space:]]*}"}"
+          test_paths="${test_paths%"${test_paths##*[![:space:]]}"}"
+          have_tp=1
+        fi
+        ;;
+    esac
+  done < "$ledger" 2>/dev/null
+
+  # 11. status missing -> rc 1 (malformed). Terminal -> rc 1 (stale pointer).
+  # Any other value (including unrecognised) -> continue.
+  [ "$have_status" -eq 1 ] || return 1
+  case "$status" in
+    done|blocked|parked|dropped) return 1 ;;
+  esac
+
+  # 12. write_set missing or empty after trimming -> rc 1 (load-bearing, not
+  # defensive: an empty BP_WRITE_SET would deny every write outside BP_DIR/tmp).
+  [ "$have_ws" -eq 1 ] && [ -n "$write_set" ] || return 1
+
+  # 13. test_paths missing -> "" (not an error; a package may have no oracle).
+
+  # 14. BP_DRIVER_ROLE: read the existing solo marker. Absent/empty/unreadable/
+  # unrecognised, or older than CCPRAXIS_SOLO_WORKER_STALE_MIN minutes (default
+  # 180, sanitised) -> "" (the driver itself). Substring match, as
+  # guard-validation-interlock.sh:110-113 does.
+  local role="" marker="$data_dir/.drive-solo/.active-worker"
+  if [ -f "$marker" ]; then
+    local m_content m_stale m_now m_mt m_age m_fresh=1
+    m_content=$(cat "$marker" 2>/dev/null)
+    m_stale="${CCPRAXIS_SOLO_WORKER_STALE_MIN:-180}"
+    case "$m_stale" in ''|*[!0-9]*) m_stale=180 ;; esac
+    [ "$m_stale" -gt 0 ] 2>/dev/null || m_stale=180
+    m_now=$(date +%s 2>/dev/null || echo 0)
+    m_mt=$(bp_mtime "$marker")
+    if [ "$m_now" -gt 0 ] && [ "$m_mt" -gt 0 ]; then
+      m_age=$(( (m_now - m_mt) / 60 ))
+      [ "$m_age" -ge "$m_stale" ] && m_fresh=0
+    fi
+    if [ "$m_fresh" -eq 1 ]; then
+      case "$m_content" in
+        *bp-implementer*) role="bp-implementer" ;;
+        *bp-test-writer*) role="bp-test-writer" ;;
+        *bp-ui-prober*)   role="bp-ui-prober" ;;
+        *)                role="" ;;
+      esac
+    fi
+  fi
+
+  # 15. Set every global; rc 0.
+  BP_DRIVER_SESSION=1
+  BP_DATA_DIR="$data_dir"
+  BP_PROJECT_ROOT="$project_root"
+  BP_BLUEPRINT="$blueprint"
+  BP_DIR="$bp_dir"
+  BP_PACKAGE="$package"
+  BP_WRITE_SET="$write_set"
+  BP_TEST_PATHS="$test_paths"
+  BP_DRIVER_ROLE="$role"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # g01-explicit-continuity-arming: a THIRD, INDEPENDENT registry, sibling to
 # .drive-solo-active/.reporter-active — explicit arm/disarm for a session
 # doing unattended work with no blueprint, no drive-solo, no reporter. See

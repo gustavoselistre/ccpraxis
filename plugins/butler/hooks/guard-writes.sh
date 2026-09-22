@@ -16,8 +16,22 @@ set -u
 HOOK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib.sh
 source "$HOOK_DIR/lib.sh"
-bp_hook_gate
-bp_hook_require_json_parser
+
+# 07-guards-reach-the-driver: two activation paths, one body. BP_LEDGER set ->
+# a launched worker, byte-identical to today (bp_hook_gate, fail-CLOSED on a
+# missing parser). Otherwise -> a driver / driver-dispatched Task subagent,
+# reached via lib.sh's driver-context predicate, which fails OPEN on any
+# internal error (spec §2.3): a driver that can wedge on a guard error is
+# worse than the thing the guard prevents.
+if [ -n "${BP_LEDGER:-}" ]; then
+  bp_hook_gate
+  bp_hook_require_json_parser
+else
+  bp_drive_any_active 2>/dev/null || exit 0
+  bp_read_payload open
+  _cwd=$(bp_json_get "$PAYLOAD" cwd 2>/dev/null || true)
+  bp_driver_context "${_cwd:-$PWD}" || exit 0
+fi
 
 # longest_glob_match REL PATTERNS
 #   PATTERNS: colon-separated, same dialect as lib.sh:match_any
@@ -109,10 +123,47 @@ case "$FP" in
 esac
 ABS=$(realpath -m "$ABS")
 
-# Always allowed: the blueprint's own dir (ledger, reports, specs) and /tmp.
-case "$ABS" in
-  "$BP_DIR"/*|/tmp/*) exit 0 ;;
-esac
+# fix-batch MAJOR-3: derive the driver/worker branch from whether the
+# lib.sh driver-context predicate actually populated BP_DATA_DIR, not from
+# BP_DRIVER_SESSION alone. BP_DRIVER_SESSION is an ordinary shell variable
+# that can be inherited
+# ambiently (same doctrine lib.sh:100-109 already states for
+# BP_PAYLOAD_READ_DONE); trusting it alone as the sole discriminator, combined
+# with an unbraced "$BP_DATA_DIR" reference under `set -u`, previously let a
+# stray ambient BP_DRIVER_SESSION=1 crash this script with an unbound-variable
+# error on the worker path -- rc 1 from a PreToolUse hook is non-blocking, so
+# the write proceeded with nothing checked (redteam MAJOR-3).
+IS_DRIVER=0
+if [ "${BP_DRIVER_SESSION:-0}" = "1" ] && [ -n "${BP_DATA_DIR:-}" ]; then IS_DRIVER=1; fi
+
+# The hatch advertisement (§2.5), only ever emitted on the driver path.
+HATCH_ADVERT=""
+if [ "$IS_DRIVER" -eq 1 ]; then
+  HATCH_ADVERT=" Escape hatch: touch \"${BP_DATA_DIR:-}/.drive-solo/.driver-guards-off\" or export CCPRAXIS_DRIVER_GUARDS_OFF=1 (self-clearing by default after ${CCPRAXIS_DRIVER_GUARDS_OFF_TTL_MIN:-60} minutes; override with CCPRAXIS_DRIVER_GUARDS_OFF_TTL_MIN)."
+fi
+
+# Always allowed: /tmp, and -- worker path -- the blueprint's own dir
+# (ledger, reports, specs); driver path -- the data dir, EXCEPT the
+# control-plane directory <data>/.drive-solo/ (redteam BLOCKER-1/BLOCKER-2:
+# that directory holds the hatch file, the current-package pointer file,
+# the active-worker marker and other director-owned state that the driver
+# predicate in lib.sh re-reads on every invocation -- a guarded actor with
+# the whole data dir always-allowed could switch both
+# guards off, or rewrite its own policy inputs, with one permitted write. It
+# is written only by bp-drive-next.pl and the tracking hooks, never by a
+# legitimate Edit/Write tool call, so carving it out of the always-allow
+# costs the driver nothing and falls through to ordinary write-set
+# enforcement below, which denies it (none of it is ever in a write_set)).
+if [ "$IS_DRIVER" -eq 1 ]; then
+  case "$ABS" in
+    "${BP_DATA_DIR:-}"/.drive-solo/*) ;;
+    "${BP_DATA_DIR:-}"/*|/tmp/*) exit 0 ;;
+  esac
+else
+  case "$ABS" in
+    "${BP_DIR:-}"/*|/tmp/*) exit 0 ;;
+  esac
+fi
 
 REL=$(realpath -m --relative-to="$BP_PROJECT_ROOT" "$ABS")
 case "$REL" in
@@ -144,30 +195,57 @@ if [ "$T_LEN" -ge 0 ]; then
   esac
 fi
 
-WORKER=""
-MARKER=$(marker_path)
-[ -f "$MARKER" ] && WORKER=$(cat "$MARKER" 2>/dev/null || true)
+# Role resolution: driver path reads BP_DRIVER_ROLE (the predicate above
+# already consulted the solo marker); marker_path() -- the COORDINATOR marker
+# at $BP_DIR/runs/<pkg>.active-worker -- is never consulted on the driver
+# path, because a solo run does not write it.
+if [ "$IS_DRIVER" -eq 1 ]; then
+  WORKER="${BP_DRIVER_ROLE:-}"
+else
+  WORKER=""
+  MARKER=$(marker_path)
+  [ -f "$MARKER" ] && WORKER=$(cat "$MARKER" 2>/dev/null || true)
+fi
 
-if [ "$IN_TESTS" -eq 0 ] && [[ "$WORKER" == *bp-implementer* ]]; then
-  echo "BLOCKED: bp-implementer may not modify test files ($REL; matched test_paths pattern '$T_PAT'). Tests are the immutable oracle for this package. If a test is wrong, finish what you can, then report the exact test, why it contradicts the spec, and your evidence — the coordinator decides." >&2
+# The driver is the implementer's PEER with respect to the oracle: it
+# dispatches bp-test-writer to author tests and must not hand-edit them
+# itself (§2.3.3). "the driver itself is writing" = driver path with an
+# empty WORKER (no solo worker marker, or one that resolved to "").
+DRIVER_SELF=0
+if [ "$IS_DRIVER" -eq 1 ] && [ -z "$WORKER" ]; then DRIVER_SELF=1; fi
+
+# review M1: the package-name interpolation below is gated on IS_DRIVER, same
+# pattern as HATCH_ADVERT -- unconditional interpolation would contaminate
+# the worker-path denial text, which the spec pins as byte-identical to
+# today's (BP_PACKAGE is exported into every worker session too, so this was
+# a real, observable text change on that path, not a no-op).
+PKG_NOTE=""
+[ "$IS_DRIVER" -eq 1 ] && PKG_NOTE=" in package ${BP_PACKAGE:-pkg}"
+
+if [ "$IN_TESTS" -eq 0 ] && { [[ "$WORKER" == *bp-implementer* ]] || [ "$DRIVER_SELF" -eq 1 ]; }; then
+  WHO="bp-implementer"
+  [ "$DRIVER_SELF" -eq 1 ] && WHO="the driver"
+  echo "BLOCKED: $WHO may not modify test files ($REL; matched test_paths pattern '$T_PAT')$PKG_NOTE. Tests are the immutable oracle for this package. If a test is wrong, finish what you can, then report the exact test, why it contradicts the spec, and your evidence — the coordinator decides.$HATCH_ADVERT" >&2
   exit 2
 fi
 
 if [ "$IN_TESTS" -ne 0 ] && [[ "$WORKER" == *bp-test-writer* ]]; then
-  echo "BLOCKED: bp-test-writer may only write under the package's test paths ($BP_TEST_PATHS), not $REL. If implementation scaffolding is genuinely required, report it back instead of writing it." >&2
+  echo "BLOCKED: bp-test-writer may only write under the package's test paths ($BP_TEST_PATHS), not $REL.$HATCH_ADVERT If implementation scaffolding is genuinely required, report it back instead of writing it." >&2
   exit 2
 fi
 
 if [ "$IN_TESTS" -ne 0 ] && [[ "$WORKER" == *bp-ui-prober* ]]; then
-  echo "BLOCKED: bp-ui-prober may only write under the package's test paths ($BP_TEST_PATHS), not $REL. Prober artifacts (screenshots, fixtures) are produced by test *runs*, not by Edit/Write. If something else genuinely must change, report it back instead of writing it." >&2
+  echo "BLOCKED: bp-ui-prober may only write under the package's test paths ($BP_TEST_PATHS), not $REL.$HATCH_ADVERT Prober artifacts (screenshots, fixtures) are produced by test *runs*, not by Edit/Write. If something else genuinely must change, report it back instead of writing it." >&2
   exit 2
 fi
 
 if [ "$IN_TESTS" -eq 0 ]; then exit 0; fi
 if match_any "$REL" "${BP_WRITE_SET:-}"; then exit 0; fi
 
-echo "BLOCKED: $REL is outside this package's write set." >&2
+PKG_PAREN=""
+[ "$IS_DRIVER" -eq 1 ] && PKG_PAREN=" (package ${BP_PACKAGE:-pkg})"
+echo "BLOCKED: $REL is outside this package's write set$PKG_PAREN." >&2
 show_patterns "write_set" "${BP_WRITE_SET:-}"
 show_patterns "test_paths" "${BP_TEST_PATHS:-}"
-echo "If the path you tried to write appears above only as part of a LONGER element, this package's write_set was serialized wrong and the scope is already correct — relaunch is the only recovery, because nothing re-derives BP_WRITE_SET mid-session. Otherwise this is a scope problem: record it in the ledger under 'Next action' / escalation, set status to blocked or finish without it — the orchestrator re-scopes packages, coordinators do not." >&2
+echo "If the path you tried to write appears above only as part of a LONGER element, this package's write_set was serialized wrong and the scope is already correct — relaunch is the only recovery, because nothing re-derives BP_WRITE_SET mid-session. Otherwise this is a scope problem: record it in the ledger under 'Next action' / escalation, set status to blocked or finish without it — the orchestrator re-scopes packages, coordinators do not.$HATCH_ADVERT" >&2
 exit 2
