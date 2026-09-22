@@ -197,6 +197,43 @@ for my $cmd (
     is($rc, 0, 'ORACLE-GAP control: explicitly-allowed read-only "git stash list" stays ALLOWED') or diag("hook output: $out");
 }
 
+# ── AC-33 (almanac 20260918-234106-0377): a quoted single-word SUBCOMMAND is
+#    byte-identical argv to its unquoted form, so it must be caught exactly
+#    like the unquoted invocation. WRITTEN BLIND TO THE FIX: every row here
+#    is expected to FAIL (rc=0, wrongly ALLOWED) against the pre-fix tree,
+#    since the old walk X-masked every quoted span unconditionally regardless
+#    of internal whitespace or position. Scope matches the reported defect
+#    and mirrors guard-run-finish.sh's own fix: only the word immediately
+#    after an UNQUOTED "git" (verb-adjacent) is unmasked. ────────────────────
+for my $cmd (
+    q{git 'stash'},
+    q{git "stash"},
+    q{git 'reset' --hard},
+    q{git "checkout" main},
+    q{foo && git 'stash'},
+) {
+    my ($rc, $out) = run_guard($cmd);
+    is($rc, 2, "AC-33: '$cmd' (quoted single-word subcommand) is DENIED") or diag("hook output: $out");
+}
+
+# ── AC-33 controls: a single-word quoted span NOT verb-adjacent (after a
+#    flag, or the "git" token itself quoted) must still X-mask / stay
+#    unmatched and ALLOWED. The sibling hook's own red-team false-positive
+#    class (Finding A) must not reappear here -- and widening the carve-out
+#    to command-start position would newly misfire on a real command like
+#    `echo 'git' 'stash'`, which merely PRINTS the words "git stash" and
+#    never invokes git at all. That shape is asserted explicitly below. ─────
+for my $cmd (
+    q{perl bp-blueprint.pl add-decision --file f --id 22 --text "stash"},
+    q{echo "stash" "reset"},
+    q{'git' stash},
+    q{"git" stash},
+    q{echo 'git' 'stash'},
+) {
+    my ($rc, $out) = run_guard($cmd);
+    is($rc, 0, "AC-33 control: '$cmd' (non-verb-adjacent single-word quote) stays ALLOWED") or diag("hook output: $out");
+}
+
 # ── AC-32 (existing, must-not-regress companions from spec observable-behavior 32) ──
 {
     my $payload = $J->encode({ tool_name => 'Bash', tool_input => { command => '' } });

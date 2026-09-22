@@ -195,9 +195,17 @@ for my $row (
 
 # =====================================================================================
 # AC4 (DC2, DC3) -- git_scan_target's three-state quote walk and its ANCHOR_CLASS /
-# MUT_RE / STASH_RE selection are byte-for-byte UNCHANGED. Pinned via literal substring
-# presence (not line offsets, since the new branch's insertion shifts every subsequent
-# line number) -- captured verbatim from the pre-fix tree.
+# MUT_RE / STASH_RE selection are byte-for-byte UNCHANGED *relative to the
+# almanac 20260918-234106-0377 fix*. That fix (2026-09-22) deliberately edited
+# the walk itself -- it unconditionally X-masked every quoted span, including a
+# bare single-word quoted "git" subcommand, which made `git 'stash'` byte-
+# identical argv to `git stash` scan to a masked string neither STASH_RE nor
+# MUT_RE could match: a real guard bypass, not a mention-vs-invocation false
+# positive. This pin now protects THAT walk (verb-adjacent single-word
+# unmask, mirroring guard-run-finish.sh's own fix) from silent drift, the same
+# way the pre-fix pin protected the walk before it. Pinned via literal
+# substring presence (not line offsets, since the new branch's insertion
+# shifts every subsequent line number).
 # =====================================================================================
 {
     my $src = do { local (@ARGV, $/) = ($GUARD); <> };
@@ -206,14 +214,22 @@ for my $row (
   local state=NONE   # NONE | SINGLE | DOUBLE
   local carrier=0
   local out="" c next
+  local qbuf="" qhaswhite=0 qadjacent=0
+  local adj_re='(^|[;&|[:space:]({])git[[:space:]]+$'
   local i=0
   while [ "$i" -lt "$len" ]; do
     c=${cmd:$i:1}
     case "$state" in
       NONE)
         case "$c" in
-          "'") state=SINGLE; out+="'" ;;
-          '"') state=DOUBLE; out+='"' ;;
+          "'")
+            state=SINGLE; qbuf=""; qhaswhite=0
+            [[ "$out" =~ $adj_re ]] && qadjacent=1 || qadjacent=0
+            ;;
+          '"')
+            state=DOUBLE; qbuf=""; qhaswhite=0
+            [[ "$out" =~ $adj_re ]] && qadjacent=1 || qadjacent=0
+            ;;
           '`') carrier=1; out+='`' ;;
           '$')
             next=${cmd:$((i+1)):1}
@@ -223,18 +239,34 @@ for my $row (
         esac ;;
       SINGLE)
         case "$c" in
-          "'") state=NONE; out+="'" ;;
-          *)   out+="X" ;;
+          "'")
+            state=NONE
+            if [ "$qhaswhite" -eq 0 ] && [ "$qadjacent" -eq 1 ]; then
+              out+="$qbuf"
+            else
+              out+="'"; out+="${qbuf//?/X}"; out+="'"
+            fi
+            ;;
+          ' '|$'\t'|$'\n') qhaswhite=1; qbuf+="$c" ;;
+          *) qbuf+="$c" ;;
         esac ;;
       DOUBLE)
         case "$c" in
-          '"') state=NONE; out+='"' ;;
-          '`') carrier=1; out+="X" ;;
+          '"')
+            state=NONE
+            if [ "$qhaswhite" -eq 0 ] && [ "$qadjacent" -eq 1 ]; then
+              out+="$qbuf"
+            else
+              out+='"'; out+="${qbuf//?/X}"; out+='"'
+            fi
+            ;;
+          '`') carrier=1; qbuf+="$c" ;;
           '$')
             next=${cmd:$((i+1)):1}
             [ "$next" = "(" ] && carrier=1
-            out+="X" ;;
-          *)   out+="X" ;;
+            qbuf+="$c" ;;
+          ' '|$'\t'|$'\n') qhaswhite=1; qbuf+="$c" ;;
+          *) qbuf+="$c" ;;
         esac ;;
     esac
     i=$((i+1))

@@ -264,17 +264,44 @@ git_scan_target() {
       ;;
   esac
 
+  # almanac 20260918-234106-0377: a quoted single-word span used to be
+  # X-masked UNCONDITIONALLY, same as any multi-word (prose) span. Bash makes
+  # an unquoted verb and its single-quoted/double-quoted equivalent
+  # byte-identical argv entries once parsed (`git stash`, `git 'stash'` and
+  # `'git' stash` all run the same command) -- so a quoted "git" or a quoted
+  # subcommand walked to a masked scan string that could never match
+  # STASH_RE/MUT_RE below, silently bypassing this guard. Mirrors the fix
+  # already applied to guard-run-finish.sh's identical masking technique:
+  # a quoted span's CONTENTS are buffered (qbuf) as the walk goes, and only
+  # unmasked to their literal text (instead of X-masked) when BOTH (a) the
+  # span has no internal whitespace -- a single word, hence byte-identical
+  # whether quoted or not -- and (b) it sits in a position immediately after
+  # an unquoted "git" token, i.e. verb-adjacent, checked against the
+  # unquoted-so-far $out at the moment the quote OPENS. That positional
+  # constraint mirrors the sibling hook's own red-team-driven fix (its
+  # Finding A): without it, a single-word quoted span ANYWHERE (e.g. inside
+  # a legitimate `--text "off"`-shaped argument) would unmask and could
+  # false-positive. Anything else -- a quoted word after a flag, or multi-
+  # word prose -- stays X-masked exactly as before.
   local state=NONE   # NONE | SINGLE | DOUBLE
   local carrier=0
   local out="" c next
+  local qbuf="" qhaswhite=0 qadjacent=0
+  local adj_re='(^|[;&|[:space:]({])git[[:space:]]+$'
   local i=0
   while [ "$i" -lt "$len" ]; do
     c=${cmd:$i:1}
     case "$state" in
       NONE)
         case "$c" in
-          "'") state=SINGLE; out+="'" ;;
-          '"') state=DOUBLE; out+='"' ;;
+          "'")
+            state=SINGLE; qbuf=""; qhaswhite=0
+            [[ "$out" =~ $adj_re ]] && qadjacent=1 || qadjacent=0
+            ;;
+          '"')
+            state=DOUBLE; qbuf=""; qhaswhite=0
+            [[ "$out" =~ $adj_re ]] && qadjacent=1 || qadjacent=0
+            ;;
           '`') carrier=1; out+='`' ;;
           '$')
             next=${cmd:$((i+1)):1}
@@ -284,18 +311,34 @@ git_scan_target() {
         esac ;;
       SINGLE)
         case "$c" in
-          "'") state=NONE; out+="'" ;;
-          *)   out+="X" ;;
+          "'")
+            state=NONE
+            if [ "$qhaswhite" -eq 0 ] && [ "$qadjacent" -eq 1 ]; then
+              out+="$qbuf"
+            else
+              out+="'"; out+="${qbuf//?/X}"; out+="'"
+            fi
+            ;;
+          ' '|$'\t'|$'\n') qhaswhite=1; qbuf+="$c" ;;
+          *) qbuf+="$c" ;;
         esac ;;
       DOUBLE)
         case "$c" in
-          '"') state=NONE; out+='"' ;;
-          '`') carrier=1; out+="X" ;;
+          '"')
+            state=NONE
+            if [ "$qhaswhite" -eq 0 ] && [ "$qadjacent" -eq 1 ]; then
+              out+="$qbuf"
+            else
+              out+='"'; out+="${qbuf//?/X}"; out+='"'
+            fi
+            ;;
+          '`') carrier=1; qbuf+="$c" ;;
           '$')
             next=${cmd:$((i+1)):1}
             [ "$next" = "(" ] && carrier=1
-            out+="X" ;;
-          *)   out+="X" ;;
+            qbuf+="$c" ;;
+          ' '|$'\t'|$'\n') qhaswhite=1; qbuf+="$c" ;;
+          *) qbuf+="$c" ;;
         esac ;;
     esac
     i=$((i+1))
