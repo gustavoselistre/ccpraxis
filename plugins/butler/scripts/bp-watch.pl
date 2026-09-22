@@ -172,6 +172,13 @@ sub blueprint_settled {
     return 1;
 }
 
+# settled_verdict(\@packages) -> 'settled' | 'pending' | 'unverifiable'.  PURE.
+sub settled_verdict {
+    my ($packages) = @_;
+    return 'unverifiable' unless defined $packages && ref $packages eq 'ARRAY' && @$packages;
+    return blueprint_settled($packages) ? 'settled' : 'pending';
+}
+
 # all_pids_alive(\@pids, $pid_alive_fn) -> 1 | 0 | undef.  PURE (given the
 # injected callback). INVARIANT 3: reused liveness, never reimplemented --
 # the caller MUST pass BpRunState::pid_alive (bp-runstate.pl:59-69) in
@@ -1092,6 +1099,8 @@ unless (caller) {
         exit 65;
     }
 
+    my %arm_pkg_ids;
+
     if ($mode eq 'package') {
         my $pkgs = BpWatch::read_packages_dir($bpdir);
         my ($entry) = grep { $_->{id} eq $pkgid } @$pkgs;
@@ -1123,6 +1132,11 @@ unless (caller) {
                 . "yet -- liveness unknown, never treat as done\n";
             exit 65;
         }
+        # MEDIUM-2 (redteam, 12-waits-check-liveness fix-batch): capture the
+        # arm-time denominator once, while the tree is known-good, so a later
+        # PARTIAL unreadable-dir read (a strict subset of these ids) can be
+        # told apart from a genuinely smaller, real package set.
+        %arm_pkg_ids = map { $_->{id} => 1 } @$pkgs;
     }
 
     # INVARIANT 3: reused, not reimplemented. BpRunState::pid_alive is the
@@ -1210,7 +1224,15 @@ unless (caller) {
         }
         else {
             my $pkgs = BpWatch::read_packages_dir($bpdir);
-            $status = BpWatch::blueprint_settled($pkgs) ? 'done' : undef;
+            # MEDIUM-2: a tick whose observed id set is a STRICT SUBSET of the
+            # arm-time set is a partial/unreadable read, not a real shrink --
+            # treat it as unverifiable rather than handing it to
+            # settled_verdict, which is only zero-aware, not denominator-aware.
+            my %seen_ids = map { $_->{id} => 1 } @$pkgs;
+            my $partial = (keys %seen_ids) < (keys %arm_pkg_ids)
+                && !grep { !$arm_pkg_ids{$_} } keys %seen_ids;
+            my $verdict = $partial ? 'unverifiable' : BpWatch::settled_verdict($pkgs);
+            $status = ($verdict eq 'settled') ? 'done' : undef;
         }
 
         # --pid-file is RE-READ every tick (never cached at arm time).

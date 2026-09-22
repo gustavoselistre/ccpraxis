@@ -218,6 +218,172 @@ already sitting on disk, a suite that was already green — the whole time it po
 result **once**. If it's there, proceed. If it isn't yet, end the turn and resume on the
 completion notification; never check again in the same turn, and never in a loop.
 
+### Every wait names its subject and its liveness proof
+
+A butler-launched coordinator has no completion-notification resumption available
+(`gate-headless-background.sh` denies `run_in_background` whenever `BP_LEDGER` is set, as this
+same file states below) — so the "Check the sentinel once" paragraph's "end the turn and resume
+on the completion notification" branch above does not apply to it. Arm a bounded watch instead.
+
+Three coordinators in about twenty minutes each blocked or parked on work that had already died or
+finished (`20260917-003158-949e`), and each queued a human decision that did not need one.
+
+**A wait is legal only if you can name two things: the SUBJECT and the LIVENESS PROOF.** The
+subject is the exact process, file or ledger you are waiting on. The liveness proof is a check that
+asks a live process, not one that reads bookkeeping. **A pid you recorded, a sentinel path and a
+report filename are bookkeeping; none of them is evidence that anything is still running.**
+
+**If you cannot name a liveness proof, the wait is not legal.** Do one of these instead, in order:
+(1) run the work in the FOREGROUND and read its result in this turn; (2) re-dispatch the subject so
+the wait has a live subject again; (3) write a concrete `## Next action` and stop. **Never park, and
+never queue a human decision, on a wait whose subject you never checked.**
+
+The `liveness proof` cell below draws only from this closed vocabulary:
+
+| token | means |
+|---|---|
+| `Task return` | the Task tool returned; the dispatch is over by construction |
+| `completion notification` | the `run_in_background` completion notification (interactive drivers only) |
+| `foreground exit code` | you ran it inline and read `$?` in the same turn |
+| `bp-watch --package` | Mode A ledger-status watch |
+| `bp-watch --artifact` | mtime advance on an explicitly named path |
+| `bp-watch --expect-pids` | one or more literal pids, checked every tick |
+| `bp-watch --pid-file` | a pid file, re-read every tick |
+| `pid_alive` | `BpRunState::pid_alive`, called directly |
+| `NONE` | no liveness proof exists for this shape — legal **only** on a `BANNED` row |
+
+The wait-shape table's columns are fixed:
+
+```
+| wait shape | subject | liveness proof | ruling |
+```
+
+The sanctioned and banned shapes:
+
+| wait shape | subject | liveness proof | ruling |
+|---|---|---|---|
+| Task worker dispatch, synchronous | the dispatched subagent | `Task return` | SANCTIONED |
+| backgrounded Bash job resumed on notification (interactive drivers only — denied whenever `BP_LEDGER` is set) | the backgrounded job | `completion notification` | SANCTIONED |
+| foreground validation run | the command you ran | `foreground exit code` | SANCTIONED |
+| package ledger status | the coordinator that owns that package | `bp-watch --package` | SANCTIONED |
+| dispatch report, mtime-advance checked | the worker you dispatched | `bp-watch --artifact` + `bp-watch --expect-pids` | SANCTIONED |
+| sentinel file, writer checked | the process that must write the sentinel | `bp-watch --artifact` + `bp-watch --expect-pids` | SANCTIONED |
+| a recorded pid, checked live | the process that pid names | `pid_alive` | SANCTIONED |
+| a pid file, re-read every tick | the process the file names | `bp-watch --pid-file` | SANCTIONED |
+| naked existence read as completion — test -f on a dispatch report | the worker you dispatched | `NONE` | BANNED |
+| naked sentinel wait — an absent sentinel read as "still running" | the process that must write the sentinel | `NONE` | BANNED |
+| naked pid-file read — a recorded pid read as a live process | the process that pid named | `NONE` | BANNED |
+
+The three `BANNED` rows come from real cases: the report-stub row is `06-l1-reaudit`, the sentinel
+row is `03-scorer-rich`, and the pid-file row is `02-rich-extraction`.
+
+#### The coordinator's arming recipe
+
+**This recipe applies only when you already hold a live pid for something still running.** Both
+of a coordinator's sanctioned dispatch shapes — `Task` and a foreground `bp-worker.pl` call — are
+synchronous and have already returned by the time you could arm a watch: `Task return` (the
+verdict table's first row) already proves the dispatch is over, and needs no watch at all. Reach
+for this recipe only in the rare case you hold a pid for a process that is genuinely still
+running.
+
+```bash
+perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-watch.pl --arm \
+     --package "$BP_BLUEPRINT/$BP_PACKAGE" \
+     --expect-pids <pid of the subject> \
+     --artifact "<the report or sentinel you are waiting on>" \
+     --max-seconds <sized to THIS dispatch> \
+     --reason "<why this bound>"
+```
+
+- **Mode A only.** `--blueprint` is the reporter's whole-blueprint settlement watch
+  (`reporter/SKILL.md`, pinned by `bp-watch-doctrine.t`, "the reporter arm command uses Mode B"),
+  never a coordinator's.
+- **Never `--keepawake`.** That lease belongs to drive-solo's director ("Arm the watcher" in
+  `drive-solo/SKILL.md`); a coordinator holds none and must not create one.
+- **Foreground, always.** `gate-headless-background.sh` (the `PreToolUse` denial on
+  `run_in_background` whenever `BP_LEDGER` is set) denies backgrounding for every butler-launched
+  coordinator. A single bounded `bp-watch.pl` call is not a wait-shape the guard denies — it
+  contains no loop and no `sleep` (`wait-shape-guard.sh`, the loop-plus-sleep matcher).
+- **`--max-seconds` must fit inside the Bash tool's own timeout (≤600s), with a matching
+  `timeout:` on the call — and must never be omitted.** The 2900s code default cannot complete in
+  a foreground call; a harness kill is not one of `bp-watch.pl`'s verdicts and maps to no row
+  below.
+- **`--reason` is unconditional, not just "if below the default".** Any bound under the 2900s
+  default requires it in code, so always pass one.
+- **At least one liveness axis.** With no `--expect-pids`, `--pid-file` or `--artifact`, you have
+  armed a timer, not a liveness check: `all_pids_alive` returns `undef` for an empty pid list and
+  the watch can only ever reach BOUND.
+- **`--package` names the subject the watch is scoped to — it is not itself a liveness proof.**
+  `resolve_condition` checks `terminal` status (which includes `blocked` and `parked`) before it
+  checks liveness, so arm this watch while your own status is still `running`, not after you have
+  already set it to a terminal value.
+
+#### The verdict → action table
+
+The verdict table's columns:
+
+```
+| exit | verdict | what you do |
+```
+
+A blueprint archived mid-watch (Mode B) is not a stale SETTLED — the packages dir disappearing
+mid-watch now reads as unverifiable and the watch keeps polling to BOUND, fail-open, rather than
+reporting a settlement that may no longer be true. No behavior change here, just documented.
+
+| exit | verdict | what you do |
+|---|---|---|
+| 0 | TERMINAL | wait ENDS. Verify the artifact on disk before believing it — see "Existence is not completion". |
+| 1 | BOUND | liveness is UNKNOWN. The subject is treated as ALIVE: re-arm once with a fresh bound, or write a concrete `## Next action` and stop. Never conclude dead. |
+| 2 | WORKERS-GONE | wait ENDS NOW. Read the report first — if its mtime advanced past the stub and it carries a real conclusion, the worker finished and then exited; accept it. Only an absent or stub-sized report means re-dispatch it per "A dead worker is not a worker that found nothing" — this is not a reason to sit still, and not one to hand to a person. |
+| 3 | ARTIFACT | wait ENDS. The watched path advanced; read it and judge completeness yourself. |
+| 4 | STATUS-CHANGE | wait ENDS for this arm. Note the change and re-arm or resume. |
+| 64 | USAGE | your command line is wrong. This is evidence about your invocation, never about the subject. Fix it and re-arm. |
+| 65 | UNVERIFIABLE | the check itself could not run. The subject is treated as ALIVE. Re-arm **once** with corrected arguments. If the second attempt is also 65, the subject is not checkable from here: write a concrete `## Next action` and stop. |
+
+#### Existence is not completion
+
+The worker dispatch contract itself mandates the report file be **created before the investigation
+and appended to as it goes** (`SKILL.md`, "CREATE THIS FILE EARLY, BEFORE THE INVESTIGATION, AND
+APPEND AS YOU GO"). So at dispatch start **every** report file already exists. `test -f <report>`
+therefore proves only that the dispatch *started*.
+
+**A wait on a dispatch report is satisfied only when the report's mtime advanced after the wait
+began AND no liveness axis reported the worker dead.** Use `--artifact <report>`; never a bare
+existence test. The `≤15-line` return is not the deliverable; the file is.
+
+`--artifact` fires on the **first** mtime advance, which for a dispatch report is the mandatory
+pre-investigation stub write itself. Exit 3 (ARTIFACT) means the worker started, not that it
+finished — re-read the file, and re-arm the watch if it is still stub-shaped.
+
+**A sentinel is the same rule with the polarity flipped:** a *missing* sentinel is not evidence that
+work is still running. Pair every sentinel wait with the writer's pid.
+
+This extends, and does not replace, the existing "Confirm the artifact exists on disk before
+accepting any worker's conclusion … If the file is absent or stub-sized, the work did not happen"
+rule (`SKILL.md`, the worker dispatch contract's rules): that one governs *accepting a
+conclusion*; this one governs *ending a wait*.
+
+#### Fail OPEN means the wait CONTINUES
+
+`guard-run-finish.sh` fails open toward **ALLOWING A STOP** (`guard-run-finish.sh:29-33`): it is a
+gate on the agent's own action, its subject is a whole session, and a gate that can never be
+satisfied wedges that session forever with nobody present to notice.
+
+**A wait is not a gate, and it has a bound.** Every `bp-watch`-shaped wait carries a bound
+(`--max-seconds`, defaulting to 2900s in code), so continuing one cannot wedge anything: the worst
+case is that the watch runs to BOUND and you make a recorded decision then. The `pid_alive` row is
+a single check, not a loop: one call, then decide. The two errors are therefore not symmetric:
+
+- Treating an **unverifiable** subject as **dead** ends the wait and triggers a re-dispatch of work
+  that may still be running — two write-capable workers in one write set, and a live worker
+  abandoned moments before it would have written its report.
+- Treating it as **alive** costs at most the remainder of one bound.
+
+So: **an undeterminable subject is ALIVE, and the wait continues.** Unknown is never dead. This is
+the opposite direction from `guard-run-finish.sh`, deliberately, because the thing being protected
+is different — and copying that hook's direction here would turn a fail-open into a fail-wrong.
+This is a deliberate asymmetry, not an inconsistency.
+
 ## Fast test I/O — heavy artifacts on container-native storage
 
 Your project dir is a **bind mount**. On Windows/WSL2 that is a 9p filesystem, and every per-file syscall costs an order of magnitude more than it does on the container's own overlay FS. `node_modules` is the pathological case — hundreds of thousands of small files, ~95% of them under `node_modules/.pnpm`. It is the difference between a 30-second install and a 15-minute one, on every attempt of your convergence loop.
