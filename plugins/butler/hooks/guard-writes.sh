@@ -117,8 +117,18 @@ FP=$(bp_json_get "$PAYLOAD" tool_input.file_path tool_input.notebook_path)
 [ -n "$FP" ] || exit 0
 CWD=$(bp_json_get "$PAYLOAD" cwd); CWD=${CWD:-$PWD}
 
+# A Windows drive-letter path ("C:/..." or "C:\...") is ALREADY absolute --
+# the tool payload's file_path/cwd arrive in that form on this host. The
+# original two-way case here only recognised a POSIX leading "/" as
+# "already absolute", so a drive-letter FP fell into the "*" branch and got
+# CWD (itself POSIX-form, e.g. "/c/Development/...") prepended in front of
+# it -- producing a doubled, non-existent path like
+# "/c/Development/ccpraxis/C:/Development/ccpraxis/...". realpath -m does not
+# repair that; it has no relationship to fix. Recognise both absolute forms
+# up front so neither is ever joined onto CWD.
 case "$FP" in
   /*) ABS="$FP" ;;
+  [A-Za-z]:/*|[A-Za-z]:\\*) ABS="$FP" ;;
   *)  ABS="$CWD/$FP" ;;
 esac
 ABS=$(realpath -m "$ABS")
