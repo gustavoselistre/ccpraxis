@@ -1027,6 +1027,158 @@ sub _session_slashify {
 }
 
 # ---------------------------------------------------------------------------
+# FAST LINE READER. A session is ~130 MB of JSONL for a day of drive-solo
+# work, and JSON::PP -- the only JSON decoder core Perl ships -- decodes it at
+# about 1 MB/s: `derive-session` measured 154s on one real session. Almost
+# all of those bytes are tool output, file contents and thinking text that
+# nothing here reads.
+#
+# So a line is not decoded whole. A strict JSON grammar, written as a
+# recursive regex (it runs in the regex engine, in C), validates the line and
+# splits objects into members; only the handful of fields
+# _session_read_agent_file reads are decoded, into a THIN record with exactly
+# the shape JSON::PP would have given them. Same session: 12s.
+#
+# The result must equal a JSON::PP decode exactly. Any line the grammar
+# cannot vouch for returns undef and takes the full JSON::PP decode instead,
+# so malformed lines are still judged by JSON::PP alone
+# (record_counts.skipped_unparseable is unchanged). The grammar follows
+# RFC 8259 exactly as JSON::PP enforces it (no raw control characters in
+# strings, no unknown escapes, no leading zeros); the three things JSON::PP
+# also rejects that a regex does not see -- invalid UTF-8, unpaired
+# surrogate escapes, nesting deeper than 512 -- send the line to JSON::PP.
+# Scalars take JSON::PP too unless they are plain printable ASCII strings or
+# integers of at most 15 digits, because _safe_usage_num judges the DECODED
+# value and JSON::PP decodes a long integer to its exact digit string, where
+# `0 + $raw` would give a rounded float (25 digits: the string passes
+# _safe_usage_num's /^\d+\z/, the float's "1.23e+24" does not).
+# Measured before landing: all 32,290 lines of a real session gave
+# field-for-field the same record through both paths;
+# spend-session-fast-reader.t pins the edge cases.
+# ---------------------------------------------------------------------------
+our $SESSION_JSON_GRAMMAR = qr{
+    (?(DEFINE)
+        (?<str> " [^"\\\x00-\x1f]*+ (?: \\ (?: ["\\/bfnrt] | u[0-9a-fA-F]{4} ) [^"\\\x00-\x1f]*+ )*+ " )
+        (?<num> -?+ (?: 0 | [1-9][0-9]*+ ) (?: \.[0-9]++ )?+ (?: [eE][-+]?+[0-9]++ )?+ )
+        (?<ws>  [\x20\x09\x0a\x0d]*+ )
+        (?<val> (?&str) | (?&num) | (?&obj) | (?&arr) | true | false | null )
+        (?<obj> \{ (?&ws) (?: (?&str) (?&ws) : (?&ws) (?&val) (?&ws)
+                              (?: , (?&ws) (?&str) (?&ws) : (?&ws) (?&val) (?&ws) )*+ )?+ \} )
+        (?<arr> \[ (?&ws) (?: (?&val) (?&ws) (?: , (?&ws) (?&val) (?&ws) )*+ )?+ \] )
+    )
+}x;
+my $SESSION_MEMBER_RE = qr{ \G (?&ws) ( (?&str) ) (?&ws) : (?&ws) ( (?&val) ) (?&ws) ( [,\}] ) $SESSION_JSON_GRAMMAR }x;
+my $SESSION_ELEM_RE   = qr{ \G (?&ws) (?&val) (?&ws) ( [,\]] ) $SESSION_JSON_GRAMMAR }x;
+my $SESSION_JSON_ONE  = JSON::PP->new->utf8->allow_nonref;
+my $SESSION_JSON_LINE = JSON::PP->new->utf8;
+
+# _session_json_members($text) -> [ [key, raw-value-text], ... ] in document
+# order for a text that is exactly one JSON object, else undef.
+sub _session_json_members {
+    my ($t) = @_;
+    pos($t) = 0;
+    $t =~ /\G[\x20\x09\x0a\x0d]*\{[\x20\x09\x0a\x0d]*/gc or return undef;
+    my @members;
+    unless ($t =~ /\G\}/gc) {
+        while (1) {
+            $t =~ /$SESSION_MEMBER_RE/gc or return undef;
+            my ($k, $v, $sep) = ($1, $2, $3);
+            push @members, [ _session_json_scalar($k), $v ];
+            last if $sep eq '}';
+        }
+    }
+    return ($t =~ /\G[\x20\x09\x0a\x0d]*\z/gc) ? \@members : undef;
+}
+
+# _session_json_array_len($text) -> element count of a text that is exactly
+# one JSON array, else undef.
+sub _session_json_array_len {
+    my ($t) = @_;
+    pos($t) = 0;
+    $t =~ /\G[\x20\x09\x0a\x0d]*\[[\x20\x09\x0a\x0d]*/gc or return undef;
+    my $n = 0;
+    unless ($t =~ /\G\]/gc) {
+        while (1) {
+            $t =~ /$SESSION_ELEM_RE/gc or return undef;
+            $n++;
+            last if $1 eq ']';
+        }
+    }
+    return ($t =~ /\G[\x20\x09\x0a\x0d]*\z/gc) ? $n : undef;
+}
+
+# _session_json_scalar($raw) -> exactly what JSON::PP (utf8, allow_nonref)
+# returns for one grammar-valid JSON value.
+sub _session_json_scalar {
+    my ($raw) = @_;
+    return substr($raw, 1, -1) if $raw =~ /\A"[\x20\x21\x23-\x5b\x5d-\x7e]*"\z/;
+    return 0 + $raw            if $raw =~ /\A(?:0|[1-9][0-9]{0,14})\z/;
+    return $SESSION_JSON_ONE->decode($raw);
+}
+
+# _session_json_pick($raw, \%scalars, \%nested) -> for a raw OBJECT value, a
+# hashref holding only the keys named in %scalars (decoded as scalars) and
+# %nested (key => coderef applied to the raw sub-value); any other raw value
+# decodes as-is. Duplicate keys: last wins, as in JSON::PP.
+sub _session_json_pick {
+    my ($raw, $scalars, $nested) = @_;
+    return _session_json_scalar($raw) unless $raw =~ /\A\{/;
+    my $members = _session_json_members($raw) or return _session_json_scalar($raw);
+    my %h;
+    for my $m (@$members) {
+        my ($k, $v) = @$m;
+        if    ($scalars->{$k})         { $h{$k} = _session_json_scalar($v) }
+        elsif ($nested && $nested->{$k}) { $h{$k} = $nested->{$k}->($v) }
+    }
+    return \%h;
+}
+
+my %SESSION_THIN_TOP   = map { $_ => 1 } qw(type timestamp requestId effort uuid session_id);
+my %SESSION_THIN_MSG   = map { $_ => 1 } qw(model id);
+my %SESSION_THIN_USAGE = map { $_ => 1 } qw(input_tokens output_tokens cache_read_input_tokens
+                                            cache_creation_input_tokens speed);
+my %SESSION_THIN_CC    = map { $_ => 1 } qw(ephemeral_5m_input_tokens ephemeral_1h_input_tokens);
+
+my %SESSION_THIN_USAGE_NESTED = (
+    cache_creation => sub { _session_json_pick($_[0], \%SESSION_THIN_CC) },
+    # Only the element count is ever read (multi_iteration), so the array is
+    # counted, not decoded: a list of that many placeholders.
+    iterations     => sub {
+        my $n = ($_[0] =~ /\A\[/) ? _session_json_array_len($_[0]) : undef;
+        return defined($n) ? [ (undef) x $n ] : _session_json_scalar($_[0]);
+    },
+);
+my %SESSION_THIN_MSG_NESTED = (
+    usage => sub { _session_json_pick($_[0], \%SESSION_THIN_USAGE, \%SESSION_THIN_USAGE_NESTED) },
+);
+
+# _session_thin_record($line) -> thin record (see the block comment above),
+# or undef when the line must take the full JSON::PP decode.
+sub _session_thin_record {
+    my ($line) = @_;
+    return undef if $line =~ /[\x80-\xff]/ && !do { my $c = $line; utf8::decode($c) };
+    return undef if $line =~ /\\u[dD][89abAB]/;
+    # Only a line holding 512+ brackets can nest past JSON::PP's limit, so
+    # only such a line pays for counting the brackets outside strings.
+    if (($line =~ tr/{[//) > 512) {
+        (my $s = $line) =~ s/"[^"\\]*+(?:\\.[^"\\]*+)*+"//g;
+        return undef if ($s =~ tr/{[//) > 512;
+    }
+    my $top = _session_json_members($line) or return undef;
+    my %rec;
+    for my $m (@$top) {
+        my ($k, $v) = @$m;
+        if ($SESSION_THIN_TOP{$k}) {
+            $rec{$k} = _session_json_scalar($v);
+        }
+        elsif ($k eq 'message') {
+            $rec{message} = _session_json_pick($v, \%SESSION_THIN_MSG, \%SESSION_THIN_MSG_NESTED);
+        }
+    }
+    return \%rec;
+}
+
+# ---------------------------------------------------------------------------
 # _session_read_agent_file($path, \%record_counts) -> ( \@order, \%requests,
 # $first_ts ). Reads one agent transcript, deduplicates its assistant records
 # into per-request entries keyed per B1, and returns them in
@@ -1048,8 +1200,9 @@ sub _session_read_agent_file {
         $line =~ s/\r?\n\z//;
         next unless length $line;
 
-        my $rec = eval { JSON::PP->new->utf8->decode($line) };
-        if ($@ || ref($rec) ne 'HASH') {
+        my $rec = _session_thin_record($line)
+            // eval { $SESSION_JSON_LINE->decode($line) };
+        if (ref($rec) ne 'HASH') {
             $counts->{skipped_unparseable}++;
             next;
         }
