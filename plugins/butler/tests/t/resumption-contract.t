@@ -151,22 +151,36 @@ SKIP: {
 
 # ── AC8 — the two guards share ONE implementation ─────────────────────────
 #
-# Asserted structurally rather than by comparing behaviour: if bp-runstate.pl
-# grew its own copy again, this fails, which is the whole point. The lesson that
-# cost a fix batch was that knowledge living in one file cannot be reached from
-# the other.
+# MIGRATED (package 03-retire-runstate, spec §5.1's resumption-contract.t
+# entry): bp-runstate.pl is DELETED, not merely edited, so it can no longer
+# be the subject of "uses the shared module" / "no longer carries its own
+# fingerprint implementation". Both assertions are repointed at the two
+# files that now load BpResumption.pm DIRECTLY (spec §2.2): bp-watch.pl and
+# bp-worker.pl. Same intent, unweakened: "if anybody grew their own copy
+# again, this fails."
+#
+# Asserted structurally rather than by comparing behaviour: if either file
+# grew its own copy again, this fails, which is the whole point. The lesson
+# that cost a fix batch was that knowledge living in one file cannot be
+# reached from the other.
 {
-    open my $fh, '<', "$SCRIPTS/bp-runstate.pl" or die $!;
-    local $/;
-    my $src = <$fh>;
-    close $fh;
-    like($src, qr/BpResumption/,
-         'AC8 bp-runstate.pl uses the shared resumption module');
-    unlike($src, qr/sub pid_fingerprint \{\s*\n\s*my \(\$pid\)/,
-           'AC8 and no longer carries its own fingerprint implementation');
+    for my $f (['bp-watch.pl', "$SCRIPTS/bp-watch.pl"],
+               ['bp-worker.pl', "$SCRIPTS/bp-worker.pl"]) {
+        my ($name, $path) = @$f;
+        open my $fh, '<', $path or die "$path: $!";
+        local $/;
+        my $src = <$fh>;
+        close $fh;
+        like($src, qr/BpResumption/,
+             "AC8 MIGRATED: $name uses the shared resumption module");
+        unlike($src, qr/^[ \t]*sub[ \t]+pid_alive\b/m,
+               "AC8 MIGRATED: $name does not define its own sub pid_alive");
+        unlike($src, qr/^[ \t]*sub[ \t]+pid_fingerprint\b/m,
+               "AC8 MIGRATED: $name does not define its own sub pid_fingerprint");
+    }
 
     open my $gh, '<', "$Bin/../../hooks/gate-continuity.sh" or die $!;
-    my $gate = <$gh>;
+    my $gate = do { local $/; <$gh> };
     close $gh;
     like($gate, qr/bp-resumption\.pl/,
          'AC8 the continuity gate verifies through the same module, via the CLI');

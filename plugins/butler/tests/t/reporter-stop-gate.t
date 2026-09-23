@@ -41,11 +41,15 @@ use JSON::PP;
 my $HOOKS = "$Bin/../../hooks";
 my $MARK  = "$HOOKS/mark-wakeup.sh";
 my $GATE  = "$HOOKS/gate-drive-loop.sh";
-my $RS    = "$Bin/../../scripts/bp-runstate.pl";
 
 ok(-f $MARK, 'A1: mark-wakeup.sh exists') or BAIL_OUT('hook missing');
 ok(-f $GATE, 'A2: gate-drive-loop.sh exists') or BAIL_OUT('hook missing');
-ok(-f $RS,   'A3: bp-runstate.pl exists') or BAIL_OUT('state machine missing');
+# A3 RETIRED (package 03-retire-runstate, spec §5.1's reporter-stop-gate.t
+# entry, verbatim): "the -f $RS existence assertion is RETIRED (the file is
+# meant to be absent)". Proving bp-runstate.pl's absence from disk is
+# runstate-references-retired.t's job (AC-1), not this file's -- this file's
+# subject is gate-drive-loop.sh's reporter branch, which (per D and E below)
+# no longer depends on that script existing at all.
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -165,12 +169,9 @@ sub registered_reporter {
     return ($root, $rdir, $sid, $mrc);
 }
 
-sub pause_reporter {
-    my ($root, $pid, $until, %opt) = @_;
-    my $reason = $opt{reason} // 'bp-watch.pl armed';
-    return system(qq{perl "$RS" pause --surface reporter --watcher-pid $pid --until $until }
-                . qq{--reason "$reason" --root "$root" >/dev/null 2>&1});
-}
+# pause_reporter() RETIRED (package 03-retire-runstate): it shelled out to
+# `bp-runstate.pl pause --surface reporter`, a verb/flag pair that no longer
+# exists. Its one call site (the old AC19b) is re-expressed below without it.
 
 sub runstate_reporter_path {
     my ($root) = @_;
@@ -421,10 +422,15 @@ sub runstate_reporter_path {
     my ($rc_a) = run_gate(stop_payload($root, $sid), rdir => $rdir, probe_dir => $probe_none);
     is($rc_a, 2, 'AC19 (reporter) precondition: registered, probe NONE, no marker -> DENIED');
 
-    my $prc = pause_reporter($root, $$, time() + 600);
+    # AC19b MIGRATED (package 03-retire-runstate): the old fixture shelled out
+    # to `bp-runstate.pl pause --surface reporter` here, a verb/flag pair that
+    # no longer exists to call. Re-expressed as a plain repeat of the same
+    # baseline fixture -- the claim survives unweakened: nothing an agent can
+    # do outside arming a live watcher or touching the marker resolves this.
     my ($rc_b) = run_gate(stop_payload($root, $sid), rdir => $rdir, probe_dir => proc_dir_none());
-    is($rc_b, 2, 'AC19b (reporter): a `pause --surface reporter` call (even a granted one, or '
-              . 'a no-op if --surface is gone) still DENIED -- no longer read at all');
+    is($rc_b, 2, 'AC19b (reporter) MIGRATED: repeating the baseline fixture (registered, probe '
+              . 'NONE, no marker, no --surface reporter record of any kind -- the verb is gone) '
+              . 'is still DENIED');
 
     make_path("$root/.ccpraxis-local-data/.subagent-guard");
     open my $f1, '>', "$root/.ccpraxis-local-data/.subagent-guard/run-state.reporter.json" or die $!;

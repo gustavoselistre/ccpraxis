@@ -136,8 +136,18 @@ my $T = "$Bin";
 # guard.t): 67 -> 93; 137 (drive-loop-runstate-fold.t): 12 -> 13.
 # mark-wakeup-agent-dispatch.t (120) is untouched by package 02 and stays at
 # 21.
+#
+# RE-BASELINED AGAIN 2026-09-23 (blueprint butler-gate-ergonomics, package
+# 03-retire-runstate): 93 -> 83. This is a legitimate DECREASE, not loss the
+# floor exists to catch -- package 03's own assertion contract (its ledger's
+# "THE ASSERTION CONTRACT FOR THIS PACKAGE" section, Decision 18) required
+# retiring subagent-stall-guard.t's "THE STATE MACHINE" section wholesale
+# (a direct bp-runstate.pl state-machine test with no probe-based successor,
+# since the state machine itself was deleted, not relocated) and migrating
+# AC19a/AC19b off the legacy finish/pause verbs. Every retirement is recorded
+# with a reason in package 03's ledger; nothing was silently dropped.
 my %baseline = (
-    'subagent-stall-guard.t'      => 93,
+    'subagent-stall-guard.t'      => 83,
     'mark-wakeup-agent-dispatch.t'=> 21,
     'drive-loop-runstate-fold.t'  => 13,
 );

@@ -31,7 +31,7 @@
 #   2. read_packages_dir() reads packages/*.md, NEVER runs/registry.json --
 #      the registry only knows LAUNCHED packages. With 2 of 5 launched,
 #      "all registry entries terminal" was reachable with three never run.
-#   3. Liveness is PID-scoped via BpRunState::pid_alive (bp-runstate.pl,
+#   3. Liveness is PID-scoped via BpResumption::pid_alive (BpResumption.pm,
 #      kill(0)-then-tasklist), reused rather than reinvented. The shipped bug
 #      was `ps -eo args | grep -c '[c]laude'`, which matched every bash
 #      tool-call process through the shell-snapshot path -- the headline
@@ -103,16 +103,19 @@ my %TERMINAL = map { $_ => 1 } qw(done dropped blocked parked);
 # MAJOR-4 (redteam-step6.md): the probe's common path (a candidate armed
 # WITHOUT an explicit --max-seconds, which is the default and recommended
 # shape) must not be structurally coupled to bp-runstate.pl -- package 03
-# deletes that file, and main::DEFAULT_MAX_SECONDS()'s `require` would then
-# raise inside the eval that calls it, silently turning every such candidate
-# into a permanent 'undecidable' with no error surfaced anywhere (spec §3.8's
-# laziness addresses COST only, not the structural dependency). Inlined here
-# as a literal, matching bp-watch.pl's own currently-resolved value
-# (BpRunState::MAX_PAUSE_SECONDS() - 100 == 50*60 - 100 == 2900) so the two
-# cannot silently drift without a comment update on both sides. This is the
-# value probe_scan actually uses; main::DEFAULT_MAX_SECONDS remains the
-# derivation the CLI's own --arm path uses (and the one a caller-supplied
-# opts->{default_max_seconds}, i.e. every test in this package, overrides).
+# deleted that file, so this is a literal with NO runtime dependency on it.
+# main::DEFAULT_MAX_SECONDS() now returns this same constant directly (no
+# require of anything), so the two cannot drift apart -- there is only one
+# value any more, not two kept in sync by comment discipline.
+#
+# THE NUMBER'S OWN REASONING (moved here from bp-runstate.pl's deleted
+# MAX_PAUSE_SECONDS, package 03): 2900s is ~48 minutes, inside the ~10-minute
+# headroom this repo keeps under the provider's one-hour prompt-cache TTL for
+# these sessions. A bound longer than that wakes a watcher whose context has
+# gone cold -- every turn re-read before anything useful happens, the single
+# most expensive way a long run can resume. This constant is what now bounds
+# the watcher that replaced the old pause; the cap's number and its reasoning
+# survive here even though the pause itself is gone.
 use constant PROBE_DEFAULT_MAX_SECONDS => 2900;
 
 sub is_terminal_status {
@@ -181,7 +184,7 @@ sub settled_verdict {
 
 # all_pids_alive(\@pids, $pid_alive_fn) -> 1 | 0 | undef.  PURE (given the
 # injected callback). INVARIANT 3: reused liveness, never reimplemented --
-# the caller MUST pass BpRunState::pid_alive (bp-runstate.pl:59-69) in
+# the caller MUST pass BpResumption::pid_alive (BpResumption.pm) in
 # production; this function defines no liveness primitive of its own.
 # undef ("not applicable") iff the pid list is empty -- an empty list must
 # never be read as "confirmed alive". 0 the MOMENT any one pid is dead.
@@ -768,12 +771,11 @@ sub usage {
 usage: bp-watch.pl --arm [--max-seconds N] (--package BP/PKGID | --blueprint BP)
                     [--pid-file PATH | --expect-pids P1,P2,...]
                     [--artifact PATH[:PATH...]] [--poll SECS] [--data DIR]
-                    [--keepawake] [--self-pause [--reason TEXT]]
+                    [--keepawake] [--reason TEXT]
        bp-watch.pl probe [--data DIR]
 
---max-seconds defaults to 2900 (matching BpRunState::pause's own 50-minute
-cap) when omitted. Passing a SHORTER --max-seconds requires --reason TEXT
-saying why; a longer one needs none.
+--max-seconds defaults to 2900s when omitted. Passing a SHORTER --max-seconds
+requires --reason TEXT saying why; a longer one needs none.
 
 --max-seconds is REQUIRED, no default.
 
@@ -961,7 +963,6 @@ unless (caller) {
         elsif ($a eq '--poll')        { $opt{poll}         = shift @ARGV }
         elsif ($a eq '--data')        { $opt{data}         = shift @ARGV }
         elsif ($a eq '--keepawake')   { $opt{keepawake}    = 1 }
-        elsif ($a eq '--self-pause')  { $opt{self_pause}   = 1 }
         elsif ($a eq '--reason')      { $opt{reason}       = shift @ARGV }
         else                          { push @unknown, $a }
     }
@@ -972,25 +973,24 @@ unless (caller) {
     }
 
     # DEFAULT_MAX_SECONDS: what --max-seconds defaults to when omitted.
-    # Derived from BpRunState::MAX_PAUSE_SECONDS (the same cap --self-pause
-    # clamps to), minus headroom for this watch's own round trip -- not an
-    # independent literal, so the two can't silently drift apart. Operator
-    # ruling 2026-09-19: this REPLACES the old "REQUIRED, no default" rule,
-    # which guarded against a different failure (bp-watchdog.pl's fixed
-    # 30-minute RE-POLL TICK manufacturing false verdicts from unchanged
-    # state -- this file's poll loop exits the moment its condition
-    # resolves, so the bound is a ceiling, never a repeating tick). Forcing
-    # a number on every call instead produced its own regression: guessed
-    # low, re-armed often. A SHORTER override needs --reason TEXT (so a
+    # Returns BpWatch::PROBE_DEFAULT_MAX_SECONDS() directly -- a literal
+    # constant with NO runtime dependency on any file that could disappear
+    # (see that constant's own comment for the 2900s reasoning). package 03
+    # deleted bp-runstate.pl, which this used to `require`; a caller-supplied
+    # opts->{default_max_seconds} (every test in this package) still
+    # overrides the probe's own copy of the same number independently. This
+    # sub stays here, inside the block the CLI's own --arm path reads from,
+    # simply because that is where that path looks for it -- not because it
+    # would otherwise be unreachable. A named sub installs into the symbol
+    # table at COMPILE time regardless of the enclosing `unless (caller)`
+    # runtime conditional, so bp-watch-cli.t's A1d test (which loads this
+    # file via `require` from a caller() context) can call it either way;
+    # that is exactly why A1d already passes today.
+    # A SHORTER --max-seconds override needs --reason TEXT (so a
     # hallucinated "this'll be fast" is at least visible); a longer one
-    # needs none, since --self-pause clamps it to the same cap regardless.
-    # require lives INSIDE the sub, not above it: bp-watch-cli.t's own A1d
-    # test calls this via `require bp-watch.pl` from a caller() context,
-    # which skips this whole unless(caller) body -- a require statement out
-    # here would never run for that caller, leaving BpRunState unloaded.
+    # needs none.
     sub DEFAULT_MAX_SECONDS {
-        require "$DIR/bp-runstate.pl";
-        return BpRunState::MAX_PAUSE_SECONDS() - 100;
+        return BpWatch::PROBE_DEFAULT_MAX_SECONDS();
     }
 
     my $max_seconds;
@@ -1054,7 +1054,7 @@ unless (caller) {
     my @expect_pids;
     if (defined $opt{expect_pids}) {
         # Every comma-separated entry MUST be a strictly positive integer.
-        # "0" is not a real pid -- BpRunState::pid_alive treats pid 0 as
+        # "0" is not a real pid -- BpResumption::pid_alive treats pid 0 as
         # unconditionally dead, so silently accepting it turned a caller's
         # bug (a failed pgrep, a $?/$! mix-up) into an instant, false
         # WORKERS-GONE verdict. A malformed entry (whitespace, non-numeric,
@@ -1139,9 +1139,9 @@ unless (caller) {
         %arm_pkg_ids = map { $_->{id} => 1 } @$pkgs;
     }
 
-    # INVARIANT 3: reused, not reimplemented. BpRunState::pid_alive is the
+    # INVARIANT 3: reused, not reimplemented. BpResumption::pid_alive is the
     # ONLY liveness primitive this file calls.
-    require "$DIR/bp-runstate.pl";
+    require "$DIR/BpResumption.pm";
 
     # BLOCKER-1 (redteam-step6.md): record THIS process's own pid-reuse-safe
     # fingerprint NOW, at the moment this file actually starts running
@@ -1177,35 +1177,6 @@ unless (caller) {
         }
         1;
     };
-
-    # --self-pause: register THIS process (its own real pid, not a caller's
-    # guess) as the guard-subagent-stall.sh watcher, via BpRunState::pause
-    # in-process -- no subprocess, no second `ps` lookup. See that function's
-    # own header for the incident this avoids (a hand-rolled watcher built
-    # instead of using this flag) and the pause cap this doesn't duplicate.
-    if ($opt{self_pause}) {
-        my $watching = sprintf('%s %s (max %ss)', $mode, ($mode eq 'package' ? $opt{package} : $bpname), $max_seconds);
-        # $DATA is the resolved .ccpraxis-local-data dir (respects --data /
-        # CCPRAXIS_DATA_DIR / walk-up, same as everything else in this file);
-        # BpRunState wants its PARENT (the project root) -- passing undef here
-        # would instead auto-resolve via git-toplevel/cwd, silently targeting
-        # the WRONG root whenever --data points somewhere else (a test
-        # fixture, a non-default project layout). Must stay the same root
-        # this watch itself is reading from, or a caller who disagrees with
-        # the pause can never find where it actually landed.
-        require File::Basename;
-        my ($ok, $msg) = BpRunState::pause(File::Basename::dirname($DATA),
-            watcher_pid => $$,
-            until       => time + $max_seconds,
-            watching    => $watching,
-            reason      => ($opt{reason} // "bp-watch.pl self-armed, watching $watching"),
-        );
-        print STDERR "bp-watch: --self-pause: $msg\n";
-        # Non-fatal on refusal (e.g. a race on the state file) -- the watch
-        # itself is still valid and still worth running; a caller relying on
-        # the pause should check this line, but a failed self-pause must
-        # never stop a legitimate watch from proceeding.
-    }
 
     my $art_before = @art_paths ? BpWatch::artifact_snapshot(\@art_paths) : {};
 
@@ -1244,7 +1215,7 @@ unless (caller) {
         elsif (@expect_pids) {
             @cur_pids = @expect_pids;
         }
-        my $pids_alive = BpWatch::all_pids_alive(\@cur_pids, \&BpRunState::pid_alive);
+        my $pids_alive = BpWatch::all_pids_alive(\@cur_pids, \&BpResumption::pid_alive);
 
         my $art_changed = 0;
         if (@art_paths) {
@@ -1308,7 +1279,7 @@ unless (caller) {
             # creates the FIRST lease.
             my $lease_f      = "$DATA/.drive-solo/keepawake.pid";
             my $existing_pid = _read_pidfile($lease_f);
-            if (defined $existing_pid && BpRunState::pid_alive($existing_pid)) {
+            if (defined $existing_pid && BpResumption::pid_alive($existing_pid)) {
                 eval {
                     require "$DIR/bp-keepawake.pl";
                     BpKeepAwake::apply('active', "$DATA/.drive-solo", {});

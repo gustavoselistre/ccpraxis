@@ -55,6 +55,7 @@ use IO::Handle;
 use File::Path qw(make_path);
 use File::Basename qw(dirname);
 use File::Spec;
+use Cwd ();
 
 # The session-identity resolver. All of "which session am I" lives there, once,
 # for every consumer -- see BpSession.pm's header.
@@ -944,14 +945,64 @@ sub cmd_lease {
     emit('ARMED_ANY',    BpContinuityLease::any_active($dir) ? 'yes' : 'no');
 }
 
+# PROJECT-ANCHORED ROOT RESOLUTION — never script-relative. Lifted from
+# bp-runstate.pl (package 03, butler-gate-ergonomics deleted that file), which
+# is where this lesson was first learned and paid for.
+#
+# butler normally runs from an INSTALL outside the project (~/.claude/ccpraxis,
+# or a marketplace dir), so a script-relative guess like
+# Cwd::abs_path("$SCRIPT_DIR/../../..") resolves the INSTALL root, not the
+# project. That failed silently and expensively: guard-ask-operator.sh (a
+# hook) always carries $CLAUDE_PROJECT_DIR, but a driver's own Bash tool does
+# not, so a driver-side write landed under the install root while the hook
+# went on reading the project's — the queue was written and read from two
+# different directories with nobody ever finding an error. A wrong answer
+# anchored to the PROJECT is recoverable; one anchored to the INSTALL is a
+# different repo's state file.
+#
+# Priority mirrors bp-drive-next.pl's _resolve_project_root and
+# bp-lib.sh's bp_project_root, and — the four-leg duplication convention this
+# file's own header already documents for the continuity registry — this is
+# the same rule stated a fourth time, for the questions queue:
+#
+#   $CLAUDE_PROJECT_DIR > $BP_PROJECT_ROOT > git toplevel
+#     > walk up from cwd for a dir holding .ccpraxis-local-data > cwd
+#
+# CLAUDE_PROJECT_DIR stays first because in a hook it is authoritative and is
+# exactly what guard-ask-operator.sh itself uses. The chain ENDS at cwd,
+# never at the install dir.
+sub _resolve_project_root {
+    return $ENV{CLAUDE_PROJECT_DIR}
+        if defined $ENV{CLAUDE_PROJECT_DIR} && length $ENV{CLAUDE_PROJECT_DIR};
+
+    return $ENV{BP_PROJECT_ROOT}
+        if defined $ENV{BP_PROJECT_ROOT} && length $ENV{BP_PROJECT_ROOT};
+
+    # git toplevel — trust only a clean exit and a real directory.
+    my $top = `git rev-parse --show-toplevel 2>/dev/null`;
+    if ($? == 0 && defined $top) {
+        chomp $top;
+        return $top if length $top && -d $top;
+    }
+
+    # Walk up from cwd for the first ancestor that already holds .ccpraxis-local-data.
+    my $d = Cwd::getcwd();
+    if (defined $d && length $d) {
+        my %seen;
+        while (!$seen{$d}++) {
+            return $d if -d "$d/.ccpraxis-local-data";
+            my $parent = dirname($d);
+            last if $parent eq $d;    # reached the filesystem / drive root
+            $d = $parent;
+        }
+    }
+
+    return Cwd::getcwd() // '.';
+}
+
 sub questions_path {
-    my $rs = "$SCRIPT_DIR/bp-runstate.pl";
-    return undef unless -f $rs;
-    my $dir = `"$^X" "$rs" state-dir 2>/dev/null`;
-    return undef unless defined $dir;
-    chomp $dir;
-    return undef unless length $dir;
-    return "$dir/questions.md";
+    my $root = _resolve_project_root();
+    return "$root/.ccpraxis-local-data/.subagent-guard/questions.md";
 }
 
 # APPEND, never overwrite. Several questions across a long run are the norm and

@@ -354,14 +354,15 @@ if [ -f "$MARK.wakeup-pending" ]; then
   #
   # This used to parse the marker in awk and decide in shell: bounded? deadline
   # ahead? pid alive? Two of those three were subtly wrong, and both had already
-  # been solved in bp-runstate.pl -- kill -0 reports a healthy native Windows
+  # been solved in BpResumption.pm -- kill -0 reports a healthy native Windows
   # process as dead, and a live pid is not the SAME pid once the holding process
   # has exited and the OS recycled the number. `hold` exits at its deadline BY
   # DESIGN, so pid reuse is the ordinary case here, not an exotic one.
   #
   # Shell cannot compute a process fingerprint, so translating the rules here a
   # second time could only reproduce that gap. bp-resumption.pl answers instead,
-  # over the same module bp-runstate.pl uses. The marker is consumed either way,
+  # over `BpResumption.pm` -- one implementation of these two rules, not a
+  # second translation. The marker is consumed either way,
   # so a stale one can never be spent twice.
   # THE RECORD ON DISK IS ALWAYS THE EXPIRED ONE AT THIS MOMENT, AND THAT IS
   # STRUCTURAL RATHER THAN UNLUCKY.

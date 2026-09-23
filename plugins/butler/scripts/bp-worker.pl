@@ -491,9 +491,9 @@ sub _dispatch_tmp_owner_alive {
     my ($pid, $fp) = split(/:/, $line, 2);
     return 0 unless defined $pid && $pid =~ /^\d+$/;
     return 0 unless defined $fp && length $fp;
-    require "$Bin/bp-runstate.pl";
-    return 0 unless BpRunState::pid_alive($pid);
-    my $have = BpRunState::pid_fingerprint($pid);
+    require "$Bin/BpResumption.pm";
+    return 0 unless BpResumption::pid_alive($pid);
+    my $have = BpResumption::pid_fingerprint($pid);
     return (defined $have && $have eq $fp) ? 1 : 0;
 }
 
@@ -521,8 +521,8 @@ sweep_stale_tmp($TMPROOT, $WORKER_TMP_TTL_MIN);
 my $DISPATCH_TMP = "$TMPROOT/$BP_PACKAGE.$SHORT.$ts.$$";
 make_path($DISPATCH_TMP);
 {
-    require "$Bin/bp-runstate.pl";
-    my $owner_fp = BpRunState::pid_fingerprint($$);
+    require "$Bin/BpResumption.pm";
+    my $owner_fp = BpResumption::pid_fingerprint($$);
     if (defined $owner_fp && length $owner_fp) {
         if (open(my $ownfh, '>', "$DISPATCH_TMP/.owner")) {
             print {$ownfh} "$$:$owner_fp\n";

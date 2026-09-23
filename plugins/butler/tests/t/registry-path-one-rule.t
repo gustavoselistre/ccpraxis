@@ -571,8 +571,9 @@ for my $case (
     #     exit 0` (unrelated to this package) exits 0 immediately AFTER
     #     finding the marker (t/94's own fixture shape).
     #   reporter -- a marker WAS found, so the reporter branch proceeds to ask
-    #     bp-runstate.pl whether a pause/finish was ever declared for this
-    #     session (it was not, in this fixture) and BLOCKS, exit 2 -- this is
+    #     bp-watch.pl's probe (and the finish marker) whether anything ever
+    #     resolved this session's watch (it did not, in this fixture) and
+    #     BLOCKS, exit 2 -- this is
     #     t/143 section B's own pinned behavior for "registered, nothing
     #     declared". A registry MISMATCH (the bug this package fixes) would
     #     instead have found NO marker and exited 0 silently, exactly as

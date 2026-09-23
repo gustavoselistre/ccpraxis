@@ -249,7 +249,7 @@ The `liveness proof` cell below draws only from this closed vocabulary:
 | `bp-watch --artifact` | mtime advance on an explicitly named path |
 | `bp-watch --expect-pids` | one or more literal pids, checked every tick |
 | `bp-watch --pid-file` | a pid file, re-read every tick |
-| `pid_alive` | `BpRunState::pid_alive`, called directly |
+| `pid_alive` | `BpResumption::pid_alive`, called directly |
 | `NONE` | no liveness proof exists for this shape — legal **only** on a `BANNED` row |
 
 The wait-shape table's columns are fixed:

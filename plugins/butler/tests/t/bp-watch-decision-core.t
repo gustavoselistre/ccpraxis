@@ -205,7 +205,7 @@ sub write_ledger {
 }
 
 # ===========================================================================
-# D. INVARIANT 3 — liveness is PID-SCOPED (via BpRunState::pid_alive), NEVER
+# D. INVARIANT 3 — liveness is PID-SCOPED (via BpResumption::pid_alive), NEVER
 #    a name-grep.
 #
 #    Falsifiable two ways, both asserted: (1) a structural grep of the SOURCE
@@ -227,7 +227,7 @@ sub write_ledger {
         my $code = join "\n", map { /^\s*#/ ? '' : $_ } split /\n/, $src, -1;
         unlike($code, qr/\bkill\s*\(\s*0\s*,/,
            'D1 INVARIANT-3 CANONICAL: source contains no bare kill(0, ...) call of its own — '
-         . 'liveness must be REUSED from BpRunState::pid_alive (bp-runstate.pl:59-69), never '
+         . 'liveness must be REUSED from BpResumption::pid_alive (BpResumption.pm), never '
          . 'reimplemented ad hoc');
         unlike($code, qr/\btasklist\b/,
            'D2: source contains no direct tasklist invocation of its own, for the same reason');
@@ -237,7 +237,7 @@ sub write_ledger {
          . 'tool-call process through the shell-snapshot path and could NEVER have fired');
         like($code, qr/pid_alive/,
            'D4: source actually references pid_alive at all — a file that reuses NOTHING '
-         . 'named pid_alive cannot be reusing BpRunState\'s implementation');
+         . 'named pid_alive cannot be reusing BpResumption\'s implementation');
     } else {
         fail('D1 INVARIANT-3 CANONICAL: cannot check source (file absent)');
         fail('D2: cannot check source (file absent)');

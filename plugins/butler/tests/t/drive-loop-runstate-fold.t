@@ -5,9 +5,11 @@
 # ORIGINALLY: gate-drive-loop.sh consulted bp-runstate.pl's effective 'paused'
 # state as an ADDITIONAL escape from BLOCK, on top of everything
 # t/drive-loop-gate.t already pins. Package 02 (butler-gate-ergonomics)
-# replaces that consultation everywhere with the pair (probe verdict, finish
-# marker) — D3 in that package's spec removes `bp-runstate.pl status` from
-# every one of its three call sites, this fold's included. This file migrates
+# REPLACED that consultation everywhere with the pair (probe verdict, finish
+# marker) — D3 in that package's spec removed `bp-runstate.pl status` from
+# every one of its three call sites, this fold's included; the read is gone
+# and stays gone, and package 03 (retire-runstate) deletes the script itself,
+# leaving nothing here to still be reachable even in principle. This file migrates
 # 1:1 per 02-gates-use-the-probe-spec.md §4.8's own table: every existing I1-
 # I9 assertion is re-pointed to the probe fixture that reproduces its original
 # intent, and I5 ("malformed run-state still BLOCKS") is the one AUTHORISED
@@ -53,7 +55,9 @@ use File::Basename qw(dirname);
 
 my $HOOKS    = "$Bin/../../hooks";
 my $GATE     = "$HOOKS/gate-drive-loop.sh";
-my $RUNSTATE = "$Bin/../../scripts/bp-runstate.pl";
+# The dangling `my $RUNSTATE = ".../bp-runstate.pl";` with no remaining use
+# is DROPPED here (package 03-retire-runstate, spec §2.9's entry for this
+# file) -- nothing below ever referenced it even before this package.
 
 ok(-f $GATE, 'A0: gate-drive-loop.sh exists (sanity — this file assumes it, per spec §2.1: '
            . 'the fold is additive to an EXISTING file, never a new one)');

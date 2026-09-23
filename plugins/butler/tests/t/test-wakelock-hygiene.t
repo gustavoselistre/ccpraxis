@@ -41,7 +41,10 @@ my $T = $Bin;
 
 # The scripts that can reach BpKeepAwake::apply / BpContinuityLease::ensure_daemon
 # from a subprocess. Add to this list when another one learns to hold the lease.
-my $ACTUATORS = qr/(?:bp-continuity\.pl|bp-runstate\.pl|gate-continuity\.sh)/;
+# bp-runstate.pl DROPPED (package 03-retire-runstate, spec §2.9's entry for
+# this file): the script is deleted, so it can no longer reach anything as a
+# subprocess; the rule and its other two actuators stay unchanged.
+my $ACTUATORS = qr/(?:bp-continuity\.pl|gate-continuity\.sh)/;
 
 # A POSITIVE setting, not a mention. `delete $ENV{CCPRAXIS_NO_WAKELOCK}` is a
 # legitimate thing for a test of the lease itself to do, and it is the opposite

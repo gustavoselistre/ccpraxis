@@ -45,13 +45,19 @@ use FindBin qw($Bin);
 use File::Temp qw(tempdir);
 use File::Path qw(make_path);
 use JSON::PP ();
+use Cwd qw(getcwd abs_path);
 
-my $GUARD    = "$Bin/../../hooks/guard-ask-operator.sh";
-my $RUNSTATE = "$Bin/../../scripts/bp-runstate.pl";
-my $CONT     = "$Bin/../../scripts/bp-continuity.pl";
+my $GUARD = "$Bin/../../hooks/guard-ask-operator.sh";
+my $CONT  = "$Bin/../../scripts/bp-continuity.pl";
 
-ok(-f $GUARD,    'guard-ask-operator.sh exists') or BAIL_OUT('guard missing');
-ok(-f $RUNSTATE, 'bp-runstate.pl exists')        or BAIL_OUT('runstate missing');
+ok(-f $GUARD, 'guard-ask-operator.sh exists') or BAIL_OUT('guard missing');
+# The old ok(-f $RUNSTATE...) or BAIL_OUT is RETIRED along with $RUNSTATE
+# itself (package 03-retire-runstate, spec §2.3(a)): the guard's own
+# `[ -f "$RUNSTATE" ] || exit 0` early-exit is deleted in the same edit that
+# removes its "status" read (that early-exit, left behind, would silently
+# turn the whole guard into a no-op the moment bp-runstate.pl is deleted --
+# exactly the fail-open failure mode this blueprint exists to prevent), so
+# nothing in this file should assert that file's presence either.
 
 sub new_project {
     my $root = tempdir(CLEANUP => 1);
@@ -59,22 +65,36 @@ sub new_project {
     return $root;
 }
 
-sub set_run_state {
-    my ($root, $verb, @args) = @_;
-    system($^X, $RUNSTATE, $verb, '--root', $root, @args) == 0 or return 0;
-    return 1;
-}
-
 sub run_guard {
     my ($root, @questions) = @_;
+    # Optional trailing hashref: { reg => <continuity-active-dir> } -- makes
+    # the session ARMED (the guard's one remaining unattended signal, per
+    # package 03-retire-runstate §2.3(a)) for callers that need a real
+    # denial to happen so the queue actually gets written to.
+    my %opt = (ref $questions[-1] eq 'HASH') ? %{ pop @questions } : ();
     my $payload = JSON::PP->new->canonical->encode({
         session_id => 'sess-q', cwd => $root, tool_name => 'AskUserQuestion',
         tool_input => { questions => [ map { { question => $_ } } @questions ] },
     });
-    my $out = `CLAUDE_PROJECT_DIR='$root' bash "$GUARD" <<'PAYLOAD_EOF' 2>&1
+    my $env = "CLAUDE_PROJECT_DIR='$root'";
+    $env .= " CCPRAXIS_CONTINUITY_ACTIVE_DIR='$opt{reg}'" if defined $opt{reg};
+    my $out = `$env bash "$GUARD" <<'PAYLOAD_EOF' 2>&1
 $payload
 PAYLOAD_EOF`;
     return ($? >> 8, $out // '');
+}
+
+# arm_registry(ROOT) -> REG_DIR -- the same fixture shape AC4 below uses to
+# make session 'sess-q' (run_guard's fixed session_id) ARMED, without going
+# through the real bp-continuity.pl arm verb.
+sub arm_registry {
+    my ($root) = @_;
+    my $reg = "$root/reg";
+    make_path($reg);
+    open my $fh, '>', "$reg/sess-q" or die $!;
+    print {$fh} "operator 2026-09-10T00:00:00Z\n";
+    close $fh;
+    return $reg;
 }
 
 sub queue_contents {
@@ -88,51 +108,42 @@ sub queue_contents {
     return $c // '';
 }
 
-# ── AC1/AC2 — denied while active, and the question survives ──────────────
-{
-    my $root = new_project();
-    ok(set_run_state($root, 'activate', '--reason', 'unattended work'),
-       'AC1 fixture: a run is active');
-
-    my ($rc, $out) = run_guard($root, 'Which approach, A or B?');
-    is($rc, 2, 'AC1 CANONICAL: AskUserQuestion is DENIED while a run is active -- this is '
-             . 'the tool call that used to halt a whole overnight run');
-    like($out, qr/queued/i, 'AC1 and the refusal says the question was kept');
-    like($out, qr/escalate-product-decisions-only|PRODUCT decision/,
-         'AC1 and points at the standing ruling on what actually needs an operator');
-
-    like(queue_contents($root), qr/Which approach, A or B\?/,
-         'AC2 CANONICAL: the question text is in the queue -- refusing without keeping it '
-       . 'would just move the loss from the run to the question');
-}
-
-# ── AC3 — NOT a blanket ban ───────────────────────────────────────────────
+# ── AC1/AC2 — RETIRED (package 03-retire-runstate, spec §2.3(a)/§6) ───────
 #
-# The failure mode of a guard like this is over-blocking: an interactive session
-# that can no longer talk to its operator. Each non-active state is checked
-# rather than assumed.
-{
-    for my $state (['inert', undef], ['finished', 'finish']) {
-        my ($label, $verb) = @$state;
-        my $root = new_project();
-        set_run_state($root, $verb, '--reason', 'done') if defined $verb;
-        my ($rc) = run_guard($root, 'Is this ok?');
-        is($rc, 0, "AC3 CANONICAL: a $label run does NOT block the question -- asking the "
-                 . 'operator is normal when nothing unattended is in flight');
-    }
+# These pinned the guard's "a run is ACTIVE" arm: `bp-runstate.pl activate`
+# followed by a DENY. `active` was never WRITTEN directly by any production
+# caller, but it WAS produced on READ: `BpRunState::effective` manufactured
+# it from any stale `paused` record (dead watcher pid, mismatched
+# fingerprint, or elapsed `until`), and `paused` records were written by the
+# now-retired `bp-watch.pl --self-pause`, doctrinal until package 12 -- so
+# the arm genuinely fired, on real sessions, once such a lease went stale.
+# Package 03 deletes the arm outright anyway (not merely disables it): the
+# `[ -f "$RUNSTATE" ] || exit 0` early-exit and the
+# `STATE=$(perl "$RUNSTATE" status ...)` read both go, and UNATTENDED is now
+# set by the continuity-ARMED check alone. Spec §6 records this as a
+# deliberate, named degradation: "a drive-solo run that is NOT continuity-
+# armed and asks a question will now be allowed to ask, even one that
+# previously carried a stale self-paused lease -- that is a real narrowing
+# of the guard's STATED contract, not the removal of dead code, and must be
+# written into the ledger rather than discovered later." There is no
+# probe-based fixture this
+# migrates onto because the property itself ("a run being active denies the
+# question") is gone, not relocated. AC2's surviving half -- "a denied
+# question's text is queued, not lost" -- is not lost either: it is what
+# AC4/AC5 below (the ARMED case, the guard's one remaining denial path)
+# already assert on a real denial.
 
-    # A PAUSED run has a live watcher, so the session is not unattended in the
-    # sense that matters here.
-    my $root = new_project();
-    set_run_state($root, 'activate', '--reason', 'work');
-    my $ok = set_run_state($root, 'pause', '--watcher-pid', $$,
-                           '--until', time() + 600, '--reason', 'waiting');
-    SKIP: {
-        skip 'could not establish a paused run', 1 unless $ok;
-        my ($rc) = run_guard($root, 'Is this ok?');
-        is($rc, 0, 'AC3 a paused run does not block either');
-    }
-}
+# ── AC3 — RETIRED in its run-state-driven form, same reason as AC1/AC2 ────
+#
+# The three sub-fixtures here (inert/finished/paused, via bp-runstate.pl)
+# existed to prove the run-based arm was not over-blocking. With that arm
+# gone, "a non-active run state does not block" is vacuously true --
+# there is no run-state read left to over-block on. Only the paused
+# sub-case named an actual mechanism (`pause`) that is itself deleted by
+# this package (§2.1), so it has no successor to migrate onto either. The
+# real "not a blanket ban" property -- an UNARMED session may still ask --
+# is what AC4's second half (below) proves against the guard's one
+# remaining signal.
 
 # ── AC4/AC5 — ARMED counts as unattended, and `ask` is the way through ────
 #
@@ -167,6 +178,17 @@ PAYLOAD_EOF`;
              . 'with no run active, which is the overnight case the run-only check missed');
     like($out, qr/ARMED/, 'AC4 and the refusal names the real reason rather than claiming a run');
     like(queue_contents($root), qr/Should I rename it\?/, 'AC5 the question is queued');
+
+    # AC8/B10 (spec §2.3(c)): the denial stops naming a dead verb. The old
+    # remedy #3 was `bp-runstate.pl finish --reason "blocked: <what you
+    # need>"`; it is replaced by the operator-only marker, matching
+    # guard-subagent-stall.sh's own wording and Decision 7/16.
+    unlike($out, qr/bp-runstate/,
+        'AC8: the denial never names bp-runstate -- no verb, flag or argument ends a run any more');
+    like($out, qr/\.run-finished/,
+        'AC8: ...and names the .run-finished marker instead');
+    like($out, qr/only the operator/i,
+        'AC8: ...stating plainly that only the OPERATOR ends a run');
 
     # An UNARMED session with no run is free to ask. Over-blocking is the real
     # risk with a guard like this.
@@ -205,12 +227,18 @@ PAYLOAD_EOF`;
 }
 
 # ── AC7 — the queue accumulates ───────────────────────────────────────────
+#
+# MIGRATED (package 03-retire-runstate): the fixture used to call
+# `bp-runstate.pl activate` to make the session unattended, so the guard
+# would deny and actually write to the queue. The guard's only unattended
+# signal now is continuity-ARMED (§2.3(a)), so arm_registry() takes its
+# place -- same shape as AC4's fixture below, reused rather than duplicated.
 {
     my $root = new_project();
-    set_run_state($root, 'activate', '--reason', 'work');
-    run_guard($root, 'First question?');
-    run_guard($root, 'Second question?');
-    run_guard($root, 'Third question?', 'And a fourth in the same call?');
+    my $reg  = arm_registry($root);
+    run_guard($root, 'First question?', { reg => $reg });
+    run_guard($root, 'Second question?', { reg => $reg });
+    run_guard($root, 'Third question?', 'And a fourth in the same call?', { reg => $reg });
 
     my $q = queue_contents($root);
     like($q, qr/First question\?/,  'AC7 first survives');
@@ -219,6 +247,152 @@ PAYLOAD_EOF`;
     like($q, qr/And a fourth in the same call\?/,
          'AC7 CANONICAL: and multiple questions in ONE call are all captured -- the payload '
        . 'nests them in an array, which is why this is not read with a scalar path');
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# NEW — bp-continuity.pl's questions_path: PROJECT-ANCHORED ROOT RESOLUTION.
+# MIGRATED from runstate-root-resolution.t (DELETED by this package; spec
+# §5.1's own migration table names this file, or a sibling, as the target).
+#
+# THE LESSON THIS CARRIES FORWARD (c724d0d). bp-runstate.pl used to resolve
+# its root as Cwd::abs_path("$DIR/../../.."), three levels up from the
+# SCRIPT -- which resolves the INSTALL root (butler normally runs from an
+# install outside the project), not the project. A driver's Bash tool does
+# not carry CLAUDE_PROJECT_DIR (only a hook always does), so a driver's own
+# `ask` call and a hook's read landed on DIFFERENT roots -- a wrong answer
+# anchored to the project is recoverable, one anchored to the install is a
+# different repo's state file entirely. Spec §2.4 lifts _resolve_project_
+# root() into bp-continuity.pl itself, ladder and comment block together:
+#   $CLAUDE_PROJECT_DIR > $BP_PROJECT_ROOT > git toplevel
+#     > walk up from cwd for a dir holding .ccpraxis-local-data > cwd
+# ═══════════════════════════════════════════════════════════════════════
+{
+    my $ORIG2 = getcwd();
+    my $INSTALL_GUESS2 = abs_path("$Bin/../../..");   # the old wrong guess
+
+    my $proj2 = abs_path(tempdir(CLEANUP => 1));
+    make_path("$proj2/.ccpraxis-local-data");
+
+    chdir $proj2 or BAIL_OUT("cannot chdir to $proj2");
+    my $top2 = `git rev-parse --show-toplevel 2>/dev/null`;
+    my $in_repo2 = ($? == 0 && defined $top2 && length $top2);
+    chdir $ORIG2 or BAIL_OUT("cannot chdir back to $ORIG2");
+
+    sub _cont_ask {
+        my ($cwd, $env, $text) = @_;
+        local %ENV = %ENV;
+        for my $k (keys %$env) {
+            if (defined $env->{$k}) { $ENV{$k} = $env->{$k} }
+            else                    { delete $ENV{$k} }
+        }
+        my $here = getcwd();
+        chdir $cwd or die "chdir $cwd: $!";
+        my $out = `"$^X" "$CONT" ask --text "$text" 2>&1`;
+        chdir $here or die "chdir back: $!";
+        return $out // '';
+    }
+
+    my %CLEAR2 = (CLAUDE_PROJECT_DIR => undef, BP_PROJECT_ROOT => undef);
+
+    # ---- A. resolution anchors to the project found by walking up from cwd
+  SKIP: {
+        skip 'system temp dir is inside a git repository; walk-up leg not isolable', 2
+            if $in_repo2;
+
+        _cont_ask($proj2, \%CLEAR2, 'root-resolution A fixture');
+        my $qpath = "$proj2/.ccpraxis-local-data/.subagent-guard/questions.md";
+        (my $qpath_n = $qpath) =~ s{\\}{/}g;
+        ok(-f $qpath, 'ROOT-A: bp-continuity.pl ask (no CLAUDE_PROJECT_DIR/BP_PROJECT_ROOT, cwd '
+                    . 'inside the project) writes questions.md under the project it was run from');
+
+        my ($guess) = ($INSTALL_GUESS2 =~ s{\\}{/}gr);
+        unlike($qpath_n, qr/^\Q$guess\E/,
+            'ROOT-A: ...and NEVER under the install root the old three-levels-up guess produced');
+    }
+
+    # ---- BP_PROJECT_ROOT wins over the git and walk-up legs
+    {
+        my $other2 = abs_path(tempdir(CLEANUP => 1));
+        _cont_ask($ORIG2, { %CLEAR2, BP_PROJECT_ROOT => $other2 }, 'root-resolution BPPR fixture');
+        ok(-f "$other2/.ccpraxis-local-data/.subagent-guard/questions.md",
+           'ROOT-BPPR: BP_PROJECT_ROOT wins over the git and walk-up legs');
+    }
+
+    # ---- D. BP_PROJECT_ROOT-only (no CLAUDE_PROJECT_DIR): the hook and
+    #      bp-continuity.pl::questions_path must still agree. Redteam
+    #      MEDIUM-3: this is the one leg ROOT-BPPR (script only) and ROOT-B/C
+    #      (CLAUDE_PROJECT_DIR set) never exercised together on the HOOK.
+  SKIP: {
+        skip 'system temp dir is inside a git repository; walk-up leg not isolable', 2
+            if $in_repo2;
+
+        my $proj4 = abs_path(tempdir(CLEANUP => 1));
+        make_path("$proj4/.ccpraxis-local-data");
+
+        # writer: bp-continuity.pl, BP_PROJECT_ROOT set, no CLAUDE_PROJECT_DIR
+        my $wout4 = _cont_ask($ORIG2, { %CLEAR2, BP_PROJECT_ROOT => $proj4 },
+                               'ROOT-D writer question');
+        like($wout4, qr/STATUS:\s*queued/, 'ROOT-D setup: the writer\'s ask call queues');
+
+        # reader: the HOOK itself, BP_PROJECT_ROOT set, no CLAUDE_PROJECT_DIR --
+        # run_guard always sets CLAUDE_PROJECT_DIR, so invoke the guard
+        # directly here to isolate the BP_PROJECT_ROOT-only leg.
+        my $reg4 = arm_registry($proj4);
+        my $payload4 = JSON::PP->new->canonical->encode({
+            session_id => 'sess-q', cwd => $proj4, tool_name => 'AskUserQuestion',
+            tool_input => { questions => [ { question => 'ROOT-D reader question' } ] },
+        });
+        `env -u CLAUDE_PROJECT_DIR BP_PROJECT_ROOT='$proj4' CCPRAXIS_CONTINUITY_ACTIVE_DIR='$reg4' bash "$GUARD" <<'PAYLOAD_EOF' 2>&1
+$payload4
+PAYLOAD_EOF`;
+
+        my $q4 = queue_contents($proj4);
+        like($q4, qr/ROOT-D writer question/,
+            'ROOT-D: the writer (bp-continuity.pl, BP_PROJECT_ROOT-only) and the reader '
+          . '(the guard hook, BP_PROJECT_ROOT-only) land on the SAME questions.md');
+        like($q4, qr/ROOT-D reader question/,
+            'ROOT-D: ...and the hook\'s own append under BP_PROJECT_ROOT-only lands there too');
+    }
+
+    # ---- B. the round-trip that actually failed live: writer (no
+    #      CLAUDE_PROJECT_DIR, a driver's own Bash tool) and reader (a hook,
+    #      CLAUDE_PROJECT_DIR always set) must land on the SAME file.
+  SKIP: {
+        skip 'system temp dir is inside a git repository; walk-up leg not isolable', 1
+            if $in_repo2;
+
+        my $proj3 = abs_path(tempdir(CLEANUP => 1));
+        make_path("$proj3/.ccpraxis-local-data");
+
+        # The driver's call, verbatim in shape: no CLAUDE_PROJECT_DIR, no
+        # BP_PROJECT_ROOT, cwd inside the project -- exactly AC6's own
+        # documented invocation, just run from inside $proj3 this time.
+        my $wout = _cont_ask($proj3, \%CLEAR2, 'the writer\'s own question');
+        like($wout, qr/STATUS:\s*queued/, 'ROOT-B setup: the writer\'s ask call queues');
+
+        # The reader's call, verbatim in shape: CLAUDE_PROJECT_DIR set, an
+        # ARMED session, exactly what a real hook invocation looks like.
+        my $reg3 = arm_registry($proj3);
+        run_guard($proj3, "the reader's own question", { reg => $reg3 });
+
+        my $q3 = queue_contents($proj3);
+        like($q3, qr/the writer's own question/,
+            'ROOT-B CANONICAL: the WRITER\'s text (no CLAUDE_PROJECT_DIR, cwd-anchored) is '
+          . 'visible to the READER (CLAUDE_PROJECT_DIR set) -- both landed on the SAME file, '
+          . 'which is the exact round-trip that failed live before c724d0d');
+        like($q3, qr/the reader's own question/,
+            'ROOT-B: ...and the reader\'s own append is in the SAME file too, not a sibling one');
+    }
+
+    # ---- C. CLAUDE_PROJECT_DIR still wins over the git and walk-up legs
+    {
+        my $hookroot2 = abs_path(tempdir(CLEANUP => 1));
+        _cont_ask($proj2, { CLAUDE_PROJECT_DIR => $hookroot2, BP_PROJECT_ROOT => undef },
+                  'root-resolution CPD fixture');
+        ok(-f "$hookroot2/.ccpraxis-local-data/.subagent-guard/questions.md",
+           'ROOT-C: CLAUDE_PROJECT_DIR still wins over the git and walk-up legs -- exactly what '
+         . 'a hook (which always carries it) relies on');
+    }
 }
 
 done_testing();

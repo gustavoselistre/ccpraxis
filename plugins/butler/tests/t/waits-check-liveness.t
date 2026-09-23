@@ -50,7 +50,7 @@ use File::Path qw(make_path);
 use Time::HiRes qw(time);
 
 my $WATCH     = "$Bin/../../scripts/bp-watch.pl";
-my $RUNSTATE  = "$Bin/../../scripts/bp-runstate.pl";
+my $RESUMPTION = "$Bin/../../scripts/BpResumption.pm";
 my $COORD_SKILL = "$Bin/../../skills/coordinator-protocol/SKILL.md";
 
 # ===========================================================================
@@ -91,16 +91,18 @@ sub new_bp {
 
 # pid_alive() for the helper assertions below -- loaded once, directly, not
 # via the CLI (so dead_pid()/live_pid() can assert liveness themselves
-# before any fixture trusts them).
+# before any fixture trusts them). Repointed to BpResumption.pm (package
+# 03-retire-runstate, spec §2.9's waits-check-liveness.t entry: "repoint to
+# BpResumption; touch nothing else in this package-12 file").
 {
     local @ARGV;
-    require $RUNSTATE if -f $RUNSTATE;
+    require $RESUMPTION if -f $RESUMPTION;
 }
 
 sub _pid_alive {
     my ($pid) = @_;
-    return BpRunState::pid_alive($pid) if defined &BpRunState::pid_alive;
-    # bp-runstate.pl absent -- cannot construct a trustworthy answer; make
+    return BpResumption::pid_alive($pid) if defined &BpResumption::pid_alive;
+    # BpResumption.pm absent -- cannot construct a trustworthy answer; make
     # every caller's own assertion fail loudly rather than silently pass.
     return undef;
 }
@@ -287,8 +289,8 @@ sub parse_arming_recipe {
 
 # ===========================================================================
 # B14 (pid_alive exercise) -- pid_alive(live)==1, pid_alive(dead)==0.
-# Expected to PASS already (BpRunState::pid_alive is untouched by this
-# package).
+# Expected to PASS already (BpResumption::pid_alive is untouched by this
+# package -- only the require path above changed).
 # ===========================================================================
 {
     my $live = live_pid();

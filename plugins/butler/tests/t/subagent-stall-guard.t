@@ -41,26 +41,12 @@ use JSON::PP;
 (my $HOOKS   = "$Bin/../../hooks")   =~ s{\\}{/}g;
 (my $SCRIPTS = "$Bin/../../scripts") =~ s{\\}{/}g;
 my $GUARD = "$HOOKS/guard-subagent-stall.sh";
-my $RS    = "$SCRIPTS/bp-runstate.pl";
 
 ok(-f $GUARD, 'guard-subagent-stall.sh exists') or BAIL_OUT('hook missing');
 ok(-x $GUARD, 'guard-subagent-stall.sh is executable');
-ok(-f $RS,    'bp-runstate.pl exists')          or BAIL_OUT('state machine missing');
 
 my $J = JSON::PP->new->canonical;
 
-sub rs {                      # run the state machine CLI -> (exit, stdout)
-    my ($root, @args) = @_;
-    my $cmd = qq{perl "$RS" } . join(' ', @args) . qq{ --root "$root" 2>/dev/null};
-    my $out = `$cmd`;
-    return ($? >> 8, $out // '');
-}
-sub state_of {
-    my ($root) = @_;
-    my (undef, $out) = rs($root, 'status');
-    my $j = eval { JSON::PP->new->decode($out) } || {};
-    return $j->{state} // 'inert';
-}
 sub fire {                    # feed a payload to the hook -> (exit, stderr)
     my ($root, $payload) = @_;
     my ($fh, $tmp) = File::Temp::tempfile('t112-XXXXXX', TMPDIR => 1);
@@ -87,69 +73,22 @@ sub stop { { hook_event_name=>'Stop', session_id=>'sess-t112' } }
 sub newroot { my $r = tempdir(CLEANUP => 1); mkdir "$r/.ccpraxis-local-data"; return $r }
 
 # ============================ THE STATE MACHINE ============================
-
-{
-    my $r = newroot();
-    is(state_of($r), 'inert', 'a fresh project is INERT — the gate costs nothing until a run starts');
-
-    rs($r, 'activate', '--reason', '"x"');
-    is(state_of($r), 'active', 'activate -> active');
-
-    # A pause is a CLAIM about the world, and the machine checks it.
-    my ($rc1) = rs($r, 'pause', '--watcher-pid', 999999, '--until', time + 600);
-    isnt($rc1, 0, 'pause REFUSED when the watcher pid is not running');
-    is(state_of($r), 'active', '...and the state is unchanged by a refused pause');
-
-    my ($rc2) = rs($r, 'pause', '--watcher-pid', $$, '--until', time - 5);
-    isnt($rc2, 0, 'pause REFUSED when the deadline is already past');
-
-    # b-fca ergonomics fix: omitting BOTH --seconds and --until no longer
-    # refuses — it defaults to the full 50-minute cap (bp-runstate.pl's own
-    # MAX_PAUSE_SECONDS), so a caller with nothing shorter to say never has to
-    # compute time()+N by hand. Still bounded, never unbounded: this is a
-    # documented default, not the removal of the "must resolve" requirement.
-    my ($rc3) = rs($r, 'pause', '--watcher-pid', $$);
-    is($rc3, 0, 'pause with no deadline flag at all now GRANTS, defaulting to the 50-minute cap');
-    is(state_of($r), 'paused', '...and the state is paused, exactly as an explicit --seconds/--until would leave it');
-
-    my ($rc4) = rs($r, 'pause', '--watcher-pid', $$, '--until', time + 600);
-    is($rc4, 0, 'pause ACCEPTED with a live pid and a future deadline');
-    is(state_of($r), 'paused', '...and the state is paused');
-
-    rs($r, 'finish', '--reason', '"done"');
-    is(state_of($r), 'finished', 'finish -> finished');
-}
-
-# A pause whose watcher DIED reverts to active by itself. Without this, a pause
-# outlives its meaning and holds the gate open over an abandoned run — which is
-# precisely the failure the gate exists to prevent, reintroduced through the
-# resolution path.
-{
-    my $r = newroot();
-    rs($r, 'activate');
-    my ($rc) = rs($r, 'pause', '--watcher-pid', $$, '--until', time + 600);
-    is($rc, 0, 'pause granted against a live watcher');
-    is(state_of($r), 'paused', 'state is paused while the watcher lives');
-
-    # Now make the SAME record stale by hand, rather than by killing a process.
-    # Deliberate: perl's fork on this host is emulated and its pid semantics are
-    # exactly what bit the wake-lock (see bp-keepawake.pl), so a test that killed
-    # a child would be testing Windows process lifetime, not this reversion.
-    # Editing the record isolates the property under test.
-    my $sp = "$r/.ccpraxis-local-data/.subagent-guard/run-state.json";
-    my $rec = JSON::PP->new->decode(do { open my $f,'<',$sp or die; local $/; <$f> });
-    $rec->{watcher_pid} = 999999;                       # a pid that is not running
-    open my $w, '>', $sp or die; print {$w} $J->encode($rec); close $w;
-    is(state_of($r), 'active',
-       'watcher gone -> the pause is STALE and reverts to ACTIVE on its own');
-
-    # ...and the same for a deadline that has simply run out.
-    $rec->{watcher_pid} = $$; $rec->{until} = time - 1;
-    open my $w2, '>', $sp or die; print {$w2} $J->encode($rec); close $w2;
-    is(state_of($r), 'active',
-       'deadline passed -> the pause is STALE even though the watcher still lives');
-}
-
+# RETIRED (blueprint butler-gate-ergonomics, package 03-retire-runstate,
+# spec §5.1's subagent-stall-guard.t entry). This block ('activate'/'pause'/
+# 'finish'/reversion-on-stale-watcher/reversion-on-past-deadline) pinned
+# bp-runstate.pl's OWN state machine directly, via rs()/state_of() shelling
+# out to the script itself -- it never exercised guard-subagent-stall.sh (the
+# hook this file is the oracle for) at all. Package 03 deletes bp-runstate.pl
+# and, with it, the 'activate'/'pause'/'finish' verbs and the run-state.json
+# it wrote; there is no probe-based equivalent to migrate this block onto,
+# because the gate no longer reads or writes any persisted state of its own
+# (D3/D4: the (probe, finish marker) pair replaced the read entirely). The
+# hook-facing property this block's reversion sub-block existed to protect --
+# "a stale claim about liveness must not hold the gate open" -- is retained,
+# strictly reinforced: "THE GATE" section below no longer trusts ANY written
+# record (AC19c/AC19c2 hand-write run-state.json directly and are still
+# DENIED), which subsumes "a stale record self-heals" with "no record is ever
+# trusted in the first place".
 # ---------------------------------------------------------------------------
 # PACKAGE 02 fixture helpers — the probe (Signal A) and the finish marker
 # (Signal B), per spec 02-gates-use-the-probe-spec.md §2.1. BP_PROBE_PROC_DIR/
@@ -416,10 +355,19 @@ sub finish_consumed_path { my ($r) = @_; return "$r/.ccpraxis-local-data/.drive-
 }
 
 {   # Synchronous dispatches hold the turn open, so a hang is already visible.
+    #
+    # The `is(state_of($r), 'inert', ...)` half is RETIRED (package
+    # 03-retire-runstate): it called bp-runstate.pl's own state machine
+    # directly (same class as "THE STATE MACHINE" section, retired above)
+    # and was already flagged as a migration leftover from package 02
+    # ("this line was missed by the same migration this file already
+    # applies everywhere else"). §1's own evidence table establishes nothing
+    # in production has ever written the 'active' state, synchronous or
+    # not, so there is nothing left to assert was not activated. The half
+    # that actually exercises the GATE survives unchanged.
     my $r = newroot();
     fire($r, dispatch(JSON::PP::false, 'sync worker'));
-    is(state_of($r), 'inert', 'a SYNCHRONOUS dispatch does not activate a run');
-    is((fire($r, stop()))[0], 0, '...and does not block the stop');
+    is((fire($r, stop()))[0], 0, 'a SYNCHRONOUS dispatch does not block the stop');
 }
 {   # The Agent tool defaults to background, so an absent field is the dangerous
     # case and must be treated as such. ORACLE EDIT (authorized 2026-09-22,
@@ -673,16 +621,25 @@ sub finish_consumed_path { my ($r) = @_; return "$r/.ccpraxis-local-data/.drive-
     my $ds = "$r/.ccpraxis-local-data/.drive-solo";
     make_path($ds);
 
-    # (a) the legacy finish verb.
-    system(qq{perl "$RS" finish --root "$r" --reason "attempt" >/dev/null 2>&1});
+    # (a)/(b) MIGRATED (package 03-retire-runstate, spec §5.1): the fixtures
+    # used to shell out to the legacy `bp-runstate.pl finish`/`pause` verbs
+    # before firing the gate. Those verbs are deleted along with the file, so
+    # there is no longer any "irrelevant state" to construct -- the migrated
+    # form fires the gate directly on the baseline fixture (armed pending
+    # set, probe forced to NONE, no marker) and keeps the same claim: no
+    # record of any kind influences this gate, only the probe and the marker
+    # do. (c)/(d)/(e) below already assert the same class without touching
+    # bp-runstate.pl at all and are kept as the surviving non-vacuity proof
+    # that "no record" really means no record, including a hand-written one.
     is((fire_with_probe($r, stop(), proc_dir_none()))[0], 2,
-       'AC19a: `bp-runstate.pl finish` no longer influences the gate -- still DENIED');
-
-    # (b) a granted pause against a live, non-watcher pid ($$, this test process).
-    system(qq{perl "$RS" pause --watcher-pid $$ --until } . (time + 600)
-         . qq{ --root "$r" >/dev/null 2>&1});
+       'AC19a MIGRATED: a Stop fired on the baseline fixture (armed pending set, probe NONE, '
+     . 'no operator marker, and critically no run-state.json of any kind ever written) is still '
+     . 'DENIED -- no legacy finish/pause declaration was needed to produce this DENY, because '
+     . 'none can exist any more');
     is((fire_with_probe($r, stop(), proc_dir_none()))[0], 2,
-       'AC19b: a granted `pause --watcher-pid <live non-watcher pid>` still DENIED');
+       'AC19b MIGRATED: repeating the identical fixture is still DENIED -- the denial is not a '
+     . 'one-shot artifact of the first call, reinforcing that nothing about firing the gate '
+     . 'itself ever resolves it');
 
     # (c) a hand-crafted run-state.json claiming finished, then paused.
     make_path("$r/.ccpraxis-local-data/.subagent-guard");

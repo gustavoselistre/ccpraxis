@@ -15,60 +15,63 @@
 # being violated, which is this repo's recurring lesson: a written instruction is
 # not an enforcement mechanism.
 #
-# WHAT IT DOES. While a run is ACTIVE, AskUserQuestion is denied and the question
-# is APPENDED to the run's question queue. Nothing is lost within the 16-item
-# safety cap below -- it is batched for the end of the run, which is what
-# "batch it" needs in order to be more than a hope -- and the agent is told to
-# carry on with the work it can still do. The deny decision itself never
-# depends on the cap: every question in a call is refused regardless of how
-# many there are or where the logging loop below stops.
+# WHAT IT DOES. While continuity is ARMED for this session, AskUserQuestion is
+# denied and the question is APPENDED to the project's question queue. Nothing
+# is lost within the 16-item safety cap below -- it is batched for the end of
+# the run, which is what "batch it" needs in order to be more than a hope --
+# and the agent is told to carry on with the work it can still do. The deny
+# decision itself never depends on the cap: every question in a call is
+# refused regardless of how many there are or where the logging loop below
+# stops.
 #
-# WHAT IT DELIBERATELY DOES NOT DO. It does not fire when a run is inert, paused
-# or finished. An interactive session asking its operator something is normal and
-# good; only `active` means unattended work is in flight right now. It also never
-# touches any other tool: an agent that genuinely cannot proceed can still finish
-# or pause the run explicitly, which is a deliberate act rather than a side
-# effect of asking a question.
+# WHAT IT DELIBERATELY DOES NOT DO. It does not fire on an unarmed session. An
+# interactive session asking its operator something is normal and good; only an
+# explicitly ARMED continuity session means unattended work is in flight right
+# now. It also never touches any other tool, and it offers no escape hatch: an
+# agent that genuinely cannot proceed still cannot end the run by asking a
+# different way -- it records the question and carries on with what it can.
+# Only the operator's `.run-finished` marker ends anything (remedy 3 below).
+#
+# UNATTENDED used to mean either of two things: a run-state file reading
+# `active`, or continuity being ARMED for this session. The run-state arm is
+# retired (package 03, butler-gate-ergonomics) -- and it was not the dead code
+# it looked like. `active` was never WRITTEN directly, but `BpRunState::effective`
+# manufactured it ON READ from any stale `paused` record (dead watcher pid,
+# mismatched fingerprint, or elapsed `until`) -- and `paused` records were
+# written by the now-retired `bp-watch.pl --self-pause`, doctrinal in
+# drive-solo/reporter's SKILL.md until package 12. So the arm DID fire, on real
+# sessions, permanently, once a self-paused watcher's lease went stale -- this
+# is a verified fact (reproduced against this project's own on-disk
+# .subagent-guard/run-state.json during redteam review), not a hypothetical.
+# Retiring this arm is therefore a deliberate, real narrowing of behavior, not
+# the removal of dead code: a drive-solo run that armed with `--self-pause`
+# used to get this guard for free even when continuity was NOT ARMED; it no
+# longer does. The continuity-ARMED check is the one that was always meant to
+# matter: the guard's own original incident was a plain armed overnight session
+# sailing straight past a version that checked only the run.
 set -u
 HOOK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib.sh
 source "$HOOK_DIR/lib.sh" 2>/dev/null || exit 0
 
-RUNSTATE="$HOOK_DIR/../scripts/bp-runstate.pl"
-[ -f "$RUNSTATE" ] || exit 0
-
-# UNATTENDED means either of two things, and both must trip this.
-#
-#   * a RUN is active -- `effective` resolves a pause whose watcher died back to
-#     active, so a stale pause cannot be used to slip a question through;
-#   * CONTINUITY IS ARMED for this session. Arming is the operator saying "watch
-#     this, I am not here", so an armed session is unattended by definition. The
-#     first version of this guard checked only the run, which meant a plain
-#     armed overnight session -- the exact case the operator described -- sailed
-#     straight past it.
 UNATTENDED=0
 WHY="unattended work is in flight"
 
-STATE=$(perl "$RUNSTATE" status 2>/dev/null | perl -ne 'print $1 if /"state"\s*:\s*"([a-z_]+)"/')
-[ "${STATE:-}" = "active" ] && { UNATTENDED=1; WHY="a run is ACTIVE"; }
-
-if [ "$UNATTENDED" -eq 0 ]; then
-  bp_read_payload open
-  _SID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
-  if [ -n "${_SID:-}" ]; then
-    _CDIR=$(bp_continuity_active_dir 2>/dev/null || true)
-    [ -n "${_CDIR:-}" ] && [ -f "$_CDIR/$_SID" ] && { UNATTENDED=1; WHY="continuity is ARMED for this session"; }
-  fi
+bp_read_payload open
+_SID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
+if [ -n "${_SID:-}" ]; then
+  _CDIR=$(bp_continuity_active_dir 2>/dev/null || true)
+  [ -n "${_CDIR:-}" ] && [ -f "$_CDIR/$_SID" ] && { UNATTENDED=1; WHY="continuity is ARMED for this session"; }
 fi
 
 [ "$UNATTENDED" -eq 1 ] || exit 0
 
 # bp_read_payload (lib.sh) is now safe to call more than once per process --
-# whichever of this call and the one in the armed-check branch above runs
-# first performs the real read; the other is a no-op that leaves PAYLOAD
-# exactly as the first call left it. No caller-side bookkeeping needed any
-# more; the guard against a hung-or-clobbered second read now lives in
-# lib.sh itself, once, for every caller.
+# whichever of this call and the one above runs first performs the real
+# read; the other is a no-op that leaves PAYLOAD exactly as the first call
+# left it. No caller-side bookkeeping needed any more; the guard against a
+# hung-or-clobbered second read now lives in lib.sh itself, once, for every
+# caller.
 bp_read_payload open
 
 # AskUserQuestion's payload nests the text inside tool_input.questions[] --
@@ -105,9 +108,14 @@ if [ "$_QI" -eq 16 ]; then
   [ -n "$_QMORE" ] && QTEXT="$QTEXT | (+more, truncated at 16)"
 fi
 
-# Queue it beside the run state, through the verb that owns that path.
-QDIR=$(perl "$RUNSTATE" state-dir 2>/dev/null || true)
-if [ -n "${QDIR:-}" ]; then
+# Queue it project-anchored, using the same ladder as bp-lib.sh's
+# bp_project_root() and bp-continuity.pl's _resolve_project_root(): explicit
+# env before the install-dir fallback, so a hook invocation that lacks
+# CLAUDE_PROJECT_DIR (but carries BP_PROJECT_ROOT, as bp-launch.sh always
+# exports) still resolves to the project, not to the live install tree.
+ROOT="${CLAUDE_PROJECT_DIR:-${BP_PROJECT_ROOT:-$(cd "$HOOK_DIR/../../.." && pwd)}}"
+QDIR="$ROOT/.ccpraxis-local-data/.subagent-guard"
+if [ -n "${ROOT:-}" ]; then
   mkdir -p "$QDIR" 2>/dev/null || true
   printf -- '- [%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)" "$QTEXT" \
     >> "$QDIR/questions.md" 2>/dev/null || true
@@ -125,8 +133,7 @@ Do this instead:
      .ccpraxis-local-data/guidance/escalate-product-decisions-only.md
   2. Carry on with the work that does NOT depend on the answer, and surface the
      batched questions when the run reports.
-  3. Only if nothing can proceed without it, end the run deliberately:
-         bp-runstate.pl finish --reason "blocked: <what you need>"
-     That is a decision, not a side effect of asking.
+  3. Only the OPERATOR ends a run. There is no verb, flag or argument that does it:
+         touch $ROOT/.ccpraxis-local-data/.drive-solo/.run-finished
 EOF
 exit 2
