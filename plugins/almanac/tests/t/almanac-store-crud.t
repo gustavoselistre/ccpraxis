@@ -146,7 +146,7 @@ ok(!defined $LOAD_ERR, 'Almanac::Store requires cleanly')
             qr/^\s*use\s+File::Spec\b/,    qr/^\s*use\s+Digest::SHA\b/,
             qr/^\s*use\s+JSON::PP\b/,      qr/^\s*use\s+Time::HiRes\b/,
             qr/^\s*use\s+Sys::Hostname\b/, qr/^\s*use\s+Almanac::Lock\b/,
-            qr/^\s*use\s+Almanac::Record\b/,
+            qr/^\s*use\s+Almanac::Record\b/, qr/^\s*use\s+overload\b/,
         );
         my @bad_imports = grep { my $l = $_; !grep { $l =~ $_ } @allowed } @uses;
         unless (ok(@bad_imports == 0, 'AC-47: Store.pm imports only from the S2.0 allowlist')) {
@@ -297,7 +297,6 @@ my ($store, $created_ac36, $ac36_path);
          . 'process (spec 2.6), so there is nothing to restamp')
             if defined $before && defined $after;
         if (defined $before && defined $after) {
-            my ($before_no_writer) = $before =~ /\A(.*?)^writer:.*?$(.*)\z/ms;
             # Compare everything except the writer line: strip the writer line
             # from both and require the remainder to be byte-identical.
             (my $b2 = $before) =~ s/^writer:.*$//m;
@@ -715,6 +714,100 @@ AC29CHILD
         fail('equivalence fixture: Almanac::Record::write_file succeeds on the same record shape');
         fail('STEP-2 GATE: Store\'s write path and Almanac::Record::write_file produce byte-identical output for the same record');
     }
+}
+
+# =============================================================================
+# FIXBATCH (redteam MEDIUM-3) -- a structural refusal from
+# Almanac::Record::serialize (a field name that is not a legal frontmatter
+# key) is wrapped and re-raised in STORE'S OWN error shape, not left to
+# propagate as a bare Almanac::Record::Error (which would bypass S2.5's
+# machine-block contract for every caller checking `ref $@ eq
+# 'Almanac::Store::Error'`).
+# =============================================================================
+{
+    my $bad = eval { $store->create(id => 'rec-fb-refused', fields => { 'bad-key' => 'x' }, order => ['bad-key']) };
+    ok(!defined $bad, 'FIXBATCH: create() with an illegal field name fails') or diag('unexpectedly succeeded');
+    ok(ref($@) eq 'Almanac::Store::Error', 'FIXBATCH: ...and the die payload is Store\'s OWN error class, not Record\'s')
+        or diag('got: ' . (ref($@) || '(not a ref)'));
+    is(err_kind($@), 'refused', 'FIXBATCH: ...with kind refused') or diag('got: ' . (ref($@) ? "$@" : $@));
+    is(err_field($@, 'exit_code'), 2, 'FIXBATCH: ...and exit_code == 2');
+    ok(has_almanac_error_block($@->{message}), 'FIXBATCH: ...and the message carries Store\'s machine block')
+        if ref($@) eq 'Almanac::Store::Error';
+}
+
+# =============================================================================
+# FIXBATCH (redteam MEDIUM-6) -- a Windows reserved device name (NUL, CON,
+# AUX, PRN, COMn, LPTn -- case-insensitive) is refused as bad_id, the same
+# as any other grammar violation, rather than being accepted and producing
+# a file that native Windows tooling cannot see or delete.
+# =============================================================================
+{
+    for my $bad_id (qw(NUL nul Nul CON PRN AUX COM1 LPT1)) {
+        my $r = eval { $store->create(id => $bad_id, fields => { t => '1' }, order => ['t']) };
+        is(err_kind($@), 'bad_id', "FIXBATCH: create(id => '$bad_id') (a Windows reserved device name) dies bad_id")
+            or diag('got: ' . (ref($@) ? "$@" : $@));
+    }
+}
+
+# =============================================================================
+# FIXBATCH (redteam MEDIUM-7) -- a reference passed as a field value or a
+# body is refused (usage) rather than being stringified into the record
+# file (which would silently destroy the caller's data and leak a heap
+# address to disk).
+# =============================================================================
+{
+    my $r1 = eval { $store->create(id => 'rec-fb-refval1', fields => { payload => ['a', 'b'] }, order => ['payload']) };
+    is(err_kind($@), 'usage', 'FIXBATCH: create() with an arrayref field value dies usage') or diag('got: ' . (ref($@) ? "$@" : $@));
+
+    my $r2 = eval { $store->create(id => 'rec-fb-refval2', fields => { t => '1' }, order => ['t'], body => { not => 'a scalar' }) };
+    is(err_kind($@), 'usage', 'FIXBATCH: create() with a hashref body dies usage') or diag('got: ' . (ref($@) ? "$@" : $@));
+
+    my $base = eval { $store->create(id => 'rec-fb-refval3', fields => { t => '1' }, order => ['t']) };
+    ok(defined $base, 'FIXBATCH fixture: a base record for the update-side ref checks exists') or diag('error: ' . ($@ // ''));
+    if (defined $base) {
+        my $r3 = eval { $store->update('rec-fb-refval3', expect => $base, set => { t => { nope => 1 } }) };
+        is(err_kind($@), 'usage', 'FIXBATCH: update() with a hashref set-value dies usage') or diag('got: ' . (ref($@) ? "$@" : $@));
+    } else {
+        fail('FIXBATCH: update() with a hashref set-value dies usage');
+    }
+}
+
+# =============================================================================
+# FIXBATCH (review SHOULD-10) -- expect => { rev => undef, fields => {} }
+# (a key present with an undef value) fails the usage gate rather than
+# passing it and warning "Use of uninitialized value" at the CAS (S2.0/
+# AC-46 forbid Store.pm from ever writing to STDERR).
+# =============================================================================
+{
+    my $base = eval { $store->create(id => 'rec-fb-undefrev', fields => { t => '1' }, order => ['t']) };
+    ok(defined $base, 'FIXBATCH fixture: a base record for the undef-rev check exists') or diag('error: ' . ($@ // ''));
+    if (defined $base) {
+        my $u = eval { $store->update('rec-fb-undefrev', expect => { rev => undef, fields => {} }, set => { t => '2' }) };
+        is(err_kind($@), 'usage', 'FIXBATCH: update() with expect => { rev => undef, ... } dies usage, not conflict')
+            or diag('got: ' . (ref($@) ? "$@" : $@));
+        my $d = eval { $store->delete('rec-fb-undefrev', expect => { rev => undef, fields => {} }) };
+        is(err_kind($@), 'usage', 'FIXBATCH: delete() with expect => { rev => undef, ... } dies usage, not conflict')
+            or diag('got: ' . (ref($@) ? "$@" : $@));
+    } else {
+        fail('FIXBATCH: update() with expect => { rev => undef, ... } dies usage, not conflict');
+        fail('FIXBATCH: delete() with expect => { rev => undef, ... } dies usage, not conflict');
+    }
+}
+
+# =============================================================================
+# FIXBATCH (redteam MEDIUM-5) -- $ENV{ALMANAC_SURFACE} may only TIGHTEN a
+# detected surface (host -> container), which is the only direction
+# testable without an actual container marker on disk; the loosening
+# refusal (container -> host, unreachable here since this host carries
+# neither marker) is verified by code inspection, per the fix-batch report.
+# =============================================================================
+{
+    ok(!-e '/run/.containerenv' && !-e '/.dockerenv',
+       'FIXBATCH fixture: this host carries no container marker (a precondition for this check)');
+    local $ENV{ALMANAC_SURFACE} = 'container';
+    my $s = eval { Almanac::Store::surface() };
+    is($s, 'container', 'FIXBATCH: ALMANAC_SURFACE=container tightens a detected host surface to container')
+        or diag('error: ' . ($@ // '') . ' got: ' . (defined $s ? $s : '(undef)'));
 }
 
 # =============================================================================
