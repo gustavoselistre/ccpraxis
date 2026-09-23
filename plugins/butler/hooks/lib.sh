@@ -1191,6 +1191,19 @@ bp_driver_context() {
   local data_dir
   data_dir=$(bp_find_data_dir "$cwd" 2>/dev/null) || return 1
   [ -n "$data_dir" ] || return 1
+  # The payload cwd arrives as "C:/...", "C:\..." or "/c/..." depending on
+  # the caller, and bp_find_data_dir keeps whichever form it was handed.
+  # guard-writes.sh normalises the TARGET path to the MSYS form, then matches
+  # it against BP_DATA_DIR/BP_DIR/BP_PROJECT_ROOT by literal prefix, so a
+  # "C:/" root never contained anything: on 2026-09-23 a bp-implementer
+  # subagent (cwd "C:/Development/ccpraxis") was refused a file in its own
+  # package's write set. Every global below derives from data_dir, so one
+  # normalisation here puts them all in the form the guards compare against.
+  # cygpath exists only on Git-for-Windows/MSYS; elsewhere this is a no-op.
+  if command -v cygpath >/dev/null 2>&1; then
+    local data_dir_u
+    data_dir_u=$(cygpath -u "$data_dir" 2>/dev/null) && [ -n "$data_dir_u" ] && data_dir="$data_dir_u"
+  fi
 
   # 5. Project root, must be absolute.
   local project_root

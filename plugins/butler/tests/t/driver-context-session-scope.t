@@ -119,6 +119,30 @@ subtest 'guard-writes: a subagent\'s own agent_type names its role' => sub {
     is($rc_rv, 2, 'a read-only role gains nothing from agent_type') or diag($o3);
 };
 
+subtest 'guard-writes: a drive-letter cwd ("C:/...") is the same project' => sub {
+    # A subagent's payload carries cwd and file_path as "C:/Development/...",
+    # while guard-writes.sh normalises the target to "/c/Development/...".
+    # bp_driver_context kept the root in the caller's form, so no target was
+    # ever inside it: on 2026-09-23 a bp-implementer was refused a file in its
+    # own package's write set.
+    plan skip_all => 'cygpath is Git-for-Windows/MSYS only' unless `cygpath -m / 2>/dev/null`;
+    my $fx = fixture();
+    chomp(my $mixed = `cygpath -m "$fx->{root}"`);
+    ok($mixed =~ m{^[A-Za-z]:/}, "fixture root in drive-letter form ($mixed)");
+    my $as = sub {
+        my ($rel) = @_;
+        return { hook_event_name => 'PreToolUse', tool_name => 'Write', cwd => $mixed,
+                 session_id => 'sess-driver', agent_id => 'a-impl',
+                 agent_type => 'butler:bp-implementer',
+                 tool_input => { file_path => "$mixed/$rel", content => 'x' } };
+    };
+    local $fx->{data} = "$mixed/.ccpraxis-local-data";
+    my ($rc_in, $o1) = run_guard($GW, $fx, $as->('src/ok.pl'));
+    is($rc_in, 0, 'inside the write set: allowed') or diag($o1);
+    my ($rc_out, $o2) = run_guard($GW, $fx, $as->('other/x.txt'));
+    is($rc_out, 2, 'outside the write set: still blocked') or diag($o2);
+};
+
 subtest 'ledger-guard: the same scope' => sub {
     my $fx = fixture();
     my $ledger = '.ccpraxis-local-data/blueprints/demo-bp/packages/01-a.md';
