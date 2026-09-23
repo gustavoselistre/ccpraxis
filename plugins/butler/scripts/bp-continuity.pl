@@ -309,7 +309,12 @@ sub cmd_disarm {
     # off. Done before the marker check so it happens on both paths.
     my $ticket_dropped = 0;
     if (my $nonce = read_beacon($dir)) {
-        if (-f "$dir/pending/$nonce") {
+        # Bug report 20260922-233054-9a5d (same shape as MEDIUM-1/cmd_status
+        # and report_and_consume_prior_unbound's $prior): a beacon value
+        # reaches this script with no shape check and becomes a path below
+        # ($dir/pending/$nonce, then unlinked) -- validate before either use.
+        undef $nonce if defined $nonce && !BpSession::valid_nonce($nonce);
+        if (defined $nonce && -f "$dir/pending/$nonce") {
             unlink "$dir/pending/$nonce";
             $ticket_dropped = 1;
         }
