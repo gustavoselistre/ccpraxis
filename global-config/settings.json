@@ -86,6 +86,11 @@
       ]
    },
    "inputNeededNotifEnabled" : true,
+   "modelSettings" : {
+      "claude-sonnet-5" : {
+         "effortLevel" : "medium"
+      }
+   },
    "permissions" : {
       "allow" : [
          "Read",
@@ -138,6 +143,7 @@
       "command" : "perl \"$HOME/.claude/ccpraxis/scripts/statusline.pl\"",
       "type" : "command"
    },
+   "timeFormat" : "24-hour",
    "useAutoModeDuringPlan" : true,
    "worktree" : {
       "baseRef" : "fresh"

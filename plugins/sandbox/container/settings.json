@@ -56,6 +56,11 @@
       ]
    },
    "inputNeededNotifEnabled" : true,
+   "modelSettings" : {
+      "claude-sonnet-5" : {
+         "effortLevel" : "medium"
+      }
+   },
    "permissions" : {
       "deny" : [
          "Read(~/.claude/projects/**/memory/**)"
@@ -70,6 +75,7 @@
       "command" : "perl \"$HOME/.claude/statusline.pl\"",
       "type" : "command"
    },
+   "timeFormat" : "24-hour",
    "worktree" : {
       "baseRef" : "fresh"
    }
