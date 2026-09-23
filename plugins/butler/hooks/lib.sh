@@ -1139,7 +1139,7 @@ bp_drive_retire_sentinel() {
 # re-implement any part of it (registry-path-one-rule.t exists because that
 # duplication already happened here once).
 #
-# bp_driver_context [CWD] -> rc 0 with BP_DRIVER_SESSION / BP_DATA_DIR /
+# bp_driver_context [CWD [SID]] -> rc 0 with BP_DRIVER_SESSION / BP_DATA_DIR /
 # BP_PROJECT_ROOT / BP_BLUEPRINT / BP_DIR / BP_PACKAGE / BP_WRITE_SET /
 # BP_TEST_PATHS / BP_DRIVER_ROLE set as plain (never exported) shell globals;
 # or rc 1 with every one of those globals left UNTOUCHED (no partial
@@ -1152,7 +1152,7 @@ bp_drive_retire_sentinel() {
 # session (BP_LEDGER set) always rc 1s here, so no session can take both
 # activation paths.
 bp_driver_context() {
-  local cwd="${1:-$PWD}"
+  local cwd="${1:-$PWD}" sid="${2:-}"
 
   # 1. Worker sessions belong to bp_hook_gate.
   [ -z "${BP_LEDGER:-}" ] || return 1
@@ -1163,6 +1163,29 @@ bp_driver_context() {
   # 3. The cheap liveness pre-check -- already reaps stale markers and
   # consults the session transcript; not re-derived here.
   bp_drive_any_active 2>/dev/null || return 1
+
+  # 3b. THIS session must be the one driving, when the caller knows which
+  # session it is (SID, the hook payload's session_id).
+  #
+  # Step 3 answers "is any drive active in this project". On its own that made
+  # every session in the project a driver: on 2026-09-23 guard-writes.sh
+  # enforced a drive-solo run's current package (almanac-records/06) on an
+  # unrelated interactive session, refusing every Edit/Write it made outside
+  # that package's write set. The pointer-freshness TTL (7b) was chosen over
+  # this narrowing because it was unverified whether a subagent's payload
+  # carries its PARENT's session_id. Checked that day on a real drive-solo
+  # session: every record in all of its subagent transcripts carries the
+  # parent's sessionId, which is the id a hook payload reports. So the
+  # driver's own workers still resolve to the driver's marker here, and
+  # mark-wakeup.sh rewrites that marker on every director call the driver
+  # makes, including the first one after /clear or --resume gives it a new id.
+  #
+  # No SID (a caller or fixture that sends none) keeps the step-3 behaviour.
+  if [ -n "$sid" ]; then
+    local own
+    own=$(bp_drive_marker "$sid" 2>/dev/null) || return 1
+    [ -f "$own" ] || return 1
+  fi
 
   # 4. Data dir (honours CCPRAXIS_DATA_DIR).
   local data_dir

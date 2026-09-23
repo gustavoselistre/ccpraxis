@@ -81,6 +81,7 @@ use File::Spec;
 use File::Path qw(make_path);
 use Cwd qw(abs_path);
 use POSIX qw(:sys_wait_h);
+use Time::HiRes ();
 # bsd_glob(), NOT the builtin glob() -- the builtin word-splits its PATTERN
 # argument on whitespace (csh-style), so an explicit target whose own path
 # contains a space (e.g. a real checkout under "C:\Users\Andre\Personal
@@ -328,6 +329,61 @@ sub _write_state_atomic {
     }
 }
 
+# --- durations (longest-first scheduling) -----------------------------------
+# test-state/durations.tsv: one "<seconds>\t<relpath>" line per file, merged
+# on every sweep exactly like the failure state (a file this run did not
+# execute keeps its last timing; a vanished file is dropped).
+#
+# WHY. The parallel queue ran in alphabetical order, so where the slowest
+# files landed was an accident of their names. Measured 2026-09-23 at -j2:
+# almanac-store-ordering.t alone took 440s of a 1957s sweep; started late,
+# it is the tail every other worker idles behind. Starting the longest
+# files first (LPT scheduling) bounds that tail by the longest single file
+# rather than by where it sorts.
+sub _durations_path { return File::Spec->catfile(_state_dir(), 'durations.tsv') }
+
+sub _read_durations {
+    my %d;
+    open my $fh, '<:raw', _durations_path() or return \%d;
+    while (my $l = <$fh>) {
+        $l =~ s/\r?\n\z//;
+        my ($secs, $rel) = split /\t/, $l, 2;
+        next unless defined $rel && length $rel && defined $secs && $secs =~ /\A\d+(?:\.\d+)?\z/;
+        $d{$rel} = $secs + 0;
+    }
+    close $fh;
+    return \%d;
+}
+
+sub _write_durations {
+    my ($d) = @_;
+    my $dir = _state_dir();
+    make_path($dir) unless -d $dir;
+    my $final = _durations_path();
+    my $tmp   = "$final.tmp.$$";
+    open my $fh, '>:raw', $tmp or return;
+    print {$fh} "$d->{$_}\t$_\n" for sort keys %$d;
+    close $fh;
+    unless (rename($tmp, $final)) {
+        unlink $final;
+        rename($tmp, $final) or warn "run-tests.pl: cannot rename $tmp to $final: $!";
+    }
+}
+
+# _order_longest_first(\@abs_files, \%durations_by_relpath) -> @abs_files.
+# Pure. Longest recorded time first; a file with no recorded time goes
+# before every timed one (it is new or renamed, and may be slow); ties,
+# including a first-ever run with no timings at all, keep path order.
+sub _order_longest_first {
+    my ($files, $dur) = @_;
+    my %t = map { ($_ => $dur->{ _relpath($_) }) } @$files;
+    return sort {
+        (defined $t{$b} ? 0 : 1) <=> (defined $t{$a} ? 0 : 1)
+            || ($t{$b} // 0) <=> ($t{$a} // 0)
+            || $a cmp $b
+    } @$files;
+}
+
 sub _cores {
     return $ENV{NUMBER_OF_PROCESSORS} if $ENV{NUMBER_OF_PROCESSORS} && $ENV{NUMBER_OF_PROCESSORS} =~ /^\d+$/;
     if (open my $c, '<', '/proc/cpuinfo') {
@@ -369,7 +425,9 @@ sub _resolve_jobs {
 # signature of a timeout or a kill, not a broken expectation).
 sub run_one {
     my ($f) = @_;
-    my $t0  = time;
+    # Sub-second: durations.tsv orders the next sweep, and whole seconds
+    # tie every short file together.
+    my $t0  = Time::HiRes::time();
     # FIX-BATCH M3 (step 7): the container-lane opt-in is a property of the
     # invocation a human/agent made, not of the process tree it spawns.
     # Without this, a nested `perl scripts/run-tests.pl` invoked BY one of
@@ -383,7 +441,8 @@ sub run_one {
     my $rc  = $? >> 8;
     $out = '' unless defined $out;
     my $notok = () = $out =~ /^not ok/mg;
-    return { file => $f, rc => $rc, notok => $notok, secs => time - $t0, out => $out };
+    return { file => $f, rc => $rc, notok => $notok,
+             secs => 0 + sprintf('%.1f', Time::HiRes::time() - $t0), out => $out };
 }
 
 # _marker_fix_message($file, $marker) -- the exact, pinned refusal text per
@@ -749,7 +808,7 @@ sub run_sweep {
         require File::Temp;
         my $dir = File::Temp::tempdir(CLEANUP => 1);
         my (%pid_of, @queue);
-        @queue = @host_parallel;
+        @queue = _order_longest_first(\@host_parallel, _read_durations());
         my $i = 0;
         my %slot;
         my %is_batch;
@@ -904,9 +963,22 @@ sub run_sweep {
         print "all green\n";
     }
 
-    my @slow = (sort { $b->{secs} <=> $a->{secs} } @results)[0 .. ($#results < 4 ? $#results : 4)];
+    my @slow = (sort { $b->{secs} <=> $a->{secs} } @results)[0 .. ($#results < 9 ? $#results : 9)];
     print "\nslowest:\n";
     printf "  %5ds  %s\n", $_->{secs}, basename($_->{file}) for grep { defined } @slow;
+
+    # Timings for the next run's ordering. Refused and container-infra
+    # results never ran, so they carry no timing worth keeping.
+    {
+        my $dur = _read_durations();
+        for my $rel (keys %$dur) { delete $dur->{$rel} unless -f _to_abs($rel) }
+        for my $r (@results) {
+            next if $r->{refused} || $r->{container_infra};
+            next unless defined $r->{file} && $r->{file} ne '?';
+            $dur->{ _relpath($r->{file}) } = $r->{secs} // 0;
+        }
+        _write_durations($dur);
+    }
 
     # --- state write (merge, never replace) -------------------------------------
     # %ran is the boundary: "did this invocation actually execute it" -- true

@@ -210,12 +210,24 @@ case "$EVENT" in
           *bp-drive-next.pl*|*bp-drive-next.sh*|*bp-drive-next\ *|*bp-drive-next) ;;
           *) exit 0 ;;
         esac
+        # MENTIONING THE DIRECTOR IS NOT CALLING IT. The two case tests above
+        # and below used to be substring matches on each side, so
+        # `grep -n ... plugins/butler/scripts/bp-drive-next.pl` activated the
+        # gate: its command names the file, and its output includes the
+        # director's own header comment, which contains the literal
+        # {"action":"run-package",...}. Observed 2026-09-23 in a session that
+        # was only reading the source, and was then refused every stop while
+        # another session drove. Now the command must run the `next` verb
+        # (the only verb that hands out a package) and some response line must
+        # BE the director's action object -- it prints exactly one canonical
+        # JSON line, so "action" is its first key.
+        printf '%s' "$CMD" \
+          | grep -Eq "bp-drive-next(\\.pl|\\.sh)?[\"']?[[:space:]]+next([[:space:]]|\$|[;&|)])" \
+          || exit 0
         RESP=$(bp_json_get "$PAYLOAD" tool_response.stdout tool_response) || RESP=""
-        case "$RESP" in
-          *'"action":"run-package"'*)
+        if printf '%s\n' "$RESP" | grep -Eq '^[[:space:]]*\{"action":"run-package"[,}]'; then
             printf '%s\n' "director handed back work" >> "$STATE" 2>/dev/null || true
-            ;;
-        esac
+        fi
         exit 0
         ;;
       *) exit 0 ;;
@@ -287,6 +299,39 @@ case "$EVENT" in
     # a scope test, not a verdict about a run in flight. Replaces the old
     # `bp-runstate.pl status` read entirely (package 02, Decision 2/3).
     if [ ! -s "$STATE" ]; then
+        _clear_pending
+        exit 0
+    fi
+
+    # THE SECOND SCOPE CONDITION: THIS SESSION MUST BE RUNNING THE RUN.
+    #
+    # The two resolutions below -- a watcher armed for a package, the
+    # operator's finish marker for a run -- only mean something to a session
+    # that is driving one. Without this, any session that dispatched a
+    # background agent in a project with unfinished blueprints was refused
+    # every stop and told "only the operator can end the run", about a run
+    # another session was driving (observed 2026-09-23: an interactive session
+    # researching butler, while a drive-solo session worked almanac-records).
+    # That session is still woken by the harness when its own background work
+    # completes; nothing is stranded by letting it stop.
+    #
+    # Driving means any of: a fleet coordinator (BP_LEDGER, exported by
+    # bp-launch.sh); a drive-solo driver holding ITS OWN marker, which
+    # mark-wakeup.sh rewrites on every director call this session makes; or
+    # a director call of this session's own that handed back work (recorded
+    # above). The last one keeps the gate on for a real driver even if its
+    # marker was never written -- the failure this gate exists for is a
+    # driver stopping unguarded, so every doubt about identity resolves
+    # toward "driving".
+    _sg_driving=0
+    if [ -n "${BP_LEDGER:-}" ]; then
+        _sg_driving=1
+    elif grep -qx 'director handed back work' "$STATE" 2>/dev/null; then
+        _sg_driving=1
+    elif _sg_mark=$(bp_drive_marker "$SESSION" 2>/dev/null) && [ -f "$_sg_mark" ]; then
+        _sg_driving=1
+    fi
+    if [ "$_sg_driving" -eq 0 ]; then
         _clear_pending
         exit 0
     fi

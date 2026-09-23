@@ -81,6 +81,7 @@ require "$SCRIPT_DIR/BpResumption.pm";
 # file's header for why arming needs one at all, and why the two platforms hold
 # two different things.
 require "$SCRIPT_DIR/BpContinuityLease.pm";
+require "$SCRIPT_DIR/BpProjectRoot.pm";
 
 my $cmd = shift @ARGV // '';
 
@@ -971,34 +972,9 @@ sub cmd_lease {
 # CLAUDE_PROJECT_DIR stays first because in a hook it is authoritative and is
 # exactly what guard-ask-operator.sh itself uses. The chain ENDS at cwd,
 # never at the install dir.
-sub _resolve_project_root {
-    return $ENV{CLAUDE_PROJECT_DIR}
-        if defined $ENV{CLAUDE_PROJECT_DIR} && length $ENV{CLAUDE_PROJECT_DIR};
-
-    return $ENV{BP_PROJECT_ROOT}
-        if defined $ENV{BP_PROJECT_ROOT} && length $ENV{BP_PROJECT_ROOT};
-
-    # git toplevel — trust only a clean exit and a real directory.
-    my $top = `git rev-parse --show-toplevel 2>/dev/null`;
-    if ($? == 0 && defined $top) {
-        chomp $top;
-        return $top if length $top && -d $top;
-    }
-
-    # Walk up from cwd for the first ancestor that already holds .ccpraxis-local-data.
-    my $d = Cwd::getcwd();
-    if (defined $d && length $d) {
-        my %seen;
-        while (!$seen{$d}++) {
-            return $d if -d "$d/.ccpraxis-local-data";
-            my $parent = dirname($d);
-            last if $parent eq $d;    # reached the filesystem / drive root
-            $d = $parent;
-        }
-    }
-
-    return Cwd::getcwd() // '.';
-}
+#
+# The rule itself now lives once, in BpProjectRoot.pm.
+sub _resolve_project_root { return BpProjectRoot::resolve() }
 
 sub questions_path {
     my $root = _resolve_project_root();
