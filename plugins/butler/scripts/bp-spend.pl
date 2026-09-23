@@ -619,13 +619,22 @@ sub _empty_package_result {
         },
         by_model      => {},
         record_counts => {
-            assistant_total       => 0,
-            coordinator           => 0,
-            subagent              => 0,
-            skipped_unparseable   => 0,
-            result_usage_seen     => 0,
-            system_usage_seen     => 0,
-            malformed_usage_field => 0,
+            assistant_total         => 0,
+            coordinator             => 0,
+            subagent                => 0,
+            skipped_unparseable     => 0,
+            result_usage_seen       => 0,
+            system_usage_seen       => 0,
+            malformed_usage_field   => 0,
+            # Added for the per-request dedup fix (bug report 20260922-214918-aa8c):
+            # requests_total counts logical API responses (one per message.id /
+            # requestId), NOT raw assistant records -- assistant_total above stays
+            # a record-level diagnostic. request_usage_mismatch counts requests
+            # whose repeated records disagreed on input/cache (never observed in
+            # the measured fleet transcripts, but surfaced rather than silently
+            # picking a value, same spirit as malformed_usage_field).
+            requests_total          => 0,
+            request_usage_mismatch  => 0,
         },
         anomaly => {
             name         => 'consecutive-same-size-cache-write',
@@ -634,9 +643,10 @@ sub _empty_package_result {
             pairs        => [],
         },
         cross_check => {
-            seen            => 0,
-            total_cost_usd  => undef,
-            model_usage     => {},
+            seen               => 0,
+            total_cost_usd     => undef,
+            model_usage        => {},
+            output_tokens_total => undef,
         },
         derived => 1,
     };
@@ -700,6 +710,41 @@ sub derive_package {
     my %prev_by_session;   # session_id => { role => { size => N, uuid => STR } }
     my @pairs;
 
+    # ---------------------------------------------------------------------
+    # Bug report 20260922-214918-aa8c: a fleet (stream-json) transcript
+    # writes ONE API response as SEVERAL `assistant` records, one per
+    # content block, and every one of those records repeats that same
+    # response's input/cache figures. Summing every record (the old
+    # behaviour) therefore multiplied input/cache by the average block
+    # count -- measured 1.3-2.5x on real archived runs. Fix: dedup per
+    # logical API response, keyed the same way the SESSION path already
+    # does (usage-telemetry Decision 6) -- `requestId` when present, else
+    # `message.id`, else a synthetic always-unique key so an unkeyed
+    # record is never folded into another one's total. Within one key:
+    # input/cache_creation/cache_read are taken from the record (last
+    # write wins, mirroring _session_read_agent_file), and `output` is the
+    # MAX seen across that key's records.
+    #
+    # output_tokens is NOT thereby made accurate for this shape. Measured
+    # fact (usage-telemetry blueprint Constraint H1, reconfirmed against
+    # b01/b05 above): stream-json's per-record output_tokens is a
+    # stream-START stub -- identical across every block of one response,
+    # never growing -- so max-across-records recovers nothing; it only
+    # stops the stub being multiplied by the block count the way
+    # input/cache were. tokens.{role}.output therefore remains a
+    # documented LOWER BOUND for this transcript shape. The only
+    # authoritative output figure available is the transcript's own
+    # `result` record(s) -- surfaced below as cross_check.output_tokens_total,
+    # summed across every `result` record in the file (a package can hold
+    # several coordinator launches), never blended into tokens/by_model
+    # because it is not split coordinator-vs-subagent.
+    # ---------------------------------------------------------------------
+    my @order;       # request keys, first-appearance order
+    my %requests;    # key => { role, model, input, output, cache_creation, cache_read }
+    my $unkeyed_n  = 0;
+    my $output_authoritative_total = 0;
+    my $output_authoritative_seen  = 0;
+
     for my $line (@lines) {
         $line =~ s/\r?\n\z//;
         next unless length $line;
@@ -726,54 +771,86 @@ sub derive_package {
             my $cc     = _safe_usage_num($u->{cache_creation_input_tokens}, $result->{record_counts});
             my $cr     = _safe_usage_num($u->{cache_read_input_tokens},     $result->{record_counts});
 
-            $result->{tokens}{$role}{input}          += $input;
-            $result->{tokens}{$role}{output}         += $output;
-            $result->{tokens}{$role}{cache_creation} += $cc;
-            $result->{tokens}{$role}{cache_read}     += $cr;
-
-            my $bm = ($result->{by_model}{$model} //= {
-                role => $role, input => 0, output => 0, cache_creation => 0, cache_read => 0,
-            });
-            $bm->{role} = 'mixed' if $bm->{role} ne $role;
-            $bm->{input}          += $input;
-            $bm->{output}         += $output;
-            $bm->{cache_creation} += $cc;
-            $bm->{cache_read}     += $cr;
-
             $result->{record_counts}{assistant_total}++;
             $result->{record_counts}{$role}++;
 
-            # Decision 5 -- consecutive same-size (>0) cache-write anomaly,
-            # per (session_id, role), in file order. A 0-size write is
-            # skipped: it participates as neither half of a pair and never
-            # resets the tracked previous value (spec §2.4).
-            #
-            # SCOPED BY ROLE TOO, not session_id alone (fix-batch M2 --
-            # red-team headline finding). Subagent (Task-tool) turns share the
-            # coordinator's session_id and interleave with it in file order as
-            # NORMAL operation, not an edge case. Tracking "previous" per
-            # session_id alone lets an interleaved subagent write both hide a
-            # real same-role duplicate (the subagent's differently-sized write
-            # overwrites the tracked pointer between two identical coordinator
-            # writes, so the real dup is never compared) and false-positive
-            # across roles (an unrelated coordinator/subagent pair that
-            # coincidentally share a cache-write size gets reported as a
-            # duplicate). Keying by (session_id, role) means only writes from
-            # the SAME branch of the conversation are ever compared.
-            my $session = $rec->{session_id};
-            if (defined $session && $cc > 0) {
-                my $uuid = defined($rec->{uuid}) ? $rec->{uuid} : '';
-                my $prev = $prev_by_session{$session}{$role};
-                if (defined $prev && $prev->{size} == $cc) {
-                    push @pairs, {
-                        session_id  => $session,
-                        role        => $role,
-                        size        => $cc,
-                        first_uuid  => $prev->{uuid},
-                        second_uuid => $uuid,
-                    };
+            my $key;
+            if (defined($rec->{requestId}) && !ref($rec->{requestId}) && length($rec->{requestId})) {
+                $key = "id:$rec->{requestId}";
+            }
+            elsif (defined($rec->{message}{id}) && !ref($rec->{message}{id}) && length($rec->{message}{id})) {
+                $key = "mid:$rec->{message}{id}";
+            }
+            else {
+                $key = "u:" . (++$unkeyed_n);
+            }
+
+            my $req = $requests{$key};
+            if (!$req) {
+                $req = $requests{$key} = {
+                    role => $role, model => $model,
+                    input => $input, output => $output,
+                    cache_creation => $cc, cache_read => $cr,
+                    session_id => $rec->{session_id},
+                    mismatched => 0,
+                };
+                push @order, $key;
+                $result->{record_counts}{requests_total}++;
+
+                # Decision 5 -- consecutive same-size (>0) cache-write
+                # anomaly, per (session_id, role), in file order. Run ONCE
+                # per logical response (here, at first sight of its key),
+                # not once per raw record -- a real response split into N
+                # content-block records shares one identical cache_creation
+                # figure across all N, and comparing every raw record would
+                # report N-1 spurious "duplicate" pairs for a single write.
+                # A 0-size write is skipped: it participates as neither
+                # half of a pair and never resets the tracked previous
+                # value (spec §2.4).
+                #
+                # SCOPED BY ROLE TOO, not session_id alone (fix-batch M2 --
+                # red-team headline finding). Subagent (Task-tool) turns
+                # share the coordinator's session_id and interleave with it
+                # in file order as NORMAL operation, not an edge case.
+                # Tracking "previous" per session_id alone lets an
+                # interleaved subagent write both hide a real same-role
+                # duplicate (the subagent's differently-sized write
+                # overwrites the tracked pointer between two identical
+                # coordinator writes, so the real dup is never compared)
+                # and false-positive across roles (an unrelated
+                # coordinator/subagent pair that coincidentally share a
+                # cache-write size gets reported as a duplicate). Keying by
+                # (session_id, role) means only writes from the SAME
+                # branch of the conversation are ever compared.
+                my $session = $rec->{session_id};
+                if (defined $session && $cc > 0) {
+                    my $uuid = defined($rec->{uuid}) ? $rec->{uuid} : '';
+                    my $prev = $prev_by_session{$session}{$role};
+                    if (defined $prev && $prev->{size} == $cc) {
+                        push @pairs, {
+                            session_id  => $session,
+                            role        => $role,
+                            size        => $cc,
+                            first_uuid  => $prev->{uuid},
+                            second_uuid => $uuid,
+                        };
+                    }
+                    $prev_by_session{$session}{$role} = { size => $cc, uuid => $uuid };
                 }
-                $prev_by_session{$session}{$role} = { size => $cc, uuid => $uuid };
+            }
+            else {
+                $req->{output} = $output if $output > $req->{output};
+                if (!$req->{mismatched}
+                    && (   $input != $req->{input}
+                        || $cc    != $req->{cache_creation}
+                        || $cr    != $req->{cache_read})) {
+                    $req->{mismatched} = 1;
+                    $result->{record_counts}{request_usage_mismatch}++;
+                }
+                $req->{input}          = $input;
+                $req->{cache_creation} = $cc;
+                $req->{cache_read}     = $cr;
+                $req->{model}          = $model;
             }
         }
         elsif ($type eq 'system'
@@ -800,12 +877,44 @@ sub derive_package {
                         cache_creation_input_tokens => $mu->{cacheCreationInputTokens}  // 0,
                         cost_usd                    => $mu->{costUSD}                   // 0,
                     };
+                    # Package files hold one `result` per coordinator
+                    # launch (a killed coordinator never writes one at
+                    # all), so the authoritative output total is a SUM
+                    # across every result record's modelUsage, across every
+                    # model -- never split by role, unlike tokens/by_model.
+                    $output_authoritative_total += ($mu->{outputTokens} // 0);
+                    $output_authoritative_seen = 1;
                 }
             }
         }
         # else: system/init, user, or any other record type -- ignored, no
         # usage to account for (spec §2.2, last bullet).
     }
+
+    # Second pass: fold each logical (deduplicated) request into
+    # tokens/by_model exactly once, in first-appearance order.
+    for my $key (@order) {
+        my $req   = $requests{$key};
+        my $role  = $req->{role};
+        my $model = $req->{model};
+
+        $result->{tokens}{$role}{input}          += $req->{input};
+        $result->{tokens}{$role}{output}         += $req->{output};
+        $result->{tokens}{$role}{cache_creation} += $req->{cache_creation};
+        $result->{tokens}{$role}{cache_read}     += $req->{cache_read};
+
+        my $bm = ($result->{by_model}{$model} //= {
+            role => $role, input => 0, output => 0, cache_creation => 0, cache_read => 0,
+        });
+        $bm->{role} = 'mixed' if $bm->{role} ne $role;
+        $bm->{input}          += $req->{input};
+        $bm->{output}         += $req->{output};
+        $bm->{cache_creation} += $req->{cache_creation};
+        $bm->{cache_read}     += $req->{cache_read};
+    }
+
+    $result->{cross_check}{output_tokens_total} = $output_authoritative_seen
+        ? $output_authoritative_total : undef;
 
     $result->{anomaly}{pairs} = \@pairs;
     $result->{anomaly}{count} = scalar(@pairs);
