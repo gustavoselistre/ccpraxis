@@ -231,6 +231,17 @@ fi
 # path, because a solo run does not write it.
 if [ "$IS_DRIVER" -eq 1 ]; then
   WORKER="${BP_DRIVER_ROLE:-}"
+  # A subagent's own call names its role in the payload (agent_type), and
+  # that beats the solo marker. The marker is written when a write-capable
+  # worker is DISPATCHED and cleared on that dispatch's PostToolUse, which
+  # for a background Agent call fires the moment the dispatch returns --
+  # before the worker makes a single edit. Observed 2026-09-23: a
+  # bp-test-writer was refused its own package's test file as "the
+  # driver". Only the three write-capable roles are taken from it.
+  _AGENT_TYPE=$(bp_json_get "$PAYLOAD" agent_type 2>/dev/null || true)
+  case "${_AGENT_TYPE##*:}" in
+    bp-implementer|bp-test-writer|bp-ui-prober) WORKER="${_AGENT_TYPE##*:}" ;;
+  esac
 else
   WORKER=""
   MARKER=$(marker_path)

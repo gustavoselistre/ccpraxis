@@ -98,6 +98,27 @@ subtest 'guard-writes: only the driving session is held to the write set' => sub
     is($rc_none, 2, 'a payload with no session_id keeps the old any-drive-active behaviour');
 };
 
+subtest 'guard-writes: a subagent\'s own agent_type names its role' => sub {
+    # The solo worker marker is cleared as soon as a BACKGROUND dispatch
+    # returns, so the payload's agent_type is what identifies a write-capable
+    # worker; without it a bp-test-writer was refused its own test file as
+    # "the driver" (2026-09-23).
+    my $fx = fixture();
+    my $as = sub {
+        my ($type) = @_;
+        my $p = write_payload($fx, 't/oracle.t', 'sess-driver');
+        if (defined $type) { $p->{agent_id} = 'a-test'; $p->{agent_type} = $type }
+        return $p;
+    };
+    my ($rc_drv, $o1) = run_guard($GW, $fx, $as->(undef));
+    is($rc_drv, 2, 'the driver itself may not write a test file') or diag($o1);
+    like($o1, qr/driver may not modify test files/, '...and is told why');
+    my ($rc_tw, $o2) = run_guard($GW, $fx, $as->('butler:bp-test-writer'));
+    is($rc_tw, 0, 'a bp-test-writer subagent may write its package\'s test file') or diag($o2);
+    my ($rc_rv, $o3) = run_guard($GW, $fx, $as->('butler:bp-reviewer'));
+    is($rc_rv, 2, 'a read-only role gains nothing from agent_type') or diag($o3);
+};
+
 subtest 'ledger-guard: the same scope' => sub {
     my $fx = fixture();
     my $ledger = '.ccpraxis-local-data/blueprints/demo-bp/packages/01-a.md';
