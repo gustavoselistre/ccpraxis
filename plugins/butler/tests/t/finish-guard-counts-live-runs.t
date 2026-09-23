@@ -22,6 +22,9 @@
 # which is the incident it exists to prevent.
 use strict;
 use warnings;
+
+# A test must never actuate a real wake-lock (test-wakelock-hygiene.t).
+BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
 use FindBin qw($Bin);
 use Test::More;
 use JSON::PP;

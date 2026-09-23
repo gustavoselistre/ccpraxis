@@ -2405,13 +2405,27 @@ sub registry_remove_project {
 # degrades into the existing ceiling rather than into a corrupted vault.
 sub lock_holder_is_dead {
     my ($pid) = @_;
-    return 0 unless defined $pid && !ref($pid) && $pid =~ /^\d+$/ && $pid > 0;
-    return 0 if $pid == $$;
+    return lock_holder_liveness($pid) eq 'dead';
+}
+
+# Three-way classification a bare is-dead boolean can't carry: 'alive' (the
+# kill(0,...) probe positively confirms it), 'dead' (positively absent --
+# ESRCH), or 'unknown' (every other case, including an unusable pid and a
+# foreign-namespace errno kill(0,...) cannot resolve either way). A refusal
+# an operator actually sees is, by construction, never 'dead' -- acquire_lock
+# reclaims on 'dead' before ever recording a refusal -- so 'unknown' is the
+# case worth naming out loud in the message: it is exactly what
+# lock_refusal_detail could not previously distinguish from a genuinely live
+# holder (almanac 20260829-193916-e091's follow-on report).
+sub lock_holder_liveness {
+    my ($pid) = @_;
+    return 'unknown' unless defined $pid && !ref($pid) && $pid =~ /^\d+$/ && $pid > 0;
+    return 'alive' if $pid == $$;
     local $!;
-    return 0 if kill(0, $pid);   # exists
-    return 0 if $!{EPERM};       # exists, not ours to signal
-    return 1 if $!{ESRCH};       # positively absent
-    return 0;                    # any other errno: we could not tell -- assume alive
+    return 'alive' if kill(0, $pid);   # exists
+    return 'alive' if $!{EPERM};       # exists, not ours to signal
+    return 'dead'  if $!{ESRCH};       # positively absent
+    return 'unknown';                  # any other errno: we could not tell
 }
 
 # Detail about the most recent REFUSED acquire, so the call sites can say more
@@ -2421,14 +2435,26 @@ our %LAST_LOCK_REFUSAL;
 # lock_refusal_detail() -> a one-line ", held by ..." suffix, or ''.
 sub lock_refusal_detail {
     return '' unless %LAST_LOCK_REFUSAL;
-    my $pid  = $LAST_LOCK_REFUSAL{pid};
-    my $age  = $LAST_LOCK_REFUSAL{age};
+    my $pid      = $LAST_LOCK_REFUSAL{pid};
+    my $age      = $LAST_LOCK_REFUSAL{age};
+    my $liveness = $LAST_LOCK_REFUSAL{liveness} // '';
     my @bits;
     push @bits, "pid $pid"                    if defined $pid && length $pid;
     push @bits, "held for " . int($age) . "s" if defined $age && $age =~ /^\d+$/;
     push @bits, "lock file $LAST_LOCK_REFUSAL{path}" if defined $LAST_LOCK_REFUSAL{path};
     return '' unless @bits;
+    # The operator cannot otherwise tell a live holder from a leaked stale
+    # lock without reading this file's source: say so plainly. 'alive' means
+    # the kill(0,...) probe positively confirmed the process; 'unknown' means
+    # it could not -- a foreign PID namespace answers "no such process" for a
+    # process that is very much alive, so an unresolved probe is reported as
+    # unresolved, never guessed at (never "probably dead").
+    my $liveness_note
+        = $liveness eq 'alive'   ? 'confirmed still running'
+        : $liveness eq 'unknown' ? 'liveness could not be confirmed (e.g. a different PID namespace) -- treated as still running'
+        :                          undef;
     return ' Holder: ' . join(', ', @bits)
+         . (defined $liveness_note ? " ($liveness_note)" : '')
          . '. It is reclaimed automatically once the holder exits, or after '
          . int($LOCK_STALE_SEC / 60) . ' minutes.';
 }
@@ -2476,7 +2502,12 @@ sub acquire_lock {
         } elsif ($age > $LOCK_STALE_SEC) {
             # Stale — reclaim below
         } else {
-            %LAST_LOCK_REFUSAL = (pid => $info->{pid}, age => $age, path => $path);
+            %LAST_LOCK_REFUSAL = (
+                pid      => $info->{pid},
+                age      => $age,
+                path     => $path,
+                liveness => lock_holder_liveness($info->{pid}),
+            );
             flock($flock_fh, LOCK_UN);
             close $flock_fh;
             return 0;  # Another active session

@@ -67,6 +67,37 @@ sub _sanitize {
     return $s;
 }
 
+# _neutralize_structural($v) -- fix-batch MEDIUM-7: title/target cannot forge
+# entry structure. Backticks and "**" are the two markers the entry-line
+# shape (S2.4) relies on to delimit the title/target fields, and " -- " is
+# the field separator itself; neutralising all three in title/target closes
+# the in-line forgery the red-team report demonstrated, without touching
+# column 0 (already unreachable per the sanitize step above).
+sub _neutralize_structural {
+    my ($v) = @_;
+    return $v unless defined $v;
+    my $s = $v;
+    $s =~ s/`/'/g;
+    $s =~ s/\*\*/*/g;
+    $s =~ s/ -- / - /g;
+    return $s;
+}
+
+# _hash_payload($payload) -- sha256_hex of the payload's UTF-8 bytes. When
+# $payload is a raw byte string (Encode::is_utf8 false -- e.g. read directly
+# off disk by apply_file/remove_block_file, fix-batch C-1/HIGH-2), it is
+# already the exact UTF-8 octets that were (or will be) written, so hashing
+# it directly reproduces the same digest without a decode/encode round trip
+# that would risk mangling bytes outside the block. When $payload is an
+# in-memory Perl string carrying real Unicode codepoints (Encode::is_utf8
+# true -- e.g. built by render_block from note fields, or passed in by an
+# apply_text caller), it is encoded first, exactly as before.
+sub _hash_payload {
+    my ($payload) = @_;
+    my $bytes = Encode::is_utf8($payload) ? Encode::encode('UTF-8', $payload) : $payload;
+    return Digest::SHA::sha256_hex($bytes);
+}
+
 # =============================================================================
 # 2.6 -- covers truncation (rulings 1 and 2).
 # =============================================================================
@@ -168,13 +199,20 @@ sub render_block {
     my $payload = "\n" . "## Almanac notes -- the directory\n" . "\n"
                 . "Generated from the almanac note store. Edit the note, never this block.\n" . "\n";
     for my $e (@sorted) {
+        # MEDIUM-6: title/target get the same byte-budget discipline as
+        # covers, so a pathologically long field cannot break DC3's growth
+        # bound (block size ~ note count, not note content length).
+        # MEDIUM-7: neutralise before truncating, so the fields that could
+        # forge entry structure never reach render, at any length.
+        my $title  = _truncate_covers(_neutralize_structural($e->{title}), $budget);
+        my $target = _truncate_covers(_neutralize_structural($e->{target}), $budget);
         my $covers_disp = (defined $e->{covers} && length $e->{covers})
                          ? _truncate_covers($e->{covers}, $budget)
                          : '-';
-        $payload .= "- **$e->{title}** ($e->{audience}) -- `$e->{target}`\n  $covers_disp\n";
+        $payload .= "- **$title** ($e->{audience}) -- `$target`\n  $covers_disp\n";
     }
 
-    my $hex  = Digest::SHA::sha256_hex(Encode::encode('UTF-8', $payload));
+    my $hex  = _hash_payload($payload);
     my $line = HASH_PREFIX() . $hex . HASH_SUFFIX();
     return BEGIN_MARKER() . "\n" . $line . "\n" . $payload . END_MARKER() . "\n";
 }
@@ -265,7 +303,7 @@ sub inspect {
                     ? substr($text, $offsets[$payload_start_line], $offsets[$e0] - $offsets[$payload_start_line])
                     : '';
         (my $norm_payload = $payload) =~ s/\r\n/\n/g;
-        my $computed_hash = Digest::SHA::sha256_hex(Encode::encode('UTF-8', $norm_payload));
+        my $computed_hash = _hash_payload($norm_payload);
 
         $state{stored_hash}   = $stored_hash;
         $state{computed_hash} = $computed_hash;
@@ -298,8 +336,10 @@ my %REASON = (
     conflict_markers_outside_block => 'This file contains git conflict markers outside the '
                                      . 'generated block. Finish the merge first; regenerating now '
                                      . 'would write into a half-merged file.',
-    markers_malformed => "The generated block's markers are not a single BEGIN/END pair. Remove "
-                        . 'the block and regenerate it.',
+    markers_malformed => "The generated block's markers are not a single BEGIN/END pair, so it "
+                        . 'cannot be regenerated automatically. If the BEGIN marker is missing, '
+                        . 'delete the stray END line by hand; otherwise remove the block and '
+                        . 'regenerate it.',
 );
 
 sub reason {
@@ -340,6 +380,18 @@ sub remove_block {
         return ($text, undef);
     }
 
+    # H-2 / HIGH-1 / MEDIUM-3: a BEGIN with no well-formed END -- the END
+    # line missing entirely, or the last END line sitting before the first
+    # BEGIN line (a merge outcome) -- has no span per S2.9 ("first BEGIN
+    # line to the last END line"). Refuse rather than inventing a span that
+    # either runs to end-of-file (deleting host prose after the block) or
+    # duplicates the text between end() and start() (an END-before-BEGIN
+    # ordering). The well-formed cases (including a merge-duplicated block
+    # with an END at or after the first BEGIN, AC-27) are unaffected.
+    unless (defined $insp->{end_line} && $insp->{end_line} > $insp->{begin_line}) {
+        _die(kind => 'refused', path => undef, detail => 'markers_malformed');
+    }
+
     my $new_text = substr($text, 0, $insp->{start}) . substr($text, $insp->{end});
     my $removed  = substr($text, $insp->{start}, $insp->{end} - $insp->{start});
 
@@ -360,16 +412,49 @@ sub _read_file {
     return defined($bytes) ? $bytes : '';
 }
 
+# MEDIUM-5 / N-2 / LOW-9: a fresh, unpredictable temp name per call (instead
+# of the previous fixed "$path.almanac-tmp") so two concurrent syncs, or a
+# pre-placed file at the old fixed name, do not collide; a short syswrite is
+# looped rather than treated as fatal; the original file's mode is copied
+# onto the replacement before the rename. This module's import allowlist
+# (S2.0/AC-37) has no room for Fcntl, so true O_CREAT|O_EXCL exclusivity and
+# an explicit fsync are not available here -- the random name is the
+# mitigation this write set can reach; see the fix-batch report for the
+# escalation this leaves open. This module never deletes a file (S2.0): a
+# mid-write failure leaves the temp file in place rather than removing it,
+# matching the file's pre-existing behaviour.
 sub _write_file_atomic {
     my ($path, $bytes) = @_;
-    my $tmp = "$path.almanac-tmp";
-    open(my $fh, '>:raw', $tmp) or _die(kind => 'io', path => $path, errno => "$!");
-    my $want    = length($bytes);
-    my $written = syswrite($fh, $bytes, $want);
-    my $closed  = close($fh);
-    unless (defined($written) && $written == $want && $closed) {
+
+    my @st   = stat($path);
+    my $mode = @st ? ($st[2] & 07777) : undef;
+
+    my ($tmp, $fh);
+    for (my $attempt = 0; $attempt < 64 && !defined($fh); $attempt++) {
+        my $candidate = sprintf('%s.almanac-tmp-%d-%d-%d', $path, $$, time(), int(rand(1_000_000_000)));
+        if (open(my $h, '>:raw', $candidate)) {
+            ($fh, $tmp) = ($h, $candidate);
+        }
+    }
+    _die(kind => 'io', path => $path, errno => "$!") unless defined $fh;
+
+    my $want = length($bytes);
+    my $off  = 0;
+    while ($off < $want) {
+        my $n = syswrite($fh, $bytes, $want - $off, $off);
+        unless (defined $n) {
+            my $errno = "$!";
+            close($fh);
+            _die(kind => 'io', path => $path, errno => $errno);
+        }
+        $off += $n;
+    }
+    unless (close($fh)) {
         _die(kind => 'io', path => $path, errno => "$!");
     }
+
+    chmod($mode, $tmp) if defined $mode;
+
     unless (rename($tmp, $path)) {
         my $errno = "$!";
         _die(kind => 'io', path => $path, errno => $errno);
@@ -377,53 +462,98 @@ sub _write_file_atomic {
     return 1;
 }
 
+# _reraise_with_path($err, $path) -- H-1 / LOW-8: Almanac::Store::Error
+# freezes its prose line and machine block into {message} at construction
+# (Store.pm), so mutating $err->{path} afterwards changes nothing that is
+# ever printed. Re-raise a freshly constructed error carrying the real
+# path instead.
+sub _reraise_with_path {
+    my ($err, $path) = @_;
+    if (ref($err) && ref($err) =~ /::Error$/) {
+        my %fields = %$err;
+        delete $fields{message};
+        delete $fields{exit_code};
+        $fields{path} = $path;
+        die Almanac::Store::Error->new(%fields);
+    }
+    die $err;
+}
+
+# apply_file(%opt) -- C-1 / HIGH-2: the host file's bytes outside the
+# marker span are never decoded or re-encoded. inspect()'s marker/hash/
+# conflict-line patterns are all pure ASCII and line-splitting is on "\n"
+# (0x0A, which UTF-8 never embeds inside a multi-byte sequence), so
+# inspect() can run directly against the raw bytes -- no full-file decode
+# is needed to find the span. Only the freshly generated block (which can
+# contain real Unicode from note fields) is encoded, and only that encoded
+# span is spliced in; every byte before start() and after end() is an
+# untouched substr() of the bytes read from disk.
 sub apply_file {
     my (%opt) = @_;
     _die(kind => 'usage', detail => 'path_required') unless defined $opt{path} && length $opt{path};
     my $path = $opt{path};
 
-    my $bytes = _read_file($path);
-    my $text  = Encode::decode('UTF-8', $bytes);
-
-    my $insp_before  = inspect($text);
-    my $state_before = $insp_before->{state};
-
-    my $new_text = eval {
-        apply_text(text => $text, notes => $opt{notes}, covers_budget => $opt{covers_budget});
-    };
-    if (my $err = $@) {
-        if (ref($err) && exists $err->{path}) {
-            $err->{path} = $path;
+    my $result = eval {
+        my $bytes = _read_file($path);
+        my $insp  = inspect($bytes);
+        my $state = $insp->{state};
+        if ($state ne 'absent' && $state ne 'clean') {
+            _die(kind => 'refused', path => $path, detail => $state);
         }
-        die $err;
-    }
 
-    my $new_bytes = Encode::encode('UTF-8', $new_text);
-    if ($new_bytes eq $bytes) {
-        return { path => $path, state => $state_before, changed => 0, bytes => length($new_bytes) };
-    }
+        my $block       = render_block(notes => $opt{notes}, covers_budget => $opt{covers_budget});
+        my $block_bytes = Encode::encode('UTF-8', $block);
 
-    _write_file_atomic($path, $new_bytes);
-    return { path => $path, state => $state_before, changed => 1, bytes => length($new_bytes) };
+        my $new_bytes;
+        if ($state eq 'clean') {
+            $new_bytes = substr($bytes, 0, $insp->{start}) . $block_bytes . substr($bytes, $insp->{end});
+        } else {
+            my $t = $bytes;
+            $t .= "\n" if length($t) && $t !~ /\n\z/;
+            $new_bytes = length($t) ? ($t . "\n" . $block_bytes) : $block_bytes;
+        }
+
+        # M-1: a no-op regeneration writes nothing, even on a CRLF working
+        # tree -- compare after \r\n -> \n normalisation (the same
+        # normalisation inspect() hashes against) rather than byte-exact,
+        # so a checkout that re-normalises line endings does not make every
+        # sync report changed => 1.
+        (my $norm_old = $bytes)     =~ s/\r\n/\n/g;
+        (my $norm_new = $new_bytes) =~ s/\r\n/\n/g;
+        if ($norm_new eq $norm_old) {
+            return { path => $path, state => $state, changed => 0, bytes => length($bytes) };
+        }
+
+        _write_file_atomic($path, $new_bytes);
+        return { path => $path, state => $state, changed => 1, bytes => length($new_bytes) };
+    };
+    _reraise_with_path($@, $path) if $@;
+    return $result;
 }
 
+# remove_block_file(%opt) -- C-1 / HIGH-2: works entirely in raw bytes.
+# remove_block() only locates markers (ASCII, "\n"-anchored) and slices the
+# text; it never needs to decode a single byte, so nothing outside (or
+# even inside) the removed span is ever touched by an encode/decode round
+# trip.
 sub remove_block_file {
     my (%opt) = @_;
     _die(kind => 'usage', detail => 'path_required') unless defined $opt{path} && length $opt{path};
     my $path = $opt{path};
 
-    my $bytes = _read_file($path);
-    my $text  = Encode::decode('UTF-8', $bytes);
+    my $result = eval {
+        my $bytes = _read_file($path);
+        my ($new_bytes, $removed) = remove_block($bytes);
 
-    my ($new_text, $removed) = remove_block($text);
-    my $new_bytes = Encode::encode('UTF-8', $new_text);
+        if ($new_bytes eq $bytes) {
+            return { path => $path, changed => 0, removed => $removed };
+        }
 
-    if ($new_bytes eq $bytes) {
-        return { path => $path, changed => 0, removed => $removed };
-    }
-
-    _write_file_atomic($path, $new_bytes);
-    return { path => $path, changed => 1, removed => $removed };
+        _write_file_atomic($path, $new_bytes);
+        return { path => $path, changed => 1, removed => $removed };
+    };
+    _reraise_with_path($@, $path) if $@;
+    return $result;
 }
 
 1;

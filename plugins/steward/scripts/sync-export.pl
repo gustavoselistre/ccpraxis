@@ -77,22 +77,29 @@ sub _dirs_equal {
 
 sub check_symlink {
     my $name = shift;
-    my $link = "$claude_dir/$name";
-    my $target = $name eq 'CLAUDE.md'
-        ? "$export_dir/global-config/CLAUDE.md"
-        : "$export_dir/$name";
+    # repo_file is the path *relative to the repo root* that this live item
+    # is actually paired with. It usually equals $name, but CLAUDE.md is the
+    # one exception: the live symlink target is global-config/CLAUDE.md, NOT
+    # a repo-root CLAUDE.md (that's ccpraxis's own project-instructions file,
+    # a completely unrelated document that happens to share the basename).
+    # Callers MUST use repo_file -- never reconstruct the repo path from
+    # $name/basename alone -- or they'll pair live's CLAUDE.md against the
+    # wrong repo file. See bug report 20260922-211416-1b92.
+    my $repo_file = $name eq 'CLAUDE.md' ? 'global-config/CLAUDE.md' : $name;
+    my $link      = "$claude_dir/$name";
+    my $target    = "$export_dir/$repo_file";
 
     if (-l $link) {
-        return { file => $name, status => 'linked' };
+        return { file => $name, repo_file => $repo_file, status => 'linked' };
     } elsif (-e $link) {
         if (is_windows()) {
             return content_matches($link, $target)
-                ? { file => $name, status => 'linked',     note => 'copy matches repo' }
-                : { file => $name, status => 'not_linked', note => 'copy differs from repo' };
+                ? { file => $name, repo_file => $repo_file, status => 'linked',     note => 'copy matches repo' }
+                : { file => $name, repo_file => $repo_file, status => 'not_linked', note => 'copy differs from repo' };
         }
-        return { file => $name, status => 'not_linked', note => 'exists but should be symlink' };
+        return { file => $name, repo_file => $repo_file, status => 'not_linked', note => 'exists but should be symlink' };
     }
-    return { file => $name, status => 'missing', note => 'missing from ~/.claude/' };
+    return { file => $name, repo_file => $repo_file, status => 'missing', note => 'missing from ~/.claude/' };
 }
 
 sub check_repo_file {

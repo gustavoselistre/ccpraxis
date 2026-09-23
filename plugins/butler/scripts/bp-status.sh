@@ -42,10 +42,10 @@ STRAYS=()
 if [ -x "$SCRIPT_DIR/bp-lifecycle.pl" ] || [ -f "$SCRIPT_DIR/bp-lifecycle.pl" ]; then
   if [ -n "$ONLY_BP" ]; then
     perl "$SCRIPT_DIR/bp-lifecycle.pl" reconcile --blueprint "$ONLY_BP" \
-         --no-archive --quiet > /dev/null 2>&1 || true
+         --data-dir "$DATA" --no-archive --quiet > /dev/null 2>&1 || true
   else
     perl "$SCRIPT_DIR/bp-lifecycle.pl" reconcile --all \
-         --no-archive --quiet > /dev/null 2>&1 || true
+         --data-dir "$DATA" --no-archive --quiet > /dev/null 2>&1 || true
   fi
 fi
 

@@ -41,6 +41,9 @@
 # bp-dispatch-log.sh exist yet.
 use strict;
 use warnings;
+
+# A test must never actuate a real wake-lock (test-wakelock-hygiene.t).
+BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
 use FindBin qw($Bin);
 use Test::More;
 use File::Temp qw(tempdir);

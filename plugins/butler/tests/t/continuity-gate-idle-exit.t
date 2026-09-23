@@ -21,6 +21,9 @@
 # would be worse than the trap, because the trap only wasted tokens.
 use strict;
 use warnings;
+
+# A test must never actuate a real wake-lock (test-wakelock-hygiene.t).
+BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
 use FindBin qw($Bin);
 use Test::More;
 use JSON::PP;

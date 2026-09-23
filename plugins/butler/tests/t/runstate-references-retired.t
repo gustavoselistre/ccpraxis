@@ -41,6 +41,9 @@
 # ===========================================================================
 use strict;
 use warnings;
+
+# A test must never actuate a real wake-lock (test-wakelock-hygiene.t).
+BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
 use Test::More;
 use FindBin qw($Bin);
 use File::Find ();
