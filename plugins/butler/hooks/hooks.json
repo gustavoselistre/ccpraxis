@@ -40,6 +40,16 @@
                }
             ],
             "matcher" : "Task|Bash"
+         },
+         {
+            "hooks" : [
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch-discipline-nudge.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Bash|Read|Edit|Grep"
          }
       ],
       "PreToolUse" : [

@@ -72,6 +72,20 @@ our $DEFAULT_BUDGET_SECONDS = 1800;
 # elapsed_seconds below.
 our $STALE_BUDGET_MULTIPLE = 4;
 
+# RATIO_DEFAULT / RATIO_ENV -- coordinator-context-discipline/
+# 03-dispatch-discipline-enforcement §2.1, the canonical threshold table. The
+# ONLY places either number is written in code -- neither the CLI nor the
+# nudge hook holds a second copy. min_calls is a floor (below it the ratio is
+# never computed, so a handful of calls at session start never fires);
+# min_ratio is a multiplier a well-behaved coordinator's own call volume
+# should stay well under. Both gates must hold; see the spec's own worked
+# table for why 200/40.
+our %RATIO_DEFAULT = ( min_calls => 200, min_ratio => 40 );
+our %RATIO_ENV     = ( min_calls => 'BP_DISPATCH_RATIO_MIN_CALLS',
+                       min_ratio => 'BP_DISPATCH_RATIO_MIN' );
+our $RATIO_MAX_LINES     = 100_000;      # lines examined in one transcript scan
+our $RATIO_MAX_LINE_BYTES = 1024 * 1024; # a longer line is skipped, never decoded
+
 # log_dir($root) -> ".../.ccpraxis-local-data/.dispatch-log" — same
 # resolution convention as bp-runstate.pl::state_dir, not reinvented.
 sub log_dir {
@@ -566,6 +580,176 @@ sub resolve_plan {
     return $sorted[0]{id};
 }
 
+# ratio_thresholds() -> \%thresh -- PURE apart from reading %ENV and warning
+# on stderr. Same validation convention as _ctx_ceiling_env/
+# _min_relaunch_secs elsewhere in this family: an UNSET env var is quiet (not
+# a mistake); a SET-but-malformed one falls back to the default and warns,
+# naming the offending value, one logical sentence, stderr only. Never falls
+# back to 0 -- an absent/garbage threshold must not make the gate trivially
+# easy to cross.
+sub ratio_thresholds {
+    my %out;
+    for my $k (qw(min_calls min_ratio)) {
+        my $env = $RATIO_ENV{$k};
+        unless (exists $ENV{$env}) {
+            $out{$k} = $RATIO_DEFAULT{$k};
+            next;
+        }
+        my $raw = $ENV{$env} // '';
+        if ($raw =~ /^[0-9]+$/ && $raw > 0) {
+            $out{$k} = $raw + 0;
+        } else {
+            warn "bp-dispatch-log: $env='$raw' is not a positive integer -- falling back to the default ($RATIO_DEFAULT{$k}).\n";
+            $out{$k} = $RATIO_DEFAULT{$k};
+        }
+    }
+    return \%out;
+}
+
+# scan_transcript_counts($path [, $max_lines]) -> \%counts | undef -- READER.
+# The one bounded pass over the transcript (spec §2.3). undef (never a
+# zeroed hash) when $path is undef/empty/a directory or cannot be opened --
+# "not measured" must never render as "measured zero". Coordinator-owned
+# records only (no parent_tool_use_id -- D-B, the whole point of this file).
+# Deduped by tool_use id, or by (line, position) when a block carries none.
+#
+# fixbatch (review M-1): the dispatch tool is serialized into a real
+# `bp-launch.sh` (--output-format stream-json) transcript as "Agent", never
+# "Task" -- measured against real transcripts on disk, zero "name":"Task"
+# matches anywhere. Both names are counted as a dispatch (`counts{tasks}`)
+# so this reader matches the tool this system actually emits, not only the
+# one the original spec pseudocode assumed.
+sub scan_transcript_counts {
+    my ($path, $max_lines) = @_;
+    return undef unless defined $path && length $path;
+    return undef if -d $path;
+    $max_lines = $RATIO_MAX_LINES
+        unless defined $max_lines && $max_lines =~ /^[0-9]+$/ && $max_lines > 0;
+    open my $fh, '<:raw', $path or return undef;
+    my %counts = (bash => 0, read => 0, edit => 0, grep => 0, self => 0,
+                  tasks => 0, lines => 0, truncated => 0);
+    my %seen;
+    while (my $line = <$fh>) {
+        # fixbatch (review N-2): the bound check runs BEFORE the increment, so
+        # `lines` reflects exactly the count of lines examined -- a
+        # `$max_lines` of 10 leaves `lines == 10`, not 11.
+        if ($counts{lines} >= $max_lines) { $counts{truncated} = 1; last }
+        $counts{lines}++;
+        next if length($line) > $RATIO_MAX_LINE_BYTES;   # never decode an unbounded line
+        next unless $line =~ /"name"\s*:\s*"(?:Bash|Read|Edit|Grep|Task|Agent)"/;   # cheap prefilter
+        my $rec = eval { JSON::PP->new->decode($line) };
+        next unless ref $rec eq 'HASH';
+        next unless defined $rec->{type} && $rec->{type} eq 'assistant';
+        next if defined $rec->{parent_tool_use_id};   # the coordinator/worker split (D-B)
+        my $msg = $rec->{message};
+        next unless ref $msg eq 'HASH';
+        my $content = $msg->{content};
+        next unless ref $content eq 'ARRAY';
+        for my $i (0 .. $#$content) {
+            my $b = $content->[$i];
+            next unless ref $b eq 'HASH';
+            next unless defined $b->{type} && $b->{type} eq 'tool_use';
+            next unless defined $b->{name} && !ref $b->{name};
+            my $key = (defined $b->{id} && !ref $b->{id} && length $b->{id})
+                    ? "id:" . $b->{id}
+                    : "pos:" . $counts{lines} . ":" . $i;
+            next if $seen{$key}++;   # count each tool_use ONCE
+            if    ($b->{name} eq 'Task' || $b->{name} eq 'Agent') { $counts{tasks}++ }
+            elsif ($b->{name} eq 'Bash') { $counts{bash}++; $counts{self}++ }
+            elsif ($b->{name} eq 'Read') { $counts{read}++; $counts{self}++ }
+            elsif ($b->{name} eq 'Edit') { $counts{edit}++; $counts{self}++ }
+            elsif ($b->{name} eq 'Grep') { $counts{grep}++; $counts{self}++ }
+        }
+    }
+    close $fh;
+    return \%counts;
+}
+
+# ratio_verdict(\%counts, $recorded, \%thresh) -> \%v -- PURE, no I/O, no
+# warnings on any input including undef and non-hashrefs (spec §2.4). D-D:
+# the LARGER of the transcript's own Task count and the store's recorded
+# total wins as the denominator -- over-reporting dispatches can only
+# suppress the nudge. The gate is integer multiplication compared to self,
+# never a division compared to a float, so the boundary is exact.
+sub ratio_verdict {
+    my ($counts, $recorded, $thresh) = @_;
+    return { verdict => 'unknown' } unless ref $counts eq 'HASH';
+    my $self  = $counts->{self}  // 0;
+    my $tasks = $counts->{tasks} // 0;
+
+    # fixbatch (review SHOULD-3): §2.4 promises "no I/O, no warnings on any
+    # input including undefs and non-hashrefs" -- the guard previously
+    # covered $counts only. A non-hashref/incomplete $thresh must default
+    # from %RATIO_DEFAULT rather than warn (and, worse, let
+    # `$self >= undef` evaluate as `$self >= 0`, true -- turning a missing
+    # threshold into a false "imbalance").
+    my $min_calls = (ref $thresh eq 'HASH' && looks_like_number($thresh->{min_calls}))
+                   ? $thresh->{min_calls} + 0 : $RATIO_DEFAULT{min_calls};
+    my $min_ratio = (ref $thresh eq 'HASH' && looks_like_number($thresh->{min_ratio}))
+                   ? $thresh->{min_ratio} + 0 : $RATIO_DEFAULT{min_ratio};
+
+    # A non-numeric $recorded must not warn or participate in the `>`
+    # comparison -- treat it the same as "absent".
+    $recorded = undef unless defined $recorded && looks_like_number($recorded);
+
+    my $den = $tasks;
+    $den = $recorded if defined $recorded && $recorded > $den;
+    my $eff = $den < 1 ? 1 : $den;   # never divide by zero
+    my $ratio = $self / $eff;
+    my $verdict = ($self >= $min_calls && $self >= $min_ratio * $eff)
+                ? 'imbalance' : 'proportional';
+    return { verdict => $verdict, denominator => $den, effective => $eff, ratio => $ratio };
+}
+
+# dispatch_totals($root, \%crit) -> \%totals -- READER (spec §2.5). Counts
+# dispatch RECORDS (any status) matching optional blueprint/package criteria,
+# using the SAME filter semantics `outstanding` already uses (_norm_attr): an
+# omitted criterion does not filter, a supplied one requires the record's own
+# value to equal it exactly -- a record missing the field never matches a
+# supplied criterion. history.jsonl is deliberately never read (it carries no
+# id and no attribution -- spec §2.5's own reasoning). An absent store
+# directory is an EMPTY store (readable=>1, zero counts) and creates nothing;
+# a path that exists but cannot be opened as a directory is genuinely
+# unreadable (readable=>0, every count undef).
+sub dispatch_totals {
+    my ($root, $crit) = @_;
+    $crit ||= {};
+    my $dir = log_dir($root);
+    my %totals = (readable => 1, total => 0, running => 0, closed => 0, unreadable => 0);
+    my $cb = _norm_attr($crit->{blueprint});
+    my $cp = _norm_attr($crit->{package});
+    if (opendir my $dh, $dir) {
+        for my $f (readdir $dh) {
+            next unless $f =~ /^(.+)\.json\z/;
+            my $id  = $1;
+            my $rec = read_record($root, $id);
+            unless (ref $rec eq 'HASH') {
+                $totals{total}++;
+                $totals{unreadable}++;
+                next;
+            }
+            if (defined $cb) {
+                my $rb = _norm_attr($rec->{blueprint});
+                next unless defined $rb && $rb eq $cb;
+            }
+            if (defined $cp) {
+                my $rp = _norm_attr($rec->{package});
+                next unless defined $rp && $rp eq $cp;
+            }
+            $totals{total}++;
+            (defined $rec->{status} && $rec->{status} eq 'running')
+                ? $totals{running}++ : $totals{closed}++;
+        }
+        closedir $dh;
+    } elsif (-e $dir) {
+        $totals{readable} = 0;
+        $totals{total}    = undef;
+        $totals{running}  = undef;
+        $totals{closed}   = undef;
+    }
+    return \%totals;
+}
+
 package main;
 use strict;
 use warnings;
@@ -574,7 +758,14 @@ use Cwd ();
 use Scalar::Util qw(looks_like_number);
 
 my $MAIN_DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
-require "$MAIN_DIR/bp-write-guard.pl";   # fixbatch step7 / MEDIUM-3: BpWrite::guarded_write
+# fixbatch step7 / MEDIUM-3: BpWrite::guarded_write -- required LAZILY, only
+# by the two commands that actually call it (start; resolve, via
+# _close_record's use_guard path), not at module-load time. A query verb
+# has no business requiring a writer dependency it never invokes: `ratio`
+# (03-dispatch-discipline-enforcement), `list`, `elapsed`, `outstanding` and
+# `finish` (which closes a record via a bare write_record, not the guard)
+# never call BpWrite at all, so loading it unconditionally would give every
+# one of them a hard dependency on a module none of them use.
 
 # fixbatch 02-redteam / M1: \z, not $ -- in Perl, $ matches BEFORE a
 # trailing newline, so "..\n" matches this class AND is not eq '..',
@@ -709,6 +900,7 @@ sub _close_record {
 
 unless (caller) {
     my $cmd = shift @ARGV // '';
+    require "$MAIN_DIR/bp-write-guard.pl" if $cmd eq 'start' || $cmd eq 'resolve';
     my %o;
     while (@ARGV) {
         my $a = shift @ARGV;
@@ -726,6 +918,7 @@ unless (caller) {
         elsif ($a eq '--dispatch-key')   { $o{dispatch_key}    = shift @ARGV }
         elsif ($a eq '--keep')           { $o{keep}            = shift @ARGV }
         elsif ($a eq '--force')          { $o{force}           = 1 }
+        elsif ($a eq '--transcript')     { $o{transcript}      = shift @ARGV }
         else { usage_error("unknown option '$a'") }
     }
     my $root = $o{root};
@@ -776,7 +969,7 @@ unless (caller) {
     # and `outstanding` (filter criteria) — strictly widening, and scoped so
     # every OTHER command's behavior does not move. --role stays start-only,
     # unchanged: neither new verb ever writes a role.
-    if ($cmd ne 'start' && $cmd ne 'resolve' && $cmd ne 'outstanding') {
+    if ($cmd ne 'start' && $cmd ne 'resolve' && $cmd ne 'outstanding' && $cmd ne 'ratio') {
         for my $opt (qw(blueprint package)) {
             usage_error("--$opt is only valid with the start command")
                 if defined $o{$opt};
@@ -809,6 +1002,17 @@ unless (caller) {
     }
     usage_error("--keep '$o{keep}' must be a non-negative integer")
         if defined $o{keep} && $o{keep} !~ /^\d+\z/;
+
+    # §2.6: --transcript is new, accepted on `ratio` only -- a path is
+    # attacker-shaped text in a line-oriented protocol (MEDIUM-6), so its
+    # value is validated here (shape only, never printed) and never echoed
+    # on stdout by any verb.
+    if (defined $o{transcript}) {
+        usage_error('--transcript is only valid with the ratio command')
+            if $cmd ne 'ratio';
+        usage_error('--transcript must name a path')
+            unless length $o{transcript};
+    }
 
     # fixbatch step7 / MEDIUM-2: --now is a TEST-ONLY seam (see file header).
     # Nothing previously distinguished a test invocation from a production
@@ -1093,6 +1297,94 @@ unless (caller) {
             . (defined $result->{duration} ? $result->{duration} : 'unknown') . ")\n";
         exit 0;
     }
+    elsif ($cmd eq 'ratio') {
+        usage_error('--transcript is required') unless defined $o{transcript};
+        usage_error('--transcript must name a path') unless length $o{transcript};
+
+        my $thresh = BpDispatchLog::ratio_thresholds();
+        my $counts = BpDispatchLog::scan_transcript_counts($o{transcript});
+
+        my %totals_crit;
+        $totals_crit{blueprint} = $o{blueprint} if defined $o{blueprint};
+        $totals_crit{package}   = $o{package}   if defined $o{package};
+        my $totals = BpDispatchLog::dispatch_totals($root, \%totals_crit);
+        my $store_readable = (ref $totals eq 'HASH' && $totals->{readable}) ? 1 : 0;
+        my $recorded = $store_readable ? $totals->{total} : undef;
+
+        my $v = BpDispatchLog::ratio_verdict($counts, $recorded, $thresh);
+        my $have_counts = (ref $counts eq 'HASH') ? 1 : 0;
+
+        my ($self, $bash, $read, $edit, $grep, $disp_t, $trunc, $ratio_str, $disp, $verdict, $summary);
+        if ($have_counts) {
+            $self   = $counts->{self};
+            $bash   = $counts->{bash};
+            $read   = $counts->{read};
+            $edit   = $counts->{edit};
+            $grep   = $counts->{grep};
+            $disp_t = $counts->{tasks};
+            $trunc  = $counts->{truncated} ? 'true' : 'false';
+            $disp      = $v->{denominator};
+            $ratio_str = sprintf('%.1f', $v->{ratio});
+            $verdict   = $v->{verdict};
+            if ($verdict eq 'imbalance') {
+                $summary = "$self of the coordinator's own direct tool calls (Bash, Read, Edit, Grep) are recorded in "
+                         . "this transcript against $disp dispatch(es), a ratio of about $ratio_str own calls per dispatch, at "
+                         . "or above the $thresh->{min_ratio} this check is set to notice; this is a pattern observed in what the "
+                         . "stream recorded, not a judgment that any of that work belonged to a worker.";
+            } else {
+                $summary = "$self own direct tool calls against $disp dispatch(es) were observed, below the ratio this "
+                         . "check is set to notice; this reflects what the transcript records, not a guarantee that "
+                         . "every step was dispatched.";
+            }
+        } else {
+            $self = $bash = $read = $edit = $grep = $disp_t = $disp = $ratio_str = $trunc = 'unknown';
+            $verdict = 'unknown';
+            $summary = 'the transcript could not be read, so the ratio of own tool calls to dispatches was not determined.';
+        }
+
+        my $disp_r = $store_readable ? $totals->{total} : 'unknown';
+
+        # fixbatch (review SHOULD-4/item 3): an entry that fails to decode as
+        # a HASH is counted toward `total`/`unreadable` BEFORE the
+        # blueprint/package filters run (spec §2.5, dispatch_totals), so an
+        # unrelated corrupt record can inflate a differently-scoped query's
+        # denominator while this sentence still claims the count is "scoped
+        # to this blueprint and package" -- false when unreadable > 0. Kept
+        # §2.5's counting rule intact (the smaller of the review's two
+        # options) and instead drop the "scoped" claim from THIS sentence
+        # when it would be dishonest; the mandated byte-for-byte sentence is
+        # unchanged for the (overwhelmingly common) unreadable == 0 case.
+        my $dispatch_note;
+        if ($store_readable && $totals->{unreadable}) {
+            $dispatch_note = "$disp_r dispatch records are recorded in the dispatch log (running or closed), "
+                . "but $totals->{unreadable} of the scanned entries could not be read and are included in "
+                . "that count regardless of blueprint/package scope; this reflects what is recorded on disk, "
+                . "not a guarantee that each one ran to completion or that the count is accurately scoped.";
+        } elsif ($store_readable) {
+            $dispatch_note = "$disp_r dispatch records scoped to this blueprint and package are recorded in the dispatch "
+                . "log (running or closed); this reflects what is recorded on disk, not a guarantee that "
+                . "each one ran to completion.";
+        } else {
+            $dispatch_note = 'the dispatch log could not be read, so how many dispatches are recorded on disk was not determined.';
+        }
+
+        print "self_tool_calls: $self\n";
+        print "self_bash_calls: $bash\n";
+        print "self_read_calls: $read\n";
+        print "self_edit_calls: $edit\n";
+        print "self_grep_calls: $grep\n";
+        print "dispatches_transcript: $disp_t\n";
+        print "dispatches_recorded: $disp_r\n";
+        print "dispatches: $disp\n";
+        print "ratio: $ratio_str\n";
+        print "min_calls: $thresh->{min_calls}\n";
+        print "min_ratio: $thresh->{min_ratio}\n";
+        print "scan_truncated: $trunc\n";
+        print "verdict: $verdict\n";
+        print "summary: $summary\n";
+        print "dispatch_note: $dispatch_note\n";
+        exit 0;
+    }
     elsif ($cmd eq 'outstanding') {
         my $dir = BpDispatchLog::log_dir($root);
         my $readable = 1;
@@ -1241,12 +1533,23 @@ bp-dispatch-log.pl — the per-dispatch budget record for an Agent/Task worker.
   resolve --worker-type <TYPE> --status done|interrupted|killed [--dispatch-key <TOKEN>]
           [--blueprint <NAME>] [--package <NAME>] [--report PATH] [--note TEXT] [--root DIR] [--now EPOCH]
   outstanding [--worker-type <TYPE>] [--blueprint <NAME>] [--package <NAME>] [--root DIR] [--now EPOCH]
+  ratio   --transcript <PATH> [--blueprint <NAME>] [--package <NAME>] [--root DIR]
 
---blueprint / --package are optional, valid with `start`, `resolve` and
-`outstanding`. --role is optional and valid ONLY with `start`; it is a
-closed vocabulary of exactly coordinator, worker or judge. --dispatch-key
+--blueprint / --package are optional, valid with `start`, `resolve`,
+`outstanding` and `ratio`. --role is optional and valid ONLY with `start`; it
+is a closed vocabulary of exactly coordinator, worker or judge. --dispatch-key
 is optional and valid ONLY with `start` (stamps the record) and `resolve`
-(query criteria); shape /^[a-z0-9-]{1,48}$/.
+(query criteria); shape /^[a-z0-9-]{1,48}$/. --transcript is required and
+valid ONLY with `ratio` -- the path to the coordinator's own runs transcript;
+its value is never printed on stdout.
+
+`ratio` prints self_tool_calls/self_bash_calls/self_read_calls/
+self_edit_calls/self_grep_calls/dispatches_transcript/dispatches_recorded/
+dispatches/ratio/min_calls/min_ratio/scan_truncated/verdict/summary/
+dispatch_note, one bounded scan of --transcript plus one scoped read of the
+dispatch store, never writes anything. min_calls/min_ratio default to
+200/40 (BpDispatchLog::%RATIO_DEFAULT) and are overridable via
+BP_DISPATCH_RATIO_MIN_CALLS / BP_DISPATCH_RATIO_MIN.
 
 Exit codes: 0 ok · 2 usage error · 3 start refused (a running record already
 exists for --id) · 4 elapsed/finish/resolve: no record, or the store could

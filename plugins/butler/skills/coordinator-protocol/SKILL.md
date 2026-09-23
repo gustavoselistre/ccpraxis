@@ -603,6 +603,7 @@ Rules:
 - **One write-capable worker in flight** (implementer / test-writer / ui-prober) — hook-enforced *inside a `bp-launch.sh` coordinator only* (see "…but only inside a butler-LAUNCHED coordinator" above); elsewhere it is your discipline. Read-only workers may run in parallel.
 - A worker that returns garbage or dies: redispatch once with a sharpened prompt. Twice: log the attempt, then either change approach or block — don't loop.
 - You may make small glue edits inside your write set yourself (wiring an export, a one-line fix during validation). Anything resembling a step belongs to a worker.
+- That sentence is prose, and prose alone is not the enforcement — `dispatch-discipline-nudge.sh` measures the pattern it names against your own runs transcript via `bp-dispatch-log.pl ratio`, built after one sampled coordinator made 704 self-Bash calls against 3 dispatches in 1,561 total tool calls. It blocks nothing: it only attaches a hedged note to a tool result you were already going to receive, and it observes a ratio — it can neither prove nor disprove that any particular call belonged to a worker. Its two thresholds, `BP_DISPATCH_RATIO_MIN_CALLS` and `BP_DISPATCH_RATIO_MIN`, default from `bp-dispatch-log.pl`'s own `%RATIO_DEFAULT`, the canonical source for both numbers.
 
 ### Turn caps — two fields, one concept, and they are NOT the same field
 
