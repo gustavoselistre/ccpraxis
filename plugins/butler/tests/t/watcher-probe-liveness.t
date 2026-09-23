@@ -512,10 +512,22 @@ sub run_suite {
 # ===========================================================================
 {
     my ($root, $data) = new_project();
-    for (1 .. 20) {
-        my $p = spawn('perl', '-e', 'sleep 8');
+    my @noise = map { spawn('perl', '-e', 'sleep 8') } 1 .. 20;
+    # Wait for every one to have EXEC'D (its cmdline reads "perl -e sleep 8"),
+    # so the fixture is what the assertion says: twenty processes RUNNING,
+    # not twenty still starting. (AC9 read 0.61-0.63s on 2026-09-24. The
+    # cause was not this settle but the probe itself: MSYS /proc/<pid>/stat
+    # costs 45-70ms per read -- see _probe_ppid in bp-watch.pl.)
+    my $deadline = time() + 10;
+    for my $p (@noise) {
+        while (time() < $deadline) {
+            my $cl = '';
+            if (open my $fh, '<', "/proc/$p/cmdline") { local $/; $cl = <$fh> // ''; close $fh }
+            last if $cl =~ /sleep/;
+            select(undef, undef, undef, 0.05);
+        }
     }
-    select(undef, undef, undef, 0.3);   # give the noise a moment to actually be running
+    select(undef, undef, undef, 0.3);   # and let the last exec finish settling
 
     my ($rc, $out, $dt) = run_probe('--data', $data);
     ok(defined $dt && $dt < 0.5,

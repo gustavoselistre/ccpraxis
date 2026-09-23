@@ -45,9 +45,11 @@ ok(-f $WATCH, 'A2: bp-watch.pl exists')    or BAIL_OUT('script missing');
 #    accidentally satisfy BOTH surfaces' trigger regex at once -- so this is
 #    asserted here as ground truth, not assumed.
 # ---------------------------------------------------------------------------
+# --reason keeps the later short-bound check (--max-seconds below 2900 needs
+# one) from refusing first, which left B1 passing on the wrong refusal.
 {
     my $data = tempdir(CLEANUP => 1);
-    my $out = `perl "$WATCH" --arm --package x/p1 --blueprint x --max-seconds 5 --data "$data" 2>&1`;
+    my $out = `perl "$WATCH" --arm --package x/p1 --blueprint x --max-seconds 5 --reason "B premise fixture" --data "$data" 2>&1`;
     my $rc  = $? >> 8;
     is($rc, 64, 'B1 PREMISE: bp-watch.pl refuses --package and --blueprint together (usage '
               . 'error, exit 64) -- this is what makes --blueprint a reporter-EXCLUSIVE '
