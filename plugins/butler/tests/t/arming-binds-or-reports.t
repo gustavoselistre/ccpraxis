@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 # platform: windows
-# arming-binds-or-reports.t -- package 13-arming-binds-or-says-so
+# Oracle for package 13-arming-binds-or-says-so
 #
 # Spec: .ccpraxis-local-data/blueprints/butler-gate-ergonomics/specs/
 #       13-arming-binds-or-says-so-spec.md  SS3 (behaviors 1-20), SS4 (AC1-AC20).

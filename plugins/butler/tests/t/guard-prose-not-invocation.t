@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 # platform: any
-# guard-prose-not-invocation.t — package 09-guard-prose-false-positive
+# Oracle for package 09-guard-prose-false-positive
 # (blueprint butler-gate-ergonomics), spec
 # .ccpraxis-local-data/blueprints/butler-gate-ergonomics/specs/09-guard-prose-false-positive-spec.md
 #

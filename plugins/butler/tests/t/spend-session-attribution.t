@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 # platform: any
-# spend-session-attribution — oracle for blueprint usage-telemetry, package
+# Oracle for blueprint usage-telemetry, package
 # 02-attribution-and-report.
 #
 # Tests the new BpSpend::Derive::resolve_data_root / load_dispatch_records /
