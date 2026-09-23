@@ -1093,6 +1093,44 @@ bp_drive_marker() {
   return 0
 }
 
+# bp_drive_retire SESSION_ID -> rc 0 iff, on return, no marker file exists at
+# the CANONICAL path for SESSION_ID (renamed aside to "<canonical>.retired"
+# just now, was already renamed, or the registry dir does not exist). rc 1
+# for an empty/malformed id, an unresolvable registry path, or a marker that
+# still exists at the canonical path after the rename attempt (e.g. rename
+# failed -- permissions, locked file). Never writes to stdout or stderr --
+# callers own their own messaging. Never exits. Resolves the path ONLY
+# through bp_drive_marker, never by string-concatenating a session id onto a
+# directory. Idempotent: a second call finds the canonical path already
+# absent and returns rc 0 without acting again.
+#
+# Deliberately a RENAME, never an rm. bp_drive_any_active's reap loop
+# (lib.sh:1023-1080, out of scope for this package) globs every entry in the
+# registry directory and applies its existing two-clause TTL rule per entry,
+# unmodified. Because the rename keeps the marker's content and mtime sitting
+# in the same directory that loop already scans, the renamed-aside marker
+# keeps being counted exactly as before retirement, until it ages out under
+# the pre-existing TTL rule -- same as any other marker. Retiring one
+# session's marker therefore changes nothing about what bp_drive_any_active
+# reports to any OTHER session, or to any consumer hook that calls it. An
+# earlier `rm -f` version of this function made every session's aggregate
+# liveness signal flip the instant any one session retired -- CRITICAL-1.
+bp_drive_retire() {
+  local sid="${1:-}" m
+  m=$(bp_drive_marker "$sid" 2>/dev/null) || return 1
+  [ -e "$m" ] && mv -f "$m" "$m.retired" 2>/dev/null
+  [ -e "$m" ] && return 1
+  return 0
+}
+
+# bp_drive_retire_sentinel -> prints the ONE canonical sentinel command
+# (no trailing newline), rc 0. mark-wakeup.sh and drive-solo/SKILL.md must
+# both derive from or exactly match this string, so the trigger and the
+# documentation cannot drift apart.
+bp_drive_retire_sentinel() {
+  printf '%s' 'echo butler-drive-solo-retire'
+}
+
 # ---------------------------------------------------------------------------
 # 07-guards-reach-the-driver: bp_driver_context — the ONE definition of "a
 # butler run is in progress, whoever is driving it, and what is its current

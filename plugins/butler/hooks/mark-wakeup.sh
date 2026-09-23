@@ -785,6 +785,112 @@ fi
 # --- end ARMING block --------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# RETIRE (06-drive-solo-marker-retirement, spec S3.3). A voluntary,
+# session-triggered deregistration: the driving session runs the exact
+# sentinel command (bp_drive_retire_sentinel, lib.sh) as its last act
+# (drive-solo/SKILL.md's `done` row) or when the operator says stop before a
+# `done` is ever reached. Placed OUTSIDE the ARMING block's own
+# `[ -n "$DATA" ] && [ -d "$DATA/.drive-solo" ]` guard on purpose (spec D-A/
+# D-B) -- the whole point is to work for a run that has already ended, where
+# DATA may no longer resolve to a live .drive-solo dir. Does not go through
+# bp_wakeup_arm_check: that helper vetoes commands whose first word is a
+# reader (echo|printf|grep|...), which is exactly the sentinel's own shape
+# (spec D-B). Whole-command exact match only -- never a substring/regex
+# match -- so a grep for the token, a doc quoting it, or a compound command
+# that merely starts with it can never trigger retirement (B6/AC7).
+#
+# DRIVER AMENDMENT (2026-09-23), 06-drive-solo-marker-retirement fixbatch
+# S9.2 (HIGH-2/MEDIUM-2/MEDIUM-3). This used to re-parse a SEPARATELY
+# sanitised copy of $PAYLOAD (RPAYLOAD) with its own tool_name/session_id
+# lookups (RTOOL/RSID), to work around B7's whitespace fixture containing a
+# raw, JSON-invalid control byte. That was a second, divergent JSON parse of
+# the same payload the ARMING block above already parses correctly via
+# $TOOL/bp_json_get -- MEDIUM-3's regression risk (a future edit could drift
+# the two), and HIGH-2's measured ~2x per-call cost (every Bash/Task call
+# paid for a full extra sanitising perl pass, even the overwhelming majority
+# that never mention the sentinel at all). B7's fixture has been corrected
+# instead (proper \t/\r/\n JSON escapes, not a raw control byte -- no real
+# Claude Code payload emits one), so the sanitiser was working around an
+# invalid fixture, not a real payload shape. This block now reuses $TOOL
+# (already computed above) and reads session_id / tool_input.command from
+# the REAL $PAYLOAD via the same bp_json_get calls the rest of this file
+# uses -- one parse, not two, no divergent grammar from the ARMING block.
+#
+# Zero-fork prefilter FIRST: the sentinel's own literal text must appear
+# somewhere in $PAYLOAD before any subprocess (bp_json_get, perl) runs at
+# all. This cannot false-negative for anything Claude Code's own encoder
+# produces (it never \u-escapes ASCII), and it drops this block's cost to
+# zero forks on the common-case call that never mentions the sentinel.
+case "$PAYLOAD" in
+  *butler-drive-solo-retire*) ;;
+  *) BP_SKIP_RETIRE=1 ;;
+esac
+if [ -z "${BP_SKIP_RETIRE:-}" ] && [ "$TOOL" = "Bash" ]; then
+  RET_SID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
+  # Bad/malformed session id stays SILENT (spec B5), mirroring the ARMING
+  # block's own convention above -- no id, no diagnostic, nothing echoed.
+  case "$RET_SID" in
+    ''|*/*|*\*|.|..|*..*) : ;;
+    *)
+      RET_CMD=$(bp_json_get "$PAYLOAD" tool_input.command 2>/dev/null || true)
+      # Trim leading/trailing whitespace (space, tab, CR, LF) only -- B7.
+      # One perl call, anchored to the WHOLE decoded string value -- never a
+      # shell tr/sed pipeline over raw un-decoded bytes (that over-matched
+      # MEDIUM-1's \r inside the command and under-matched MEDIUM-2's
+      # leading LF). Case-sensitive, byte-identical comparison against the
+      # one canonical spelling.
+      RET_CMD=$(printf '%s' "$RET_CMD" | perl -0777 -pe '
+        s/\A[ \t\r\n]+//;
+        s/[ \t\r\n]+\z//;
+      ' 2>/dev/null)
+      if [ "$RET_CMD" = "$(bp_drive_retire_sentinel)" ]; then
+        # DRIVER AMENDMENT S9.3 (HIGH-1/LOW-1): a cheap cwd-vs-marker-content
+        # binding. A crafted payload built by hand, outside the real hook's
+        # own process, can guess a valid-looking session id but cannot in
+        # general also supply a cwd that resolves (via the SAME bp_find_data_
+        # dir walk already used to compute $DATA above) to the exact data
+        # dir the ARMING block originally wrote into that session's marker.
+        # Only refuse when BOTH sides are positively known and differ --
+        # $DATA empty (this invocation's own cwd has no discoverable
+        # .ccpraxis-local-data ancestor) or the marker missing/unreadable
+        # stays on the existing, unauthenticated path rather than failing
+        # closed on a signal this hook cannot actually evaluate. Does NOT
+        # defend against a legitimately-running, tricked session (the
+        # payload in that scenario is entirely genuine, real session, real
+        # matching cwd) -- accepted residual, see spec S9.3.
+        RET_MARK=$(bp_drive_marker "$RET_SID" 2>/dev/null || true)
+        RET_SKIP=0
+        if [ -n "$DATA" ] && [ -n "$RET_MARK" ] && [ -f "$RET_MARK" ]; then
+          RET_MARK_DATA=$(head -n 1 "$RET_MARK" 2>/dev/null || true)
+          if [ -n "$RET_MARK_DATA" ] && [ "$RET_MARK_DATA" != "$DATA" ]; then
+            RET_SKIP=1
+          fi
+        fi
+        if [ "$RET_SKIP" -eq 0 ]; then
+          if bp_drive_retire "$RET_SID"; then
+            echo "butler drive-solo: driver marker retired" >&2
+          elif ! bp_drive_active_dir >/dev/null 2>&1; then
+            # Never interpolate $RET_SID into this message (spec: "no
+            # session id is echoed into that message" -- the same
+            # discipline the ARMING block's own unresolved-registry
+            # diagnostic already follows).
+            echo "butler drive-solo: registry path unresolved (HOME and USERPROFILE both unset) -- driver marker NOT retired" >&2
+          else
+            # DRIVER AMENDMENT LOW-4: distinguishes "the marker survived the
+            # retire attempt itself" (permissions, locked file -- a valid id
+            # and a resolvable registry, but the rename did not stick) from
+            # the "registry unresolved" case above, which used to be the
+            # ONLY diagnostic branch and so silently swallowed this one.
+            echo "butler drive-solo: driver marker NOT retired (marker still present after the retire attempt)" >&2
+          fi
+        fi
+      fi
+      ;;
+  esac
+fi
+# --- end RETIRE block ---------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # WAKE-UP DETECTION (g01-explicit-continuity-arming, spec §2.4). Computed
 # ONCE, unconditionally -- no longer gated behind .drive-solo existing --
 # then branched into two INDEPENDENT writes. A session that is simultaneously

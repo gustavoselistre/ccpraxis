@@ -55,7 +55,7 @@ Call `bp-drive-next.pl next --scope <scope>` → dispatch the returned action **
 | `pause` (reason=`usage`) | Wait **token-cheaply** until `action.until_epoch` — **Monitor** with an until-condition, or **ScheduleWakeup** to the epoch under `/loop`; never busy-poll, never spin tokens. | `next` again (after the epoch) |
 | `stop` (reason=`token-refresh-failed`) | **Genuinely terminal:** the director already tried and failed to refresh the token (via `bp-token-keeper.pl`). Tell the user to `/login` and re-invoke `drive-solo`; add to the end-batch (Decision #15). NOT an auto-resume. | *(none — stop; user re-invokes)* |
 | `blueprint-done` | RE-EVALUATE the still-`pending` blueprints' validity (semantic Claude judgment, Decision #3/#4/#17); PARK the stale/moot ones. | `bp-drive-next.pl park <blueprint> <reason…>` for each stale bp, then `next` again |
-| `done` | Present ALL batched decisions/parks in ONE pass (Decision #5): per-blueprint done/total, every accumulated park with its one-line decision + verify command, any governance-degraded note, any relogin. | *(none — run settled; stop)* |
+| `done` | Present ALL batched decisions/parks in ONE pass (Decision #5): per-blueprint done/total, every accumulated park with its one-line decision + verify command, any governance-degraded note, any relogin. Then, as the LAST act before stopping, retire this session's driver marker by running the sentinel command verbatim: `echo butler-drive-solo-retire` (see "Retire the driver marker" below). | *(none — run settled; stop)* |
 
 > The **governor** verdict (`bp-usage-gate.pl verdict`) that produces a `pause` is fetched INTERNALLY by the director — the session never runs it (Decision #13).
 > **Keep-awake** is a director-managed side-effect, never a session action (Decision #7).
@@ -147,6 +147,25 @@ armed the way Step 2 just did, is the whole proof. Nothing further to call.
   `touch <project>/.ccpraxis-local-data/.drive-solo/.run-finished`
 - **`--keepawake` on the Step 2 arm is what keeps the machine awake across the
   wait**, by REFRESHING the director's existing lease — it never creates one.
+
+### Retire the driver marker
+
+When the operator says stop **before** the director ever returns `done` (the
+early-stop case), run the same sentinel command as the last act of the turn:
+
+```
+echo butler-drive-solo-retire
+```
+
+`mark-wakeup.sh` observes this exact command on a `Bash` call and deregisters
+this session from the machine-level driver registry (`bp_drive_retire`,
+`lib.sh`). **Retirement is NOT a verb that ends a run** — it only deregisters
+*this session* from the driver registry, after the run has already ended some
+other way (the operator's word, here, or a presented `done`, above). The
+operator's `.run-finished` marker remains the only thing that ends a run
+(Decision 7/16). An operator holding a session id directly can run the
+equivalent from a shell:
+`bash -c 'source <hooks>/lib.sh; bp_drive_retire <session-id>'`.
 
 On exit `bp-watch.pl` prints one of five verdicts — act on it, don't just re-arm
 blindly:

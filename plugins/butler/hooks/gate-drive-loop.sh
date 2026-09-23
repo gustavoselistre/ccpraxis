@@ -352,14 +352,14 @@ MNOW=$(date +%s 2>/dev/null || echo 0)
 MMT=$(bp_mtime "$MARK")
 if [ "$MNOW" -gt 0 ] && [ "$MMT" -gt 0 ] \
    && [ $(( (MNOW - MMT) / 3600 )) -ge "$TTL_H" ]; then
-  rm -f "$MARK" 2>/dev/null
+  bp_drive_retire "$SID" 2>/dev/null || true
   exit 0
 fi
 
 # The marker holds the data dir the driver was working in, so this hook needs
 # no path walk of its own — the walk that used to be here is the one that hung.
 DATA=$(head -n 1 "$MARK" 2>/dev/null || true)
-[ -n "$DATA" ] && [ -d "$DATA/.drive-solo" ] || { rm -f "$MARK" 2>/dev/null; exit 0; }
+[ -n "$DATA" ] && [ -d "$DATA/.drive-solo" ] || { bp_drive_retire "$SID" 2>/dev/null || true; exit 0; }
 DS="$DATA/.drive-solo"
 
 # A drive-solo run is only "in progress" once an order has been recorded.
@@ -483,6 +483,21 @@ fi
 # only possible if the session stays in scope. $MARK still ages out via the
 # existing TTL reap above if the session never returns, so nothing is
 # stranded; a later /butler:drive-solo re-arms it regardless.
+#
+# DRIVER AMENDMENT (2026-09-23), 06-drive-solo-marker-retirement, D-E note.
+# This restraint's CODE is untouched -- no retirement call sits anywhere
+# between _bp_finish_signal above and its exit 0 below -- but its GUARANTEE
+# is deliberately ended for a session that reaches drive-solo/SKILL.md's
+# documented `done` row, because that row now runs the retire sentinel as the
+# session's own last act (06-drive-solo-marker-retirement). Once that
+# session's $MARK has been renamed aside by the shared retire primitive
+# above, a LATER stop from it never reaches this branch at all -- it falls
+# out at :342's
+# `[ -f "$MARK" ]` check first, well before the finish marker is even looked
+# at. That is intended, not a regression of AC9: a session that has
+# explicitly retired no longer needs this branch's later-stop coverage, only
+# a session that reaches .run-finished WITHOUT ever running the sentinel
+# does.
 if _bp_finish_signal "$DS"; then
   rm -f "$DS/.stop-blocks" "$DS/.wakeup-pending" 2>/dev/null
   echo "butler drive-loop: allowing this stop -- the operator's .run-finished marker ended the run." >&2
