@@ -1486,6 +1486,472 @@ sub derive_session {
     };
 }
 
+# ===========================================================================
+# Package 02 -- attribution and report (blueprint usage-telemetry, package
+# 02-attribution-and-report). Attributes each derive_session() agent entry to
+# a blueprint/package via bp-dispatch-log.pl's dispatch records and the
+# on-disk blueprint ledgers, then pivots package 01's agents[].cells by any
+# ordered subset of role/blueprint/package/model/effort/token_type. Pure
+# functions except for the filesystem reads named in their own docs; the CLI
+# verb at the bottom of this file is the only writer-adjacent caller (and it
+# never writes -- read-only, spec §2.7 B12).
+# Spec: .ccpraxis-local-data/blueprints/usage-telemetry/specs/
+# 02-attribution-and-report-spec.md
+# ===========================================================================
+use File::Basename qw(dirname);
+use Cwd qw(abs_path);
+
+# Mirrors bp-spend.pl:51-52's require idiom exactly (spec §2.1) -- re-derives
+# its own $DISPATCH_DIR rather than reaching across packages for BpSpend's
+# file-scoped $DIR. bp-dispatch-log.pl guards its own CLI with `unless
+# (caller)` and ends `1;`, so this require is side-effect-free. The ONLY
+# symbol used from it is $BpDispatchLog::DEFAULT_BUDGET_SECONDS --
+# list_records/read_record/log_dir take the repo root, not the data root, and
+# are never called (out of scope, spec §6).
+my $DISPATCH_DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
+# Soft require: bp-orchestrator.pl, bp-spend-auth.pl and the launcher's spend
+# sampler all load bp-spend.pl at their own load time, so a compile failure in
+# bp-dispatch-log.pl must not take them down too. $DISPATCH_DEFAULT_BUDGET_FALLBACK
+# below covers the anomaly path where this failed or the upstream constant is
+# missing/renamed; the NORMAL path still reads
+# $BpDispatchLog::DEFAULT_BUDGET_SECONDS by its fully-qualified name (spec §2.1).
+eval { require "$DISPATCH_DIR/bp-dispatch-log.pl"; 1 };
+
+# Anomaly-path-only fallback -- used ONLY if the require above failed or
+# $BpDispatchLog::DEFAULT_BUDGET_SECONDS is missing/renamed upstream. Never
+# read in the normal path (spec §2.1 forbids re-typing 1800 as the
+# normal-path value, not as an anomaly fallback).
+our $DISPATCH_DEFAULT_BUDGET_FALLBACK = 1800;
+
+our @REPORT_DIMENSIONS        = qw(role blueprint package model effort token_type);
+our @REPORT_DEFAULT_BY        = qw(role model);
+our @ATTRIBUTION_REASONS      = qw(unknown-agent ambiguous id-unresolved no-dispatch-record outside-window);
+our $DRIVER_LABEL             = '(driver)';
+our $UNATTRIBUTED_LABEL       = 'unattributed';
+our $ATTRIBUTION_LEAD_SECONDS = 120;
+
+our @REPORT_TOKEN_TYPES = qw(input output cache_write_5m cache_write_1h cache_read cache_write_unsplit);
+
+# ---------------------------------------------------------------------------
+# resolve_data_root($explicit) -> slashified data-root path string. Never
+# creates or checks existence of anything (spec §2.3).
+# ---------------------------------------------------------------------------
+sub resolve_data_root {
+    my ($explicit) = @_;
+    if (defined $explicit && length $explicit) {
+        (my $r = $explicit) =~ s{\\}{/}g;
+        $r =~ s{/+\z}{};
+        return $r;
+    }
+    my $root = $ENV{CLAUDE_PROJECT_DIR} // Cwd::abs_path("$DISPATCH_DIR/../../..") // '.';
+    (my $r = "$root/.ccpraxis-local-data") =~ s{\\}{/}g;
+    $r =~ s{/+\z}{};
+    return $r;
+}
+
+# ---------------------------------------------------------------------------
+# load_dispatch_records($data_root) -> \@records (never dies). Spec §2.4.
+# ---------------------------------------------------------------------------
+sub load_dispatch_records {
+    my ($data_root) = @_;
+    my $dir = "$data_root/.dispatch-log";
+    my @records;
+    my $dh;
+    return [] unless opendir($dh, $dir);
+    my @names = sort readdir($dh);
+    closedir $dh;
+    for my $name (@names) {
+        next unless $name =~ /\.json\z/;
+        my $path = "$dir/$name";
+        next unless -f $path;
+        (my $base = $name) =~ s/\.json\z//;
+        next if $base =~ /\Ahk-/;
+        open(my $fh, '<:raw', $path) or next;
+        my $raw = do { local $/; <$fh> };
+        close $fh;
+        my $rec = eval { JSON::PP->new->utf8->decode($raw) };
+        next unless ref($rec) eq 'HASH';
+        my $id = (defined $rec->{id} && !ref($rec->{id}) && length($rec->{id})) ? $rec->{id} : $base;
+        # SANITISED: $id/worker_type/blueprint/package are record-sourced and
+        # can reach a text report or a JSON row key. Control bytes are
+        # stripped and length capped so a hostile record can neither inject a
+        # line break/ANSI escape into the report nor collide two distinct
+        # blueprint/package names into the same \x1f-joined row key via an
+        # embedded \x1f byte. Same precedent as _gate_diagnostic above.
+        $id =~ tr/\x00-\x1f\x7f//d;
+        $id = substr($id, 0, 120) if length($id) > 120;
+        next if $id =~ /\Ahk-/;
+        next unless defined $rec->{worker_type} && !ref($rec->{worker_type}) && length($rec->{worker_type});
+        next unless defined $rec->{started_at} && !ref($rec->{started_at}) && $rec->{started_at} =~ /\A\d+(?:\.\d+)?\z/;
+        my $started_at = $rec->{started_at} + 0;
+
+        my $ended_at;
+        if (defined $rec->{ended_at} && !ref($rec->{ended_at}) && $rec->{ended_at} =~ /\A\d+(?:\.\d+)?\z/) {
+            my $e = $rec->{ended_at} + 0;
+            $ended_at = $e if $e >= $started_at;
+        }
+
+        my $budget;
+        if (defined $rec->{budget_seconds} && !ref($rec->{budget_seconds})
+            && $rec->{budget_seconds} =~ /\A\d+(?:\.\d+)?\z/ && $rec->{budget_seconds} + 0 > 0) {
+            $budget = $rec->{budget_seconds} + 0;
+        }
+        else {
+            # Still the only code reference to this fully-qualified package
+            # variable in this file (the require above is soft, so it can
+            # legitimately never populate it) -- scoped no warnings 'once',
+            # not a file-wide blanket.
+            no warnings 'once';
+            $budget = $BpDispatchLog::DEFAULT_BUDGET_SECONDS // $DISPATCH_DEFAULT_BUDGET_FALLBACK;
+        }
+
+        my $worker_type = $rec->{worker_type};
+        $worker_type =~ tr/\x00-\x1f\x7f//d;
+        $worker_type = substr($worker_type, 0, 120) if length($worker_type) > 120;
+
+        my $blueprint = (defined $rec->{blueprint} && !ref($rec->{blueprint}) && length($rec->{blueprint}))
+            ? $rec->{blueprint} : undef;
+        if (defined $blueprint) {
+            $blueprint =~ tr/\x00-\x1f\x7f//d;
+            $blueprint = substr($blueprint, 0, 120) if length($blueprint) > 120;
+        }
+        my $package = (defined $rec->{package} && !ref($rec->{package}) && length($rec->{package}))
+            ? $rec->{package} : undef;
+        if (defined $package) {
+            $package =~ tr/\x00-\x1f\x7f//d;
+            $package = substr($package, 0, 120) if length($package) > 120;
+        }
+
+        push @records, {
+            id => $id, worker_type => $worker_type, started_at => $started_at,
+            ended_at => $ended_at, budget => $budget, blueprint => $blueprint, package => $package,
+        };
+    }
+    return \@records;
+}
+
+# ---------------------------------------------------------------------------
+# _blueprint_packages($bp_dir) -> { <int> => [ <ledger-id>, ... ] }, built
+# from $bp_dir/packages/*.md. Private, used only by blueprint_index below.
+# ---------------------------------------------------------------------------
+sub _blueprint_packages {
+    my ($bp_dir) = @_;
+    my %packages;
+    my $pkg_dir = "$bp_dir/packages";
+    my $dh;
+    return {} unless opendir($dh, $pkg_dir);
+    my @names = sort readdir($dh);
+    closedir $dh;
+    for my $name (@names) {
+        next unless $name =~ /\.md\z/;
+        my $path = "$pkg_dir/$name";
+        next unless -f $path;
+        (my $ledger_id = $name) =~ s/\.md\z//;
+        next unless $ledger_id =~ /\A(\d+)/;
+        my $n = $1 + 0;
+        push @{ $packages{$n} //= [] }, $ledger_id;
+    }
+    return \%packages;
+}
+
+# ---------------------------------------------------------------------------
+# blueprint_index($data_root) -> { <name> => { archived => 0|1, packages =>
+# {...} } }. Spec §2.5. A name present under both blueprints/ and
+# blueprints/_archive/ resolves to the active one; the archived entry is
+# discarded outright.
+# ---------------------------------------------------------------------------
+sub blueprint_index {
+    my ($data_root) = @_;
+    my %index;
+
+    my $active_dir = "$data_root/blueprints";
+    if (opendir(my $dh, $active_dir)) {
+        my @names = sort readdir($dh);
+        closedir $dh;
+        for my $name (@names) {
+            next if $name eq '.' || $name eq '..' || $name eq '_archive';
+            next unless -d "$active_dir/$name";
+            $index{$name} = { archived => 0, packages => _blueprint_packages("$active_dir/$name") };
+        }
+    }
+
+    my $archive_dir = "$data_root/blueprints/_archive";
+    if (opendir(my $dh2, $archive_dir)) {
+        my @names = sort readdir($dh2);
+        closedir $dh2;
+        for my $name (@names) {
+            next if $name eq '.' || $name eq '..';
+            next unless -d "$archive_dir/$name";
+            next if exists $index{$name};   # active-over-archive
+            $index{$name} = { archived => 1, packages => _blueprint_packages("$archive_dir/$name") };
+        }
+    }
+
+    return \%index;
+}
+
+# ---------------------------------------------------------------------------
+# _resolve_bp_pkg($record, $index) -> ($blueprint, $package, $source) |
+# (undef, undef). Spec §2.6/B3. $record is already-normalised (load_dispatch_
+# records shape, or an equivalent plain hash passed directly by a caller).
+# ---------------------------------------------------------------------------
+sub _resolve_bp_pkg {
+    my ($rec, $index) = @_;
+
+    if (defined $rec->{blueprint} && !ref($rec->{blueprint}) && length($rec->{blueprint})
+        && defined $rec->{package} && !ref($rec->{package}) && length($rec->{package})) {
+        return ($rec->{blueprint}, $rec->{package}, 'record-fields');
+    }
+
+    my $id = defined $rec->{id} ? $rec->{id} : '';
+    my $best_name;
+    for my $name (keys %$index) {
+        next unless $id =~ /\A\Q$name\E-/;
+        $best_name = $name if !defined($best_name) || length($name) > length($best_name);
+    }
+    return (undef, undef) unless defined $best_name;
+
+    my $rest  = substr($id, length($best_name) + 1);
+    my $token = ($rest =~ /\A([^-]*)/) ? $1 : $rest;
+    return (undef, undef) unless $token =~ /\A\d+\z/;
+    my $n = $token + 0;
+
+    my $bucket = $index->{$best_name}{packages}{$n};
+    return (undef, undef) unless $bucket && @$bucket == 1;
+    return ($best_name, $bucket->[0], 'record-id');
+}
+
+# ---------------------------------------------------------------------------
+# attribute_session(doc => \%session_doc, records => \@records,
+# index => \%blueprint_index) -> \@attributions (spec §2.6). Pure function:
+# reads no file, no wall-clock. Entry 0 is always the driver (B6); the
+# description-heuristic second pass runs over every agent left unattributed
+# by the primary pass (B4).
+# ---------------------------------------------------------------------------
+sub attribute_session {
+    my (%opts) = @_;
+    my $doc     = $opts{doc}     // {};
+    my $records = $opts{records} // [];
+    my $index   = $opts{index}   // {};
+
+    my @agents = @{ $doc->{agents} // [] };
+    my @attrs;
+
+    for my $i (0 .. $#agents) {
+        my $agent = $agents[$i];
+        if ($i == 0) {
+            push @attrs, {
+                path => $agent->{path}, role => $agent->{role}, kind => 'driver',
+                blueprint => $DRIVER_LABEL, package => $DRIVER_LABEL,
+                reason => undef, source => 'driver',
+            };
+            next;
+        }
+
+        my $role = $agent->{role};
+        if (defined $role && $role eq 'unknown-agent') {
+            push @attrs, {
+                path => $agent->{path}, role => $role, kind => 'unattributed',
+                blueprint => $UNATTRIBUTED_LABEL, package => $UNATTRIBUTED_LABEL,
+                reason => 'unknown-agent', source => 'none',
+            };
+            next;
+        }
+
+        (my $wt = defined $role ? $role : '') =~ s/\A[^:]*://;
+        my $t0 = $agent->{first_ts};
+        my @candidates = grep { defined($_->{worker_type}) && $_->{worker_type} eq $wt } @$records;
+        my @matches;
+        if (defined $t0) {
+            for my $r (@candidates) {
+                my $end = defined($r->{ended_at}) ? $r->{ended_at} : $r->{started_at} + 4 * $r->{budget};
+                push @matches, $r if ($r->{started_at} - $ATTRIBUTION_LEAD_SECONDS) <= $t0 && $t0 <= $end;
+            }
+        }
+
+        if (@matches == 1) {
+            my ($bp, $pkg, $src) = _resolve_bp_pkg($matches[0], $index);
+            if (defined $bp && defined $pkg) {
+                push @attrs, {
+                    path => $agent->{path}, role => $role, kind => 'attributed',
+                    blueprint => $bp, package => $pkg, reason => undef, source => $src,
+                };
+            }
+            else {
+                push @attrs, {
+                    path => $agent->{path}, role => $role, kind => 'unattributed',
+                    blueprint => $UNATTRIBUTED_LABEL, package => $UNATTRIBUTED_LABEL,
+                    reason => 'id-unresolved', source => 'none',
+                };
+            }
+        }
+        elsif (@matches >= 2) {
+            push @attrs, {
+                path => $agent->{path}, role => $role, kind => 'unattributed',
+                blueprint => $UNATTRIBUTED_LABEL, package => $UNATTRIBUTED_LABEL,
+                reason => 'ambiguous', source => 'none',
+            };
+        }
+        else {
+            my $reason = @candidates ? 'outside-window' : 'no-dispatch-record';
+            push @attrs, {
+                path => $agent->{path}, role => $role, kind => 'unattributed',
+                blueprint => $UNATTRIBUTED_LABEL, package => $UNATTRIBUTED_LABEL,
+                reason => $reason, source => 'none',
+            };
+        }
+    }
+
+    # Description heuristic, second pass (B4). S is computed once from the
+    # primary pass ONLY -- heuristic successes never enlarge it.
+    my %S;
+    for my $a (@attrs) {
+        $S{ $a->{blueprint} } = 1
+            if $a->{kind} eq 'attributed' && ($a->{source} eq 'record-fields' || $a->{source} eq 'record-id');
+    }
+    if (%S) {
+        for my $i (0 .. $#attrs) {
+            next unless $attrs[$i]{kind} eq 'unattributed';
+            my $desc = $agents[$i]{description};
+            next unless defined $desc && !ref($desc);
+            next unless $desc =~ /\b(?:package|pkg)\s+(\d{1,3})\b/i;
+            my $n = $1 + 0;
+            my @found;
+            for my $bp_name (keys %S) {
+                my $bucket = $index->{$bp_name} && $index->{$bp_name}{packages}{$n};
+                next unless $bucket;
+                push @found, [$bp_name, $_] for @$bucket;
+            }
+            next unless @found == 1;
+            $attrs[$i] = {
+                path => $attrs[$i]{path}, role => $attrs[$i]{role}, kind => 'attributed',
+                blueprint => $found[0][0], package => $found[0][1],
+                reason => undef, source => 'description-heuristic',
+            };
+        }
+    }
+
+    return \@attrs;
+}
+
+# ---------------------------------------------------------------------------
+# _valid_by_list(\@dims) -> 1|0. Shared predicate for --by validation, used
+# by both report_session (below) and the CLI's own --by parsing, so the two
+# call sites can never drift on what counts as a valid dimension list.
+# PRIVATE.
+# ---------------------------------------------------------------------------
+sub _valid_by_list {
+    my ($dims) = @_;
+    return 0 unless ref($dims) eq 'ARRAY';
+    return 0 unless @$dims >= 1 && @$dims <= scalar(@REPORT_DIMENSIONS);
+    my %valid = map { $_ => 1 } @REPORT_DIMENSIONS;
+    my %seen;
+    for my $d (@$dims) { return 0 if !$valid{$d} || $seen{$d}++ }
+    return 1;
+}
+
+# ---------------------------------------------------------------------------
+# report_session(session => PATH, data_root => DIR|undef, by => \@dims|undef)
+# -> \%report_doc. Spec §2.7. The ONLY source of tokens/costs is
+# derive_session(); this aggregates agents[].cells and nothing else.
+# ---------------------------------------------------------------------------
+sub report_session {
+    my (%opts) = @_;
+    my $doc = derive_session(session => $opts{session});
+
+    my $by = $opts{by};
+    $by = [@REPORT_DEFAULT_BY] unless defined $by;
+    die "report_session: invalid --by dimension list\n" unless _valid_by_list($by);
+
+    my $data_root = resolve_data_root($opts{data_root});
+    my $records   = load_dispatch_records($data_root);
+    my $index     = blueprint_index($data_root);
+    my $attrs     = attribute_session(doc => $doc, records => $records, index => $index);
+
+    my @agents = @{ $doc->{agents} };
+
+    my %rows;
+    for my $i (0 .. $#agents) {
+        my $agent = $agents[$i];
+        my $attr  = $attrs->[$i];
+        for my $c (@{ $agent->{cells} }) {
+            next unless $c->{tokens} > 0;
+            my %dimval = (
+                role => $c->{role}, model => $c->{model}, effort => $c->{effort},
+                token_type => $c->{token_type}, blueprint => $attr->{blueprint}, package => $attr->{package},
+            );
+            my @vals = map { $dimval{$_} } @$by;
+            my $key = join("\x1f", @vals);
+            my $row = $rows{$key};
+            unless ($row) {
+                $row = {};
+                for my $idx (0 .. $#$by) { $row->{ $by->[$idx] } = $vals[$idx]; }
+                $row->{tokens} = 0; $row->{cost_usd} = 0; $row->{unpriced_tokens} = 0;
+                $rows{$key} = $row;
+            }
+            $row->{tokens}          += $c->{tokens};
+            $row->{cost_usd}        += $c->{cost_usd};
+            $row->{unpriced_tokens} += $c->{unpriced_tokens};
+        }
+    }
+
+    my @rows = values %rows;
+    for my $row (@rows) {
+        $row->{tokens}          = int($row->{tokens});
+        $row->{unpriced_tokens} = int($row->{unpriced_tokens});
+        $row->{cost_usd}        = 0 + sprintf('%.6f', $row->{cost_usd});
+    }
+    @rows = sort {
+        my $cmp = 0;
+        for my $d (@$by) {
+            $cmp = $a->{$d} cmp $b->{$d};
+            last if $cmp;
+        }
+        $cmp;
+    } @rows;
+
+    my %driver       = map { $_ => 0 } @REPORT_TOKEN_TYPES;
+    my %attributed   = map { $_ => 0 } @REPORT_TOKEN_TYPES;
+    my %unattributed = map { $_ => 0 } @REPORT_TOKEN_TYPES;
+    my %reasons;
+    for my $reason (@ATTRIBUTION_REASONS) {
+        $reasons{$reason} = { map { $_ => 0 } @REPORT_TOKEN_TYPES };
+    }
+
+    for my $i (0 .. $#agents) {
+        my $agent = $agents[$i];
+        my $attr  = $attrs->[$i];
+        for my $c (@{ $agent->{cells} }) {
+            next unless $c->{tokens} > 0;
+            my $t   = $c->{token_type};
+            my $tok = $c->{tokens};
+            if ($attr->{kind} eq 'driver')          { $driver{$t}     += $tok; }
+            elsif ($attr->{kind} eq 'attributed')   { $attributed{$t} += $tok; }
+            else {
+                $unattributed{$t} += $tok;
+                $reasons{ $attr->{reason} }{$t} += $tok;
+            }
+        }
+    }
+
+    return {
+        cost_basis   => 'notional-api-equivalent',
+        price_source => $SESSION_PRICE_SOURCE,
+        price_as_of  => $SESSION_PRICE_AS_OF,
+        by           => [@$by],
+        data_root    => $data_root,
+        rows         => \@rows,
+        totals       => $doc->{totals},
+        attribution  => {
+            driver       => \%driver,
+            attributed   => \%attributed,
+            unattributed => \%unattributed,
+            reasons      => \%reasons,
+            agents       => $attrs,
+        },
+    };
+}
+
 # ---------------------------------------------------------------------------
 # write_derived(%opts) -> writes the spend-derived.json shape (spec §4)
 # atomically (temp file in the same directory + rename()), mirroring
@@ -1581,16 +2047,25 @@ unless (caller) {
         elsif ($a =~ /^--session=(.*)$/)    { $opt{session}    = $1 }
         elsif ($a eq '--session')           { $opt{session}    = shift @ARGV }
         elsif ($a eq '--json')              { $opt{json}       = 1 }
+        elsif ($a =~ /^--data-root=(.*)$/)  { $opt{data_root}  = $1 }
+        elsif ($a eq '--data-root')         { $opt{data_root}  = shift @ARGV }
+        elsif ($a =~ /^--by=(.*)$/)         { $opt{by}         = $1 }
+        elsif ($a eq '--by')                { $opt{by}         = shift @ARGV }
         else { print STDERR "bp-spend: unrecognised argument '$a'\n"; exit 2 }
     }
 
-    # --session/--json living in the shared option loop above means a verb
-    # that never asked for them (snapshot, derive-package, derive-blueprint)
-    # now parses them instead of hitting the old unrecognised-argument hard
-    # error (fix-batch redteam M3) -- restore that safety net explicitly for
-    # every verb except derive-session.
-    if ($verb ne 'derive-session' && (exists $opt{session} || $opt{json})) {
-        print STDERR "bp-spend: --session/--json only apply to derive-session\n";
+    # --session/--json/--data-root/--by living in the shared option loop
+    # above means a verb that never asked for them (snapshot, derive-package,
+    # derive-blueprint) now parses them instead of hitting the old
+    # unrecognised-argument hard error (fix-batch redteam M3) -- restore that
+    # safety net explicitly for every verb that does not ask for a given flag.
+    my %SESSION_VERBS = (('derive-session') => 1, ('report-session') => 1);
+    if (!$SESSION_VERBS{$verb} && (exists $opt{session} || $opt{json})) {
+        print STDERR "bp-spend: --session/--json only apply to derive-session or report-session\n";
+        exit 2;
+    }
+    if ($verb ne 'report-session' && (exists $opt{data_root} || exists $opt{by})) {
+        print STDERR "bp-spend: --data-root/--by only apply to report-session\n";
         exit 2;
     }
 
@@ -1735,12 +2210,99 @@ unless (caller) {
         exit 0;
     }
 
+    # ---------------------------------------------------------------------
+    # report-session (blueprint usage-telemetry, package
+    # 02-attribution-and-report). Read-only: never calls write_derived,
+    # prints to stdout only. See spec §2.7-2.8.
+    # ---------------------------------------------------------------------
+    if ($verb eq 'report-session') {
+        unless (defined $opt{session} && length $opt{session}) {
+            print STDERR "bp-spend: report-session requires --session PATH\n";
+            exit 2;
+        }
+        if (exists $opt{data_root} && !(defined $opt{data_root} && length $opt{data_root})) {
+            print STDERR "bp-spend: --data-root requires a directory\n";
+            exit 2;
+        }
+
+        my @by_dims;
+        if (exists $opt{by}) {
+            unless (defined $opt{by}) {
+                print STDERR "bp-spend: --by requires a dimension list\n";
+                exit 2;
+            }
+            @by_dims = split(/,/, $opt{by}, -1);
+            unless (BpSpend::Derive::_valid_by_list(\@by_dims)) {
+                print STDERR "bp-spend: --by '$opt{by}' is not a valid dimension list (allowed: "
+                    . join(',', @BpSpend::Derive::REPORT_DIMENSIONS) . "; each at most once)\n";
+                exit 2;
+            }
+        }
+
+        my $doc = eval {
+            BpSpend::Derive::report_session(
+                session   => $opt{session},
+                data_root => $opt{data_root},
+                (@by_dims ? (by => \@by_dims) : ()),
+            );
+        };
+        if ($@) {
+            my $err = $@;
+            if ($err =~ /^derive_session: no such/) {
+                print STDERR "bp-spend: no such session transcript: "
+                    . BpSpend::Derive::_session_truncate_for_error($opt{session}) . "\n";
+                exit 4;
+            }
+            print STDERR "bp-spend: $err";
+            exit 1;
+        }
+
+        if ($opt{json}) {
+            print JSON::PP->new->canonical->utf8->encode($doc), "\n";
+            exit 0;
+        }
+
+        print "report-session: notional as-if-API-billed cost equivalent, not an actual charge\n";
+        print "session: $doc->{attribution}{agents}[0]{path}\n";
+        print "data-root: $doc->{data_root}\n";
+        print "price-source: $doc->{price_source} (as-of $doc->{price_as_of})\n";
+        print "by: " . join(',', @{ $doc->{by} }) . "\n";
+
+        my $grand_cost   = 0;
+        my $grand_tokens = 0;
+        for my $row (@{ $doc->{rows} }) {
+            my @parts = map { "$_=$row->{$_}" } @{ $doc->{by} };
+            printf "row: %s | %s tokens, \$%.6f notional as-if-API-billed, unpriced %s tokens\n",
+                join(' ', @parts), $row->{tokens}, $row->{cost_usd}, $row->{unpriced_tokens};
+            $grand_cost   += $row->{cost_usd};
+            $grand_tokens += $row->{tokens};
+        }
+        printf "TOTAL: \$%.6f notional as-if-API-billed across %s tokens\n", $grand_cost, $grand_tokens;
+
+        my $sum_types = sub {
+            my ($map) = @_;
+            my $s = 0;
+            $s += $map->{$_} for @BpSpend::Derive::REPORT_TOKEN_TYPES;
+            return $s;
+        };
+        printf "attribution: driver %s tokens, attributed %s tokens, unattributed %s tokens\n",
+            $sum_types->($doc->{attribution}{driver}),
+            $sum_types->($doc->{attribution}{attributed}),
+            $sum_types->($doc->{attribution}{unattributed});
+        for my $reason (@BpSpend::Derive::ATTRIBUTION_REASONS) {
+            printf "attribution-reason %s: %s tokens\n", $reason, $sum_types->($doc->{attribution}{reasons}{$reason});
+        }
+
+        exit 0;
+    }
+
     if ($verb ne 'snapshot') {
         print STDERR "usage: bp-spend.pl snapshot [--run-dir DIR] [--global-dir DIR] [--offline]\n"
                    . "                            [--force] [--now EPOCH] [--log PATH]\n"
                    . "       bp-spend.pl derive-package --run-dir DIR --pkg PKG [--now EPOCH]\n"
                    . "       bp-spend.pl derive-blueprint --run-dir DIR [--now EPOCH]\n"
-                   . "       bp-spend.pl derive-session --session PATH [--json]\n";
+                   . "       bp-spend.pl derive-session --session PATH [--json]\n"
+                   . "       bp-spend.pl report-session --session PATH [--data-root DIR] [--by dims] [--json]\n";
         exit 2;
     }
 
