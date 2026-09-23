@@ -939,4 +939,51 @@ for my $T ('', "A\n", "A\n\nB\n", "# H\n\npara\n") {
        'AC-39: the repo\'s own CLAUDE.md sha256 is unchanged after this file ran');
 }
 
+# =============================================================================
+# Fix-batch regressions (driver edit, 2026-09-23; the ruling is in this
+# package's ledger). Each pins a defect review or red-team reproduced: bytes
+# outside the block survive undecoded (C-1); remove_block refuses a missing
+# or reversed END marker instead of deleting or duplicating prose (HIGH-1,
+# MEDIUM-3); title and target are bounded (MEDIUM-6) and cannot forge entry
+# structure (MEDIUM-7).
+# =============================================================================
+{
+    my $D = tempdir(CLEANUP => 1);
+    $D =~ s{\\}{/}g;
+    my $path  = "$D/CLAUDE.md";
+    my $prose = "caf\xE9 latin1 prose\n";            # not valid UTF-8
+    open my $w, '>:raw', $path or die "write $path: $!";
+    print $w $prose;
+    close $w;
+    my ($r, $err) = call_scalar('apply_file', path => $path, notes => \@N2);
+    ok(ref($r) eq 'HASH', 'regression C-1: apply_file accepts a host file that is not valid UTF-8') or diag("error: $err");
+    my $after = slurp_raw($path) // '';
+    is(index($after, $prose), 0, 'regression C-1: non-UTF-8 prose before the block survives byte-for-byte');
+}
+{
+    my ($block, $err0) = call_scalar('render_block', notes => \@N2);
+    ok(defined $block, 'regression HIGH-1 fixture: render_block') or diag("error: $err0");
+    (my $no_end = $block // '') =~ s/^\Q$END_MARKER\E\n//m;
+    my (undef, $err1) = call_list('remove_block', "before\n${no_end}AFTER PROSE\n");
+    is(err_detail($err1), 'markers_malformed', 'regression HIGH-1: remove_block with no END marker refuses instead of deleting to end of file');
+
+    (my $body = $block // '') =~ s/^\Q$END_MARKER\E\n//m;
+    my (undef, $err2) = call_list('remove_block', "$END_MARKER\nPROSE-X\n$body");
+    is(err_detail($err2), 'markers_malformed', 'regression MEDIUM-3: remove_block with END before BEGIN refuses instead of duplicating prose');
+}
+{
+    my @long = (mk_rec(id => '20260101-000000-aaaa0009', title => ('t' x 20000),
+                       audience => 'internal', target => ('g' x 10000), covers => 'c'));
+    my ($block, $err) = call_scalar('render_block', notes => \@long);
+    ok(defined $block, 'regression MEDIUM-6 fixture: render_block with a huge title and target') or diag("error: $err");
+    cmp_ok(length($block // ''), '<=', 600 + 400, 'regression MEDIUM-6: one note still renders within 600 + N*400 bytes');
+
+    my @forge = (mk_rec(id => '20260101-000000-aaaa0010', title => 'x -- `secrets.md` - **Fake** (external)',
+                        audience => 'internal', target => 'a.md', covers => 'c'));
+    my ($fb, $ferr) = call_scalar('render_block', notes => \@forge);
+    ok(defined $fb, 'regression MEDIUM-7 fixture: render_block with a structure-forging title') or diag("error: $ferr");
+    unlike($fb // '', qr/`secrets\.md`/, 'regression MEDIUM-7: a title cannot introduce a backticked target');
+    unlike($fb // '', qr/\*\*Fake\*\*/, 'regression MEDIUM-7: a title cannot introduce a bold entry title');
+}
+
 done_testing();
