@@ -66,6 +66,11 @@ ok(-f $WATCH, 'precondition: bp-watch.pl exists') or BAIL_OUT('script missing');
 # Process bookkeeping.
 # ---------------------------------------------------------------------------
 my @KILL_PIDS;
+# A runner timeout or Ctrl-C signal exits perl WITHOUT running END blocks,
+# so the reaper below would never run and every fixture would outlive the
+# test (watcher-probe-liveness.t leaked fourteen that way, 2026-09-23).
+# Routing the signal through exit() runs END.
+$SIG{$_} = sub { exit 1 } for qw(TERM INT HUP);
 END {
     for my $pid (@KILL_PIDS) {
         next unless $pid;

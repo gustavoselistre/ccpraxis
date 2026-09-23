@@ -87,6 +87,12 @@ END {
     # exit status is never mistaken for this script's own.
     $? = 0;
 }
+# A runner timeout or Ctrl-C sends a signal, and perl's default action for
+# one exits WITHOUT running END blocks -- so the reaper above never ran and
+# every fixture outlived the test. Observed 2026-09-23: fourteen leaked
+# `perl -e 'sleep 99999' bp-watch.pl --arm ...` forgers on the host, each
+# good for another ~28 hours. Routing the signal through exit() runs END.
+$SIG{$_} = sub { exit 1 } for qw(TERM INT HUP);
 
 # ---------------------------------------------------------------------------
 # Fixture helpers
@@ -246,6 +252,9 @@ sub spawn {
         open(STDERR, '>', File::Spec->devnull);
         exec(@cmd) or POSIX::_exit(127);
     }
+    # Recorded HERE, not at each call site: the BLOCKER-1a forger was spawned
+    # without the call-site push, so it outlived every run of this file.
+    push @KILL_PIDS, $pid;
     return $pid;
 }
 
@@ -253,7 +262,6 @@ sub spawn {
 sub spawn_watcher {
     my (@args) = @_;
     my $pid = spawn('perl', $WATCH, @args);
-    push @KILL_PIDS, $pid;
     return $pid;
 }
 
@@ -434,7 +442,6 @@ sub run_suite {
         'perl', $stub, '--arm', '--package', 'bpx/other', '--max-seconds', 'garbage',
         '--data', $data,
     );
-    push @KILL_PIDS, $undecidable_pid;
     wait_proc_visible($undecidable_pid, 5);
 
     my ($rc, $out) = run_probe('--data', $data);
@@ -484,7 +491,6 @@ sub run_suite {
         'perl', $stub, '--arm', '--package', 'bp/p1', '--max-seconds', '2',
         '--reason', 'AC8 fixture: real short-budget watcher', '--data', $data,
     );
-    push @KILL_PIDS, $pid;
     wait_proc_visible($pid, 5) or diag("AC8: stub pid $pid not visible in /proc within timeout");
 
     my ($rc0) = run_probe('--data', $data);
@@ -508,7 +514,6 @@ sub run_suite {
     my ($root, $data) = new_project();
     for (1 .. 20) {
         my $p = spawn('perl', '-e', 'sleep 8');
-        push @KILL_PIDS, $p;
     }
     select(undef, undef, undef, 0.3);   # give the noise a moment to actually be running
 
@@ -794,14 +799,18 @@ sub run_suite {
     my ($root, $data) = new_project();
     new_running_bp($data, 'bpx', 'p1');
 
-    # (a) THE EXACT REPRO: `perl -e 'sleep 99999' ./bp-watch.pl --arm
+    # (a) THE EXACT REPRO (sleep shortened, see below): `perl -e 'sleep 99999' ./bp-watch.pl --arm
     # --max-seconds 99999` -- the trailing tokens are unused arguments to
     # `perl -e`, never parsed or executed as this script. A real process,
     # a real /proc/<pid>/cmdline containing exactly those tokens, and (by
     # construction) no arm-registry entry anywhere, because the code that
     # would write one never ran.
+    # The forger's own lifetime is bounded (120s -- far past the one probe
+    # it has to survive) so that even a SIGKILLed test run, which no END
+    # block can survive, leaves it behind for minutes rather than a day.
+    # The "--max-seconds 99999" it CLAIMS is the forged part and stays.
     my $forger_pid = spawn(
-        'perl', '-e', 'sleep 99999',
+        'perl', '-e', 'sleep 120',
         'bp-watch.pl', '--arm', '--max-seconds', '99999',
         '--package', 'bpx/p1', '--data', $data,
     );
