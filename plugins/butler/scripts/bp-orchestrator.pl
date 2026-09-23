@@ -2631,6 +2631,28 @@ sub _project_root_of {
     return undef;
 }
 
+# lifecycle_data_dir($bpdir) -> the data root (parent of blueprints/) to hand
+# bp-lifecycle.pl as --data-dir, or undef when it cannot be determined.
+#
+# Bug report 20260922-214319-9389: bp-lifecycle.pl re-derives its OWN data
+# root (project_root(), a fresh `git rev-parse`/walk-up from ITS cwd) whenever
+# a caller omits --data-dir. That need not be the data root this orchestrator
+# is actually running against -- a drive-solo driver started with an explicit
+# --data-dir (bp-drive-next.pl) writes its solo-claim pointer
+# (<data>/.drive-solo/current.json) under that root, and if the reconciler's
+# own guess lands somewhere else, solo_claimed() reads a missing file and
+# returns 0 -- silently defeating the P4 solo-driver protection in
+# bp-lifecycle.pl's orphan_running repair. Passing the SAME root explicitly,
+# derived from $bpdir (not from this process's cwd either) closes that gap.
+# Undef when no .ccpraxis-local-data ancestor exists (e.g. a bare test
+# tempdir) -- callers must skip the flag rather than pass a wrong root.
+sub lifecycle_data_dir {
+    my ($bpdir) = @_;
+    my $proot = _project_root_of($bpdir);
+    return undef unless defined $proot && length $proot;
+    return "$proot/.ccpraxis-local-data";
+}
+
 # b02: a log `detail` is one trimmed line of at most 200 chars — git output and
 # $@ are both multi-line, and the log is one JSON record per line.
 sub _oneline {
@@ -4999,9 +5021,16 @@ sub run {
     {
         my $lifecycle = "$DIR/bp-lifecycle.pl";
         if (-f $lifecycle) {
+            # --data-dir: see lifecycle_data_dir()'s header comment (bug
+            # report 20260922-214319-9389) -- without it, bp-lifecycle.pl
+            # guesses its own data root from cwd, which can defeat the
+            # solo-driver claim check. Skip the flag only when the root
+            # cannot be determined, so behaviour there is unchanged.
+            my $ldd = lifecycle_data_dir($bpdir);
+            my @data_dir_arg = (defined $ldd && length $ldd) ? ('--data-dir', $ldd) : ();
             my $rc = eval {
                 system($^X, $lifecycle, 'reconcile', '--blueprint', $bpdir,
-                       '--no-archive', '--quiet');
+                       @data_dir_arg, '--no-archive', '--quiet');
             };
             _log($log, 'lifecycle_reconcile', {
                 ok  => (!$@ && defined $rc && $rc == 0) ? 1 : 0,
