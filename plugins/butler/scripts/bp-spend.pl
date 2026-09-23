@@ -602,6 +602,7 @@ use strict;
 use warnings;
 use JSON::PP;
 use Fcntl ();
+use Time::Local ();
 
 # ---------------------------------------------------------------------------
 # _empty_package_result($pkg) -> the zero-valued shape every derive_package()
@@ -657,7 +658,13 @@ sub _safe_usage_num {
     my ($val, $counts) = @_;
     return 0 unless defined $val;
     if (!ref($val) && $val =~ /^\d+\z/) {
-        return $val + 0;
+        my $n = $val + 0;
+        # A ~300+-digit token count overflows a Perl NV to Inf (fix-batch
+        # redteam M1) -- that would otherwise pass through int()/rounding
+        # unrounded and land in the JSON output as an invalid `Infinity`
+        # token, breaking every consumer that decodes it. Reject non-finite
+        # results the same way any other malformed field is rejected.
+        return $n if $n == $n && $n != 9**9**9 && $n != -9**9**9;
     }
     $counts->{malformed_usage_field}++;
     return 0;
@@ -892,6 +899,593 @@ sub derive_blueprint {
     return $result;
 }
 
+# ===========================================================================
+# derive_session(%opts) -- blueprint usage-telemetry, package
+# 01-drive-solo-input-and-pricing. Reads a DRIVE-SOLO session's own
+# transcripts directly: a `<uuid>.jsonl` main transcript plus a sibling
+# `<uuid>/subagents/agent-<id>.jsonl` per subagent and its `.meta.json`
+# sidecar. This shape has no `result` record (no self-reported cost) and no
+# `parent_tool_use_id` (role must come from the sidecar, not the record), and
+# one API request is spread over several `assistant` records that repeat
+# their input/cache figures while `output_tokens` grows -- hence the
+# per-request dedup below. Spec: .ccpraxis-local-data/blueprints/
+# usage-telemetry/specs/01-drive-solo-input-and-pricing-spec.md. Pure,
+# read-only: opens files '<:raw', writes nothing, creates nothing (Decision
+# 7). Deliberately does NOT reuse derive_package's (session_id, role)
+# anomaly key -- see the per-agent-file rationale at _agent_anomaly() below.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Price table (spec §2.4). US dollars per million tokens (MTok), fetched live
+# 2026-09-23 from the docs pricing page (chosen over claude.com/pricing per
+# Decisions 11-12, because only the docs page itemises the cache-write
+# 5m/1h split). `claude-haiku-4-5-20251001` is priced from the
+# `claude-haiku-4-5` alias row -- an alias identity, not a sibling/older-model
+# substitution (Decision 8 is not violated). Every other id is read from a
+# row that names that exact id.
+# ---------------------------------------------------------------------------
+our $SESSION_PRICE_SOURCE = 'https://platform.claude.com/docs/en/about-claude/pricing';
+our $SESSION_PRICE_AS_OF  = '2026-09-23';
+our @SESSION_PRICE_REQUIRED = qw(
+    claude-opus-5-5 claude-sonnet-5 claude-fable-5-1
+    claude-haiku-4-5-20251001 claude-opus-5
+);
+our %SESSION_PRICES = (
+    'claude-opus-5-5'           => { input => 4,  output => 20, cache_write_5m => 5,     cache_write_1h => 8,  cache_read => 0.20 },
+    'claude-sonnet-5'           => { input => 2,  output => 10, cache_write_5m => 2.50,  cache_write_1h => 4,  cache_read => 0.20 },
+    'claude-fable-5-1'          => { input => 10, output => 50, cache_write_5m => 12.50, cache_write_1h => 20, cache_read => 0.25 },
+    'claude-haiku-4-5-20251001' => { input => 1,  output => 5,  cache_write_5m => 1.25,  cache_write_1h => 2,  cache_read => 0.10 },
+    'claude-opus-5'             => { input => 5,  output => 25, cache_write_5m => 6.25,  cache_write_1h => 10, cache_read => 0.50 },
+);
+our %SESSION_PRICES_MISSING = ();   # model id => reason string; empty for this release
+
+# ---------------------------------------------------------------------------
+# session_price_table() -> { source, as_of, required => \@, prices => \%,
+# missing => \% }. Returns COPIES -- callers must not mutate the originals.
+# ---------------------------------------------------------------------------
+sub session_price_table {
+    my %prices;
+    for my $id (keys %SESSION_PRICES) {
+        $prices{$id} = { %{ $SESSION_PRICES{$id} } };
+    }
+    return {
+        source   => $SESSION_PRICE_SOURCE,
+        as_of    => $SESSION_PRICE_AS_OF,
+        required => [ @SESSION_PRICE_REQUIRED ],
+        prices   => \%prices,
+        missing  => { %SESSION_PRICES_MISSING },
+    };
+}
+
+# ---------------------------------------------------------------------------
+# _norm_scalar_or_unknown($v) -> $v when it is a defined, non-ref, non-empty
+# scalar; else the literal string 'unknown' (B5). Never a default such as
+# 'medium'.
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# _session_truncate_for_error($s) -> $s, or its first 200 chars + '...' when
+# longer (fix-batch redteam L10) -- keeps a pathologically long --session
+# value from being echoed verbatim (and unbounded) into a diagnostic.
+# ---------------------------------------------------------------------------
+sub _session_truncate_for_error {
+    my ($s) = @_;
+    return '' unless defined $s;
+    return $s if !ref($s) && length($s) <= 200;
+    return ref($s) ? "$s" : substr($s, 0, 200) . '...';
+}
+
+sub _norm_scalar_or_unknown {
+    my ($v) = @_;
+    return (defined($v) && !ref($v) && length($v)) ? $v : 'unknown';
+}
+
+# ---------------------------------------------------------------------------
+# _session_parse_ts($str) -> epoch seconds, or undef when $str is not one of
+# the accepted forms (B12): YYYY-MM-DDTHH:MM:SS, an optional fractional part
+# (truncated), and either Z or +-HH:MM.
+# ---------------------------------------------------------------------------
+sub _session_parse_ts {
+    my ($str) = @_;
+    return undef unless defined($str) && !ref($str);
+    return undef unless $str =~ /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+    my ($y, $mo, $d, $h, $mi, $s, $off) = ($1, $2, $3, $4, $5, $6, $7);
+    my $epoch = eval { Time::Local::timegm($s, $mi, $h, $d, $mo - 1, $y) };
+    return undef unless defined $epoch;
+    if ($off ne 'Z') {
+        my ($sign, $oh, $om) = $off =~ /^([+-])(\d{2}):(\d{2})$/;
+        my $off_secs = ($oh * 3600 + $om * 60);
+        $off_secs = -$off_secs if $sign eq '-';
+        $epoch -= $off_secs;
+    }
+    return $epoch;
+}
+
+# ---------------------------------------------------------------------------
+# _session_read_sidecar($path) -> \%hashref, or undef when the file is
+# absent, unreadable, not valid JSON, or not a JSON object. Never fatal.
+# ---------------------------------------------------------------------------
+sub _session_read_sidecar {
+    my ($path) = @_;
+    return undef unless -f $path;
+    open(my $fh, '<:raw', $path) or return undef;
+    my $raw = do { local $/; <$fh> };
+    close $fh;
+    my $data = eval { JSON::PP->new->utf8->decode($raw) };
+    return undef if $@ || ref($data) ne 'HASH';
+    return $data;
+}
+
+# ---------------------------------------------------------------------------
+# _session_slashify($path) -> $path with every backslash replaced by a
+# forward slash, so emitted path strings are byte-identical on Windows and
+# POSIX (spec §2.3).
+# ---------------------------------------------------------------------------
+sub _session_slashify {
+    my ($path) = @_;
+    (my $out = $path) =~ s{\\}{/}g;
+    return $out;
+}
+
+# ---------------------------------------------------------------------------
+# _session_read_agent_file($path, \%record_counts) -> ( \@order, \%requests,
+# $first_ts ). Reads one agent transcript, deduplicates its assistant records
+# into per-request entries keyed per B1, and returns them in
+# first-appearance file order (@order holds the keys). Every usage figure is
+# read through the shared _safe_usage_num($val, \%record_counts) so
+# malformed fields tally centrally (spec §2.1).
+# ---------------------------------------------------------------------------
+sub _session_read_agent_file {
+    my ($path, $counts) = @_;
+
+    my @order;
+    my %requests;
+    my $first_ts;
+    my $unkeyed_n = 0;
+
+    open(my $fh, '<:raw', $path) or return (\@order, \%requests, undef);
+
+    while (defined(my $line = <$fh>)) {
+        $line =~ s/\r?\n\z//;
+        next unless length $line;
+
+        my $rec = eval { JSON::PP->new->utf8->decode($line) };
+        if ($@ || ref($rec) ne 'HASH') {
+            $counts->{skipped_unparseable}++;
+            next;
+        }
+
+        if (defined $rec->{timestamp} && !ref($rec->{timestamp})) {
+            my $ts = _session_parse_ts($rec->{timestamp});
+            if (defined $ts && (!defined($first_ts) || $ts < $first_ts)) {
+                $first_ts = $ts;
+            }
+        }
+
+        next unless defined($rec->{type}) && $rec->{type} eq 'assistant'
+            && ref($rec->{message}) eq 'HASH'
+            && ref($rec->{message}{usage}) eq 'HASH';
+
+        $counts->{assistant_records}++;
+        my $usage = $rec->{message}{usage};
+
+        if (ref($usage->{iterations}) eq 'ARRAY' && scalar(@{ $usage->{iterations} }) > 1) {
+            $counts->{multi_iteration}++;
+        }
+        $counts->{speed_absent}++ unless defined $usage->{speed};
+
+        my $key;
+        if (defined($rec->{requestId}) && !ref($rec->{requestId}) && length($rec->{requestId})) {
+            $key = "id:$rec->{requestId}";
+        }
+        elsif (defined($rec->{message}{id}) && !ref($rec->{message}{id}) && length($rec->{message}{id})) {
+            $key = "mid:$rec->{message}{id}";
+        }
+        else {
+            $key = "u:" . (++$unkeyed_n);
+            $counts->{unkeyed}++;
+        }
+
+        my $input      = _safe_usage_num($usage->{input_tokens}, $counts);
+        my $output     = _safe_usage_num($usage->{output_tokens}, $counts);
+        my $cache_read = _safe_usage_num($usage->{cache_read_input_tokens}, $counts);
+        my $cc_unsplit = _safe_usage_num($usage->{cache_creation_input_tokens}, $counts);
+        my ($cc_5m, $cc_1h) = (0, 0);
+        my $has_split_hash = ref($usage->{cache_creation}) eq 'HASH';
+        if ($has_split_hash) {
+            $cc_5m = _safe_usage_num($usage->{cache_creation}{ephemeral_5m_input_tokens}, $counts);
+            $cc_1h = _safe_usage_num($usage->{cache_creation}{ephemeral_1h_input_tokens}, $counts);
+        }
+        my $use_split = $has_split_hash && ($cc_5m + $cc_1h > 0);
+
+        my $uuid       = (defined($rec->{uuid}) && !ref($rec->{uuid})) ? $rec->{uuid} : '';
+        my $session_id = (defined($rec->{session_id}) && !ref($rec->{session_id})) ? $rec->{session_id} : '';
+
+        my $req = $requests{$key};
+        if (!$req) {
+            $req = $requests{$key} = {
+                output          => $output,
+                input           => $input,
+                cache_read      => $cache_read,
+                cc_unsplit      => $cc_unsplit,
+                cc_5m           => $cc_5m,
+                cc_1h           => $cc_1h,
+                use_split       => $use_split,
+                model           => $rec->{message}{model},
+                effort          => $rec->{effort},
+                speed           => $usage->{speed},
+                first_uuid      => $uuid,
+                first_session_id => $session_id,
+                mismatched      => 0,
+            };
+            push @order, $key;
+        }
+        else {
+            $req->{output} = $output if $output > $req->{output};
+            if (!$req->{mismatched}
+                && (   $input      != $req->{input}
+                    || $cache_read != $req->{cache_read}
+                    || $cc_unsplit != $req->{cc_unsplit}
+                    || $cc_5m      != $req->{cc_5m}
+                    || $cc_1h      != $req->{cc_1h})) {
+                $req->{mismatched} = 1;
+                $counts->{request_usage_mismatch}++;
+            }
+            $req->{input}      = $input;
+            $req->{cache_read} = $cache_read;
+            $req->{cc_unsplit} = $cc_unsplit;
+            $req->{cc_5m}      = $cc_5m;
+            $req->{cc_1h}      = $cc_1h;
+            $req->{use_split}  = $use_split;
+            $req->{model}      = $rec->{message}{model};
+            $req->{effort}     = $rec->{effort};
+            $req->{speed}      = $usage->{speed};
+        }
+    }
+    close $fh;
+
+    $counts->{requests} += scalar(@order);
+    return (\@order, \%requests, $first_ts);
+}
+
+# ---------------------------------------------------------------------------
+# _session_price_request($req, $role) -> ( \@cells, \%unpriced_deltas ).
+# Prices one deduplicated request's non-zero token-type amounts per the
+# precedence of spec B9 -- exactly one reason applies to any unpriced
+# amount:
+#   1. request speed present and != 'standard' -> non-standard-speed
+#   2. else model not a key of %SESSION_PRICES  -> model-not-in-table
+#   3. else token type is cache_write_unsplit   -> cache-write-unsplit
+#   4. else priced: cost = tokens / 1_000_000 * rate[model][token_type]
+# ---------------------------------------------------------------------------
+sub _session_price_request {
+    my ($req, $role) = @_;
+
+    my $model  = _norm_scalar_or_unknown($req->{model});
+    my $effort = _norm_scalar_or_unknown($req->{effort});
+    # No `!ref` guard here (fix-batch review L3, per spec B8's literal
+    # wording): a ref-valued (boolean/object/array) `speed` is still PRESENT
+    # and is not the exact string 'standard', so it must be treated as
+    # non-standard-speed, not silently priced as standard.
+    my $non_standard_speed = defined($req->{speed})
+        && (ref($req->{speed}) || $req->{speed} ne 'standard');
+
+    my %amounts;
+    $amounts{input}               = $req->{input};
+    $amounts{output}              = $req->{output};
+    $amounts{cache_read}          = $req->{cache_read};
+    if ($req->{use_split}) {
+        $amounts{cache_write_5m}       = $req->{cc_5m};
+        $amounts{cache_write_1h}       = $req->{cc_1h};
+        $amounts{cache_write_unsplit}  = 0;
+    }
+    else {
+        $amounts{cache_write_5m}       = 0;
+        $amounts{cache_write_1h}       = 0;
+        $amounts{cache_write_unsplit}  = $req->{cc_unsplit};
+    }
+
+    my @cells;
+    my %unpriced_deltas;
+    for my $type (qw(input output cache_write_5m cache_write_1h cache_read cache_write_unsplit)) {
+        my $tokens = $amounts{$type};
+        next unless $tokens > 0;
+
+        my $reason;
+        my $cost = 0;
+        if ($non_standard_speed) {
+            $reason = 'non-standard-speed';
+        }
+        elsif (!exists $SESSION_PRICES{$model}) {
+            $reason = 'model-not-in-table';
+        }
+        elsif ($type eq 'cache_write_unsplit') {
+            $reason = 'cache-write-unsplit';
+        }
+        else {
+            $cost = $tokens / 1_000_000 * $SESSION_PRICES{$model}{$type};
+        }
+
+        my $unpriced_tokens = defined($reason) ? $tokens : 0;
+        $unpriced_deltas{$reason} += $tokens if defined $reason;
+
+        push @cells, {
+            role => $role, model => $model, effort => $effort, token_type => $type,
+            tokens => $tokens, cost_usd => $cost, unpriced_tokens => $unpriced_tokens,
+        };
+    }
+
+    return (\@cells, \%unpriced_deltas);
+}
+
+# ---------------------------------------------------------------------------
+# _session_agent_anomaly(\@order, \%requests, $role) -> \%anomaly. Mirrors
+# bp-spend.pl's consecutive-same-size-cache-write anomaly (:757-770), but
+# DELIBERATELY keyed by the agent FILE alone, not (session_id, role): within
+# one file every request is the same conversation branch, and session_id is
+# shared across every file of a drive-solo session, so keying by it here
+# would compare unrelated branches (spec B11).
+# ---------------------------------------------------------------------------
+sub _session_agent_anomaly {
+    my ($order, $requests, $role) = @_;
+
+    my @pairs;
+    my $prev;
+    for my $key (@$order) {
+        my $req  = $requests->{$key};
+        my $size = $req->{cc_unsplit};
+        next if $size == 0;
+        if (defined($prev) && $prev->{size} == $size) {
+            push @pairs, {
+                session_id  => $req->{first_session_id},
+                role        => $role,
+                size        => $size,
+                first_uuid  => $prev->{first_uuid},
+                second_uuid => $req->{first_uuid},
+            };
+        }
+        $prev = { size => $size, first_uuid => $req->{first_uuid} };
+    }
+
+    my $total = 0;
+    $total += $_->{size} for @pairs;
+    return {
+        name         => 'consecutive-same-size-cache-write',
+        count        => scalar(@pairs),
+        total_tokens => $total,
+        pairs        => \@pairs,
+    };
+}
+
+# ---------------------------------------------------------------------------
+# _session_cell_key($cell) -> the (role, model, effort, token_type) string
+# key used to merge cells emitted by different requests/agents into one.
+# ---------------------------------------------------------------------------
+sub _session_cell_key {
+    my ($c) = @_;
+    # \x1e-escape each field before joining (fix-batch redteam L4): without
+    # this, a field containing a literal \x1e could collide two genuinely
+    # distinct cells into one.
+    return join("\x1e", map { (my $x = defined($_) ? $_ : ''); $x =~ s/\x1e/\x1e\x1e/g; $x }
+        ($c->{role}, $c->{model}, $c->{effort}, $c->{token_type}));
+}
+
+# ---------------------------------------------------------------------------
+# _session_merge_cells(\%acc, \@cells) -> merges @cells into %acc in place,
+# keyed by _session_cell_key.
+# ---------------------------------------------------------------------------
+sub _session_merge_cells {
+    my ($acc, $cells) = @_;
+    for my $c (@$cells) {
+        my $k = _session_cell_key($c);
+        my $entry = ($acc->{$k} //= {
+            role => $c->{role}, model => $c->{model}, effort => $c->{effort},
+            token_type => $c->{token_type}, tokens => 0, cost_usd => 0, unpriced_tokens => 0,
+        });
+        $entry->{tokens}          += $c->{tokens};
+        $entry->{cost_usd}        += $c->{cost_usd};
+        $entry->{unpriced_tokens} += $c->{unpriced_tokens};
+    }
+    return;
+}
+
+# ---------------------------------------------------------------------------
+# _session_sorted_cells(\%acc) -> \@cells, rounded per B10 (0 +
+# sprintf('%.6f', $c) once at emission), sorted ascending by role, then
+# model, then effort, then token_type (cmp on each), zero-tokens cells
+# dropped.
+# ---------------------------------------------------------------------------
+sub _session_sorted_cells {
+    my ($acc) = @_;
+    my @cells =
+        grep { $_->{tokens} > 0 }
+        map  {
+            my $c = $acc->{$_};
+            {
+                role => $c->{role}, model => $c->{model}, effort => $c->{effort},
+                token_type => $c->{token_type}, tokens => int($c->{tokens}),
+                cost_usd => 0 + sprintf('%.6f', $c->{cost_usd}),
+                unpriced_tokens => int($c->{unpriced_tokens}),
+            };
+        }
+        keys %$acc;
+    @cells = sort {
+           $a->{role} cmp $b->{role}
+        || $a->{model} cmp $b->{model}
+        || $a->{effort} cmp $b->{effort}
+        || $a->{token_type} cmp $b->{token_type}
+    } @cells;
+    return \@cells;
+}
+
+# ---------------------------------------------------------------------------
+# derive_session(%opts) -> \%session_result. See spec §2.1-2.5.
+#   opts: session => PATH (required)
+# Dies (never returns a partial doc) when the session's main transcript
+# cannot be resolved or opened.
+# ---------------------------------------------------------------------------
+sub derive_session {
+    my (%opts) = @_;
+    my $session = $opts{session};
+
+    my $p = defined($session) ? $session : '';
+    $p =~ s{[/\\]+\z}{};
+
+    my ($main, $dir);
+    if ($p =~ /\.jsonl\z/) {
+        $main = $p;
+        ($dir = $p) =~ s/\.jsonl\z//;
+    }
+    else {
+        $dir  = $p;
+        $main = "$p.jsonl";
+    }
+    my $subdir = "$dir/subagents";
+
+    unless (length($main) && -f $main) {
+        die "derive_session: no such session transcript: " . _session_truncate_for_error($session) . "\n";
+    }
+    # An existing-but-unopenable main transcript (permissions, a Windows
+    # sharing lock, etc.) must not silently report an all-zero document as if
+    # the session were genuinely empty (fix-batch redteam M4/review L1) --
+    # only the MAIN transcript is fatal here; subagent files stay non-fatal
+    # on open failure via _session_read_agent_file.
+    unless (open(my $main_probe_fh, '<:raw', $main)) {
+        die "derive_session: no such session transcript: " . _session_truncate_for_error($session) . "\n";
+    }
+    else {
+        close $main_probe_fh;
+    }
+
+    my @agent_files;   # { path => STR, kind => 'driver'|'subagent', name => STR }
+    push @agent_files, { path => $main, kind => 'driver' };
+    if (-d $subdir) {
+        my $dh;
+        opendir($dh, $subdir);
+        if ($dh) {
+            my @names = sort grep { /^agent-.*\.jsonl\z/ && -f "$subdir/$_" } readdir($dh);
+            closedir $dh;
+            for my $n (@names) {
+                push @agent_files, { path => "$subdir/$n", kind => 'subagent', name => $n };
+            }
+        }
+    }
+
+    my $record_counts = {
+        assistant_records       => 0,
+        requests                => 0,
+        unkeyed                 => 0,
+        request_usage_mismatch  => 0,
+        multi_iteration         => 0,
+        speed_absent            => 0,
+        skipped_unparseable     => 0,
+        malformed_usage_field   => 0,
+    };
+
+    my %session_cell_acc;
+    my %unpriced = ('model-not-in-table' => 0, 'cache-write-unsplit' => 0, 'non-standard-speed' => 0);
+    my @agents;
+    my @session_pairs;
+
+    for my $af (@agent_files) {
+        my ($role, $spawn_depth, $description);
+        if ($af->{kind} eq 'driver') {
+            $role = 'driver';
+            $spawn_depth = 0;
+            $description = undef;
+        }
+        else {
+            (my $base = $af->{name}) =~ s/\.jsonl\z//;
+            my $meta = _session_read_sidecar("$subdir/$base.meta.json");
+            if (ref($meta) eq 'HASH' && defined($meta->{agentType}) && !ref($meta->{agentType}) && length($meta->{agentType})) {
+                $role = $meta->{agentType};
+            }
+            else {
+                $role = 'unknown-agent';
+            }
+            if (ref($meta) eq 'HASH' && defined($meta->{spawnDepth}) && !ref($meta->{spawnDepth})
+                && $meta->{spawnDepth} =~ /^\d+\z/) {
+                $spawn_depth = $meta->{spawnDepth} + 0;
+            }
+            else {
+                $spawn_depth = undef;
+            }
+            if (ref($meta) eq 'HASH' && defined($meta->{description}) && !ref($meta->{description})
+                && length($meta->{description})) {
+                $description = $meta->{description};
+            }
+            else {
+                $description = undef;
+            }
+        }
+
+        my ($order, $requests, $first_ts) = _session_read_agent_file($af->{path}, $record_counts);
+
+        my %agent_cell_acc;
+        for my $key (@$order) {
+            my $req = $requests->{$key};
+            my ($cells, $deltas) = _session_price_request($req, $role);
+            _session_merge_cells(\%agent_cell_acc, $cells);
+            _session_merge_cells(\%session_cell_acc, $cells);
+            for my $reason (keys %$deltas) {
+                $unpriced{$reason} += $deltas->{$reason};
+            }
+        }
+
+        my $anomaly = _session_agent_anomaly($order, $requests, $role);
+        push @session_pairs, @{ $anomaly->{pairs} };
+
+        push @agents, {
+            path        => _session_slashify($af->{path}),
+            role        => $role,
+            spawn_depth => $spawn_depth,
+            description => $description,
+            first_ts    => $first_ts,
+            cells       => _session_sorted_cells(\%agent_cell_acc),
+            anomaly     => $anomaly,
+        };
+    }
+
+    my $session_cells = _session_sorted_cells(\%session_cell_acc);
+
+    my %totals;
+    for my $type (qw(input output cache_write_5m cache_write_1h cache_read cache_write_unsplit)) {
+        $totals{$type} = { tokens => 0, cost_usd => 0, unpriced_tokens => 0 };
+    }
+    # Accumulated from the UNROUNDED %session_cell_acc, not from $session_cells
+    # (whose cost_usd is already rounded to 6dp by _session_sorted_cells) --
+    # fix-batch review M1/redteam L8/n2: summing already-rounded per-cell
+    # figures and rounding the sum again is a double-round. Rounding happens
+    # exactly once, below, at final emission.
+    for my $c (values %session_cell_acc) {
+        $totals{ $c->{token_type} }{tokens}          += $c->{tokens};
+        $totals{ $c->{token_type} }{cost_usd}        += $c->{cost_usd};
+        $totals{ $c->{token_type} }{unpriced_tokens} += $c->{unpriced_tokens};
+    }
+    for my $type (keys %totals) {
+        $totals{$type}{cost_usd} = 0 + sprintf('%.6f', $totals{$type}{cost_usd});
+    }
+
+    my $session_anomaly_total = 0;
+    $session_anomaly_total += $_->{size} for @session_pairs;
+
+    return {
+        cost_basis   => 'notional-api-equivalent',
+        price_source => $SESSION_PRICE_SOURCE,
+        price_as_of  => $SESSION_PRICE_AS_OF,
+        cells        => $session_cells,
+        totals       => \%totals,
+        unpriced     => \%unpriced,
+        anomaly      => {
+            name         => 'consecutive-same-size-cache-write',
+            count        => scalar(@session_pairs),
+            total_tokens => $session_anomaly_total,
+            pairs        => \@session_pairs,
+        },
+        record_counts => $record_counts,
+        agents        => \@agents,
+    };
+}
+
 # ---------------------------------------------------------------------------
 # write_derived(%opts) -> writes the spend-derived.json shape (spec §4)
 # atomically (temp file in the same directory + rename()), mirroring
@@ -984,7 +1578,20 @@ unless (caller) {
         elsif ($a eq '--no-opencode')       { $opt{no_opencode} = 1 }
         elsif ($a eq '--offline')           { $opt{offline}    = 1 }
         elsif ($a eq '--force')             { $opt{force}      = 1 }
+        elsif ($a =~ /^--session=(.*)$/)    { $opt{session}    = $1 }
+        elsif ($a eq '--session')           { $opt{session}    = shift @ARGV }
+        elsif ($a eq '--json')              { $opt{json}       = 1 }
         else { print STDERR "bp-spend: unrecognised argument '$a'\n"; exit 2 }
+    }
+
+    # --session/--json living in the shared option loop above means a verb
+    # that never asked for them (snapshot, derive-package, derive-blueprint)
+    # now parses them instead of hitting the old unrecognised-argument hard
+    # error (fix-batch redteam M3) -- restore that safety net explicitly for
+    # every verb except derive-session.
+    if ($verb ne 'derive-session' && (exists $opt{session} || $opt{json})) {
+        print STDERR "bp-spend: --session/--json only apply to derive-session\n";
+        exit 2;
     }
 
     # ---------------------------------------------------------------------
@@ -1052,11 +1659,88 @@ unless (caller) {
         exit 0;
     }
 
+    # ---------------------------------------------------------------------
+    # derive-session (blueprint usage-telemetry, package
+    # 01-drive-solo-input-and-pricing). Read-only: never calls write_derived,
+    # prints to stdout only. See spec §2.6.
+    # ---------------------------------------------------------------------
+    if ($verb eq 'derive-session') {
+        unless (defined $opt{session} && length $opt{session}) {
+            print STDERR "bp-spend: derive-session requires --session PATH\n";
+            exit 2;
+        }
+
+        my $doc = eval { BpSpend::Derive::derive_session(session => $opt{session}) };
+        if ($@) {
+            my $err = $@;
+            # Match on the die message's CONTENT, not merely "any die happened"
+            # (fix-batch redteam L6/review L4) -- necessary now that an
+            # unopenable main transcript (M4 above) is a second possible die
+            # path here, and an unrelated internal failure must not be
+            # misreported as a missing-transcript edge case.
+            if ($err =~ /^derive_session: no such/) {
+                print STDERR "bp-spend: no such session transcript: "
+                    . BpSpend::Derive::_session_truncate_for_error($opt{session}) . "\n";
+                exit 4;
+            }
+            print STDERR "bp-spend: $err";
+            exit 1;
+        }
+
+        if ($opt{json}) {
+            print JSON::PP->new->canonical->utf8->encode($doc), "\n";
+            exit 0;
+        }
+
+        my @type_order = qw(input output cache_write_5m cache_write_1h cache_read cache_write_unsplit);
+        print "derive-session: notional as-if-API-billed cost equivalent, not an actual charge\n";
+        print "session: $doc->{agents}[0]{path}\n";
+        print "price-source: $doc->{price_source} (as-of $doc->{price_as_of})\n";
+        print "requests: $doc->{record_counts}{requests}  assistant-records: $doc->{record_counts}{assistant_records}  agents: "
+            . scalar(@{ $doc->{agents} }) . "\n";
+        my $grand_total_cost   = 0;
+        my $grand_total_tokens = 0;
+        for my $type (@type_order) {
+            my $t = $doc->{totals}{$type};
+            # sprintf('%.6f', ...) directly, no `+ 0` (fix-batch redteam L7) --
+            # a tiny dollar amount stringifies as exponent notation (e.g.
+            # `5e-05`) once coerced back to a number; this is TEXT-MODE DISPLAY
+            # ONLY and never touches the JSON-mode numeric value in $doc.
+            printf "total %s: %s tokens, \$%.6f notional as-if-API-billed, unpriced %s tokens\n",
+                $type, $t->{tokens}, $t->{cost_usd}, $t->{unpriced_tokens};
+            $grand_total_cost   += $t->{cost_usd};
+            $grand_total_tokens += $t->{tokens};
+        }
+        printf "TOTAL: \$%.6f notional as-if-API-billed across %s tokens\n",
+            $grand_total_cost, $grand_total_tokens;
+        print "unpriced: model-not-in-table $doc->{unpriced}{'model-not-in-table'}, "
+            . "cache-write-unsplit $doc->{unpriced}{'cache-write-unsplit'}, "
+            . "non-standard-speed $doc->{unpriced}{'non-standard-speed'}\n";
+        print "anomaly consecutive-same-size-cache-write: count $doc->{anomaly}{count}, total_tokens $doc->{anomaly}{total_tokens}\n";
+
+        # Surface the six diagnostic counters in text mode too (fix-batch
+        # redteam M2) -- previously only --json exposed them, so a text-mode
+        # run could silently degrade (skipped lines, malformed fields, a
+        # dropped mismatch, etc.) with no visible sign at all.
+        my $rc = $doc->{record_counts};
+        my @warn_parts;
+        push @warn_parts, "skipped-unparseable $rc->{skipped_unparseable}"     if $rc->{skipped_unparseable};
+        push @warn_parts, "malformed-usage-field $rc->{malformed_usage_field}" if $rc->{malformed_usage_field};
+        push @warn_parts, "request-usage-mismatch $rc->{request_usage_mismatch}" if $rc->{request_usage_mismatch};
+        push @warn_parts, "unkeyed $rc->{unkeyed}"                             if $rc->{unkeyed};
+        push @warn_parts, "multi-iteration $rc->{multi_iteration}"            if $rc->{multi_iteration};
+        push @warn_parts, "speed-absent $rc->{speed_absent}"                  if $rc->{speed_absent};
+        print "warnings: " . join(', ', @warn_parts) . "\n" if @warn_parts;
+
+        exit 0;
+    }
+
     if ($verb ne 'snapshot') {
         print STDERR "usage: bp-spend.pl snapshot [--run-dir DIR] [--global-dir DIR] [--offline]\n"
                    . "                            [--force] [--now EPOCH] [--log PATH]\n"
                    . "       bp-spend.pl derive-package --run-dir DIR --pkg PKG [--now EPOCH]\n"
-                   . "       bp-spend.pl derive-blueprint --run-dir DIR [--now EPOCH]\n";
+                   . "       bp-spend.pl derive-blueprint --run-dir DIR [--now EPOCH]\n"
+                   . "       bp-spend.pl derive-session --session PATH [--json]\n";
         exit 2;
     }
 
