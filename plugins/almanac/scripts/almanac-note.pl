@@ -266,7 +266,14 @@ sub _validate_target {
             unless $t =~ m{\A\Q$prefix\E/[^/]+\.md\z};
     } elsif ($audience eq 'external') {
         my $unv = _unversioned_prefix($store);
-        _usage('external_target_unversioned') if $t =~ m{\A\Q$unv\E/};
+        # Compared case-insensitively on Windows (and other case-insensitive
+        # filesystems): NTFS resolves '.CCPRAXIS-LOCAL-DATA/x.md' and
+        # '.ccpraxis-local-data/x.md' to the same file, so a case-sensitive
+        # prefix check here would let an "external" note point right back
+        # into the unversioned area it exists to escape (redteam MEDIUM).
+        my ($tt, $uu) = ($t, $unv);
+        if ($^O =~ /^(MSWin32|cygwin|msys)$/) { $tt = lc($tt); $uu = lc($uu); }
+        _usage('external_target_unversioned') if $tt =~ m{\A\Q$uu\E/};
     }
     return $t;
 }
@@ -335,7 +342,7 @@ sub check_pointers {
                     target     => $target,
                     promote_to => $promote_to,
                     resolved   => $resolved,
-                    record     => $rec->{path},
+                    record     => _decode_maybe($rec->{path}),
                     status     => $status,
                 };
             }
@@ -438,7 +445,8 @@ sub _print_check_pointers_default {
 # verbs
 # ---------------------------------------------------------------------------
 sub _cmd_create {
-    my ($scope, $o) = @_;
+    my ($scope, $o, $pos) = @_;
+    _usage('extra_positional') if @$pos > 0;
 
     _usage('missing_title') unless exists $o->{title};
     my $title = _trim($o->{title});
@@ -534,7 +542,8 @@ sub _cmd_create {
 }
 
 sub _cmd_list {
-    my ($scope, $o) = @_;
+    my ($scope, $o, $pos) = @_;
+    _usage('extra_positional') if @$pos > 0;
     my $store = _open_store($scope, $o);
     my $list  = $store->list();
     if ($o->{json}) { _print_list_json($list) }
@@ -657,13 +666,41 @@ sub _cmd_promote {
     }
 
     my $src_rel = $rec->{fields}{target};
-    my $src_abs = defined($src_rel) ? "$anchor_abs/$src_rel" : undef;
+
+    # redteam HIGH-1: this record's OWN `target` field is trusted as a
+    # rename source below with no path validation, while check_pointers()
+    # guards the identical field via _structurally_valid_target before ever
+    # treating it as a filesystem path. A malformed `target` (hand-edited,
+    # written by a stale script version, or a future bug) must not be able
+    # to turn a rename source into an out-of-anchor path.
+    die Almanac::Store::Error->new(kind => 'malformed', id => $id,
+            path => _encode_for_error(defined($src_rel) ? "$anchor_abs/$src_rel" : undef))
+        unless defined($src_rel) && _structurally_valid_target($src_rel);
+
+    my $src_abs = "$anchor_abs/$src_rel";
 
     my $resuming = defined($rec->{fields}{promote_to}) && $rec->{fields}{promote_to} eq $dest_rel;
 
-    # guard: something already occupies the destination
+    # redteam MEDIUM: a resume must still fail closed against an occupied
+    # destination -- but "occupied" only means something UNRELATED sits
+    # there. If we are resuming and the source file is already gone, the
+    # destination is what THIS promote's own phase 2 already wrote, and
+    # that is not a conflict. If the source is still present, phase 2 never
+    # ran and whatever is at $dest_abs is a foreign occupant.
     die Almanac::Store::Error->new(kind => 'exists', id => $id, path => _encode_for_error($dest_abs))
-        if -e $dest_abs && !$resuming;
+        if -e $dest_abs && (!$resuming || -e $src_abs);
+
+    # redteam HIGH-2 / review MEDIUM-3: two interleaved promotes on the same
+    # note must not let the second phase-1 write clobber the first's live
+    # `promote_to` journal entry -- that would orphan the already-moved (or
+    # about-to-move) content with no crash and no recovery. A resume of the
+    # SAME destination is fine; a different, still-live journal entry is a
+    # conflict.
+    if (defined($rec->{fields}{promote_to}) && !$resuming) {
+        die Almanac::Store::Error->new(kind => 'conflict', id => $id, field => 'promote_to',
+            winner => undef, expected_rev => undef, actual_rev => $rec->{rev},
+            path => _encode_for_error($rec->{path}));
+    }
 
     my %baseline = (rev => $rec->{rev}, fields => $rec->{fields});
     $baseline{rev} = $o->{'expect-rev'} if exists $o->{'expect-rev'};
@@ -709,7 +746,8 @@ sub _cmd_delete {
 }
 
 sub _cmd_check_pointers {
-    my ($o) = @_;
+    my ($o, $pos) = @_;
+    _usage('extra_positional') if @$pos > 0;
     my $cp = check_pointers(root => $o->{root}, home => $o->{home});
     if ($o->{json}) { print JSON::PP->new->canonical(1)->encode($cp) }
     else            { _print_check_pointers_default($cp) }
@@ -778,13 +816,13 @@ unless (caller) {
         }
         my $scope = exists($o{global}) ? 'global' : 'project';
 
-        if    ($cmd eq 'create')          { _cmd_create($scope, \%o) }
-        elsif ($cmd eq 'list')            { _cmd_list($scope, \%o) }
+        if    ($cmd eq 'create')          { _cmd_create($scope, \%o, \@pos) }
+        elsif ($cmd eq 'list')            { _cmd_list($scope, \%o, \@pos) }
         elsif ($cmd eq 'show')            { _cmd_show($scope, \%o, \@pos) }
         elsif ($cmd eq 'edit')            { _cmd_edit($scope, \%o, \@pos) }
         elsif ($cmd eq 'promote')         { _cmd_promote($scope, \%o, \@pos) }
         elsif ($cmd eq 'delete')          { _cmd_delete($scope, \%o, \@pos) }
-        elsif ($cmd eq 'check-pointers')  { _cmd_check_pointers(\%o) }
+        elsif ($cmd eq 'check-pointers')  { _cmd_check_pointers(\%o, \@pos) }
         1;
     };
     unless ($ok) {
