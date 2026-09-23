@@ -30,6 +30,16 @@
                }
             ],
             "matcher" : "Task|Agent"
+         },
+         {
+            "hooks" : [
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/context-ceiling-guidance.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Task|Bash"
          }
       ],
       "PreToolUse" : [
@@ -170,6 +180,16 @@
                }
             ],
             "matcher" : "AskUserQuestion"
+         },
+         {
+            "hooks" : [
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/context-ceiling-flush.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Task|Bash"
          }
       ],
       "Stop" : [

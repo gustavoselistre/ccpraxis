@@ -110,34 +110,21 @@ sub sentence_matches {
 }
 
 # ===========================================================================
-# B. AC2 -- distinguishes a ccpraxis tooling defect from a Claude Code
-#    product defect, and does NOT instruct the reader to avoid/suppress
-#    SendFeedback.
+# B. SUPERSEDED. Package 05's original AC2 required global-config/CLAUDE.md to
+#    distinguish a ccpraxis tooling defect from a Claude Code product defect
+#    by pointing the latter at SendFeedback, and forbade any language telling
+#    the reader to avoid it. Bug 20260922-205201-f421 / operator instruction
+#    reversed that: SendFeedback is now denied globally (permissions.deny, in
+#    both global-config/settings.json and plugins/sandbox/container/
+#    settings.json) and the CLAUDE.md pointer to it was deliberately removed
+#    -- a denied tool is not a real destination to route a defect to. This
+#    section now asserts the OPPOSITE of the original AC2: no dangling
+#    pointer to a channel that no longer exists.
 # ===========================================================================
 {
-    like($raw, qr/SendFeedback/,
-        'B1: global-config/CLAUDE.md mentions the SendFeedback tool')
-        or diag('no mention of SendFeedback at all -- the fix has not landed yet');
-
-    ok(sentence_matches($raw, qr/almanac-bug\.pl/, qr/(Claude Code|SendFeedback)/),
-        'B2: the paragraph naming almanac-bug.pl also references Claude Code or SendFeedback -- '
-      . 'i.e. the two routes are distinguished in the same breath, not documented in isolation')
-        or diag('AC2 requires the ccpraxis-defect pointer to be adjacent to the Claude-Code-defect '
-               . 'contrast, per spec section 2');
-
-    # Negative check: no sentence mentioning SendFeedback tells the reader to
-    # avoid, suppress, or stop using it. Scoped to paragraphs (not single
-    # sentences split on '.') for the same run-on-prose reason as above.
-    my @suppressing_paragraphs;
-    for my $para (split /\n{2,}/, $raw) {
-        next unless $para =~ qr/SendFeedback/;
-        push @suppressing_paragraphs, $para
-            if $para =~ qr/\b(avoid|suppress|never use|don't use|do not use|stop using|discourag\w*)\b/i;
-    }
-    is(scalar(@suppressing_paragraphs), 0,
-        'B3: no paragraph mentioning SendFeedback instructs the reader to avoid/suppress/stop '
-      . 'using it (spec: this would fix a routing gap by breaking a working channel)')
-        or diag('offending paragraph(s): ' . join("\n---\n", @suppressing_paragraphs));
+    unlike($raw, qr/SendFeedback/,
+        'B1 (superseded): global-config/CLAUDE.md no longer mentions SendFeedback -- '
+      . 'it is denied globally, so no prose should point a reader at it');
 }
 
 # ===========================================================================
@@ -146,7 +133,11 @@ sub sentence_matches {
 # ===========================================================================
 {
     # Baseline: ordered MD5 hashes of every line in global-config/CLAUDE.md
-    # as of 2026-09-22, before this package's fix landed. 102 lines.
+    # as of 2026-09-22, AFTER the SendFeedback pointer was deliberately
+    # removed per operator instruction (see section B above) and bug
+    # 20260922-205201-f421. Regenerated against the post-removal file
+    # content -- this IS the new floor additive-only checks against, not a
+    # historical snapshot. 103 lines.
     my @BASELINE_LINE_HASHES = (
         '39dbf6c7953b868bed9faa8584f53aa8',
         'd41d8cd98f00b204e9800998ecf8427e',
@@ -171,6 +162,7 @@ sub sentence_matches {
         '55ef4bf5f0d04b943d333f2ffe6a837a',
         'ff90a68c47dc83b5bec93f51f5e71cd9',
         'b4159efd6a1d3983495c8244d19e2f31',
+        '5d30f0dbefec0be27834152bc6a31d10',
         'd41d8cd98f00b204e9800998ecf8427e',
         '5c6ed9e30722e93e2869038c2200fdda',
         'd41d8cd98f00b204e9800998ecf8427e',
@@ -252,8 +244,8 @@ sub sentence_matches {
         'b81a80ad04ee375504da3b8d523d7ce3',
     );
 
-    is(scalar(@BASELINE_LINE_HASHES), 102,
-        'C0: baseline itself carries the expected 102 lines (sanity check on this test, not the fixture)');
+    is(scalar(@BASELINE_LINE_HASHES), 103,
+        'C0: baseline itself carries the expected 103 lines (sanity check on this test, not the fixture)');
 
     # Re-hash the CURRENT file's lines the same way the baseline was produced:
     # split on \n, strip a trailing \r (tolerate either line-ending style),
@@ -277,7 +269,7 @@ sub sentence_matches {
     $first_missing_baseline_index = $bi if $bi <= $#BASELINE_LINE_HASHES;
 
     ok(!defined($first_missing_baseline_index),
-        'C2: every pre-existing line (baseline, 102 lines) is still present in the current file, '
+        'C2: every pre-existing line (baseline, 103 lines) is still present in the current file, '
       . 'in its original relative order -- an additive-only diff')
         or diag(defined($first_missing_baseline_index)
             ? "first baseline line not found as a subsequence element: baseline index $first_missing_baseline_index "

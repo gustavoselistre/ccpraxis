@@ -732,66 +732,58 @@ The deterministic orchestrator can stop the fleet mid-package without killing yo
 
 In all three, `## Next action` must be concrete enough for a fresh coordinator (or your warm-resumed self) to pick up — the Stop gate enforces it. **Don't fight the gate**: keep trying denied work and you just burn the budget the pause exists to protect.
 
-## Context-growth checkpoint (self-initiated)
+## Context-growth checkpoint
 
-This is the same stop ritual as the usage/telemetry pause above (`## Graceful stop
-(orchestrator-initiated)`, "Usage / telemetry pause" bullet) — finish the step, write `## Next
-action`, leave `status:` non-terminal, stop — triggered on a different condition: your own context
-size, not an external quota. Unlike that pause, nothing external polls or gates you here: there is
-no `PreToolUse` deny, no `runs/.paused` signal file, no cheaper or more accurate observer of "how
-much context does this turn's request actually carry" than you. This is convention-level prose you
-follow on your own initiative.
+This is now a **two-tier, mostly mechanical** ritual (coordinator-context-discipline/02), not
+something you compute by hand. The canonical numbers live in exactly one place in code —
+`bp-orchestrator.pl`'s `%CTX_CEILING_DEFAULT` — and this section is a restatement of it, not a
+second source of truth: **soft = 250,000 tokens**, **hard = 350,000 tokens**. An operator overrides
+either independently via `BP_CONTEXT_CEILING_SOFT_TOKENS` / `BP_CONTEXT_CEILING_HARD_TOKENS` (the
+old single-ceiling variable this superseded no longer exists — superseded, not aliased).
 
-- **When to check**: at every natural pipeline-step boundary — after a dispatched worker (`Task` or
-  `bp-worker.pl`) returns, and before starting the next pipeline step or dispatching the next
-  worker; a ledger checkbox transition (`## Pipeline` step ticked) counts as a boundary even when no
-  worker was involved. **Also check during extended direct work** — a stretch of your own
-  Read/Grep/Bash tool calls with no worker dispatch in between (e.g. a review or fix-batch pass you
-  execute yourself, a long investigation) — at least every 20 of your own tool calls, or before
-  starting any `Bash`-heavy investigation expected to produce a lot of output, whichever comes
-  first. Never mid-tool-call, never inside a single worker's turn.
-- **How to check**: `runs/<pkg>.jsonl` (also read by `bp-spend.pl` for cost accounting) is a
-  transcript that only grows. A bare `Read` returns the file's **START**, not its end, so on any
-  transcript past ~2000 lines that's stale data and a false all-clear — use `Bash` instead:
-  1. `wc -l "runs/<pkg>.jsonl"` for the current total line count `N`.
-  2. `tail -c 200000 "runs/<pkg>.jsonl"` (last ~200KB is comfortably enough for the newest few
-     records; widen only if that slice doesn't contain a complete JSON line) — or equivalently
-     `Read` the file with `offset` near `N` (e.g. `N - 50`) and `limit` unset.
-  3. Parse each line of that tail slice as JSON (skip any partial first line — `tail -c` can cut
-     mid-line) and find the LAST record where `type == "assistant"` AND `parent_tool_use_id` is
-     absent/null — not merely "last assistant record," because interleaved subagent turns carry a
-     non-null `parent_tool_use_id`. Sum `input_tokens + cache_creation_input_tokens +
-     cache_read_input_tokens` from that record's `message.usage` (excluding `output_tokens`, which
-     is what you produced this turn, not what was resent as context).
-- **Ceiling**: compare that sum to the ceiling. Default: **300,000 tokens** — raised from the
-  package's originally-measured 200K "knee" (2026-09-19, operator request). Modelled cache-read
-  cost is $712 at 300K vs. $522 at 200K (against $1,399.88 with zero checkpointing): 300K trades
-  some of 200K's better read efficiency for meaningfully fewer handovers, since each handover means
-  a fresh coordinator re-reading `blueprint.md` and its own ledger cold before it can do anything
-  else. An operator overriding it sets `BP_CONTEXT_CEILING_TOKENS` for the orchestrator process
-  (mirrored in `bp-orchestrator.pl`'s `_tunables_base()` as `ctx_ceiling`) and communicates the
-  value to running coordinators the same way any other tunable is communicated today — there is no
-  live-push channel, so treat this section's stated default as authoritative unless told otherwise
-  by the ledger or the operator.
-- **At or above the ceiling**: checkpoint now. Finish the step you were mid-way through (do not
-  abandon it half-done), write a concrete `## Next action` describing exactly what to resume, leave
-  `status:` at `running`/`converging` (never `parked`/`done` for this reason alone), refresh
-  `last_updated`, and stop. Do **not** write `runs/.paused` — that file is the orchestrator's own
-  signal for a usage pause specifically, unrelated to this trigger. You write no signal file at all:
-  this checkpoint exits cleanly (structurally identical to an ordinary turn-end), and the
-  orchestrator independently re-derives the same ceiling check from your own transcript at relaunch
-  time — if your last usage record was at/over ceiling, it forces a COLD relaunch regardless of how
-  fresh the cache looks, exactly like its existing `max_turns` override
-  (`bp-orchestrator.pl`, the `watchdog_relaunch` site). Without that check, a same-session,
-  seconds-old checkpoint would otherwise resume WARM — cache-fresh, `--resume`d back into the exact
-  context you just tried to discard — which is the bug this package's own follow-up fix closed.
-- **Below the ceiling**: do nothing different — proceed to the next pipeline step normally. This
-  check must be cheap and silent when it doesn't fire; it must never itself become a source of extra
-  tool calls or state writes.
-- **If a worker turn itself grows context past the ceiling before returning**: the check happens
-  only after that worker returns, same as above — you cannot interrupt an in-flight worker (matching
-  the usage-pause ritual's own "in-flight workers can't be cancelled" stance). You may therefore stop
-  noticeably above the ceiling in this case; that's expected, not a defect.
-- **If this trigger and the usage/telemetry pause condition are both true at the same boundary**: no
-  ordering is prescribed — either one produces the identical stop mechanics, so firing "both"
-  collapses to firing the ritual once. Don't try to satisfy two separate stop procedures.
+You no longer measure your own context by hand — the old line-count-plus-tail recipe is gone. Two
+hooks do the measurement for you, from the same bounded tail-read of `runs/<pkg>.jsonl` the
+orchestrator itself uses:
+
+- **`context-ceiling-guidance.sh`** (`PostToolUse` on `Task`/`Bash`) — at or above the **soft**
+  ceiling, this attaches a short **guidance** reminder to a tool result you were already going to
+  receive. It is purely informational and blocks nothing: no new tool call is made on your behalf,
+  and the reminder rides on an existing turn rather than manufacturing one. It re-injects at most
+  once every 15 minutes while you stay at/above soft (so a single mention doesn't read as
+  "resolved"), and resets the moment you drop back below soft. The reminder's own dispatch-status
+  line quotes `bp-dispatch-log.pl outstanding` (scoped to your blueprint and package) verbatim — it
+  is not your own guess about what's still running.
+- **`context-ceiling-flush.sh`** (`PreToolUse` on `Task`/`Bash`) — at or above the **hard** ceiling,
+  this is the mandatory **flush**: it denies `Task` dispatch outright and denies any `Bash` command
+  that isn't exactly flush work. The allow-list is `bp-ledger.pl set-status|set-next-action|
+  tick-step|append-attempt|add-output|validate` and `bp-dispatch-log.pl outstanding` — `Read`,
+  `Edit`, `Grep` and `Write` are never gated by this hook at all, so you can still write the
+  `## Escalation` prose and re-read your ledger freely. The flush is capped at **5 turns**: use them
+  to run the scoped `bp-dispatch-log.pl outstanding` check, write a concrete `## Next action` with
+  `bp-ledger.pl set-next-action`, leave `status:` non-terminal, and stop — exactly the same stop
+  shape as the usage/telemetry pause above (`## Graceful stop (orchestrator-initiated)`, "Usage /
+  telemetry pause" bullet). If you cannot finish within 5 turns, the overrun is recorded to disk and
+  becomes visible to the orchestrator; at that point set `status: blocked` with a filled
+  `## Escalation` naming what is preventing completion, then stop — the established stuck-coordinator
+  path, not a new one.
+
+You write no signal file at either tier: a soft-tier checkpoint exits cleanly (structurally identical
+to an ordinary turn-end), exactly as the old ritual did. The orchestrator independently re-derives
+the **soft** check from your own transcript at relaunch time — if your last coordinator-owned usage
+record was at or above the soft ceiling, it forces a **COLD** relaunch regardless of how fresh the
+cache looks, exactly like its existing `max_turns` override (`bp-orchestrator.pl`, the
+`watchdog_relaunch` site). Checking soft (not just hard) here is deliberate: soft subsumes hard (any
+usage at/above hard is also at/above soft), so a flushed coordinator relaunching cold holds by
+construction — without that, a same-session, seconds-old checkpoint could resume WARM, `--resume`d
+back into the exact context you just tried to discard.
+
+**If a worker turn itself grows context past a ceiling before returning**: the guidance/flush check
+happens only after that worker returns, on its next `Task`/`Bash` call — you cannot interrupt an
+in-flight worker (matching the usage-pause ritual's own "in-flight workers can't be cancelled"
+stance). You may therefore be noticeably above a ceiling for one tool call before either hook fires;
+that's expected, not a defect (the figure the guidance hook reports may lag your true current context
+by up to one turn for the same reason).
+
+**If this trigger and the usage/telemetry pause condition are both true at the same boundary**: no
+ordering is prescribed — either one produces the identical stop mechanics, so firing "both" collapses
+to firing the ritual once. Don't try to satisfy two separate stop procedures.

@@ -263,8 +263,10 @@ my @pkgs_main = (
     ['unknown_warm',  '-', 'running', 'p/unknown_warm/'],
     ['unknown_cold',  '-', 'running', 'p/unknown_cold/'],
     ['ratelimit_mt',  '-', 'running', 'p/ratelimit_mt/'], # C6
-    ['ctx_over_warm', '-', 'running', 'p/ctx_over_warm/'],  # C8
-    ['ctx_under_warm','-', 'running', 'p/ctx_under_warm/'], # C8
+    ['ctx_over_warm', '-', 'running', 'p/ctx_over_warm/'],  # C8 (soft tier)
+    ['ctx_under_warm','-', 'running', 'p/ctx_under_warm/'], # C8 (negative control)
+    ['ctx_over_hard', '-', 'running', 'p/ctx_over_hard/'],  # C8 (hard tier, AC28/B27)
+    ['ctx_overrun_pkg','-', 'running', 'p/ctx_overrun_pkg/'], # C8 overrun visibility (AC29/B28)
 );
 my $mt_subtype_age  = $WARM_AGE;
 my $crash_age       = $WARM_AGE;
@@ -279,6 +281,8 @@ my %reg_main = (
     ratelimit_mt => warm_registry('sid-ratelimit', attempt => 2, rate_limit_discounted_attempt => 0),
     ctx_over_warm  => warm_registry('sid-ctx-over'),
     ctx_under_warm => warm_registry('sid-ctx-under'),
+    ctx_over_hard  => warm_registry('sid-ctx-over-hard'),
+    ctx_overrun_pkg => warm_registry('sid-ctx-overrun'),
 );
 my $dir_main = mk_bp(\@pkgs_main, \%reg_main);
 
@@ -313,6 +317,19 @@ spit(transcript_path($dir_main, 'ctx_over_warm'),
 spit(transcript_path($dir_main, 'ctx_under_warm'),
     jline(assistant_line(epoch => $NOW - $WARM_AGE*60, sid => 'sid-ctx-under', cache_read => 500))
   . jline(result_line(reason => 'success', epoch => $NOW - $WARM_AGE*60, sid => 'sid-ctx-under')));
+# AC28/B27 -- a usage OVER the hard ceiling (5000 >= ctx_ceiling_hard=3000), same
+# clean-success shape as ctx_over_warm/ctx_under_warm.
+spit(transcript_path($dir_main, 'ctx_over_hard'),
+    jline(assistant_line(epoch => $NOW - $WARM_AGE*60, sid => 'sid-ctx-over-hard', cache_read => 5000))
+  . jline(result_line(reason => 'success', epoch => $NOW - $WARM_AGE*60, sid => 'sid-ctx-over-hard')));
+# AC29/B28 -- same soft-tier-over shape as ctx_over_warm (so it IS force-relaunched
+# cold), but with a pre-existing one-line ctx-flush-overrun.log planted BEFORE go()
+# runs, so the watchdog_relaunch event for THIS package must carry ctx_flush_overrun:1.
+spit(transcript_path($dir_main, 'ctx_overrun_pkg'),
+    jline(assistant_line(epoch => $NOW - $WARM_AGE*60, sid => 'sid-ctx-overrun', cache_read => 1500))
+  . jline(result_line(reason => 'success', epoch => $NOW - $WARM_AGE*60, sid => 'sid-ctx-overrun')));
+spit("$dir_main/runs/ctx_overrun_pkg.ctx-flush-overrun.log",
+    iso_of($NOW - 60) . " package=ctx_overrun_pkg turns=6 cap=5 context_tokens=5000 next_action_written=false\n");
 
 # ---- ground-truth cache verdicts, proven BEFORE the orchestrator ever runs a tick ----
 is(ground_truth_verdict($dir_main, 'mt_subtype'),  'warm',
@@ -334,11 +351,20 @@ is(ground_truth_verdict($dir_main, 'ctx_over_warm'), 'warm',
   . 'trivially-cold fixture)');
 is(ground_truth_verdict($dir_main, 'ctx_under_warm'), 'warm',
     'GROUND TRUTH: ctx_under_warm\'s BpCacheState verdict really is warm (C8 negative-control fixture)');
+is(ground_truth_verdict($dir_main, 'ctx_over_hard'), 'warm',
+    'GROUND TRUTH: ctx_over_hard\'s BpCacheState verdict really is warm (C8 hard-tier positive gate)');
+is(ground_truth_verdict($dir_main, 'ctx_overrun_pkg'), 'warm',
+    'GROUND TRUTH: ctx_overrun_pkg\'s BpCacheState verdict really is warm (AC29 overrun-visibility fixture)');
 
-# ctx_ceiling => 1000: small on purpose, so the fixtures above (1500/500 cache-read
-# tokens) stay readable, and so C1/C3/C5/C6's own assistant-line usage (2-20 tokens)
-# is nowhere near it and cannot accidentally trip the new C8 rule.
-my ($L_main, $err_main) = go(dir => $dir_main, tunables => tun(ctx_ceiling => 1000));
+# AC28: ctx_ceiling_soft => 1000, ctx_ceiling_hard => 3000 -- small on purpose, so the
+# fixtures above (500/1500/5000 cache-read tokens) stay readable, and so C1/C3/C5/C6's
+# own assistant-line usage (2-20 tokens) is nowhere near either tier and cannot
+# accidentally trip the new C8 rule.
+# max_par bumped from tun()'s default 10 to 20: dir_main now carries 11 packages
+# (nine original + ctx_over_hard + ctx_overrun_pkg for AC28/AC29), and the default
+# cap would silently starve one of them out of this single go() tick with no error
+# -- exactly what happened to unknown_warm before this override was added.
+my ($L_main, $err_main) = go(dir => $dir_main, tunables => tun(ctx_ceiling_soft => 1000, ctx_ceiling_hard => 3000, max_par => 20));
 is($err_main, '', 'dir_main: go() ran without a Perl exception') or diag($err_main);
 
 sub relaunch_of { my ($pkg) = @_; my @e = log_of_pkg($dir_main, 'watchdog_relaunch', $pkg); return $e[0] }
@@ -479,6 +505,12 @@ is(kind_of('ctx_over_warm'), 'cold',
     is($ev && $ev->{ctx_ceiling_forced_cold}, 1,
         'C8: watchdog_relaunch carries an explicit ctx_ceiling_forced_cold marker, so an operator '
       . 'reading the log can tell this apart from an ordinary cold relaunch (e.g. max_turns)');
+    # AC28/B27 -- the two-tier migration: the new ctx_ceiling_tier field is 'soft' for a
+    # usage that crossed the soft ceiling but not the hard one (1500 tokens, soft=1000,
+    # hard=3000).
+    is($ev && $ev->{ctx_ceiling_tier}, 'soft',
+        "AC28: watchdog_relaunch carries ctx_ceiling_tier:'soft' for ctx_over_warm (1500 tokens, "
+      . 'soft=1000/hard=3000) -- the watchdog checks SOFT per spec SS2.6, and this is the mid-band case');
 }
 is(kind_of('ctx_under_warm'), 'warm',
     'C8 (vacuity negative control): ctx_under_warm (usage under ctx_ceiling, warm cache, clean success '
@@ -489,6 +521,9 @@ is(kind_of('ctx_under_warm'), 'warm',
     ok(!$ev->{ctx_ceiling_forced_cold},
         'C8: ctx_ceiling_forced_cold is absent/false for ctx_under_warm -- the marker is not set '
       . 'unconditionally on every C8 fixture');
+    ok(!$ev->{ctx_ceiling_tier},
+        'AC28: ctx_ceiling_tier is absent for ctx_under_warm -- the field is only set alongside '
+      . 'ctx_ceiling_forced_cold, never unconditionally');
 }
 {
     my $mode_over  = kind_of('ctx_over_warm');
@@ -497,6 +532,44 @@ is(kind_of('ctx_under_warm'), 'warm',
         'C8 VACUITY CROSS-CHECK: the SAME warm cache and the SAME clean-success exit_reason produce '
       . "DIFFERENT modes depending solely on whether usage crossed ctx_ceiling (over => $mode_over vs "
       . "under => $mode_under) -- a constant-returning mode selector cannot produce this divergence");
+}
+
+# =====================================================================================
+# AC28/B27 (new fixture) -- a usage OVER THE HARD ceiling (5000 >= hard=3000, also >=
+# soft=1000) is relaunched cold with ctx_ceiling_tier:'hard'. Hard subsumes soft (spec
+# SS2.6): checking soft alone still catches this, and the TIER reported is 'hard'
+# because context_ceiling_tier checks hard first (spec SS2.5).
+# =====================================================================================
+is(kind_of('ctx_over_hard'), 'cold',
+    'AC28: ctx_over_hard (5000 tokens, over both soft=1000 and hard=3000) is relaunched COLD');
+{
+    my $ev = relaunch_of('ctx_over_hard');
+    is($ev && $ev->{mode}, 'cold', 'AC28: watchdog_relaunch log records mode=cold for ctx_over_hard');
+    is($ev && $ev->{ctx_ceiling_forced_cold}, 1, 'AC28: ctx_ceiling_forced_cold is set for ctx_over_hard');
+    is($ev && $ev->{ctx_ceiling_tier}, 'hard',
+        "AC28: ctx_ceiling_tier is 'hard' for ctx_over_hard (context_ceiling_tier checks hard FIRST, "
+      . 'per spec SS2.5, so a usage over both tiers is reported as hard, not soft)');
+}
+
+# =====================================================================================
+# AC29/B28 -- when runs/<pkg>.ctx-flush-overrun.log exists (one line, planted before
+# go() ran) for a package that IS ceiling-forced-cold, the watchdog_relaunch event
+# carries ctx_flush_overrun:1. With no such file (ctx_over_warm, ctx_over_hard above),
+# the field is absent.
+# =====================================================================================
+is(kind_of('ctx_overrun_pkg'), 'cold', 'AC29: ctx_overrun_pkg is relaunched COLD (same soft-tier-over shape as ctx_over_warm)');
+{
+    my $ev = relaunch_of('ctx_overrun_pkg');
+    is($ev && $ev->{ctx_ceiling_forced_cold}, 1, 'AC29: ctx_ceiling_forced_cold is set for ctx_overrun_pkg (fixture sanity)');
+    is($ev && $ev->{ctx_flush_overrun}, 1,
+        'AC29: watchdog_relaunch carries ctx_flush_overrun:1 when runs/<pkg>.ctx-flush-overrun.log exists '
+      . 'and is non-empty for a ceiling-forced-cold package');
+}
+{
+    my $ev_no_overrun = relaunch_of('ctx_over_warm');
+    ok(!$ev_no_overrun->{ctx_flush_overrun},
+        'AC29: ctx_flush_overrun is absent for ctx_over_warm, which has no ctx-flush-overrun.log file -- '
+      . 'the field is not set unconditionally on every ceiling-forced-cold event');
 }
 
 sub explain_log { my ($dir) = @_; return join("\n", map { $J->encode($_) } log_events($dir)) }
