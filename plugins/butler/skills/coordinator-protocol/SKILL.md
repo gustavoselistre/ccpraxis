@@ -552,7 +552,22 @@ Check off pipeline steps in the ledger as you go. Steps may be skipped only with
 same per-dispatch budget/elapsed-time mechanism `drive-solo/SKILL.md`'s "Arm the
 watcher" section documents for the interactive driver; both surfaces share the same
 blind spot — a dispatched worker has no elapsed-time signal independent of its own
-self-report, regardless of which one dispatched it):
+self-report, regardless of which one dispatched it). **This manual bracket is what
+gives you `--budget-seconds`/`elapsed`/the over-budget-interrupt-loop signal below —
+`track-dispatch.sh`'s automatic hook tracking (see "Checking what is outstanding"
+further down) does NOT provide that; it gives you `outstanding` instead, a
+different, weaker check.** If you bracket a dispatch manually here, do not also
+assume the hook leaves it alone: `track-dispatch.sh`'s `PostToolUse` half tries to
+resolve a matching `running` record automatically the moment the `Task` call
+returns, which fires **before** your own next turn's `finish` call ever runs — so
+by the time you call `finish`, the hook has typically already closed the record to
+`done`. `finish` does not check that a record is still `running` before closing
+it, so it re-closes the already-`done` record anyway: `ended_at`/`duration_seconds`
+get overwritten with a second, near-identical measurement, and a second
+`history.jsonl` line gets appended for the same dispatch. This is not a correctness
+problem for the record's final `done` state, but it IS a duplicate history entry —
+know that this double-bracketing is what produces it, rather than treating it as a
+bug in either mechanism.
 
 ```bash
 perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-dispatch-log.pl start \
@@ -660,6 +675,44 @@ What does **not** change, and why it matters:
 Exit codes: `0` ok · `2` usage · `3` a write-capable worker is already in flight · `4` unrecognised backend · `5` refused, fleet stop in force · `6` env contract not satisfied · `7` the backend itself exited non-zero · `8` backend binary not found.
 
 **Judges never port.** Harvest, conformance and resolve judges stay on Claude regardless of `worker_backend:`.
+
+### Checking what is outstanding, without asserting the answer
+
+`track-dispatch.sh`'s `PostToolUse` half resolves a worker's dispatch record automatically the
+moment its `Task` call returns — for a `Task` dispatch tracked only through the hook (i.e. not also
+manually bracketed per the "Worker dispatch contract" section above), you do not need to call
+`finish`/`resolve` yourself. The START half's `dispatch_key` correlation is what lets the completion
+half find the right record; see `track-dispatch.sh`'s own header comment (in this repo, not the
+blueprint's gitignored spec, which does not travel to a fresh clone) if you need the mechanism. What
+you get for free is a check, not a guarantee:
+
+```bash
+perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-dispatch-log.pl outstanding \
+     --root "$BP_PROJECT_ROOT" --blueprint "$BP_BLUEPRINT" --package "$BP_PACKAGE"
+```
+
+**Always scope with `--blueprint`/`--package` like this when the answer feeds an automated
+decision** (a stop, a gate, anything beyond an operator-facing report) — both env vars are already
+exported into your process. The unfiltered, whole-store form (omitting both flags) reports every
+outstanding record across every blueprint and package ever run against this store, including
+pre-existing keyless records this mechanism can never resolve; an unscoped automated stop condition
+built on it is permanently true. The unfiltered form stays useful for an operator-facing audit — just
+never as the input to an automatic decision.
+
+Read `outstanding_count:` from its stdout. If the line is absent or reads `unknown`, the answer is
+**unknown** — never treat that as zero. Every `summary:` line this verb can print is hedged
+deliberately: a dispatch **appears** to be outstanding, or none was detected — it is never asserted
+as settled, because the check only reflects what is recorded on disk, not whether a process is
+actually still alive. A crashed dispatch whose `PostToolUse` never fired stays outstanding forever;
+`outstanding` has no timeout that clears it. Use this to catch a false "nothing left to do" before
+you park or checkpoint — not to prove a negative on its own.
+
+**What this signal cannot claim (L1):** two dispatches identical in `subagent_type`, package and
+`dispatch_key` within 120 seconds of each other collapse to ONE record (the start half's own
+pre-existing dedup window, which cannot tell a double-stamped single dispatch from two genuinely
+concurrent same-key ones). `outstanding` can therefore read zero while a second, genuinely-running
+dispatch of that exact shape still exists — narrow, but real. See the "Worker dispatch contract"
+section above for the manual-bracket alternative this signal does not replace.
 
 ## Resumption
 

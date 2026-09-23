@@ -14,6 +14,16 @@
          {
             "hooks" : [
                {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/track-dispatch.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Task"
+         },
+         {
+            "hooks" : [
+               {
                   "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/untrack-worker-solo.sh\"",
                   "timeout" : 15,
                   "type" : "command"
