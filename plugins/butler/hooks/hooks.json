@@ -200,6 +200,16 @@
                }
             ],
             "matcher" : "Task|Bash"
+         },
+         {
+            "hooks" : [
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-ledger-create.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Edit|Write|MultiEdit|NotebookEdit"
          }
       ],
       "Stop" : [

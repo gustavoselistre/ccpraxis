@@ -39,6 +39,28 @@ The blueprint directory path. Read `blueprint.md` and every ledger under `packag
 
   This moves detection from execution time to **authoring time**, which is where it is cheap. The failure it prevents is a defect that sits latent until the closing gate and surfaces as an ownerless mystery on whichever package happens to run last — long after the package that caused it closed. Attribution for one such lint error needed a `git log -S`.
 
+- **Ledger model/effort values** — REQUIRED pass. **You cannot run it, and you must not pretend to.**
+
+  ```
+  perl plugins/butler/scripts/bp-model-check.pl audit --blueprint <blueprint.md>
+  ```
+
+  `bp-ledger.pl create` refuses an unsupported `model:`/`effort:` at creation time, and
+  `guard-ledger-create.sh` denies the hand-written path that would skip it. Neither can see a ledger
+  that predates them or one that came through the guard's escape hatch, and a bad value is not
+  caught until `bp-launch.sh` refuses to launch that package — mid-run, with the coordinator already
+  scheduled. This is the backstop for exactly those two populations.
+
+  Same rule as the check above: **the dispatcher runs it and gives you the output.**
+
+  - Output supplied → authoritative. Report each flagged package as a finding, naming the package,
+    the field, and the value.
+  - **Output NOT supplied → that is itself a FINDING**, and a blocking one. Say so plainly; do not
+    hand-derive it from the ledgers and present the result as if it were the command's.
+
+  Exit 1 means some ledger carries an unsupported value. Exit 0 is clean. An ABSENT `model:` or
+  `effort:` is not a finding — both fields are optional and default (`bp-launch.sh:49-50`, `:67-69`).
+
 - **DAG integrity** — REQUIRED pass: every `depends_on` token in `blueprint.md`'s package-status table names an existing package row (no dangling refs; a short id like `b01` must resolve to exactly one full package id), the graph has no cycles, every `packages/*.md` ledger has a matching table row and vice versa, and no package declares an empty `write_set`.
 - **Missing inputs** — referenced paths that don't exist; inputs a coordinator would clearly need but isn't given.
 - **Scope ambiguity** — boundaries where two packages could both believe they own a file or behavior.

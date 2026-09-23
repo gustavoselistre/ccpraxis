@@ -11,6 +11,13 @@
 # ledger stays inside a context budget. See:
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b45-ledger-context-budget-spec.md
 #
+# Plus a tenth op, `create` (04-model-effort-ledger-validation), which renders
+# plugins/blueprint/templates/package-ledger.md into a new, validate()-clean package
+# ledger -- the only op that creates a file rather than splicing an existing one,
+# validating `model:`/`effort:` against @MODELS/@EFFORTS before anything reaches disk.
+# See:
+# .ccpraxis-local-data/blueprints/coordinator-context-discipline/specs/04-model-effort-ledger-validation-spec.md
+#
 # Exit codes (an interface, fixed): 0 success, 2 validation rejection (byte-identical
 # file), 3 usage/argument error (nothing read), 4 I/O/lock/atomicity failure
 # (byte-identical), 5 target region not found (byte-identical).
@@ -130,6 +137,17 @@ sub arg_error      { my ($sub, $msg)          = @_; emit_err("bp-ledger: $sub: $
 sub io_error       { my ($sub, $path, $msg)   = @_; emit_err("bp-ledger: $sub: $path: $msg"); exit 4 }
 sub reject_error   { my ($sub, $path, $detail)= @_; emit_err("bp-ledger: $sub: $path: $detail"); exit 2 }
 sub notfound_error { my ($sub, $path, $msg)   = @_; emit_err("bp-ledger: $sub: $path: $msg"); exit 5 }
+
+# `create`'s own arg-safety check, copied verbatim from bp-blueprint.pl's
+# field_safe (op_init) -- a value carrying a pipe or a CR/LF cannot round-trip
+# through the frontmatter's single-line `key: value` shape.
+# Guarded against a "Subroutine redefined" warning if this file and
+# bp-blueprint.pl (which defines the same sub, same package) are ever loaded
+# together in one process -- same defensive idiom ledger-guard.sh:241-244
+# already needed for its own require of this file.
+unless (defined &main::field_safe) {
+    *main::field_safe = sub { my ($s) = @_; return defined($s) && $s !~ /[\r\n|]/ };
+}
 
 # A NOTICE is a state of the ledger, never an outcome of the call (a03 spec §2.1): it
 # must NOT reuse the `bp-ledger: <sub>: <path>: <msg>` shape the four error helpers
@@ -336,6 +354,16 @@ my @REQUIRED_KEYS = qw(package blueprint status write_set last_updated);
 # package ledger's mid-flight value, which the blueprint.md summary table has no
 # use for. Two vocabularies on purpose -- do not "unify" them.
 my @STATUSES      = qw(pending running converging reviewing done blocked parked dropped);
+
+# 04-model-effort-ledger-validation §2.1. Model is derived from every real usage
+# site in this codebase (D-A); effort is anchored to bp-launch.sh:70-73, which
+# validates the `claude` CLI's own accepted values. DUPLICATED, deliberately, in
+# bp-model-check.pl (D-B) -- bp-ledger.pl loads core Perl only (:29-30) and
+# cannot `require` it. model-effort-check.t's AC-17 pins the two copies (plus
+# bp-launch.sh's effort case arm) together by PARSING the sources, so a drift
+# between them is a test failure, not a silent divergence.
+my @MODELS  = qw(sonnet opus haiku);
+my @EFFORTS = qw(low medium high xhigh max);
 
 # A STRINGIFIED PERL REFERENCE IN A LEDGER BODY IS NEVER INTENTIONAL.
 #
@@ -2297,6 +2325,219 @@ sub op_migrate_depends_on {
 }
 
 # =====================================================================================
+# op_create — 04-model-effort-ledger-validation §2.1. The tenth verb, and the
+# only one that CREATES a file rather than splicing an existing one -- so, like
+# bp-blueprint.pl's op_init (the shape this mirrors), it owns its own
+# lock/temp/rename/read-back and cannot go through run_op (run_op:1148ff slurps
+# and validates the TARGET first, which cannot work when there is no target
+# yet).
+#
+# Renders plugins/blueprint/templates/package-ledger.md into a real, clean,
+# validate()-passing ledger: drops every `#`-comment frontmatter line (D-E),
+# substitutes the ten frontmatter keys in template order, and rewrites the
+# `# Package <NN-slug> — <title>` body title line. Nothing is written to disk
+# until the fully-rendered bytes pass validate_bytes() AND last_updated_check()
+# -- `create` must never be able to produce a ledger its own `validate` verb
+# would reject (AC-9).
+# =====================================================================================
+
+# dirname(), core-Perl only (mirrors ensure_dir_exists' own no-File::Path
+# discipline, §2.5): '' when $p has no directory component, else the parent.
+sub op_create_dirname {
+    my ($p) = @_;
+    return '' unless defined $p && length $p;
+    (my $d = $p) =~ s{[\\/][^\\/]*\z}{};
+    return $d eq $p ? '' : $d;
+}
+
+sub op_create {
+    my @args = @_;
+    my %opt;
+    my $ok;
+    { local $SIG{__WARN__} = sub { };
+      $ok = GetOptionsFromArray(\@args, \%opt,
+            'ledger=s', 'package=s', 'blueprint=s', 'template=s', 'write-set=s',
+            'test-paths=s', 'checks=s', 'model=s', 'effort=s', 'max-turns=s', 'title=s'); }
+
+    # Rule 1 — unrecognised option / extra args / missing required option.
+    arg_error('create', 'unrecognised option') unless $ok;
+    arg_error('create', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
+    for my $r (qw(ledger package blueprint template write-set)) {
+        arg_error('create', "missing required --$r") unless defined $opt{$r};
+    }
+
+    # Rule 2 — every SUPPLIED value must survive the frontmatter's single-line
+    # `key: value` shape. Iterates only keys GetOptionsFromArray actually set,
+    # so an unsupplied optional field (default-filled below) is never checked
+    # against a value it never carried.
+    for my $k (sort keys %opt) {
+        next unless defined $opt{$k};
+        next if field_safe($opt{$k});
+        arg_error('create', "--$k contains a pipe or newline");
+    }
+
+    # Rule 3 — --package shape: NN-slug.
+    unless ($opt{package} =~ /\A[0-9]{2}-[a-z0-9]+(?:-[a-z0-9]+)*\z/) {
+        arg_error('create', "--package '$opt{package}' is not NN-slug shaped "
+                           . '(two digits, a hyphen, then lowercase kebab-case)');
+    }
+    # Rule 4 — --blueprint shape: kebab-case.
+    unless ($opt{blueprint} =~ /\A[a-z0-9]+(?:-[a-z0-9]+)*\z/) {
+        arg_error('create', "--blueprint '$opt{blueprint}' is not kebab-case (a-z, 0-9, single hyphens)");
+    }
+    # Rule 5 — --max-turns shape, only when supplied (unsupplied -> default 800).
+    if (defined $opt{'max-turns'} && $opt{'max-turns'} !~ /\A[1-9][0-9]*\z/) {
+        arg_error('create', "--max-turns '$opt{'max-turns'}' is not a positive integer");
+    }
+
+    my $model      = defined $opt{model}         ? $opt{model}         : 'sonnet';
+    my $effort     = defined $opt{effort}        ? $opt{effort}        : 'medium';
+    my $max_turns  = defined $opt{'max-turns'}   ? $opt{'max-turns'}   : 800;
+    my $test_paths = defined $opt{'test-paths'}  ? $opt{'test-paths'}  : '';
+    my $checks     = defined $opt{checks}        ? $opt{checks}        : '';
+    my $title      = defined $opt{title}         ? $opt{title}         : $opt{package};
+
+    # Rule 6 — --model against @MODELS. Exit 2, not 3 (D-D): the argument is
+    # well-formed; what is refused is the LEDGER CONTENT the call would produce.
+    unless (grep { $_ eq $model } @MODELS) {
+        emit_err("bp-ledger: create: model \"$model\" is not a supported model; "
+               . 'allowed values: ' . join(', ', @MODELS));
+        exit 2;
+    }
+    # Rule 7 — --effort against @EFFORTS. Same exit-2 reasoning as rule 6.
+    unless (grep { $_ eq $effort } @EFFORTS) {
+        emit_err("bp-ledger: create: effort \"$effort\" is not a supported effort; "
+               . 'allowed values: ' . join(', ', @EFFORTS));
+        exit 2;
+    }
+
+    # Rule 8 — refuse rather than overwrite (mirrors op_init:503-506).
+    if (-e $opt{ledger}) {
+        reject_error('create', $opt{ledger},
+            "already exists -- refusing to overwrite an existing ledger. Use the typed verbs "
+          . '(set-status, append-attempt, tick-step, set-next-action, add-output) to modify it.');
+    }
+
+    # Rule 9 — template must be readable.
+    my $tpl;
+    {
+        open(my $fh, '<:raw', $opt{template}) or io_error('create', $opt{template}, "cannot read: $!");
+        local $/;
+        $tpl = <$fh>;
+        close $fh;
+        $tpl = '' unless defined $tpl;
+    }
+
+    # Rule 10 — the template must carry a \A--- frontmatter block with all ten
+    # keys. Same \A---...--- anchor validate_bytes' V2 uses (byte 0, non-greedy).
+    unless ($tpl =~ /\A---\s*\n(.*?)\n---/s) {
+        reject_error('create', $opt{template},
+            'has no parseable \A--- frontmatter block; refusing to guess its shape');
+    }
+    my $fm_content = $1;
+    my $body       = substr($tpl, $+[0]);
+
+    # Rendering (spec §2.1 "Rendering"): drop every `#`-comment frontmatter
+    # line, then substitute the ten keys, IN TEMPLATE ORDER, into whatever
+    # (non-comment) lines remain.
+    my @fm_lines = grep { !/^\s*#/ } split(/\n/, $fm_content, -1);
+    my @KEY_ORDER = qw(package blueprint status model effort max_turns
+                        write_set test_paths checks last_updated);
+    my %values = (
+        package      => $opt{package},
+        blueprint    => $opt{blueprint},
+        status       => 'pending',
+        model        => $model,
+        effort       => $effort,
+        max_turns    => $max_turns,
+        write_set    => $opt{'write-set'},
+        test_paths   => $test_paths,
+        checks       => $checks,
+        last_updated => iso_now(),
+    );
+    my @missing_keys;
+    for my $k (@KEY_ORDER) {
+        my $found = 0;
+        for my $i (0 .. $#fm_lines) {
+            if ($fm_lines[$i] =~ /^\Q$k\E:/) {
+                $fm_lines[$i] = length($values{$k}) ? "$k: $values{$k}" : "$k:";
+                $found = 1;
+                last;
+            }
+        }
+        push @missing_keys, $k unless $found;
+    }
+    if (@missing_keys) {
+        reject_error('create', $opt{template},
+            'is missing required frontmatter key(s): ' . join(', ', @missing_keys) . '.');
+    }
+
+    # Body: verbatim except the title line (D-E / B-6).
+    $body =~ s/^# Package\b.*$/# Package $opt{package} $EMDASH $title/m;
+
+    my $rendered = "---\n" . join("\n", @fm_lines) . "\n---" . $body;
+
+    # Rule 11 — `create` must never produce a ledger its own `validate` verb
+    # would reject (AC-9).
+    my $detail = validate_bytes($rendered);
+    reject_error('create', $opt{ledger}, $detail) if defined $detail;
+    my $lu_detail = last_updated_check(undef, $rendered);
+    reject_error('create', $opt{ledger}, $lu_detail) if defined $lu_detail;
+
+    # Rule 12 — write discipline mirroring op_init: make_path, lock, re-check
+    # under the lock, temp + rename (via the injected $RENAME_FN test seam),
+    # read-back, unlock.
+    my $dir = op_create_dirname($opt{ledger});
+    if (length($dir) && !-d $dir) {
+        unless (ensure_dir_exists($dir)) {
+            io_error('create', $opt{ledger}, "cannot create directory $dir: $!");
+        }
+    }
+
+    my $lockpath = "$opt{ledger}.lock";
+    open(my $lk, '>', $lockpath) or io_error('create', $opt{ledger}, "cannot open lock file $lockpath: $!");
+    flock($lk, LOCK_EX) or io_error('create', $opt{ledger}, "cannot acquire lock on $lockpath: $!");
+
+    if (-e $opt{ledger}) {
+        close $lk;
+        reject_error('create', $opt{ledger}, "already exists (created concurrently) -- refusing to overwrite");
+    }
+
+    my $tmp = "$opt{ledger}.tmp.$$";
+    open(my $w, '>:raw', $tmp) or do {
+        close $lk; io_error('create', $opt{ledger}, "cannot open temp file $tmp: $!") };
+    print {$w} $rendered or do {
+        close $w; unlink $tmp; close $lk; io_error('create', $opt{ledger}, "write to $tmp failed: $!") };
+    close($w) or do {
+        unlink $tmp; close $lk; io_error('create', $opt{ledger}, "close $tmp failed: $!") };
+    unless ($RENAME_FN->($tmp, $opt{ledger})) {
+        unlink $tmp;
+        close $lk;
+        io_error('create', $opt{ledger}, "rename $tmp -> $opt{ledger} failed: $!");
+    }
+
+    my $after;
+    {
+        open(my $rfh, '<:raw', $opt{ledger}) or do {
+            unlink $opt{ledger}; close $lk;
+            io_error('create', $opt{ledger}, "read-back: cannot read: $!") };
+        local $/;
+        $after = <$rfh>;
+        close $rfh;
+        $after = '' unless defined $after;
+    }
+    unless ($after eq $rendered) {
+        unlink $opt{ledger};
+        close $lk;
+        io_error('create', $opt{ledger}, "value did not survive the write");
+    }
+
+    flock($lk, LOCK_UN);
+    close($lk);
+    exit 0;
+}
+
+# =====================================================================================
 # Main
 # =====================================================================================
 
@@ -2310,6 +2551,7 @@ my %DISPATCH = (
     'rotate'           => \&op_rotate,
     'validate'         => \&op_validate,
     'claim-check'      => \&op_claim_check,
+    'create'           => \&op_create,
 );
 
 # Guarded so ledger-guard.sh's embedded validator (b19) can `require` this file for
