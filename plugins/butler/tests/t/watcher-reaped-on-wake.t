@@ -254,6 +254,40 @@ sub run_suite {
 }
 
 # ===========================================================================
+# AC16b (2026-09-23) -- a SUBAGENT's tool call carries its parent's
+# session_id plus an agent_id; it is not the session waking, so it must not
+# reap the watcher the driver armed for that very subagent. The session's
+# own next call still reaps (the counter-check proves the watcher was
+# reapable all along).
+# ===========================================================================
+{
+    my ($root, $data) = new_project();
+    new_running_bp($data, 'bpx', 'p1');
+    my $sid = 'sess-ac16b';
+    my $pid = spawn_watcher(
+        '--arm', '--package', 'bpx/p1', '--max-seconds', '300', '--poll', '1',
+        '--reason', 'AC16b fixture: real matching watcher', '--data', $data,
+    );
+    wait_proc_visible($pid, 5);
+    my ($rc1) = run_mark(bg_bash_payload($root, $sid, arm_cmd('bpx/p1', $data, 300)));
+    is($rc1, 0, 'AC16b precondition: arming succeeded (exit 0)');
+
+    my $sub = JSON::PP->new->canonical->encode({
+        session_id => $sid, agent_id => 'a0c18528918a800ac', agent_type => 'butler:bp-test-writer',
+        cwd => $root, tool_name => 'Bash', tool_input => { command => 'ls' },
+    });
+    my ($rc2) = run_mark($sub);
+    is($rc2, 0, 'AC16b: the subagent-call invocation exits 0');
+    select(undef, undef, undef, 0.5);
+    ok(!proc_is_dead($pid), 'AC16b: a subagent tool call (agent_id present) does NOT reap its driver\'s watcher');
+
+    my ($rc3) = run_mark(task_payload($root, $sid));
+    is($rc3, 0, 'AC16b counter-check: the session\'s own call exits 0');
+    select(undef, undef, undef, 0.5);
+    ok(proc_is_dead($pid), 'AC16b counter-check: the session\'s own next call still reaps it');
+}
+
+# ===========================================================================
 # AC17 -- in the same run as AC16, a live bp-keepawake.pl-style lease process
 # and its <DATA>/.drive-solo/keepawake.pid are UNTOUCHED.
 # ===========================================================================

@@ -634,7 +634,15 @@ if [ -n "$DATA" ]; then
       fi
       return 0
     }
-    _bp_watch_reap || true
+    # A SUBAGENT's tool call is not the session waking. Claude Code sends a
+    # subagent's hook payloads with its PARENT's session_id plus an
+    # agent_id, so without this check every tool call a dispatched worker
+    # made reaped the watcher its driver had just armed for it -- observed
+    # 2026-09-23: four consecutive arms killed within seconds while a
+    # bp-test-writer ran, leaving the Stop gates that consult the probe
+    # with no live watcher to find. Only the session's own calls reap.
+    WAGENT=$(bp_json_get "$PAYLOAD" agent_id 2>/dev/null || true)
+    [ -n "$WAGENT" ] || _bp_watch_reap || true
 
     if [ "$TOOL" = "Bash" ]; then
       WCMD=$(bp_json_get "$PAYLOAD" tool_input.command 2>/dev/null || true)
