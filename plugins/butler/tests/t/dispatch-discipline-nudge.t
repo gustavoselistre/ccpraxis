@@ -249,6 +249,8 @@ sub stub_hook_tree {
     } else {
         write_file("$stub/scripts/bp-dispatch-log.pl", read_file($DISPATCHLOG));
         write_file("$stub/scripts/bp-write-guard.pl", read_file($WRITEGUARD));
+        # bp-dispatch-log.pl loads its project-root rule from this sibling.
+        write_file("$stub/scripts/BpProjectRoot.pm", read_file(dirname($DISPATCHLOG) . '/BpProjectRoot.pm'));
     }
     return "$stub/hooks/dispatch-discipline-nudge.sh";
 }

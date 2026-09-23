@@ -21,9 +21,8 @@
 #
 # Follows the family convention exactly (bp-runstate.pl's own shape): a
 # pure/injectable-seam library (package BpDispatchLog) with a thin CLI
-# (package main, guarded by `unless (caller)`), storage resolved the same
-# way bp-runstate.pl::state_dir resolves its own root (CLAUDE_PROJECT_DIR,
-# else computed from __FILE__, overridable via --root), atomic
+# (package main, guarded by `unless (caller)`), storage under the project
+# root (--root, else BpProjectRoot::resolve -- see log_dir), atomic
 # tmp-then-rename writes copied from bp-runstate.pl::_write, including its
 # corrected absolute-path mkdir -p (an earlier version of that pattern
 # treated an absolute state dir as relative and left stray dirs under the
@@ -44,6 +43,7 @@ use Cwd ();
 use Scalar::Util qw(looks_like_number);
 
 my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
+require "$DIR/BpProjectRoot.pm" unless grep { m{(?:^|/)BpProjectRoot\.pm$} } keys %INC;
 
 # ROLE VOCABULARY (D6, locked) -- exactly these three words, in this order.
 # No fourth role name may appear anywhere in this script, its tests, or any
@@ -86,11 +86,18 @@ our %RATIO_ENV     = ( min_calls => 'BP_DISPATCH_RATIO_MIN_CALLS',
 our $RATIO_MAX_LINES     = 100_000;      # lines examined in one transcript scan
 our $RATIO_MAX_LINE_BYTES = 1024 * 1024; # a longer line is skipped, never decoded
 
-# log_dir($root) -> ".../.ccpraxis-local-data/.dispatch-log" — same
-# resolution convention as bp-runstate.pl::state_dir, not reinvented.
+# log_dir($root) -> ".../.ccpraxis-local-data/.dispatch-log". With no root
+# (undef or empty), the project comes from BpProjectRoot::resolve -- never
+# from this script's own location. The old fallback,
+# abs_path("$DIR/../../.."), named the INSTALL whenever a driver's Bash call
+# lacked CLAUDE_PROJECT_DIR (a driver's Bash tool does not carry it), and 21
+# records from Sep 11-16 were found inside the live install's own data dir.
+# An empty --root, which dispatch-discipline-nudge.sh and
+# context-ceiling-guidance.sh pass when BP_PROJECT_ROOT is unset, used to
+# resolve to "/.ccpraxis-local-data"; it now means "resolve it".
 sub log_dir {
     my ($root) = @_;
-    $root //= $ENV{CLAUDE_PROJECT_DIR} // Cwd::abs_path("$DIR/../../..") // '.';
+    $root = BpProjectRoot::resolve() unless defined $root && length $root;
     return "$root/.ccpraxis-local-data/.dispatch-log";
 }
 

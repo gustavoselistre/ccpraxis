@@ -924,6 +924,9 @@ sub isolated_guard {
     if (!exists $opt{with_dispatch_log} || $opt{with_dispatch_log} eq 'real') {
         copy("$SCRIPTS/bp-dispatch-log.pl", "$iso/scripts/bp-dispatch-log.pl")
             or die "copy bp-dispatch-log.pl: $!";
+        # ...and the sibling module it loads its project-root rule from.
+        copy("$SCRIPTS/BpProjectRoot.pm", "$iso/scripts/BpProjectRoot.pm")
+            or die "copy BpProjectRoot.pm: $!";
     }
     elsif ($opt{with_dispatch_log} eq 'garbage') {
         open my $fh, '>', "$iso/scripts/bp-dispatch-log.pl" or die $!;
