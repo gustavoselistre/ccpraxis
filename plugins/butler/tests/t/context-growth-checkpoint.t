@@ -2,7 +2,7 @@
 # platform: any
 # Package 02-context-ceiling-guidance-and-flush (blueprint coordinator-context-discipline).
 #
-# MIGRATED from the fleet-cost-accounting/02-context-growth-checkpoint single-ceiling
+# MIGRATED from fleet-cost-accounting package 02's single-ceiling
 # oracle. Derived ONLY from
 # .ccpraxis-local-data/blueprints/coordinator-context-discipline/specs/
 # 02-context-ceiling-guidance-and-flush-spec.md (AC1-AC10, AC31, AC32; Observable
@@ -23,7 +23,7 @@
 # stale SKILL.md section) -- never a harness bug of this file's own making.
 #
 # UNCHANGED BY THIS MIGRATION (spec SS5.2: "No existing assertion in
-# context-growth-checkpoint.t:34-135 may change"): the context_tokens_from_usage and
+# [this file]:34-135 may change"): the context_tokens_from_usage and
 # last_coordinator_usage blocks immediately below are copied byte-for-byte from the
 # pre-migration file. They test two PURE, I/O-free helpers that the spec explicitly
 # keeps "byte-identical behaviour and signatures" (SS5.2). If any of these regress,

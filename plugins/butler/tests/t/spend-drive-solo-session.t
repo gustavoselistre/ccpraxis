@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 # platform: any
-# spend-drive-solo-session — oracle for blueprint usage-telemetry, package
+# Oracle for blueprint usage-telemetry, package
 # 01-drive-solo-input-and-pricing.
 #
 # Tests the new `derive_session` library function and `derive-session` CLI

@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 # platform: any
-# ledger-create-api.t -- oracle for `bp-ledger.pl create` (04-model-effort-ledger-validation).
+# Oracle for `bp-ledger.pl create` (04-model-effort-ledger-validation).
 #
 # Derived ONLY from
 # .ccpraxis-local-data/blueprints/coordinator-context-discipline/specs/04-model-effort-ledger-validation-spec.md

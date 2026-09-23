@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 # platform: any
-# spend-derived-from-transcripts — oracle for blueprint fleet-cost-accounting,
+# Oracle for blueprint fleet-cost-accounting,
 # package 01-spend-is-recorded.
 #
 # Tests the new `derive-package` / `derive-blueprint` verbs on bp-spend.pl,
