@@ -225,6 +225,7 @@ Plugins live under `plugins/<name>/` (`sandbox`, `backpack`, `blueprint`, `butle
 | [Reference](docs/reference.md) | How each surface works: install contract, commands, statusline, backup, vault sync, sandbox, backpack |
 | [Repo layout](docs/repo-layout.md) | Every file, annotated and generated from disk |
 | [Design conventions](docs/design-conventions.md) | Packaging, approval flows, and what gets enforced in code |
+| [Disabling a Claude Code feature](docs/disabling-claude-code-features.md) | Which lever removes a tool/MCP server/subagent/skill from context vs only gates calls |
 
 ## Platforms
 
