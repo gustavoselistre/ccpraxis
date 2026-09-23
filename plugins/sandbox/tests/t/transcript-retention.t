@@ -419,6 +419,16 @@ sub assert_baseline_preserved {
         'permissions.deny[0]'  => 1,   # 1edc0d3 -- the belt to autoMemoryEnabled's
                                        # braces: Read(~/.claude/projects/**/memory/**).
                                        # Both files carry exactly this one entry.
+        # bug 20260922-213748-6c76 -- the operator wants SendFeedback never
+        # loaded into any agent's context, host or sandbox. Three independent
+        # levers, each of which alone leaves the tool out, so losing one to a
+        # /config rewrite or a re-stated deny array does not bring it back:
+        # feedbackDrafts "off" is the tool's own isEnabled() switch,
+        # CLAUDE_CODE_SEND_FEEDBACK=0 its documented env gate, and a bare-name
+        # deny removes a tool from context. Both files carry all three.
+        'permissions.deny[1]'           => 1,
+        'feedbackDrafts'                => 1,
+        'env.CLAUDE_CODE_SEND_FEEDBACK' => 1,
         # 2026-08-29 -- two guards promoted from prose to enforcement, both
         # registered globally so they apply in EVERY project, not just ccpraxis.
         #

@@ -13,7 +13,16 @@
 #      (bp-orchestrator.pl names this script "the only clearer" of it; a
 #      reused pid would otherwise make `bp-status.sh` draw a dead run as
 #      live);
-#   3. archives the blueprint (moves it into `blueprints/_archive/`) once its
+#   3. writes a package's ledger `status: running` back to `pending` when the
+#      registry cannot supply a pid for it (no row, or a row with no `pid`
+#      key) AND no live process — fleet coordinator or solo driver — can be
+#      attributed to it ("orphaned running"; 10-unreapable-running). Only the
+#      ledger is written; `runs/registry.json` is never touched by this
+#      repair;
+#   4. withdraws (never deletes) a queued escalation of a nominated kind
+#      whose premise has demonstrably evaporated, gaining `withdrawn_at` /
+#      `withdrawn_reason` on the record (10-unreapable-running, criterion 7);
+#   5. archives the blueprint (moves it into `blueprints/_archive/`) once its
 #      lifecycle derives `done` (see `BpState::blueprint_lifecycle`), unless
 #      `--no-archive` was given.
 #
@@ -93,12 +102,47 @@ my $SCRIPT_DIR = do {
 my $BP_BLUEPRINT = "$SCRIPT_DIR/bp-blueprint.pl";
 
 require "$SCRIPT_DIR/BpState.pm";
+require "$SCRIPT_DIR/bp-write-guard.pl";   # BpWrite::guarded_write
 
 # ---------------------------------------------------------------- statuses ---
 # The six package statuses bp-blueprint.pl recognises. `dropped` is accepted as
 # terminal-but-not-delivered because bp-drive-next.pl emits it.
 my %TERMINAL   = map { $_ => 1 } qw(done dropped blocked parked);
 my %DELIVERED  = map { $_ => 1 } qw(done dropped);
+
+# ---------------------------------------------------- self-withdrawable ------
+# EXPLICIT, CLOSED LIST. Adding a kind here is a decision about whether a
+# machine may retract a question a human can already see. Getting it wrong in
+# the permissive direction makes a real question vanish, which is strictly
+# worse than the noise it removes (package ledger, done-criterion 7).
+#
+# M3 (redteam, 10-unreapable-running): this writer's `withdrawn_at` is INERT
+# until two readers are wired that are OUTSIDE this file's write set --
+# RunState::decision_live (plugins/sandbox/scripts/RunState.pm) must stop
+# counting a withdrawn record as live, AND bp-orchestrator.pl's
+# queue_needs_you dedupe (its persistent (package, kind) scan) must skip a
+# withdrawn record so the SAME transient can be re-filed if it recurs.
+# THESE TWO MUST LAND IN THE SAME CHANGE, NEVER ONE WITHOUT THE OTHER: wiring
+# decision_live alone makes a withdrawn record disappear from the operator's
+# count while queue_needs_you STILL treats it as filed, so the transient can
+# never be re-escalated if it recurs -- a silent permanent hold, which is
+# exactly the failure criterion 7 exists to close, reopened one level down.
+# See this package's ledger for the deferral note this comment mirrors.
+my %SELF_WITHDRAWABLE = (
+    'awaiting-ledger' => {
+        # premise: the package has no ledger, or its frontmatter status will
+        # not parse. Mirrors bp-orchestrator.pl:2787's `ledger_missing` exactly.
+        premise_holds => sub {
+            my ($bpdir, $pkg) = @_;
+            my $f = "$bpdir/packages/$pkg.md";
+            return 1 unless -f $f;
+            return 1 unless defined fm_get($f, 'status');
+            return 0;
+        },
+        reason => 'the package ledger now exists and parses; the condition this decision '
+                . 'reported no longer holds',
+    },
+);
 
 sub die_usage {
     my ($msg) = @_;
@@ -148,6 +192,23 @@ sub slurp {
     return $c;
 }
 
+# LOW L1 (redteam): a bounded read of at most $cap+1 bytes, so an oversized
+# file under runs/escalations/ (or a bloated current.json/pid marker) is
+# never pulled fully into memory just to be rejected a moment later on a
+# length() check -- bp-status.sh runs this reconciler on every invocation,
+# for every blueprint (spec edge case 7). Returns undef if unreadable;
+# otherwise a scalar whose length may exceed $cap, which the caller rejects
+# with its own existing length check (unchanged from before this fix).
+sub slurp_capped {
+    my ($path, $cap) = @_;
+    open my $fh, '<:raw', $path or return undef;
+    my $buf = '';
+    my $n = read($fh, $buf, $cap + 1);
+    close $fh;
+    return undef unless defined $n;
+    return $buf;
+}
+
 # Frontmatter `key:` lookup inside the FIRST `---` block. Mirrors fm_get in
 # bp-lib.sh so the two surfaces cannot disagree about what a ledger says.
 sub fm_get {
@@ -183,7 +244,7 @@ sub norm_status {
 sub marker_pid {
     my ($path) = @_;
     return undef unless -e $path;
-    my $c = slurp($path);
+    my $c = slurp_capped($path, 4096);
     return undef unless defined $c;
     return undef if length($c) > 4096;      # a marker is a pid, not a document
     $c =~ s/\s+//g;
@@ -195,6 +256,54 @@ sub pid_alive {
     my ($pid) = @_;
     return 0 unless defined $pid && $pid =~ /\A[0-9]+\z/ && $pid > 0;
     return kill(0, $pid) ? 1 : 0;
+}
+
+# The coordinator pid bp-launch.sh's watcher recorded for this package, or
+# undef. Reuses marker_pid(), whose 4096-byte cap and digits-only rule already
+# fit a pid file.
+sub coordinator_pid {
+    my ($runs, $pkg) = @_;
+    return marker_pid("$runs/$pkg.pid");
+}
+
+# 1 if a solo driver's current-package pointer names this (blueprint, package).
+# $data_root is the reconciler's own resolved data dir.
+sub solo_claimed {
+    my ($data_root, $bp_name, $pkg) = @_;
+    return 0 unless defined $data_root && length $data_root;
+    my $path = "$data_root/.drive-solo/current.json";
+    return 0 unless -f $path;
+    my $c = slurp_capped($path, 65536);
+    return 0 unless defined $c && length $c && length($c) <= 65536;
+    require JSON::PP;
+    my $rec = eval { JSON::PP->new->decode($c) };
+    return 0 if $@ || ref $rec ne 'HASH';
+    return 0 unless defined $rec->{package} && !ref($rec->{package}) && $rec->{package} eq $pkg;
+    my $rec_bp = $rec->{blueprint};
+    return 1 if !defined $rec_bp || (!ref($rec_bp) && $rec_bp eq '');
+    return 1 if !ref($rec_bp) && $rec_bp eq $bp_name;
+    return 0;
+}
+
+# A package key is "safe" for reading/writing as packages/<pkg>.md. Mirrors
+# RunState::_safe_pkg_name (plugins/sandbox/scripts/RunState.pm:163-172)
+# exactly: escalation records are attacker-adjacent input (spec §2.7 step 5),
+# and that precedent additionally rejects ':' (NTFS Alternate Data Streams,
+# e.g. "pkg:stream") and Windows reserved device names (CON/PRN/AUX/NUL/
+# COM1-9/LPT1-9, with or without an extension -- "NUL.md" resolves to the
+# device the same as bare "NUL"). review MUST-FIX 1: this sub previously
+# omitted both, letting a record like {"package":"NUL"} reach -f/open on
+# packages/<pkg>.md via premise_holds, on every bp-status.sh invocation.
+sub safe_pkg_name {
+    my ($pkg) = @_;
+    return 0 unless defined $pkg && !ref($pkg) && length($pkg);
+    return 0 if $pkg =~ /[\/\\\x00]/;
+    return 0 if $pkg =~ /\.\./;
+    return 0 if $pkg =~ /^\./;
+    return 0 if length($pkg) > 128;
+    return 0 if $pkg =~ /:/;
+    return 0 if $pkg =~ /\A(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|\z)/i;
+    return 1;
 }
 
 # --------------------------------------------------------------- packages ----
@@ -346,6 +455,13 @@ sub _copy_tree {
 sub reconcile_one {
     my ($bpdir, $opt) = @_;
     my $name = $bpdir;
+    # LOW L2 (redteam): strip trailing separators BEFORE taking the
+    # basename. "…/foo/" without this yields '', which silently makes
+    # solo_claimed's blueprint comparison unmatchable for the whole
+    # invocation (P4 goes inert). bp-orchestrator.pl already passes a bare
+    # directory (no trailing slash) at its own call site, so this is
+    # defense-in-depth for any other caller, not a live bug today.
+    $name =~ s{[\\/]+\z}{};
     $name =~ s{.*[\\/]}{};
 
     my %r = (blueprint => $name, dir => $bpdir, actions => [], errors => []);
@@ -371,6 +487,9 @@ sub reconcile_one {
     my $marker = "$runs/.orchestrator";
     my $pid    = marker_pid($marker);
     my $live   = (-e $marker && pid_alive($pid)) ? 1 : 0;
+    # H2/H1 (redteam): whether an orchestrator marker EVER existed here, not
+    # merely whether it still does after block 1 below may remove it.
+    my $marker_existed = -e $marker ? 1 : 0;
     $r{live} = $live;
     $r{orchestrator_pid} = $pid;
 
@@ -403,16 +522,30 @@ sub reconcile_one {
     #        independently live: bp-orchestrator.pl names this script "the
     #        only clearer" of it, and bp-status.sh's PROC column consumes
     #        the same field -- so that half survives, renamed honestly. ----
+    # review SHOULD-FIX 2: read/decode runs/registry.json exactly ONCE per
+    # invocation and reuse the decode for both block 2 and block 3 below
+    # (previously each block read and JSON-decoded it independently; spec
+    # edge case 7 flags this script's cost sensitivity explicitly, since
+    # bp-status.sh runs it on every invocation). Block 2 only ever mutates
+    # a TERMINAL package's entry; block 3 only ever inspects a `running`
+    # package's entry -- the two sets are disjoint (a ledger cannot be both
+    # TERMINAL and `running`), so sharing the same in-memory hash between
+    # them is safe.
     my $regpath = "$runs/registry.json";
+    my ($reg_data, $reg_unknown) = (undef, 0);
     if (-f $regpath) {
-        my $reg = read_registry($regpath);
-        if (!defined $reg) {
+        $reg_data = read_registry($regpath);
+        $reg_unknown = 1 unless defined $reg_data;
+    }
+
+    if (-f $regpath) {
+        if ($reg_unknown) {
             push @{ $r{errors} }, 'runs/registry.json is unreadable or not JSON; left untouched';
-        } elsif (ref($reg->{packages}) eq 'HASH') {
+        } elsif (ref($reg_data->{packages}) eq 'HASH') {
             my @cleared;
             my %by_pkg = map { $_->{pkg} => $_->{status} } @ledgers;
-            for my $pkg (sort keys %{ $reg->{packages} }) {
-                my $entry = $reg->{packages}{$pkg};
+            for my $pkg (sort keys %{ $reg_data->{packages} }) {
+                my $entry = $reg_data->{packages}{$pkg};
                 next unless ref $entry eq 'HASH';
                 next unless exists $by_pkg{$pkg};
                 my $ledger_status = $by_pkg{$pkg};
@@ -431,11 +564,314 @@ sub reconcile_one {
                 my $detail = scalar(@cleared) . ' package(s): ' . join(', ', @cleared);
                 if ($opt->{dry_run}) {
                     push @{ $r{actions} }, { kind => 'stale_pid', detail => "would clear $detail", applied => 0 };
-                } elsif (write_registry($regpath, $reg)) {
+                } elsif (write_registry($regpath, $reg_data)) {
                     push @{ $r{actions} }, { kind => 'stale_pid', detail => "cleared $detail", applied => 1 };
                 } else {
                     push @{ $r{errors} }, 'could not write runs/registry.json';
                 }
+            }
+        }
+    }
+
+    # --- H2 (redteam): the pid-namespace gate for repairs 3 and 4 -----------
+    #
+    # Every pid artefact this blueprint can carry (runs/.orchestrator,
+    # runs/<pkg>.pid, a registry row's `pid`) is written EXCLUSIVELY by
+    # tooling that requires the sandbox (bp-launch.sh's bp_require_sandbox
+    # gate; drive-solo is sandbox-only by the same convention -- see
+    # skills/drive-solo/SKILL.md). `bp-status.sh` is deliberately
+    # host-runnable and carries no such gate (its own comment records why:
+    # a hard requirement made the whole status surface unusable on the
+    # host). `pid_alive` is `kill(0,$pid)` against the CALLER's own pid
+    # namespace -- on the host, that is never the namespace that wrote a
+    # container pid (project CLAUDE.md: "Crossing them does not error — it
+    # answers 'no such process'"). Before this package, that false negative
+    # cost a deleted `.orchestrator` marker; after it, the SAME false
+    # negative would flip every `running` ledger the new repair touches to
+    # `pending`. Refuse repairs 3/4 entirely, rather than risk it, whenever
+    # this blueprint carries a pid artefact we cannot trust ourselves to
+    # judge: a run only exists in the sandbox, so this loses nothing real.
+    #
+    # Only relevant, and only reported, when there is actually something for
+    # repairs 3/4 to consider -- a `running` package (repair 3's only input)
+    # or an escalations directory (repair 4's only input). A blueprint with
+    # neither has nothing this gate could ever protect, and reporting a
+    # `skipped` action anyway would be pure noise indistinguishable from a
+    # real refusal, breaking every existing exact-action-count assertion in
+    # sibling test files (lifecycle-reconcile.t s05 AC-8) that fixture a
+    # stale marker / registry pid alongside packages that are NOT `running`.
+    my $has_running_pkg = (grep { $_->{status} eq 'running' } @ledgers) ? 1 : 0;
+    my $has_escalations_dir = -d "$runs/escalations" ? 1 : 0;
+    my $pid_artefacts_present = $marker_existed;
+    unless ($pid_artefacts_present) {
+        for my $l (@ledgers) {
+            if (-e "$runs/$l->{pkg}.pid") { $pid_artefacts_present = 1; last }
+        }
+    }
+    if (!$pid_artefacts_present && !$reg_unknown
+            && ref($reg_data) eq 'HASH' && ref($reg_data->{packages}) eq 'HASH') {
+        for my $row (values %{ $reg_data->{packages} }) {
+            if (ref($row) eq 'HASH' && exists $row->{pid}) { $pid_artefacts_present = 1; last }
+        }
+    }
+    my $skip_new_repairs = ($pid_artefacts_present && !$ENV{IS_SANDBOX}
+                             && ($has_running_pkg || $has_escalations_dir)) ? 1 : 0;
+    if ($skip_new_repairs) {
+        push @{ $r{actions} }, {
+            kind   => 'skipped',
+            detail => 'pid artefacts present (marker/pidfile/registry pid) and IS_SANDBOX is unset; '
+                    . 'a host-side reconcile cannot judge a container pid\'s liveness, so repairs 3 '
+                    . 'and 4 are refused rather than risk reaping live work',
+        };
+    }
+
+    # --- 3. orphaned `running` ------------------------------------------------
+    #
+    # A package whose ledger says `running` while the registry cannot supply a
+    # pid for it, and no live process (fleet coordinator OR solo driver) can be
+    # attributed to it, is invisible to both halves of the orchestrator tick.
+    # The ledger word is written back to `pending` -- the exact word the launch
+    # path checks -- so the package re-enters the launch path. The registry is
+    # never touched by this repair. See spec §2.4/§2.5/§3.
+    if (!$skip_new_repairs) {
+        unless ($reg_unknown) {
+            my $pkgs = (ref($reg_data) eq 'HASH' && ref($reg_data->{packages}) eq 'HASH') ? $reg_data->{packages} : {};
+            my @orphans;
+            for my $l (@ledgers) {
+                next unless $l->{status} eq 'running';
+                my $pkg = $l->{pkg};
+                my $shape;
+                my $reg_row_exists = exists $pkgs->{$pkg};
+                if (!$reg_row_exists) {
+                    $shape = 'no registry row';
+                } elsif (ref $pkgs->{$pkg} eq 'HASH' && !exists $pkgs->{$pkg}{pid}) {
+                    $shape = 'registry row has no pid';
+                } else {
+                    next;   # P2 fails: a checkable pid, or a non-HASH (corrupt) row
+                }
+                next if pid_alive(coordinator_pid($runs, $pkg));                 # P3
+                next if solo_claimed($opt->{data_root}, $name, $pkg);            # P4: a positive claim
+                # H1 (redteam), IN-WRITE-SET HALF ONLY: for the ZERO-FLEET-
+                # ARTEFACT shape -- no registry.json file at all, no
+                # coordinator pid file ever for this package, no
+                # orchestrator marker ever for this blueprint -- P4's
+                # "no pointer found" is not proof of absence, only proof we
+                # looked at $opt->{data_root}. drive-solo's own pointer
+                # write is documented never-fatal and can silently fail
+                # (bp-drive-next.pl _write_current_pointer), and a caller
+                # that resolved a DIFFERENT data root than the one a solo
+                # driver is using would see the same "no pointer" shape.
+                # Invert the default for exactly this shape: decline unless
+                # we can even name a data root to have positively looked
+                # in. This does NOT touch the reported bug's own shape
+                # (a registry.json that exists but lacks a row for this
+                # package, per AC3a) -- only the strictly narrower shape
+                # where no registry.json exists at all. The fuller fix
+                # (threading --data-dir through bp-status.sh and
+                # bp-orchestrator.pl so this data root is never wrong) is
+                # outside this package's write set; recorded as a
+                # follow-up in the package ledger.
+                if (!$reg_row_exists && !-f $regpath
+                        && !defined(coordinator_pid($runs, $pkg))
+                        && !$marker_existed
+                        && !(defined $opt->{data_root} && length $opt->{data_root})) {
+                    next;
+                }
+                push @orphans, [ $pkg, $shape ];
+            }
+            @orphans = sort { $a->[0] cmp $b->[0] } @orphans;
+
+            if (@orphans && $opt->{dry_run}) {
+                my @pkg_list  = map { $_->[0] } @orphans;
+                my @rendered  = map { "$_->[0] ($_->[1])" } @orphans;
+                my $detail = 'would repair ' . scalar(@pkg_list) . ' package(s): ' . join(', ', @rendered);
+                push @{ $r{actions} }, { kind => 'orphan_running', detail => $detail, packages => \@pkg_list, applied => 0 };
+            }
+            elsif (@orphans) {
+                my (@repaired_pkgs, @repaired_rendered);
+                for my $o (@orphans) {
+                    my ($pkg, $shape) = @$o;
+                    my $f = "$bpdir/packages/$pkg.md";
+                    my $res = BpWrite::guarded_write({
+                        site  => 'reconcile_orphan_running',
+                        path  => $f,
+                        valid => sub {
+                            my ($txt) = @_;
+                            return 'ledger unreadable or missing frontmatter'
+                                unless defined $txt && $txt =~ /\A---\s*\n(.*?)\n---/s;
+                            my $fm = $1;
+                            # M1 (redteam): THE RE-READ THAT CLOSES THE RACE
+                            # must check the CAPTURED FRONTMATTER ONLY,
+                            # mirroring `mutate` below -- not scan the whole
+                            # file/body, where an unrelated "status: running"
+                            # line (e.g. quoted in a Decisions log entry, or
+                            # a fenced YAML example) would otherwise pass.
+                            return 'status-moved' unless $fm =~ /^status:\s*running\s*$/m;
+                            # M2 (redteam): re-validate P3/P4 UNDER THE LOCK.
+                            # The pre-lock @orphans snapshot above can be
+                            # stale by the time this runs -- a coordinator's
+                            # pid file, or a solo driver's claim, appearing
+                            # in that window is exactly the TOCTOU window
+                            # H1 depends on. These are two small file reads;
+                            # under the lock they actually mean something.
+                            return 'coordinator now alive' if pid_alive(coordinator_pid($runs, $pkg));
+                            return 'solo-claimed now'      if solo_claimed($opt->{data_root}, $name, $pkg);
+                            return undef;
+                        },
+                        mutate => sub {
+                            my ($txt) = @_;
+                            return (undef, 'no frontmatter block to update')
+                                unless $txt =~ /\A---\s*\n(.*?)\n---/s;
+                            my $fm = $1;
+                            my $newfm = $fm;
+                            $newfm =~ s/^status:.*$/status: pending/m;
+                            my $iso = iso_now();
+                            if ($newfm =~ /^last_updated:.*$/m) { $newfm =~ s/^last_updated:.*$/last_updated: $iso/m; }
+                            (my $new = $txt) =~ s/\A---\s*\n.*?\n---/---\n$newfm\n---/s;
+                            return ($new, undef);
+                        },
+                    });
+                    if ($res->{ok} && ($res->{outcome} eq 'written' || $res->{outcome} eq 'unchanged')) {
+                        push @repaired_pkgs, $pkg;
+                        push @repaired_rendered, "$pkg ($shape)";
+                    }
+                    elsif (!$res->{ok} && $res->{outcome} eq 'refused') {
+                        # the world moved under us; skip silently, not an error.
+                        next;
+                    }
+                    else {
+                        push @{ $r{errors} },
+                            "could not set packages/$pkg.md to pending: $res->{outcome}: $res->{reason}";
+                    }
+                }
+                if (@repaired_pkgs) {
+                    my $detail = 'repaired ' . scalar(@repaired_pkgs) . ' package(s): ' . join(', ', @repaired_rendered);
+                    push @{ $r{actions} }, { kind => 'orphan_running', detail => $detail, packages => \@repaired_pkgs, applied => 1 };
+                }
+            }
+        }
+    }
+
+    # --- 4. escalation self-withdrawal (criterion 7) --------------------------
+    #
+    # A queued escalation of a nominated kind whose condition is demonstrably
+    # gone gains `withdrawn_at` + `withdrawn_reason`. The record is never
+    # deleted. See spec §2.6/§2.7.
+    #
+    # M4 (redteam): the per-record rewrite goes through BpWrite::guarded_write
+    # -- the same house primitive the ledger repair above already uses --
+    # rather than an unlocked read-decode-mutate-rename. Without a lock,
+    # `bp-answer-decision.pl`/`bp-resolve.pl` archiving a record and unlinking
+    # its queue file, interleaved with this sweep's decode-then-rename, could
+    # RESURRECT an already-answered decision (its own header states a deleted
+    # id with no archive entry IS the record that a human answered it -- a
+    # queue file reappearing after that breaks the model outright). This also
+    # closes H3 as a side effect: `guarded_write`'s commit is a bare `rename`
+    # with NO pre-unlink of the destination (spec edge case 13; verified
+    # against bp-write-guard.pl's own `$RENAME_FN`), so the destination is
+    # never deleted before a successful rename -- a failed rename leaves the
+    # ORIGINAL record intact rather than gone.
+    if (!$skip_new_repairs) {
+        my $esc_dir = "$runs/escalations";
+        if (-d $esc_dir) {
+            my @withdrawn;   # [ { f, kind, reason }, ... ]
+            if (opendir(my $edh, $esc_dir)) {
+                for my $f (sort readdir $edh) {
+                    next unless $f =~ /\.json\z/;
+                    my $path = "$esc_dir/$f";
+                    next unless -f $path;
+                    # LOW L1: bounded read (cap+1), never a full slurp of an
+                    # oversized/hostile file just to reject it a moment later.
+                    my $c = slurp_capped($path, 1_000_000);
+                    next unless defined $c && length $c && length($c) <= 1_000_000;
+                    require JSON::PP;
+                    my $rec = eval { JSON::PP->new->decode($c) };
+                    next if $@ || ref $rec ne 'HASH';
+                    # LOW L4: align with the documented reader contract (spec
+                    # §7's "known gap" note) -- withdrawn iff a non-empty,
+                    # non-ref scalar, not merely `exists`. A record already
+                    # carrying `"withdrawn_at": null` should not be
+                    # permanently unwithdrawable while every reader still
+                    # counts it live.
+                    next if defined $rec->{withdrawn_at} && !ref($rec->{withdrawn_at}) && length($rec->{withdrawn_at});
+                    my $kind = $rec->{kind};
+                    my $spec = defined $kind ? $SELF_WITHDRAWABLE{$kind} : undef;
+                    next unless $spec;
+                    my $pkg = $rec->{package};
+                    next unless safe_pkg_name($pkg);
+                    # LOW L3: a record filed under a DIFFERENT blueprint than
+                    # this one must not have its premise judged against this
+                    # blueprint's packages/ tree. Not currently reachable (the
+                    # orchestrator only ever files into its own runs/), but
+                    # the record is declared attacker-adjacent input.
+                    next if defined $rec->{blueprint} && !ref($rec->{blueprint}) && length($rec->{blueprint})
+                            && $rec->{blueprint} ne $name;
+                    next if $spec->{premise_holds}->($bpdir, $pkg);
+
+                    if ($opt->{dry_run}) {
+                        push @withdrawn, { f => $f, kind => $kind, reason => $spec->{reason} };
+                        next;
+                    }
+
+                    my $reason = $spec->{reason};
+                    my $res = BpWrite::guarded_write({
+                        site  => 'reconcile_escalation_withdrawn',
+                        path  => $path,
+                        valid => sub {
+                            my ($txt) = @_;
+                            # M4: the re-read under the lock -- if the record
+                            # is gone (archived + unlinked by an answer path
+                            # that raced us), there is nothing to withdraw,
+                            # and writing a fresh file back here would
+                            # resurrect it. Refuse rather than recreate it.
+                            return 'record gone' unless defined $txt;
+                            my $cur = eval { JSON::PP->new->decode($txt) };
+                            return 'record unreadable' if $@ || ref $cur ne 'HASH';
+                            return 'already withdrawn'
+                                if defined $cur->{withdrawn_at} && !ref($cur->{withdrawn_at}) && length($cur->{withdrawn_at});
+                            return undef;
+                        },
+                        mutate => sub {
+                            my ($txt) = @_;
+                            my $cur = eval { JSON::PP->new->decode($txt) };
+                            return (undef, 'record unreadable') if $@ || ref $cur ne 'HASH';
+                            $cur->{withdrawn_at}     = iso_now();
+                            $cur->{withdrawn_reason} = $reason;
+                            my $json = eval { JSON::PP->new->canonical->pretty->encode($cur) };
+                            return (undef, 'encode failed') if $@ || !defined $json;
+                            return ($json, undef);
+                        },
+                    });
+                    if ($res->{ok} && ($res->{outcome} eq 'written' || $res->{outcome} eq 'unchanged')) {
+                        push @withdrawn, { f => $f, kind => $kind, reason => $reason };
+                    }
+                    elsif (!$res->{ok} && $res->{outcome} eq 'refused') {
+                        # the world moved under us; skip silently, not an error.
+                        next;
+                    }
+                    else {
+                        push @{ $r{errors} },
+                            "could not withdraw escalation $f: $res->{outcome}: $res->{reason}";
+                    }
+                }
+                closedir $edh;
+            }
+            if (@withdrawn) {
+                @withdrawn = sort { $a->{f} cmp $b->{f} } @withdrawn;
+                my @basenames = map { $_->{f} } @withdrawn;
+                # LOW L7 / review SHOULD-FIX 2: render each entry
+                # "<file> (<kind>: <reason>)", matching spec §2.6's worked
+                # example shape and the orphan_running block's own precedent
+                # for rendering distinguishable shapes in `detail`.
+                my @rendered = map { "$_->{f} ($_->{kind}: $_->{reason})" } @withdrawn;
+                my $detail = ($opt->{dry_run} ? 'would withdraw ' : 'withdrew ')
+                           . scalar(@basenames) . ' escalation(s): ' . join(', ', @rendered);
+                push @{ $r{actions} }, {
+                    kind    => 'escalation_withdrawn',
+                    detail  => $detail,
+                    records => \@basenames,
+                    applied => $opt->{dry_run} ? 0 : 1,
+                };
             }
         }
     }
@@ -620,6 +1056,7 @@ die_usage('need exactly one of --blueprint or --all')
 $opt{dry_run} = delete $opt{'dry-run'};
 
 my $DATA  = data_dir($opt{'data-dir'});
+$opt{data_root} = $DATA;
 my $ROOT  = "$DATA/blueprints";
 
 my @dirs;

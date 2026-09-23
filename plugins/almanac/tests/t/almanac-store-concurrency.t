@@ -89,6 +89,15 @@ sub bounded_wait_for_death {
     return 0; # tolerate a platform where kill(0,...) is uninformative
 }
 
+sub read_all_lines {
+    my ($path) = @_;
+    open(my $fh, '<', $path) or return ();
+    my @l = <$fh>;
+    close $fh;
+    return @l;
+}
+sub err_kind { my ($e) = @_; return (ref($e) =~ /::Error$/) ? $e->{kind} : undef }
+
 sub machine_block_field {
     my ($text, $key) = @_;
     return undef unless defined $text;
@@ -134,10 +143,12 @@ sub run_barrier_pair {
 }
 
 # ---------------------------------------------------------------------------
-# child fixture: the "mutate" child. Reads its baseline right after signalling
-# ready (before the barrier, i.e. before anybody could have written), waits
-# for the shared "go" sentinel, then performs exactly one Store call. Result
-# and any error's stderr machine-block text land in per-child files.
+# child fixture: the "mutate" child. Reads its baseline FIRST, THEN signals
+# ready, then waits for the shared "go" sentinel, then performs exactly one
+# Store call. Result and any error's stderr machine-block text land in
+# per-child files. (This ordering is itself the fix for the defect the
+# in-script comment below documents -- see that comment for the "before"
+# shape and why it made the race untestable.)
 # ---------------------------------------------------------------------------
 sub write_mutate_child {
     my ($path) = @_;
@@ -688,6 +699,202 @@ KILLREORDER
     eval { $store->list() } if defined $store;
     ok(!-e $holder_path, 'AC-24: the store-lock holder file is still absent after list() on a journal-free store (no lock was taken)')
         if defined $holder_path;
+}
+
+# =============================================================================
+# FIXBATCH-4 (review MUST-4 / redteam MEDIUM-1) -- a journal that decodes as
+# JSON but not the expected shape (a schema change, a hand-edit, a
+# half-written file from a future version) is self-healing: reorder()
+# succeeds instead of permanently bricking with a 'reentrant' lock error,
+# and the malformed journal is gone afterward (not stuck forever).
+# =============================================================================
+{
+    my ($root, $store, $err) = open_test_store();
+    ok(defined $store, 'FIXBATCH-4 fixture: store handle opens') or diag("error: $err");
+    my $ok_create = defined($store) ? 1 : 0;
+    if (defined $store) {
+        for my $id (qw(fb4-p fb4-q)) {
+            my $r = eval { $store->insert_last(id => $id, fields => { t => '1' }, order => ['t']) };
+            $ok_create = 0 unless defined $r;
+        }
+    }
+    ok($ok_create, 'FIXBATCH-4 fixture: two ranked records exist');
+
+    my $dir = eval { $store->dir } if defined $store;
+    my $journal_path = defined $dir ? "$dir/.reorder-journal.json" : undef;
+    if (defined $journal_path) {
+        write_raw($journal_path, '{"version":1}');   # decodable JSON, wrong shape (no "entries")
+    }
+    ok(defined $journal_path && -f $journal_path, 'FIXBATCH-4 fixture: a shape-invalid journal is staged');
+
+    # Before the fix: list() would short-circuit forever (MEDIUM-1) and
+    # reorder() would die 'io'/'reentrant' because list() (called while the
+    # store lock was already held) unconditionally called recover(), which
+    # tried to re-acquire that same lock.
+    my $list_ok = eval { $store->list(); 1 } if defined $store;
+    ok($list_ok, 'FIXBATCH-4: list() does not die against a shape-invalid journal') or diag('error: ' . ($@ // ''));
+
+    my $reordered = eval { $store->reorder(['fb4-q', 'fb4-p']) } if defined $store;
+    ok(defined $reordered, 'FIXBATCH-4: reorder() succeeds against a shape-invalid journal (not permanently bricked)')
+        or diag('error: ' . ($@ // ''));
+    ok(defined($journal_path) && !-f $journal_path, 'FIXBATCH-4: the shape-invalid journal is gone afterward');
+
+    my $list2 = eval { $store->list() } if defined $store;
+    if (ref($list2) eq 'ARRAY') {
+        is_deeply([map { $_->{id} } @$list2], ['fb4-q', 'fb4-p'],
+            'FIXBATCH-4: the requested reorder actually applied');
+    } else {
+        fail('FIXBATCH-4: the requested reorder actually applied');
+    }
+}
+
+# =============================================================================
+# FIXBATCH-5 (redteam HIGH-1 / HIGH-2 / review MUST-5) -- a per-record lock
+# that is merely BUSY during rollback marks that entry incomplete rather
+# than silently discarding it: the journal is RETAINED (not deleted) when
+# any entry was skipped, recover() returns 0 (not 1) for an incomplete
+# rollback, the busy record keeps its pre-rollback (reorder) rank rather
+# than being silently abandoned, and a later recover() (once the lock is
+# free) finishes the job and removes the journal.
+# =============================================================================
+{
+    my ($root, $store, $err) = open_test_store();
+    ok(defined $store, 'FIXBATCH-5 fixture: store handle opens') or diag("error: $err");
+    my ($r1, $r2, $r3);
+    if (defined $store) {
+        $r1 = eval { $store->insert_last(id => 'fb5-r1', fields => { t => '1' }, order => ['t']) };
+        $r2 = eval { $store->insert_last(id => 'fb5-r2', fields => { t => '2' }, order => ['t']) };
+        $r3 = eval { $store->insert_last(id => 'fb5-r3', fields => { t => '3' }, order => ['t']) };
+    }
+    ok(defined($r1) && defined($r2) && defined($r3), 'FIXBATCH-5 fixture: three ranked records exist')
+        or diag('error: ' . ($@ // ''));
+
+    # Hand-craft a journal claiming all three were reordered, with prev_rank
+    # different from each record's CURRENT on-disk rank -- exactly the
+    # shape a crashed reorder() leaves behind.
+    my %prev_of = (
+        'fb5-r1' => 'A00001V',
+        'fb5-r2' => 'A00002V',
+        'fb5-r3' => 'A00003V',
+    );
+    my $dir = eval { $store->dir } if defined $store;
+    my $journal_path = defined $dir ? "$dir/.reorder-journal.json" : undef;
+    if (defined $journal_path) {
+        my %entries = map { $_ => { prev_rank => $prev_of{$_}, next_rank => undef } } keys %prev_of;
+        write_raw($journal_path, JSON::PP->new->canonical->encode({
+            version => 1, writer => 'fixture', started_at => time(), entries => \%entries,
+        }));
+    }
+    ok(defined $journal_path && -f $journal_path, 'FIXBATCH-5 fixture: a rollback journal is staged');
+
+    # Simulate a concurrent process holding r2's per-record lock (the same
+    # observable shape as a real lock-busy/timeout: Almanac::Lock->acquire
+    # on that path returns undef for anyone else while this lock object is
+    # alive).
+    my $r2_path = defined $dir ? "$dir/fb5-r2.md" : undef;
+    my ($busy_lock, $busy_err) = defined $r2_path ? Almanac::Lock->acquire($r2_path, verb => 'fixture-hold') : (undef, undef);
+    ok(defined $busy_lock, 'FIXBATCH-5 fixture: r2\'s per-record lock is held by a simulated concurrent process')
+        or diag('lock error: ' . (ref($busy_err) ? $busy_err->{message} : ($busy_err // '')));
+
+    my $rv1 = eval { $store->recover() } if defined $store;
+    is($rv1, 0, 'FIXBATCH-5: recover() returns 0 (incomplete) while r2\'s lock is busy') or diag('error: ' . ($@ // ''));
+    ok(defined($journal_path) && -f $journal_path,
+       'FIXBATCH-5: the journal is RETAINED (not deleted) because the rollback was incomplete');
+
+    my $r1_after  = eval { $store->read('fb5-r1') } if defined $store;
+    my $r2_after  = eval { $store->read('fb5-r2') } if defined $store;
+    ok(defined($r1_after) && $r1_after->{rank} eq $prev_of{'fb5-r1'},
+       'FIXBATCH-5: an unlocked entry (r1) IS rolled back to its prev_rank') or diag('r1 rank: ' . (defined $r1_after ? $r1_after->{rank} : '(undef)'));
+    ok(defined($r2_after) && $r2_after->{rank} ne $prev_of{'fb5-r2'},
+       'FIXBATCH-5: the busy entry (r2) keeps its pre-rollback rank rather than being silently abandoned')
+        or diag('r2 rank: ' . (defined $r2_after ? $r2_after->{rank} : '(undef)'));
+
+    $busy_lock->release if defined $busy_lock;
+    my $rv2 = eval { $store->recover() } if defined $store;
+    is($rv2, 1, 'FIXBATCH-5: a later recover(), once the lock is free, finishes the job') or diag('error: ' . ($@ // ''));
+    ok(defined($journal_path) && !-f $journal_path, 'FIXBATCH-5: ...and the journal is gone afterward');
+    my $r2_final = eval { $store->read('fb5-r2') } if defined $store;
+    ok(defined($r2_final) && $r2_final->{rank} eq $prev_of{'fb5-r2'},
+       'FIXBATCH-5: r2 is now correctly rolled back to its prev_rank too')
+        or diag('r2 final rank: ' . (defined $r2_final ? $r2_final->{rank} : '(undef)'));
+}
+
+# =============================================================================
+# FIXBATCH-6 (redteam HIGH-1, structural) -- grep: inside
+# _rollback_pending_journal, the per-record Almanac::Lock->acquire call
+# precedes the _load_record call (the fix moves the read to AFTER
+# acquisition, re-reading fresh state under the lock -- exactly reorder()'s
+# own discipline -- instead of writing a snapshot captured before the lock
+# was ever taken).
+# =============================================================================
+{
+    if (-f $STORE_PM) {
+        my $src = do {
+            open(my $fh, '<:raw', $STORE_PM) or die "fixture: cannot read $STORE_PM: $!";
+            local $/;
+            my $c = <$fh>;
+            close $fh;
+            $c;
+        };
+        my ($body) = $src =~ /^sub\s+_rollback_pending_journal\s*\{(.*?)^\}/ms;
+        $body = '' unless defined $body;
+        # Strip comment lines so a prose mention of either name (e.g. in a
+        # doc comment explaining the fix) cannot skew the position check.
+        my $code_only = join("\n", grep { !/^\s*#/ } split /\n/, $body);
+        my $acquire_pos = index($code_only, 'Lock->acquire');
+        my $load_pos    = index($code_only, '_load_record');
+        ok($acquire_pos >= 0 && $load_pos >= 0 && $acquire_pos < $load_pos,
+           'FIXBATCH-6: _rollback_pending_journal acquires the per-record lock BEFORE reading the record')
+            or diag("acquire_pos=$acquire_pos load_pos=$load_pos");
+    } else {
+        fail('FIXBATCH-6: _rollback_pending_journal acquires the per-record lock BEFORE reading the record');
+    }
+}
+
+# =============================================================================
+# FIXBATCH-7 (spec S2.6 DRIVER AMENDMENT, 2026-09-23) -- writer_id() is
+# lazy-cached PER PID, not frozen at module load: a forked child mints its
+# own writer_id() the first time it calls it post-fork, distinct from the
+# parent's.
+# =============================================================================
+{
+    my ($root, $store, $err) = open_test_store();
+    ok(defined $store, 'FIXBATCH-7 fixture: store handle opens') or diag("error: $err");
+
+    my $parent_wid = eval { Almanac::Store::writer_id() };
+    ok(defined $parent_wid, 'FIXBATCH-7 fixture: the parent process has a writer_id') or diag('error: ' . ($@ // ''));
+
+    my $WORKDIR = tempdir(CLEANUP => 1);
+    $WORKDIR =~ s{\\}{/}g;
+    my $outfile = "$WORKDIR/child-wid.txt";
+    my $child   = "$WORKDIR/fixbatch7-child.pl";
+    open(my $fh, '>', $child) or die "fixture: cannot write $child: $!";
+    print {$fh} <<'FB7CHILD';
+#!/usr/bin/env perl
+use strict;
+use warnings;
+my ($scripts_dir, $outfile) = @ARGV;
+local @INC = ($scripts_dir, @INC);
+require Almanac::Store;
+open(my $of, '>', $outfile) or die $!;
+print {$of} Almanac::Store::writer_id() . "\n";
+close $of;
+FB7CHILD
+    close $fh;
+    system(qq{perl "$child" "$S" "$outfile"});
+    my $child_wid = slurp_text($outfile);
+    chomp($child_wid) if defined $child_wid;
+
+    ok(defined $child_wid && length $child_wid, 'FIXBATCH-7: a forked/spawned child process mints its own writer_id')
+        or diag('child output: ' . (defined $child_wid ? $child_wid : '(none)'));
+    ok(defined($parent_wid) && defined($child_wid) && $parent_wid ne $child_wid,
+       "FIXBATCH-7: the child's writer_id differs from the parent's (not frozen across a process boundary)")
+        or diag("parent=$parent_wid child=" . (defined $child_wid ? $child_wid : '(undef)'));
+
+    # And within ONE process (no fork/spawn), writer_id() is still stable
+    # across repeated calls -- the property S2.6 actually requires.
+    my $again = eval { Almanac::Store::writer_id() };
+    is($again, $parent_wid, 'FIXBATCH-7: writer_id() is still stable across repeated calls within one process');
 }
 
 # =============================================================================

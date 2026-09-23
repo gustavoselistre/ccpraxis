@@ -1,45 +1,41 @@
 #!/usr/bin/env perl
 # platform: windows
-# 137 — the w02 FOLD: gate-drive-loop.sh consults
-# bp-runstate.pl's effective 'paused' state as an ADDITIONAL escape from
-# BLOCK, on top of everything t/drive-loop-gate.t already pins.
+# 137 — the w02 FOLD, MIGRATED onto package 02's probe.
 #
-# Spec: .../specs/w02-dispatch-budget-and-interrupt-spec.md §2.1 (design),
-# §3 behaviors 9-12, §4 AC9, §5 (edge cases: unreadable/malformed runstate,
-# stale pause via dead pid, stale pause via elapsed deadline).
+# ORIGINALLY: gate-drive-loop.sh consulted bp-runstate.pl's effective 'paused'
+# state as an ADDITIONAL escape from BLOCK, on top of everything
+# t/drive-loop-gate.t already pins. Package 02 (butler-gate-ergonomics)
+# REPLACED that consultation everywhere with the pair (probe verdict, finish
+# marker) — D3 in that package's spec removed `bp-runstate.pl status` from
+# every one of its three call sites, this fold's included; the read is gone
+# and stays gone, and package 03 (retire-runstate) deletes the script itself,
+# leaving nothing here to still be reachable even in principle. This file migrates
+# 1:1 per 02-gates-use-the-probe-spec.md §4.8's own table: every existing I1-
+# I9 assertion is re-pointed to the probe fixture that reproduces its original
+# intent, and I5 ("malformed run-state still BLOCKS") is the one AUTHORISED
+# RETIREMENT — inverted by Decision 3 ("cannot-tell ALLOWS"), replaced by
+# AC3/AC5 below asserting the opposite direction on the same class of input.
 #
-# THIS FILE DOES NOT TOUCH t/drive-loop-gate.t. Section H there
-# (:274-322) pins the hard constraint this fold must survive: 'in-flight'
-# + nothing scheduled must still BLOCK. That file is read-only ground
-# truth here, not duplicated — this file adds a NEW, clearly-labeled
-# section ("I") on an otherwise-identical fixture, per spec §2.1's own
-# instruction not to add the runstate fixture into H's existing block (so
-# "H is untouched" stays independently verifiable by diff).
+# THIS FILE STILL DOES NOT TOUCH t/drive-loop-gate.t. Section H there pins
+# the hard constraint this fold must survive: an in-flight package + nothing
+# scheduled must still BLOCK. That file is read-only ground truth here.
 #
-# Fixture helpers below are a DELIBERATE, LIGHT adaptation of t/94's own
-# new_project/project_with_package/run_hook — not an import (t/94 has no
-# exported library), reproduced here so this file is self-contained and a
-# change to t/94's internals cannot silently break this file's fixtures
-# without the diff being visible in THIS file's own history.
+# Fixture helpers are a DELIBERATE, LIGHT adaptation of t/94's own
+# new_project/project_with_package/run_hook, reproduced here so this file
+# stays self-contained.
 #
-# NON-VACUITY, spelled out per behavior (see also inline comments):
-#   - Behavior 9 (H1-shape, no run-state.json at all) currently ALSO passes
-#     with NO fold present — it is the "fold is inert against H's fixture"
-#     proof, not a red-before-green assertion. It is still load-bearing:
-#     the plausible WRONG implementation ("in-flight -> allow, unconditionally")
-#     would flip this to rc==0 and fail it.
-#   - Behavior 10 (verified live pause) is the ONE assertion that is RED
-#     today (current gate-drive-loop.sh never reads bp-runstate.pl at all,
-#     so this fixture BLOCKS exactly like H1) and must turn GREEN once the
-#     fold lands. This is the "MUST NOW PASS" acceptance case named in the
-#     dispatch prompt.
-#   - Behaviors 11/12 (stale pause: dead deadline, dead pid) also currently
-#     pass VACUOUSLY pre-fold (today's gate blocks everything in-flight,
-#     coincidentally including these). They stop being vacuous the moment a
-#     fold exists: a fold implemented as a blanket "in-flight -> allow"
-#     (the plausible WRONG shape) would flip BOTH to rc==0 and fail them.
-#     They are the guard-rail against exactly that wrong implementation,
-#     not a currently-red assertion — recorded honestly, not disguised.
+# NON-VACUITY, per migrated behavior:
+#   - I1 (H1-shape, probe NONE, no marker) still passes with the CURRENT,
+#     unmigrated gate too — it is the "fold is inert against H's own fixture"
+#     proof, not a red-before-green assertion on its own.
+#   - I2 (probe LIVE) is the assertion that is RED today: the current
+#     gate-drive-loop.sh never reads the probe at all, so this fixture BLOCKS
+#     exactly like I1 currently. It must turn GREEN once package 02 lands.
+#   - I3/I4/I6/I7/I8/I9 (expired watcher, unarmed process, missing --arm,
+#     genuinely non-live) largely pass coincidentally against the CURRENT gate
+#     too (which blocks everything in-flight regardless of the probe) — they
+#     are the guard-rail against a WRONG implementation ("in-flight -> allow
+#     unconditionally"), not a currently-red assertion on their own.
 #
 # Runs standalone: perl this file
 use strict;
@@ -57,9 +53,11 @@ use File::Temp qw(tempdir);
 use File::Path qw(make_path);
 use File::Basename qw(dirname);
 
-my $HOOKS   = "$Bin/../../hooks";
-my $GATE    = "$HOOKS/gate-drive-loop.sh";
-my $RUNSTATE = "$Bin/../../scripts/bp-runstate.pl";
+my $HOOKS    = "$Bin/../../hooks";
+my $GATE     = "$HOOKS/gate-drive-loop.sh";
+# The dangling `my $RUNSTATE = ".../bp-runstate.pl";` with no remaining use
+# is DROPPED here (package 03-retire-runstate, spec §2.9's entry for this
+# file) -- nothing below ever referenced it even before this package.
 
 ok(-f $GATE, 'A0: gate-drive-loop.sh exists (sanity — this file assumes it, per spec §2.1: '
            . 'the fold is additive to an EXISTING file, never a new one)');
@@ -90,6 +88,9 @@ sub run_hook {
     my $env = '';
     $env .= "CCPRAXIS_USAGE_VERDICT_JSON='{\"action\":\"ok\"}' " if $opt{verdict_ok};
     $env .= "CCPRAXIS_DRIVE_ACTIVE_DIR='$ACTIVE' " if length $ACTIVE;
+    $env .= "BP_PROBE_PROC_DIR='$opt{probe_dir}' "      if defined $opt{probe_dir};
+    $env .= "BP_PROBE_SELF_PID='$opt{probe_self_pid}' " if defined $opt{probe_self_pid};
+    $env .= "BP_PROBE_CLK_TCK=100 "                      if defined $opt{probe_dir};
     my $out = `$env bash "$script" <<'PAYLOAD_EOF' 2>&1
 $payload
 PAYLOAD_EOF`;
@@ -99,8 +100,7 @@ PAYLOAD_EOF`;
 sub payload_stop { my $cwd = shift; qq({"session_id":"$SESSION","cwd":"$cwd"}) }
 
 # project_with_package — DELIBERATELY BYTE-FOR-BYTE the same shape as t/94's
-# own fixture (director answers 'in-flight' for a 'running' package, no
-# .subagent-guard/run-state.json at all unless a caller adds one).
+# own fixture (director answers 'in-flight' for a 'running' package).
 sub project_with_package {
     my (%opt) = @_;
     my ($root, $ds) = new_project(order => 1);
@@ -115,183 +115,205 @@ sub project_with_package {
     return ($root, $ds);
 }
 
-sub runstate_path {
-    my ($root) = @_;
-    return "$root/.ccpraxis-local-data/.subagent-guard/run-state.json";
-}
-
-sub write_runstate {
-    my ($root, $json_text) = @_;
-    my $p = runstate_path($root);
-    make_path(dirname($p));
-    open my $fh, '>', $p or die "write run-state.json: $!";
-    print {$fh} $json_text;
+# ---------------------------------------------------------------------------
+# PACKAGE 02 fixture helpers — the probe (Signal A), duplicated locally per
+# spec 02-gates-use-the-probe-spec.md §2.1.
+# ---------------------------------------------------------------------------
+sub _pw_cmdline {
+    my ($procdir, $pid, @argv) = @_;
+    make_path("$procdir/$pid");
+    open my $fh, '>', "$procdir/$pid/cmdline" or die "write cmdline($pid): $!";
+    binmode $fh;
+    print {$fh} join("\0", @argv) . "\0";
     close $fh;
 }
-
-# ===========================================================================
-# I1 (behavior 9). EXACT COPY of t/94's H1 fixture — no run-state.json at
-# all. Proves the fold is inert against H's own fixture BY CONSTRUCTION:
-# bp-runstate.pl status against a project with no .subagent-guard/run-
-# state.json returns 'inert', not 'paused', so the fold's new case-arm
-# matches nothing and execution falls through to the unchanged BLOCK.
-# ===========================================================================
-{
-    my ($root) = project_with_package(status => 'running');
-    my ($rc, $out) = run_hook($GATE, payload_stop($root), verdict_ok => 1);
-    is($rc, 2, 'I1 (behavior 9): H1-shape fixture (in-flight, NO run-state.json at all) still '
-             . 'BLOCKS — the fold adds nothing here. A "blanket in-flight -> allow" wrong '
-             . 'implementation would flip this to 0 and fail it.');
-    like($out, qr/in-flight/, 'I1: block still names the in-flight action');
+sub _pw_stat {
+    my ($procdir, $pid, $ticks) = @_;
+    make_path("$procdir/$pid");
+    open my $fh, '>', "$procdir/$pid/stat" or die "write stat($pid): $!";
+    print {$fh} "$pid (perl) S 1 " . join(' ', (0) x 17) . " $ticks\n";
+    close $fh;
+}
+sub proc_dir_none { return tempdir(CLEANUP => 1) }
+sub proc_dir_cannot_tell {
+    my $r = tempdir(CLEANUP => 1);
+    my $f = "$r/not-a-directory-file";
+    open my $fh, '>', $f or die $!; print {$fh} 'x'; close $fh;
+    return $f;
+}
+sub proc_dir_live {
+    my ($data_dir, %opt) = @_;
+    my $procdir  = tempdir(CLEANUP => 1);
+    my $self_pid = 900001;
+    my $pid      = 900002;
+    my $ticks    = 1_000_000;
+    _pw_stat($procdir, $self_pid, $ticks);
+    _pw_cmdline($procdir, $pid, 'bp-watch.pl', '--arm', '--max-seconds',
+                ($opt{max_seconds} // 9999), '--data', $data_dir);
+    _pw_stat($procdir, $pid, $ticks);
+    return ($procdir, $self_pid);
+}
+sub proc_dir_expired {
+    my ($data_dir) = @_;
+    my $procdir  = tempdir(CLEANUP => 1);
+    my $self_pid = 900001;
+    my $pid      = 900002;
+    _pw_stat($procdir, $self_pid, 1_000_300);
+    _pw_cmdline($procdir, $pid, 'bp-watch.pl', '--arm', '--max-seconds', 2, '--data', $data_dir);
+    _pw_stat($procdir, $pid, 1_000_000);
+    return ($procdir, $self_pid);
+}
+sub proc_dir_unarmed_worker {                    # a live process, not an armed watcher
+    my ($data_dir) = @_;
+    my $procdir = tempdir(CLEANUP => 1);
+    _pw_cmdline($procdir, 900003, 'perl', 'plugins/butler/scripts/bp-drive-next.pl', 'next');
+    return $procdir;
+}
+sub proc_dir_unarmed_bp_watch {                  # bp-watch.pl present but NO --arm
+    my ($data_dir) = @_;
+    my $procdir = tempdir(CLEANUP => 1);
+    _pw_cmdline($procdir, 900004, 'bp-watch.pl', '--data', $data_dir);
+    return $procdir;
 }
 
 # ===========================================================================
-# I2 (behavior 10) — THE ACCEPTANCE CASE. Same director answer as I1
-# ('in-flight'), but bp-runstate.pl now reports a VERIFIED live pause: a
-# real pid (this test process's own $$, guaranteed alive for the duration
-# of this call) and a deadline in the future. THIS is the exact shape that
-# has blocked the driver all session: a WAITING turn, .wakeup-pending
-# already consumed, director says in-flight, bp-runstate says paused with a
-# live watcher and a future deadline. Today (pre-fold) this BLOCKS (rc==2,
-# identical to I1) — that is the RED this file exists to turn GREEN.
-#
-# fixbatch step7 / HIGH-2: the record is now established through the REAL
-# `pause` verb rather than hand-written JSON. bp-runstate.pl's identity fix
-# (a fingerprint captured at pause time and re-verified on every read, see
-# bp-runstate.pl::pid_fingerprint) means a bare `{state, watcher_pid,
-# until}` triple with no fingerprint is no longer sufficient to verify a
-# pause — by design, that is exactly the shape the HIGH-2 exploit crafted by
-# hand. Going through the real CLI is what a genuine watcher does, and is
-# the only way to produce a record this fold will now actually honor.
+# I1 (behavior 9, MIGRATED per §4.8: "I1 (in-flight, no run-state -> BLOCK)
+# becomes probe 1, no marker -> DENY"). Same fixture as t/94's H1, probe
+# forced to NONE, no finish marker.
 # ===========================================================================
 {
     my ($root) = project_with_package(status => 'running');
-    my $until = time() + 300;
-    my $rc_pause = system(qq{perl "$RUNSTATE" pause --watcher-pid $$ --until $until }
-                         . qq{--root "$root" >/dev/null 2>&1});
-    is($rc_pause, 0, 'I2 setup: a real `pause --watcher-pid $$` call succeeds against this '
-                    . 'test process\'s own live pid');
-    my ($rc, $out) = run_hook($GATE, payload_stop($root), verdict_ok => 1);
-    is($rc, 0, 'I2 CANONICAL (behavior 10 / AC9 acceptance case): in-flight + a VERIFIED live '
-             . 'pause (live pid, future deadline, genuine fingerprint) ALLOWS the stop — same '
-             . 'director answer as I1, only the runstate differs. This is the exact turn shape '
-             . 'that has blocked this driver session repeatedly; it must stop blocking once the '
-             . 'fold lands.');
+    my ($rc, $out) = run_hook($GATE, payload_stop($root), verdict_ok => 1,
+                               probe_dir => proc_dir_none());
+    is($rc, 2, 'I1 (migrated, behavior 9): H1-shape fixture, probe NONE, no finish marker, '
+             . 'still BLOCKS');
+    like($out, qr/BLOCKED \(butler drive-loop\)/,
+         'I1b (migrated): the block carries the new (butler drive-loop) header, not the '
+       . 'removed director\'s "in-flight" vocabulary');
 }
 
 # ===========================================================================
-# I8 (fixbatch step7 / HIGH-2 regression) — the red-team's literal
-# reproduction: a run-state.json hand-crafted with a LIVE, but completely
-# UNRELATED, process's pid (this test's own $$ stands in for "some live
-# process the attacker does not control the meaning of") and no fingerprint
-# at all. Before the HIGH-2 fix this ALLOWED the stop with nothing actually
-# watching — the worst outcome this package can produce. It must now BLOCK:
-# a bare pid, alive or not, is no longer sufficient without the identity
-# bp-runstate.pl::pause alone can attach.
+# I2 (behavior 10, MIGRATED per §4.8: "I2 (verified live pause -> ALLOW)
+# becomes probe 0 -> ALLOW"). THE ACCEPTANCE CASE — must turn GREEN once
+# package 02 lands.
 # ===========================================================================
 {
-    my ($root) = project_with_package(status => 'running');
-    my $until = time() + 300;
-    write_runstate($root, qq({"state":"paused","watcher_pid":$$,"until":$until}));
-    my ($rc, $out) = run_hook($GATE, payload_stop($root), verdict_ok => 1);
-    is($rc, 2, 'I8 (HIGH-2 regression): a hand-crafted "paused" record with a live pid but NO '
-             . 'watcher_fingerprint — the exact shape an attacker (or a recycled pid) produces '
-             . '— still BLOCKS. Liveness alone is no longer proof of identity.');
+    my ($root, $ds) = project_with_package(status => 'running');
+    my ($procdir, $self_pid) = proc_dir_live("$root/.ccpraxis-local-data");
+    ok(-d $procdir, 'I2 setup: the fixture\'s synthetic armed-watcher /proc entry is built');
+    my ($rc, $out) = run_hook($GATE, payload_stop($root), verdict_ok => 1,
+                               probe_dir => $procdir, probe_self_pid => $self_pid);
+    is($rc, 0, 'I2 CANONICAL (migrated, behavior 10): in-flight + probe LIVE (0) ALLOWS the '
+             . 'stop — same director-irrelevant fixture as I1, only the probe differs. This '
+             . 'must stop blocking once package 02 lands.');
 }
 
 # ===========================================================================
-# I9 (fixbatch step7 / HIGH-2 regression) — a record with a live pid AND a
-# fingerprint field, but one that does not match what pid_fingerprint($$)
-# actually computes right now (a forged/stale value). Must BLOCK exactly
-# like I8 — the fingerprint is re-verified on every read, not merely
-# required to be present.
+# I8/I9 (MIGRATED per §4.8, both collapse onto the same replacement: "a live
+# process that is not an armed bp-watch.pl -> DENY (= AC12)"). The
+# fingerprint-forgery attack this pair used to pin no longer has any surface
+# to attack: there is no run-state.json record left to forge at all.
 # ===========================================================================
 {
     my ($root) = project_with_package(status => 'running');
-    my $until = time() + 300;
-    write_runstate($root, qq({"state":"paused","watcher_pid":$$,)
-                           . qq("watcher_fingerprint":"forged:not-a-real-value",)
-                           . qq("until":$until}));
-    my ($rc, $out) = run_hook($GATE, payload_stop($root), verdict_ok => 1);
-    is($rc, 2, 'I9 (HIGH-2 regression): a live pid with a FORGED/mismatched watcher_fingerprint '
-             . 'still BLOCKS — the fingerprint is re-verified against the live process, not '
-             . 'just checked for presence.');
+    my ($rc, $out) = run_hook($GATE, payload_stop($root), verdict_ok => 1,
+                               probe_dir => proc_dir_unarmed_worker("$root/.ccpraxis-local-data"));
+    is($rc, 2, 'I8/I9 (migrated, = AC12): a live process that is NOT an armed bp-watch.pl '
+             . 'watcher still BLOCKS -- liveness alone (a bare pid, forgeable identity) is '
+             . 'no longer even a candidate signal; only --arm on the cmdline is');
 }
 
 # ===========================================================================
-# I3 (behavior 11) — a pause whose DEADLINE has passed is STALE.
-# bp-runstate.pl::effective reverts a stale pause to 'active' before the
-# fold ever sees it (the fold performs no bound-checking of its own — it
-# only reads the already-verified answer). Must still BLOCK.
+# I3 (behavior 11, MIGRATED per §4.8: "I3 (deadline passed -> BLOCK) becomes
+# expired-budget watcher -> DENY (= AC14)").
 # ===========================================================================
 {
     my ($root) = project_with_package(status => 'running');
-    my $past = time() - 100;
-    write_runstate($root, qq({"state":"paused","watcher_pid":$$,"until":$past}));
-    my ($rc, $out) = run_hook($GATE, payload_stop($root), verdict_ok => 1);
-    is($rc, 2, 'I3 (behavior 11): in-flight + a pause whose "until" has ALREADY PASSED still '
-             . 'BLOCKS — a stale deadline is not a confirmed watcher, and the fold must not '
-             . 'do its own bound-checking to rescue it.');
+    my ($procdir, $self_pid) = proc_dir_expired("$root/.ccpraxis-local-data");
+    my ($rc, $out) = run_hook($GATE, payload_stop($root), verdict_ok => 1,
+                               probe_dir => $procdir, probe_self_pid => $self_pid);
+    is($rc, 2, 'I3 (migrated, behavior 11 / AC14): a watcher whose --max-seconds budget has '
+             . 'already elapsed still BLOCKS');
 }
 
 # ===========================================================================
-# I4 (behavior 12) — a pause whose watcher_pid is NOT RUNNING is stale by
-# the other axis. Same reasoning as I3, different failure mode.
+# I4 (behavior 12, MIGRATED per §4.8: "I4 (watcher pid not running -> BLOCK)
+# becomes exited watcher -> DENY (= AC13)"). An exited watcher is simply
+# ABSENT from /proc -- the same fixture as "no watcher at all".
 # ===========================================================================
 {
     my ($root) = project_with_package(status => 'running');
-    my $future = time() + 300;
-    # A pid astronomically unlikely to be alive on any real system, per the
-    # spec's own suggested fixture shape (§3 behavior 12).
-    write_runstate($root, qq({"state":"paused","watcher_pid":99999999,"until":$future}));
-    my ($rc, $out) = run_hook($GATE, payload_stop($root), verdict_ok => 1);
-    is($rc, 2, 'I4 (behavior 12): in-flight + a pause whose watcher_pid is NOT running still '
-             . 'BLOCKS — "a watcher process exists" is not the claim; "THIS specific pid, '
-             . 'recorded at pause time, is alive right now" is, and it is not.');
+    my ($rc, $out) = run_hook($GATE, payload_stop($root), verdict_ok => 1,
+                               probe_dir => proc_dir_none());
+    is($rc, 2, 'I4 (migrated, behavior 12 / AC13): a watcher that has already exited (absent '
+             . 'from /proc) still BLOCKS -- "a watcher process exists" is not the claim; '
+             . '"one is alive right now" is, and it is not');
 }
 
 # ===========================================================================
-# I5 (edge case, spec §5) — a run-state.json that is malformed JSON. The
-# fold's own status call fails; RST stays empty/unparseable; the case
-# matches nothing; execution falls through to the UNCHANGED BLOCK path.
-# The safe direction: an error in the NEW check must never silently grant
-# the escape it did not earn.
+# I5 (edge case, spec §5) — RETIRED (§4.8's own authorised table): "malformed
+# run-state.json still BLOCKS" is a DIRECT INVERSION of Decision 3
+# ("cannot-tell ALLOWS"). Replaced below by the equivalent malformed-input
+# fixtures for the PROBE (a not-a-directory BP_PROBE_PROC_DIR, and a
+# malformed BP_PROBE_CLK_TCK) — both ALLOW now, the opposite direction on the
+# same class of input.
 # ===========================================================================
 {
     my ($root) = project_with_package(status => 'running');
-    write_runstate($root, '{not valid json at all');
-    my ($rc, $out) = run_hook($GATE, payload_stop($root), verdict_ok => 1);
-    is($rc, 2, 'I5 (edge case): malformed run-state.json still BLOCKS — an unreadable '
-             . 'answer from the new check must fail closed, not fail open into an allow');
+    my ($rc, $out) = run_hook($GATE, payload_stop($root), verdict_ok => 1,
+                               probe_dir => proc_dir_cannot_tell());
+    is($rc, 0, 'I5 REPLACEMENT (= AC3/AC5, Decision 3 inversion): a probe that CANNOT resolve '
+             . '(BP_PROBE_PROC_DIR pointed at a non-directory) now ALLOWS the stop -- the '
+             . 'opposite of the retired "malformed input still BLOCKS" claim, by design');
+    like($out, qr/(?i:cannot.?tell|indeterminate|fail.?open)/,
+         'I5b REPLACEMENT: ...and stderr names the verdict as indeterminate, not silent');
+}
+{
+    # ORACLE EDIT (authorized 2026-09-22, package 02-gates-use-the-probe step
+    # 4/5): proc_dir_none() has ZERO candidates, and package 01's self_pid
+    # resolution is lazy -- it is only consulted when a real armed candidate
+    # needs it for age computation (bp-watch.pl behaviour 20). With no
+    # candidates present the probe never touches self_pid at all and
+    # legitimately, correctly returns NONE (1), not CANNOT-TELL (2) --
+    # verified directly against bp-watch.pl probe with this exact env.
+    # Reproducing "self reference cannot resolve" needs an actual candidate
+    # for the malformed self_pid to matter, so this fixture now uses
+    # proc_dir_live (one armed candidate, scoped to this project's DATA dir)
+    # with probe_self_pid overridden to a value that cannot resolve.
+    my ($root) = project_with_package(status => 'running');
+    my ($procdir) = proc_dir_live("$root/.ccpraxis-local-data");
+    my ($rc) = run_hook($GATE, payload_stop($root), verdict_ok => 1,
+                         probe_dir => $procdir, probe_self_pid => 'not-a-pid');
+    is($rc, 0, 'I5c REPLACEMENT (= AC5): a probe call whose fixture cannot resolve a self '
+             . 'reference also ALLOWS -- any code outside {0,1} is an ALLOW, no exceptions '
+             . 'list');
 }
 
 # ===========================================================================
-# I6 (edge case, spec §5) — a run-state.json claiming state:paused but
-# MISSING watcher_pid/until entirely. bp-runstate.pl::effective already
-# treats an incomplete pause record's liveness check as failing closed
-# (pid_alive(undef) is 0) — the fold inherits this for free by only ever
-# reading the already-validated effective state, never the raw record.
+# I6 (edge case, spec §5, MIGRATED per §4.8: "I6 (incomplete pause record ->
+# BLOCK) becomes bp-watch.pl with no --arm -> DENY"). is_armed_watcher
+# requires --arm on the candidate's own cmdline; its absence excludes the
+# candidate before any liveness classification even runs.
 # ===========================================================================
 {
     my ($root) = project_with_package(status => 'running');
-    write_runstate($root, '{"state":"paused"}');
-    my ($rc, $out) = run_hook($GATE, payload_stop($root), verdict_ok => 1);
-    is($rc, 2, 'I6 (edge case): a "paused" record with NO watcher_pid/until still BLOCKS — '
-             . 'an incomplete pause record fails closed, inherited from bp-runstate.pl '
-             . 'effective(), not reimplemented by the fold');
+    my ($rc, $out) = run_hook($GATE, payload_stop($root), verdict_ok => 1,
+                               probe_dir => proc_dir_unarmed_bp_watch("$root/.ccpraxis-local-data"));
+    is($rc, 2, 'I6 (migrated): a bp-watch.pl process present on this project\'s data dir but '
+             . 'WITHOUT --arm on its cmdline still BLOCKS -- an incomplete/unarmed candidate '
+             . 'is excluded, not counted');
 }
 
 # ===========================================================================
-# I7 — the counter-fixture check: a genuinely 'active' (not 'paused') run-
-# state must not accidentally satisfy the case arm either (belt-and-braces
-# against a regex that matches too loosely, e.g. matching "paused" as a
-# substring of something else).
+# I7 (MIGRATED per §4.8: "I7 (explicitly active -> BLOCK) becomes probe 1 ->
+# DENY"). The counter-fixture check: a probe verdict of NONE must not
+# accidentally satisfy the ALLOW case either.
 # ===========================================================================
 {
     my ($root) = project_with_package(status => 'running');
-    write_runstate($root, '{"state":"active","reason":"run in progress"}');
-    my ($rc, $out) = run_hook($GATE, payload_stop($root), verdict_ok => 1);
-    is($rc, 2, 'I7: an explicitly ACTIVE (not paused) run-state still BLOCKS');
+    my ($rc, $out) = run_hook($GATE, payload_stop($root), verdict_ok => 1,
+                               probe_dir => proc_dir_none());
+    is($rc, 2, 'I7 (migrated): probe explicitly NONE (1) still BLOCKS');
 }
 
 done_testing();

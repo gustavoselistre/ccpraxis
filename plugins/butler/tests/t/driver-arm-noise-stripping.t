@@ -221,6 +221,14 @@ sub scoped_hooks_dir_without_bplib {
          q{perl plugins/butler/scripts/bp-drive-next.pl record-order}],
         ['AC8g park subcommand',
          q{perl plugins/butler/scripts/bp-drive-next.pl park}],
+        # fix-batch B1 (red-team HIGH-1): the SAME invocation shapes, but via
+        # the on-PATH spellings package 04-bp-on-path put into circulation --
+        # the .sh shim, and the bare/extensionless alias (non-Windows
+        # installs). Before the fix these silently never armed at all.
+        ['AC8h .sh shim spelling',
+         q{bp-drive-next.sh next}],
+        ['AC8i bare/extensionless alias spelling',
+         q{bp-drive-next next}],
     );
     my $n = 0;
     for my $shape (@shapes) {

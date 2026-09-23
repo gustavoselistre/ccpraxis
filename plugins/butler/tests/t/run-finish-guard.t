@@ -140,6 +140,20 @@ sub live_drive_dir {
                           root => $root, transcript => $tr, drive_dir => $dd);
     is($rc2, 2, 'A2: disarm is blocked on the same terms -- both halves of the wind-down, not just one');
 
+    # fix-batch B1 (red-team HIGH-2): the SAME disarm, but via the .sh-shim
+    # and bare-alias spellings package 04-bp-on-path put on PATH, and the
+    # form gate-continuity.sh's own denial text recommends (`bp-continuity`,
+    # bare). Before the fix, the mandatory `\.(pl|sh)` extension in
+    # continuity_re silently let the bare form bypass this guard entirely.
+    my ($rc2sh) = run_guard(command => 'bp-continuity.sh disarm',
+                            root => $root, transcript => $tr, drive_dir => $dd);
+    is($rc2sh, 2, 'A2b: the .sh-spelled disarm is blocked identically to the .pl form');
+
+    my ($rc2bare) = run_guard(command => 'bp-continuity disarm',
+                              root => $root, transcript => $tr, drive_dir => $dd);
+    is($rc2bare, 2, 'A2c: the bare-spelled disarm is blocked identically to the .pl form '
+                   . '(this is the exact bypass HIGH-2 reported as already live on Linux)');
+
     # THE INCIDENT ITSELF: the last thing on the user ROLE is a task
     # notification. It must not read as an instruction.
     my ($rc3) = run_guard(command => 'perl plugins/butler/scripts/bp-runstate.pl finish --reason "tasks died"',
@@ -283,6 +297,61 @@ sub live_drive_dir {
                          transcript => $mk->('carry on', '[Request interrupted by user for tool use]'),
                          drive_dir => $dd);
     is($c6, 2, 'D6: skipping the notice reveals the REAL last message, it does not authorise');
+}
+
+# ===========================================================================
+# E. CROSSCUTTING-DEFECTS -- BLOCKER-2 (redteam-step6.md). `touch
+#    .../.run-finished` is an ORDINARY, unguarded Bash command that makes
+#    both Stop gates reading that marker return an unconditional allow --
+#    the same run-ending effect as `bp-runstate.pl finish`, but until this
+#    fix, this guard had zero references to `.run-finished` at all and
+#    never intercepted it. bp_rf_is_run_ending must now recognise a write to
+#    that path (touch/cp/mv/`>`) as run-ending, gated behind the SAME
+#    operator-authorisation transcript check as the other two patterns --
+#    no new authorisation mechanism.
+# ===========================================================================
+{
+    my $root = make_root('pending');
+    my $dd   = live_drive_dir();
+    my $marker = "$root/.ccpraxis-local-data/.drive-solo/.run-finished";
+
+    # (a) UNAUTHORISED: denied the same way an unauthorised `bp-runstate.pl
+    # finish` is denied.
+    my ($rc_a, $err_a) = run_guard(command => qq{touch "$marker"},
+                                   root => $root, transcript => make_transcript('continue with the sweep please'),
+                                   drive_dir => $dd);
+    is($rc_a, 2, 'E1a: an unauthorised touch of .../.run-finished is BLOCKED');
+    like($err_a, qr/BLOCKED \(butler run-finish guard\)/, 'E1a: ...and says which guard denied it');
+
+    # (b) AUTHORISED: the operator said "stop" in their own message ->
+    # allowed, matching this file's B4 fixture pattern.
+    my ($rc_b) = run_guard(command => qq{touch "$marker"},
+                           root => $root, transcript => make_transcript('stop'),
+                           drive_dir => $dd);
+    is($rc_b, 0, 'E1b: the SAME touch is ALLOWED once the operator has said stop');
+
+    # (c) COUNTER-FIXTURE: touch of an unrelated file is untouched by this
+    # change -- the fast pre-check and the verb-position regex must not
+    # over-match a bare `touch` of something else.
+    my ($rc_c) = run_guard(command => 'touch /tmp/some-other-file.txt',
+                           root => $root, transcript => make_transcript('continue with the sweep please'),
+                           drive_dir => $dd);
+    is($rc_c, 0, 'E1c: touch of an unrelated file is untouched -- narrow by design, same as B6');
+
+    # (d) a MENTION of .run-finished inside prose/a quoted multi-word value
+    # must not false-positive, mirroring the masking discipline already
+    # pinned for the other two patterns.
+    my ($rc_d) = run_guard(
+        command => 'perl plugins/butler/scripts/bp-continuity.pl ask --text "waiting on .run-finished from the operator"',
+        root => $root, transcript => make_transcript('continue with the sweep please'), drive_dir => $dd);
+    is($rc_d, 0, 'E1d: a MENTION of .run-finished inside a multi-word quoted --text value is not run-ending');
+
+    # (e) writing to the already-CONSUMED archive (.run-finished.consumed)
+    # must not be treated as creating a fresh marker.
+    my ($rc_e) = run_guard(command => qq{touch "$marker.consumed"},
+                           root => $root, transcript => make_transcript('continue with the sweep please'),
+                           drive_dir => $dd);
+    is($rc_e, 0, 'E1e: touch of the already-consumed archive file is untouched');
 }
 
 # ===========================================================================

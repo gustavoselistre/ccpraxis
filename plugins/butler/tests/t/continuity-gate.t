@@ -87,6 +87,7 @@ sub run_gate {
     $env .= "CCPRAXIS_CONTINUITY_STOP_OK=1 "                if $opt{stop_ok};
     $env .= "CCPRAXIS_CONTINUITY_TTL_H=$opt{ttl_h} "        if defined $opt{ttl_h};
     $env .= "BP_LEDGER='$opt{bp_ledger}' "                  if defined $opt{bp_ledger};
+    $env .= "CCPRAXIS_DRIVE_ACTIVE_DIR='$opt{ddir}' "       if defined $opt{ddir};
     my $out = `${env}bash "$GATE" <<'PAYLOAD_EOF' 2>&1
 $payload
 PAYLOAD_EOF`;
@@ -739,6 +740,80 @@ PROBE_EOF
     my %uniq = map { $_ => 1 } @spellings;
     cmp_ok(scalar(keys %uniq), '<=', 1,
        'R4: all three remedies are spelled with one consistent command form');
+}
+
+# ===========================================================================
+# S. CROSSCUTTING-DEFECTS -- MAJOR-6 (redteam-step6.md). An armed continuity
+#    session that is ALSO drive-solo-active: the operator's ONE touch of
+#    <drive-data>/.drive-solo/.run-finished is consumed by the OTHER two
+#    Stop hooks (guard-subagent-stall.sh, gate-drive-loop.sh -- neither in
+#    this write set), which allow their own Stop -- but this gate knew
+#    nothing about that marker and denied anyway, spending the operator's
+#    one-shot lever on a stop that never happened. Proves: an armed session
+#    with nothing scheduled, given a fresh .run-finished marker for its OWN
+#    drive-solo data dir, now ALLOWS instead of denying.
+# ===========================================================================
+{
+    my $root = new_project();
+    my $cdir = tempdir(CLEANUP => 1);
+    plant_marker($cdir, 'sess-s1');
+
+    # Outstanding work, so the idle-exit ("nothing outstanding -> allow")
+    # path is NOT what explains an allow here -- this test must fail before
+    # the fix and pass only because of the new .run-finished recognition.
+    my $bp = "$root/.ccpraxis-local-data/blueprints/demo";
+    make_path("$bp/packages");
+    make_path("$bp/runs");
+    open my $bh, '>', "$bp/blueprint.md" or die;
+    print {$bh} "# d\n\n```\nblueprint: demo\nstatus: audited\n```\n";
+    close $bh;
+    open my $ph, '>', "$bp/packages/01-a.md" or die;
+    print {$ph} "---\npackage: 01-a\nblueprint: demo\nstatus: pending\n---\n\n# 01-a\n";
+    close $ph;
+    open my $rh, '>', "$bp/runs/registry.json" or die;
+    print {$rh} JSON::PP->new->canonical->encode(
+        { packages => { seed => { attempt => 1, session_id => 'fixture-sid' } } });
+    close $rh;
+
+    # This SID's own drive-solo marker: <ddir>/sess-s1, first line names the
+    # data dir a real drive-solo run would have recorded (gate-drive-loop.sh's
+    # own convention, DATA=$(head -n 1 "$MARK")).
+    my $ddir  = tempdir(CLEANUP => 1);
+    my $ddata = tempdir(CLEANUP => 1);
+    make_path("$ddata/.drive-solo");
+    open my $dh, '>', "$ddir/sess-s1" or die "plant drive marker: $!";
+    print {$dh} "$ddata\n";
+    close $dh;
+
+    # The precondition this test exists to demonstrate: WITHOUT the marker,
+    # nothing scheduled and work outstanding -> BLOCKED.
+    my ($rc0, $out0) = run_gate(stop_payload($root, 'sess-s1'), cdir => $cdir, ddir => $ddir);
+    isnt($rc0, 0, 'S0 precondition: armed, nothing scheduled, work outstanding -> BLOCKED '
+                . '(unchanged by this fix -- establishes the fix is what changes the next case)');
+
+    # The operator's touch -- exactly what a real drive-solo run's operator
+    # lever writes.
+    open my $fh, '>', "$ddata/.drive-solo/.run-finished" or die "plant .run-finished: $!";
+    print {$fh} "\n";
+    close $fh;
+
+    my ($rc1, $out1) = run_gate(stop_payload($root, 'sess-s1'), cdir => $cdir, ddir => $ddir);
+    is($rc1, 0, 'S1 CANONICAL: the SAME armed/nothing-scheduled/work-outstanding session, given a '
+              . 'fresh .run-finished marker for its OWN drive-solo data dir, now ALLOWS the stop');
+    like($out1, qr/run-finished/, 'S1b: the allow explains itself by naming the marker');
+
+    # COUNTER-FIXTURE: a .run-finished marker belonging to a DIFFERENT
+    # session's drive-solo dir must not leak into this one.
+    plant_marker($cdir, 'sess-s2');
+    my $ddata2 = tempdir(CLEANUP => 1);
+    make_path("$ddata2/.drive-solo");
+    open my $dh2, '>', "$ddir/sess-s2" or die "plant drive marker 2: $!";
+    print {$dh2} "$ddata2\n";   # note: NO .run-finished written under $ddata2
+    close $dh2;
+    my ($rc2) = run_gate(stop_payload($root, 'sess-s2'), cdir => $cdir, ddir => $ddir);
+    isnt($rc2, 0, 'S2 COUNTER-FIXTURE: a session with its OWN drive-solo dir but no '
+                . '.run-finished marker in it is still BLOCKED -- the recognition is scoped to '
+                . 'THIS session\'s own marker, not any marker anywhere');
 }
 
 done_testing();

@@ -26,6 +26,7 @@
       "CLAUDE_CODE_NEW_INIT" : "1",
       "CLAUDE_CODE_NO_FLICKER" : "1",
       "CLAUDE_CODE_SCROLL_SPEED" : "3",
+      "CLAUDE_CODE_SEND_FEEDBACK" : "0",
       "DISABLE_AUTOUPDATER" : "1",
       "DISABLE_INSTALL_GITHUB_APP_COMMAND" : "1",
       "DISABLE_LOGIN_COMMAND" : "0",
@@ -42,6 +43,7 @@
          }
       }
    },
+   "feedbackDrafts" : "off",
    "hooks" : {
       "PostToolUse" : [
          {
@@ -63,7 +65,8 @@
    },
    "permissions" : {
       "deny" : [
-         "Read(~/.claude/projects/**/memory/**)"
+         "Read(~/.claude/projects/**/memory/**)",
+         "SendFeedback"
       ]
    },
    "promptSuggestionEnabled" : false,

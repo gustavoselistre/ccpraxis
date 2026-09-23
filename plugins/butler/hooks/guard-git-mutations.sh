@@ -126,7 +126,8 @@ git_scan_target() {
     return 0
   fi
   # 0. A backslash, a '#', or a heredoc marker ('<<') ANYWHERE in the command:
-  #    raw fallback.
+  #    raw fallback, EXCEPT for the two narrowly-characterised shapes named
+  #    under "WHAT IS NARROWED" below.
   #
   # The three-state walk below models bash QUOTING only. It has no notion of
   # three other contexts where bash does NOT treat a quote character as a
@@ -165,21 +166,88 @@ git_scan_target() {
   # in the command) is exactly that shape. A false positive (blocking
   # legitimate report-writing) is THIS hook's real defect to fix; a false
   # negative (a real mutation slipping through) must not be introduced --
-  # hence the carrier/shellword re-check below, and the backslash/'#' branch
-  # staying on the untouched raw fallback.
+  # hence the carrier/shellword re-check below, the comment-neutrality
+  # check in the heredoc branch, and the backslash branch admitting nothing
+  # but line continuations.
   #
-  # RESIDUAL LEFT UNFIXED, KNOWINGLY: the backslash/'#'-comment-adjacent raw
-  # fallback immediately below is UNCHANGED -- prose containing a literal
-  # backslash or '#' still forces a fully-raw scan, exactly as before this
-  # package. Only the heredoc-only ('<<', no backslash/'#') trigger gains a
-  # narrower, safer path.
-  case "$cmd" in
-    *'\'*|*'#'*)
-      RAW_KIND=escape
-      SCAN_OUT="$cmd"
-      return 0
-      ;;
-  esac
+  # WHAT IS NARROWED (bug 20260916-200412-3dd6, package 09) AND WHAT IS NOT.
+  #
+  # Two shapes no longer force the raw fallback. Each is admitted ONLY into a
+  # path that already models the context that shape lives in; neither makes
+  # the three-state walk any smarter, because that is what three earlier
+  # attempts did and each one introduced a false negative.
+  #
+  #   N1. EVERY backslash in the command is a LINE CONTINUATION (immediately
+  #       followed by a newline), and there is no '#' and no '<<'. Admitted to
+  #       the walk. A backslash escapes the character after it, and a NEWLINE
+  #       is never a quote delimiter, so it cannot flip the walk's quote
+  #       parity -- which is the whole of failure mode 1 above. Every
+  #       demonstrated escape shape (\" , \' , $'...') puts a backslash before
+  #       a QUOTE, fails this predicate, and still takes the raw fallback.
+  #       Note the size of the change: with no quoted span in the command the
+  #       walk's output is byte-identical to the raw string, so the ONLY
+  #       delta is that quoted spans are masked -- exactly as they already
+  #       are for a backslash-free command.
+  #
+  #   N2. The command contains a '#' AND a heredoc marker, and EVERY heredoc
+  #       delimiter is quoted. Admitted to the heredoc branch below -- never
+  #       to the walk, which still has no comment state and still never sees
+  #       a '#', so failure mode 2 stays structurally unreachable. Two guards
+  #       bound it. Quoted delimiters only, because bash EXPANDS an unquoted
+  #       heredoc body, so a $(...) in it executes and blanking the body
+  #       would hide live code. And a COMMENT-NEUTRALITY check: the stripper
+  #       models bash comments, but its comment state eats the newline that
+  #       would have started a heredoc body, parsing the body late and, in a
+  #       constructible shape, blanking a REAL trailing mutation. So strip
+  #       twice -- as given, and with every '#' neutralised -- and require
+  #       both to blank the same positions. If they agree, the inert/live
+  #       partition is the one the already-accepted '#'-free path produces.
+  #
+  # RESIDUAL LEFT UNFIXED, KNOWINGLY, after that narrowing:
+  #   - a backslash that is NOT a line continuation still forces the fully-raw
+  #     scan anywhere it appears, so prose carrying a Windows path or an
+  #     escaped quote can still be blocked for merely NAMING a forbidden verb;
+  #   - a '#' in a command with no heredoc still forces it, unchanged;
+  #   - a heredoc command that also contains a REAL bash comment fails the
+  #     comment-neutrality check and takes the raw fallback, WHENEVER the
+  #     stripper's heredoc parse agrees with bash's own (G2 is a relative
+  #     check: it proves the '#' changed nothing RELATIVE TO the '#'-free
+  #     parse, not that the '#'-free parse itself is correct);
+  #   - an unquoted heredoc delimiter plus a '#' still forces it;
+  #   - a line continuation sitting BETWEEN 'git' and its subcommand
+  #     (git \<newline>stash) is not matched by the anchor regexes at the
+  #     bottom of this file, and is ALLOWED. That is UNCHANGED by this
+  #     package -- the pre-existing raw scan did not match it either -- and it
+  #     sits inside the ACCIDENT threat model recorded above: it is not a
+  #     shape ordinary prose or ordinary quoting produces by accident.
+  local has_bs=0 has_hash=0 has_hd=0 bs_probe hd_alt
+  case "$cmd" in *'\'*)  has_bs=1   ;; esac
+  case "$cmd" in *'#'*)  has_hash=1 ;; esac
+  case "$cmd" in *'<<'*) has_hd=1   ;; esac
+
+  if [ "$has_bs" = 1 ]; then
+    # N1. A backslash is admitted to the walk ONLY when every one of them is a
+    # line continuation, and only when nothing else on this list is present.
+    if [ "$has_hash" = 1 ] || [ "$has_hd" = 1 ]; then
+      RAW_KIND=escape; SCAN_OUT="$cmd"; return 0
+    fi
+    bs_probe=${cmd//\\$'\n'/}          # delete every backslash+newline PAIR
+    case "$bs_probe" in
+      *'\'*) RAW_KIND=escape; SCAN_OUT="$cmd"; return 0 ;;
+    esac
+    # every backslash is a line continuation -> fall through to the walk
+  elif [ "$has_hash" = 1 ]; then
+    # N2. A '#' is admitted ONLY to the heredoc branch below, never to the walk.
+    if [ "$has_hd" != 1 ]; then
+      RAW_KIND=escape; SCAN_OUT="$cmd"; return 0
+    fi
+    # G1: every heredoc delimiter must be QUOTED. With an unquoted delimiter
+    # bash expands the body, so blanking it would hide live code.
+    if printf '%s' "$cmd" | grep -Eq "<<-?[[:space:]]*([^'\"]|$)"; then
+      RAW_KIND=escape; SCAN_OUT="$cmd"; return 0
+    fi
+    # falls through to the heredoc branch, which carries G2 (2.4)
+  fi
 
   # Heredoc marker present, and NEITHER a backslash NOR a '#' (those stay on
   # the raw fallback above, untouched): this is the ONE case
@@ -223,7 +291,7 @@ git_scan_target() {
           return 0
           ;;
       esac
-      if printf '%s' "$cmd" | grep -Eq "<<-?[[:space:]]*['\"]?[A-Za-z0-9_]*[^A-Za-z0-9_'\"[:space:]]"; then
+      if printf '%s' "$cmd" | grep -Eq "<<-?[[:space:]]*([^A-Za-z0-9_'\"[:space:]]|'[A-Za-z0-9_]*[^A-Za-z0-9_']|\"[A-Za-z0-9_]*[^A-Za-z0-9_\"]|[A-Za-z0-9_]*[^A-Za-z0-9_'\"[:space:]])"; then
         RAW_KIND=escape
         SCAN_OUT="$cmd"
         return 0
@@ -240,6 +308,19 @@ git_scan_target() {
         SCAN_OUT="$cmd"
         return 0
       fi
+      if [ "$has_hash" = 1 ]; then
+        # A '#' can desync the stripper's heredoc tracking: its comment state
+        # consumes the newline that would have started the body (bp-lib.sh:252
+        # vs :295), so the body is parsed late and a real trailing mutation can
+        # be blanked. Strip twice -- as given, and with every '#' neutralised --
+        # and require the two results to blank exactly the same positions. If a
+        # '#' changed what the stripper treats as inert, take the raw fallback.
+        hd_alt=$(printf '%s' "${cmd//'#'/q}" | bp_strip_shell_noise)
+        if [ -z "$hd_alt" ] \
+           || [ "${HD_STRIPPED//[! ]/x}" != "${hd_alt//[! ]/x}" ]; then
+          RAW_KIND=escape; SCAN_OUT="$cmd"; return 0
+        fi
+      fi
       # Re-run git_scan_target's OWN carrier / shellword checks -- unmodified
       # regex text, new input -- before trusting the stripped text. Both must
       # still escalate to fully raw, exactly as the main walk already does
@@ -253,7 +334,7 @@ git_scan_target() {
         SCAN_OUT="$cmd"
         return 0
       fi
-      if printf '%s' "$HD_STRIPPED" | grep -Eq '(^|[;&|[:space:]])(bash|sh|zsh|ksh|dash|eval|xargs)([[:space:]]|$)'; then
+      if printf '%s' "$HD_STRIPPED" | grep -Eq '(^|[;&|[:space:]])(bash|sh|zsh|ksh|dash|eval|xargs)([[:space:]]|$)|(^|[;&|[:space:]])(perl|ruby|node)[[:space:]]+-e([[:space:]]|$)|(^|[;&|[:space:]])(python|python3)[[:space:]]+-c([[:space:]]|$)'; then
         RAW_KIND=shellword
         SCAN_OUT="$cmd"
         return 0
@@ -362,7 +443,7 @@ git_scan_target() {
   #    precisely so the same words appearing INSIDE someone's quoted prose do
   #    not trigger this): it re-interprets its own quoted argument as code, so
   #    e.g. `bash -c "git stash"` must still be denied. Raw fallback.
-  if printf '%s' "$out" | grep -Eq '(^|[;&|[:space:]])(bash|sh|zsh|ksh|dash|eval|xargs)([[:space:]]|$)'; then
+  if printf '%s' "${out//\\$'\n'/}" | grep -Eq '(^|[;&|[:space:]])(bash|sh|zsh|ksh|dash|eval|xargs)([[:space:]]|$)|(^|[;&|[:space:]])(perl|ruby|node)[[:space:]]+-e([[:space:]]|$)|(^|[;&|[:space:]])(python|python3)[[:space:]]+-c([[:space:]]|$)'; then
     RAW_KIND=shellword
     SCAN_OUT="$cmd"
     return 0

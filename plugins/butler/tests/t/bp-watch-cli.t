@@ -112,8 +112,24 @@ sub new_bp {
 {
     require "$Bin/../../scripts/bp-watch.pl";
     is(main::DEFAULT_MAX_SECONDS(), 2900,
-       'A1d: DEFAULT_MAX_SECONDS is exactly 2900s — matches BpRunState::pause\'s own 50-minute '
-     . 'cap (3000s) minus headroom for the round trip, not an independently-chosen number');
+       'A1d REWORDED (package 03-retire-runstate, spec §1\'s resolutions/§5.1): '
+     . 'DEFAULT_MAX_SECONDS is exactly 2900s — a DELIBERATE LITERAL (PROBE_DEFAULT_MAX_SECONDS), '
+     . 'carrying the provider\'s one-hour prompt-cache TTL minus ~10 minutes of round-trip '
+     . 'headroom as its reasoning, with NO runtime dependency on bp-runstate.pl (moot as a pause '
+     . 'cap once no bounded-wait declaration outlives a turn -- this constant is what bounds the '
+     . 'watcher that replaced the pause)');
+
+    # A1e NEW (-> B4/AC-5): resolving the default performs no require of a
+    # deleted file. %INC is the externally-observable proof: if
+    # DEFAULT_MAX_SECONDS() reached into bp-runstate.pl (directly or via a
+    # helper) to derive its number, calling it would register that file's
+    # path as a %INC key. It must not, regardless of whether the file still
+    # happens to exist on disk right now.
+    main::DEFAULT_MAX_SECONDS();
+    my @runstate_inc = grep { /bp-runstate\.pl$/ } keys %INC;
+    is(scalar(@runstate_inc), 0,
+       'A1e: calling DEFAULT_MAX_SECONDS() adds no bp-runstate.pl entry to %INC -- resolving '
+     . 'the 2900s default requires nothing from that file at runtime');
 }
 {
     my ($data, $bp, $bpname) = new_bp();

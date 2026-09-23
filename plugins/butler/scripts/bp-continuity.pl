@@ -55,6 +55,7 @@ use IO::Handle;
 use File::Path qw(make_path);
 use File::Basename qw(dirname);
 use File::Spec;
+use Cwd ();
 
 # The session-identity resolver. All of "which session am I" lives there, once,
 # for every consumer -- see BpSession.pm's header.
@@ -116,6 +117,14 @@ sub cmd_arm {
 
     my $dir = resolve_registry_dir_or_die();
     make_path($dir) unless -d $dir;
+
+    # SURFACE (AND CONSUME) A PRIOR ARM THAT NEVER BOUND, before anything else
+    # this call does -- see 13-arming-binds-or-says-so-spec.md SS2.4. The
+    # ledger's own words: the operator's false belief "was formed by the
+    # `on` command's own output", so the correction belongs at the next `on`
+    # / `arm`, not buried in a `status` nobody was told to run.
+    report_and_consume_prior_unbound($dir);
+
     my $since = iso_now();
 
     # ── explicit id: arm it directly ───────────────────────────────────────
@@ -200,6 +209,16 @@ sub cmd_arm {
     emit('NOTE', 'the arm binds to this session at the next turn boundary, when '
                . 'the Stop hook can confirm which session actually printed this '
                . 'nonce. Run `status` after that to see it bound.');
+    # THE OPERATOR-FACING HALF OF THE TTL-MISMATCH FIX (spec SS2.4). The
+    # binding window is now stated at the moment the arm is requested,
+    # instead of being a constant only bp-session.pl's claim knew about.
+    # Deliberately NOT lengthened or unified with the 12h marker TTL --
+    # see 13-arming-binds-or-says-so-spec.md SS1/SS5: a ticket whose nonce
+    # has not resolved across an hour of Stop events will not resolve
+    # later, so lengthening the window only lengthens the ungated gap.
+    my $ttl = ticket_ttl();
+    emit('TICKET_TTL_S', $ttl);
+    emit('BINDS_BY', strftime('%Y-%m-%dT%H:%M:%SZ', gmtime(time() + $ttl)));
 
     # THE LEASE IS TAKEN AT ARMING TIME, NOT AT BINDING TIME. The ticket does
     # not become a marker until the next Stop, and the turn in between can run
@@ -272,6 +291,16 @@ sub cmd_disarm {
         emit('ERROR',  "invalid session id: $sid");
         exit 1;
     }
+
+    # MEDIUM-3 (redteam)/S4 (review): a disarmed session must not go on
+    # reporting `unbound` for an arm it just deliberately cancelled --
+    # mirror what arm's own report_and_consume_prior_unbound already does:
+    # sweep everything past the 12h cutoff, then consume (unlink) whatever
+    # names THIS session specifically, regardless of age. Best-effort and
+    # unconditional: cannot fail this command, and it runs whether or not a
+    # primary marker exists below.
+    sweep_old_tombstones($dir);
+    consume_own_tombstones($dir, $sid);
 
     # An UNBOUND ticket is also an arm, and disarm has to reach it. Otherwise
     # "off" would report not_armed while a ticket sat waiting to bind at the
@@ -417,52 +446,145 @@ sub cmd_status {
         exit 1;
     }
 
+    # LOW-3: bound unbound/'s growth from status too, not only from arm --
+    # cheap (a readdir + stat on a directory that is empty in the common
+    # case) and this is the read path most likely to be run without anyone
+    # ever arming again.
+    sweep_old_tombstones($dir);
+
     unless (-f $mark) {
         # An arm that has not reached a turn boundary yet is not "unarmed" --
         # it is waiting for the Stop hook to confirm which session printed its
         # nonce. Saying "unarmed" here would look exactly like the failure this
-        # whole mechanism removes.
-        if (my $nonce = read_beacon($dir)) {
+        # whole mechanism removes. AND an arm whose ticket reached its binding
+        # deadline without ever being claimed is a THIRD state, distinct from
+        # both -- see 13-arming-binds-or-says-so-spec.md SS2.3. This decision
+        # tree never reads $confidence (done criterion 4): CONFIDENCE is
+        # reported alongside whichever STATUS the registry contents alone
+        # decide, never used to decide it.
+        my $nonce = read_beacon($dir);
+        # MEDIUM-1/MEDIUM-4 (redteam): a beacon value reaches this script with
+        # no shape check. It becomes a path below ($dir/pending/$nonce,
+        # $dir/unbound/$nonce) -- validate before either use, the same rule
+        # the gate already enforces on the write side.
+        undef $nonce if defined $nonce && !BpSession::valid_nonce($nonce);
+        my $ttl   = ticket_ttl();
+
+        if (defined $nonce && -f "$dir/pending/$nonce") {
             my $ticket = "$dir/pending/$nonce";
-            if (-f $ticket) {
-                emit('STATUS', 'arming');
-                emit('NONCE',  $nonce);
-                emit('NOTE', 'a ticket is waiting to bind at the next turn '
-                           . 'boundary; nothing is enforced until it does');
+            my $mtime  = (stat $ticket)[9] // time();
+            my $age    = time() - $mtime;
 
-                lease_report($dir);
+            # LOW-1 (redteam)/S2 (review): use ">" here, matching the only
+            # component that actually expires a ticket (bp-session.pl's
+            # claim, "(time() - $mtime) > $ttl"). Spec SS2.3 wrote ">=";
+            # this is a deliberate erratum -- at age == ttl, claim would
+            # still bind the ticket, so declaring it unbound here first
+            # (as ">=" did) was the wrong side of the only boundary that
+            # matters.
+            if ($age > $ttl) {
+                # The ticket reached its binding deadline and no Stop hook has
+                # run since to record a tombstone -- there may never be one.
+                # This is the "no gate run at all" path (behavior 8).
+                emit_unbound($sid, $confidence, $nonce, 'window_passed',
+                    strftime('%Y-%m-%dT%H:%M:%SZ', gmtime($mtime)));
+                return;
+            }
 
-                # AN ARM THAT NEVER BINDS MUST NOT LOOK LIKE ONE THAT HAS NOT
-                # BOUND YET. Binding needs the nonce to be findable in a
-                # transcript whose record names the session the Stop hook
-                # reports. Two known ways that never happens:
-                #
-                #   * `arm` ran inside a SUBAGENT. Its transcript is a separate
-                #     file under <session>/subagents/, and its records carry the
-                #     subagent's own id -- which is never the id any Stop hook
-                #     reports, so no gate can ever match it. Arming from a
-                #     subagent is meaningless: it has no Stop of its own that
-                #     gates the parent.
-                #   * the nonce turned out to be AMBIGUOUS (present in more than
-                #     one transcript), which resolves to nothing by design.
-                #
-                # Detecting the subagent case from an env var was considered and
-                # rejected: CLAUDE_CODE_CHILD_SESSION is set in ordinary
-                # top-level sessions on this machine (measured), so refusing on
-                # it would break arming exactly where it should work. Reporting
-                # the observable fact -- "this ticket has aged and still does not
-                # resolve" -- needs no such guess.
-                my $age = time() - ((stat $ticket)[9] // time());
-                if ($age >= 120 && !BpSession::session_for_nonce($nonce)) {
-                    emit('WARN', "this ticket has been pending ${age}s and its nonce still "
-                               . "resolves to no session, so it may never bind. Arming from "
-                               . "inside a subagent cannot bind (its transcript is its own, "
-                               . "and no Stop hook reports its id); an ambiguous nonce cannot "
-                               . "either. Disarm and re-arm from the main session.");
+            emit('STATUS', 'arming');
+            emit('NONCE',  $nonce);
+            emit('NOTE', 'a ticket is waiting to bind at the next turn '
+                       . 'boundary; nothing is enforced until it does');
+            emit('TICKET_TTL_S', $ttl);
+            emit('TICKET_AGE_S', $age);
+            emit('BINDS_BY', strftime('%Y-%m-%dT%H:%M:%SZ', gmtime($mtime + $ttl)));
+
+            lease_report($dir);
+
+            # AN ARM THAT NEVER BINDS MUST NOT LOOK LIKE ONE THAT HAS NOT
+            # BOUND YET. Binding needs the nonce to be findable in a
+            # transcript whose record names the session the Stop hook
+            # reports. Two known ways that never happens:
+            #
+            #   * `arm` ran inside a SUBAGENT. Its transcript is a separate
+            #     file under <session>/subagents/, and its records carry the
+            #     subagent's own id -- which is never the id any Stop hook
+            #     reports, so no gate can ever match it. Arming from a
+            #     subagent is meaningless: it has no Stop of its own that
+            #     gates the parent.
+            #   * the nonce turned out to be AMBIGUOUS (present in more than
+            #     one transcript), which resolves to nothing by design.
+            #
+            # Detecting the subagent case from an env var was considered and
+            # rejected: CLAUDE_CODE_CHILD_SESSION is set in ordinary
+            # top-level sessions on this machine (measured), so refusing on
+            # it would break arming exactly where it should work. Reporting
+            # the observable fact -- "this ticket has aged and still does not
+            # resolve" -- needs no such guess.
+            if ($age >= 120 && !BpSession::session_for_nonce($nonce)) {
+                emit('WARN', "this ticket has been pending ${age}s and its nonce still "
+                           . "resolves to no session, so it may never bind. Arming from "
+                           . "inside a subagent cannot bind (its transcript is its own, "
+                           . "and no Stop hook reports its id); an ambiguous nonce cannot "
+                           . "either. Disarm and re-arm from the main session.");
+            }
+            return;
+        }
+
+        if (defined $nonce && -f "$dir/unbound/$nonce") {
+            my ($reason, $since) = read_tombstone("$dir/unbound/$nonce");
+            emit_unbound($sid, $confidence, $nonce, $reason, $since);
+            return;
+        }
+
+        # FALLBACK: no beacon, or the beacon's own nonce matches neither a
+        # live ticket nor a tombstone (e.g. this process's
+        # CLAUDE_CODE_SESSION_ID differs from the one that armed, so its own
+        # beacon is irrelevant). A tombstone the gate wrote names the Stop's
+        # own session id in its third field regardless of which nonce it
+        # came from -- find it that way instead.
+        #
+        # NOT AUTHORITATIVE (HIGH-1/S1, redteam+review). The third field is
+        # "the session that ran the claim", not "the session that armed" --
+        # bp-session.pl's claim expires ANY over-age ticket in the shared
+        # registry, not only the caller's, so a stale ticket left behind by
+        # session A can be expired by session B's own Stop and tombstoned
+        # with B's id. This scan can therefore match a ticket this session
+        # never issued. The driver ruling (package 13 fix-batch) is to keep
+        # the scan -- AC16/behavior 12 requires it, and it is still the only
+        # way a beacon-less session can be told anything at all -- but to
+        # stop the WARN from asserting an ownership this branch cannot prove
+        # (see emit_unbound's fallback => 1 below; AC16 pins only STATUS and
+        # CONFIDENCE on this path, never the WARN wording).
+        if (-d "$dir/unbound") {
+            my ($best_nonce, $best_reason, $best_since, $best_mtime);
+            if (opendir(my $dh, "$dir/unbound")) {
+                for my $f (readdir $dh) {
+                    next if $f =~ /^\.\.?$/;
+                    # MEDIUM-4 (redteam): a raw readdir filename becomes the
+                    # NONCE value emitted below with no sanitization -- refuse
+                    # anything that is not a nonce this codebase could ever
+                    # have written, before it is used for anything.
+                    next unless BpSession::valid_nonce($f);
+                    my $path = "$dir/unbound/$f";
+                    next unless -f $path;
+                    my ($reason, $since, $tsid) = read_tombstone($path);
+                    next unless defined $tsid && $tsid eq $sid;
+                    my $mt = (stat $path)[9] // 0;
+                    if (!defined $best_mtime || $mt > $best_mtime) {
+                        ($best_nonce, $best_reason, $best_since, $best_mtime)
+                            = ($f, $reason, $since, $mt);
+                    }
                 }
+                closedir $dh;
+            }
+            if (defined $best_nonce) {
+                emit_unbound($sid, $confidence, $best_nonce, $best_reason, $best_since,
+                    fallback => 1);
                 return;
             }
         }
+
         emit('STATUS',  'unarmed');
         emit('SESSION', $sid);
         emit('CONFIDENCE', $confidence);
@@ -823,14 +945,64 @@ sub cmd_lease {
     emit('ARMED_ANY',    BpContinuityLease::any_active($dir) ? 'yes' : 'no');
 }
 
+# PROJECT-ANCHORED ROOT RESOLUTION — never script-relative. Lifted from
+# bp-runstate.pl (package 03, butler-gate-ergonomics deleted that file), which
+# is where this lesson was first learned and paid for.
+#
+# butler normally runs from an INSTALL outside the project (~/.claude/ccpraxis,
+# or a marketplace dir), so a script-relative guess like
+# Cwd::abs_path("$SCRIPT_DIR/../../..") resolves the INSTALL root, not the
+# project. That failed silently and expensively: guard-ask-operator.sh (a
+# hook) always carries $CLAUDE_PROJECT_DIR, but a driver's own Bash tool does
+# not, so a driver-side write landed under the install root while the hook
+# went on reading the project's — the queue was written and read from two
+# different directories with nobody ever finding an error. A wrong answer
+# anchored to the PROJECT is recoverable; one anchored to the INSTALL is a
+# different repo's state file.
+#
+# Priority mirrors bp-drive-next.pl's _resolve_project_root and
+# bp-lib.sh's bp_project_root, and — the four-leg duplication convention this
+# file's own header already documents for the continuity registry — this is
+# the same rule stated a fourth time, for the questions queue:
+#
+#   $CLAUDE_PROJECT_DIR > $BP_PROJECT_ROOT > git toplevel
+#     > walk up from cwd for a dir holding .ccpraxis-local-data > cwd
+#
+# CLAUDE_PROJECT_DIR stays first because in a hook it is authoritative and is
+# exactly what guard-ask-operator.sh itself uses. The chain ENDS at cwd,
+# never at the install dir.
+sub _resolve_project_root {
+    return $ENV{CLAUDE_PROJECT_DIR}
+        if defined $ENV{CLAUDE_PROJECT_DIR} && length $ENV{CLAUDE_PROJECT_DIR};
+
+    return $ENV{BP_PROJECT_ROOT}
+        if defined $ENV{BP_PROJECT_ROOT} && length $ENV{BP_PROJECT_ROOT};
+
+    # git toplevel — trust only a clean exit and a real directory.
+    my $top = `git rev-parse --show-toplevel 2>/dev/null`;
+    if ($? == 0 && defined $top) {
+        chomp $top;
+        return $top if length $top && -d $top;
+    }
+
+    # Walk up from cwd for the first ancestor that already holds .ccpraxis-local-data.
+    my $d = Cwd::getcwd();
+    if (defined $d && length $d) {
+        my %seen;
+        while (!$seen{$d}++) {
+            return $d if -d "$d/.ccpraxis-local-data";
+            my $parent = dirname($d);
+            last if $parent eq $d;    # reached the filesystem / drive root
+            $d = $parent;
+        }
+    }
+
+    return Cwd::getcwd() // '.';
+}
+
 sub questions_path {
-    my $rs = "$SCRIPT_DIR/bp-runstate.pl";
-    return undef unless -f $rs;
-    my $dir = `"$^X" "$rs" state-dir 2>/dev/null`;
-    return undef unless defined $dir;
-    chomp $dir;
-    return undef unless length $dir;
-    return "$dir/questions.md";
+    my $root = _resolve_project_root();
+    return "$root/.ccpraxis-local-data/.subagent-guard/questions.md";
 }
 
 # APPEND, never overwrite. Several questions across a long run are the norm and
@@ -858,6 +1030,250 @@ sub count_questions {
 
 
 # ── Helpers ────────────────────────────────────────────────
+
+# ticket_ttl() -> the arming ticket's own TTL (CCPRAXIS_CONTINUITY_TICKET_TTL_S),
+# defaulting to 3600s -- a SEPARATE and deliberately shorter constant than
+# the 12h marker TTL (bp_continuity_ttl_hours). See
+# 13-arming-binds-or-says-so-spec.md SS1/SS5: this default is not lengthened
+# or unified by this package, on purpose -- the fix is naming the window,
+# not moving it. Must agree with bp-session.pl's own claim, which reads the
+# same env var independently (that script is outside this write set).
+sub ticket_ttl {
+    my $t = $ENV{CCPRAXIS_CONTINUITY_TICKET_TTL_S};
+    return 3600 unless defined $t && $t =~ /^\d+$/ && $t > 0;
+    return $t;
+}
+
+# read_tombstone($path) -> ($reason, $since, $sid). Tolerates a missing,
+# truncated or empty file (spec SS2.1/SS5): reason defaults to 'expired',
+# since to 'unknown', sid to undef. Never dies, never returns a value
+# containing a newline (spec SS2.5).
+sub read_tombstone {
+    my ($path) = @_;
+    my $line = '';
+    if (open my $fh, '<', $path) {
+        $line = <$fh> // '';
+        close $fh;
+    }
+    chomp $line;
+    $line =~ s/[\r\n]+/ /g;
+    my @f = split ' ', $line;
+    my $reason = (defined $f[0] && length $f[0]) ? $f[0] : 'expired';
+    my $since  = (defined $f[1] && length $f[1]) ? $f[1] : 'unknown';
+    my $tsid   = $f[2];
+    return ($reason, $since, $tsid);
+}
+
+# read_first_line($path) -> the file's first line, chomped, with any
+# embedded newlines collapsed to a space -- used for CLAIM_ERROR, which
+# must stay a single-line stdout value like everything else this script
+# prints (spec SS2.5).
+sub read_first_line {
+    my ($path) = @_;
+    open my $fh, '<', $path or return '';
+    my $line = <$fh> // '';
+    close $fh;
+    chomp $line;
+    $line =~ s/[\r\n]+/ /g;
+    return $line;
+}
+
+# emit_unbound($sid, $confidence, $nonce, $reason, $since, %opt) -- the
+# third `status` state (spec SS2.3). Emits, IN THIS ORDER (the spec's own
+# words), and returns nothing: STATUS, SESSION, CONFIDENCE, NONCE,
+# UNBOUND_REASON, UNBOUND_SINCE, WARN, NOTE. CONFIDENCE is reported
+# unconditionally -- this decision tree never reads it to decide the
+# STATUS value, only to report it alongside (done criterion 4).
+#
+# %opt: fallback => 1 marks a call reached through cmd_status's sid-keyed
+# scan of unbound/ rather than through this session's own beacon/nonce
+# match. HIGH-1/S1 (redteam+review): that scan's match is not proof the
+# tombstone is this session's own arm (see the call site's comment), so
+# the WARN there must not claim an ownership it cannot establish -- while
+# the direct, beacon-matched path (AC1g/AC1h) keeps its original, stronger
+# wording unchanged.
+sub emit_unbound {
+    my ($sid, $confidence, $nonce, $reason, $since, %opt) = @_;
+    $reason = 'expired' unless defined $reason && length $reason;
+    $since  = 'unknown'  unless defined $since  && length $since;
+    emit('STATUS',  'unbound');
+    emit('SESSION', $sid);
+    emit('CONFIDENCE', $confidence);
+    emit('NONCE',   $nonce);
+    emit('UNBOUND_REASON', $reason);
+    emit('UNBOUND_SINCE',  $since);
+    if ($opt{fallback}) {
+        emit('WARN', "an arming ticket expired while this session was stopping; it may "
+                   . "not have been this session's own arm, so nothing was necessarily "
+                   . "gated for this session specifically (found by session id in a "
+                   . "registry shared with other sessions, not by this session's own "
+                   . "beacon).");
+    } else {
+        emit('WARN', "an arming ticket did NOT bind, so nothing was gated for this session "
+                   . "(CCPRAXIS_CONTINUITY_TICKET_TTL_S is a separate, much shorter TTL than "
+                   . "the 12h marker TTL).");
+    }
+    emit('NOTE', 'this session is not armed. Re-arm with `arm` (or /butler:continuity on) '
+               . 'to try again.');
+}
+
+# report_and_consume_prior_unbound($dir) -- the arm-time half of surfacing a
+# failed binding (spec SS2.4). Runs once, at the top of cmd_arm, before
+# either arm path. CONSUMES what it finds (unlinks the tombstone / stale
+# ticket / .claim-error record) so a second consecutive arm with no new
+# failure reports nothing (behavior 14) -- and supersedes the beacon's own
+# prior live ticket (behavior 18), mirroring what cmd_disarm already does.
+#
+# The "previous arm never bound" WARN is printed FIRST, ahead of
+# UNBOUND_PRIOR/UNBOUND_REASON: at this point in cmd_arm nothing else has
+# been written to stdout yet, so this is the only place in the whole
+# subcommand where a caller can rely on a WARN line beginning the output.
+# None of this may fail the arm (spec SS2.4): every unlink here is
+# best-effort, and no branch here exits or changes cmd_arm's own STATUS.
+sub report_and_consume_prior_unbound {
+    my ($dir) = @_;
+    my $ttl = ticket_ttl();
+
+    my $prior = read_beacon($dir);
+    # MEDIUM-1 (redteam): $prior comes straight off the beacon file with no
+    # shape check, and becomes an unlink path twice below -- validate before
+    # either use (repro'd: an unvalidated beacon value here was usable for
+    # arbitrary file deletion via a path like "../../victim.txt").
+    undef $prior if defined $prior && !BpSession::valid_nonce($prior);
+    if (defined $prior) {
+        my $tomb    = "$dir/unbound/$prior";
+        my $pending = "$dir/pending/$prior";
+        my $reason;
+
+        if (-f $tomb) {
+            ($reason) = read_tombstone($tomb);
+        } elsif (-f $pending) {
+            my $mtime = (stat $pending)[9] // time();
+            # LOW-1 (redteam)/S2 (review): ">" agrees with bp-session.pl's
+            # claim, the only component that actually expires a ticket --
+            # see the identical comment at cmd_status's own TTL check.
+            $reason = 'window_passed' if (time() - $mtime) > $ttl;
+        }
+
+        if (defined $reason) {
+            emit('WARN', "the previous arm (nonce $prior) never bound to a session, "
+                       . "so nothing was gated. Re-arming now supersedes it.");
+            emit('UNBOUND_PRIOR', $prior);
+            emit('UNBOUND_REASON', $reason);
+        }
+
+        # CONSUME/SUPERSEDE regardless of whether a reason was found above --
+        # an orphaned ticket whose beacon still names it, or a stale
+        # tombstone this arm has now reported, must not linger for a later
+        # arm to trip over again (behavior 14, behavior 18).
+        unlink $tomb    if -f $tomb;
+        unlink $pending if -f $pending;
+    }
+
+    # MEDIUM-2 (redteam): `.claim-error` used to be one unkeyed slot shared
+    # by every session in the registry -- session B's failing claim could be
+    # reported to session A, and a second failure in the same window
+    # silently overwrote the first. The gate now keys it per session
+    # (`.claim-error-<sid>`) when the sid is filename-safe; read this
+    # session's own keyed file first, and fall back to the legacy unkeyed
+    # name only when no keyed file exists -- for a claim that failed with an
+    # id that could not be used in a filename, and for anything a pre-fix
+    # gate left behind.
+    my ($ce_keyed, $ce_legacy) = claim_error_candidates($dir);
+    my $ce_file = (defined $ce_keyed && -f $ce_keyed) ? $ce_keyed
+                : (-f $ce_legacy)                      ? $ce_legacy
+                :                                        undef;
+    if (defined $ce_file) {
+        my $line = read_first_line($ce_file);
+        emit('CLAIM_ERROR', $line);
+        emit('WARN', "the Stop hook's claim call itself failed for a previous arm "
+                   . "(see CLAIM_ERROR above); this session may not have been armed "
+                   . "as reported.");
+        unlink $ce_file;
+    }
+
+    sweep_old_tombstones($dir);
+}
+
+# claim_error_candidates($dir) -> ($keyed_path_or_undef, $legacy_path).
+# MEDIUM-2 (redteam): the write side (gate-continuity.sh) now keys the
+# record per session, same filename-safety refusal continuity_marker
+# already applies to a session id. This mirrors that on the read side.
+sub claim_error_candidates {
+    my ($dir) = @_;
+    my $legacy = "$dir/.claim-error";
+    my $key = $ENV{CLAUDE_CODE_SESSION_ID};
+    return (undef, $legacy) unless defined $key && length $key;
+    return (undef, $legacy) if $key =~ m{[/\\*.\x00]};
+    return ("$dir/.claim-error-$key", $legacy);
+}
+
+# consume_own_tombstones($dir, $sid) -- MEDIUM-3 (redteam)/S4 (review):
+# unlink every tombstone in unbound/ whose third field names $sid,
+# regardless of age. Called from cmd_disarm so a disarmed session's next
+# `status` cannot keep reporting `unbound` about an arm that was
+# deliberately cancelled -- the mirror of what report_and_consume_prior_
+# unbound already does for arm's own beacon-named tombstone. Best-effort:
+# never dies, never changes disarm's own STATUS.
+sub consume_own_tombstones {
+    my ($dir, $sid) = @_;
+    return unless defined $sid && length $sid;
+    my $unbound_dir = "$dir/unbound";
+    return unless -d $unbound_dir;
+    opendir(my $dh, $unbound_dir) or return;
+    for my $f (readdir $dh) {
+        next if $f =~ /^\.\.?$/;
+        next unless BpSession::valid_nonce($f);
+        my $path = "$unbound_dir/$f";
+        next unless -f $path;
+        my (undef, undef, $tsid) = read_tombstone($path);
+        unlink $path if defined $tsid && $tsid eq $sid;
+    }
+    closedir $dh;
+}
+
+# sweep_old_tombstones($dir) -- bound the unbound/ directory's growth (spec
+# SS5 "Tombstone accumulation"). arm already consumes the one tombstone its
+# own beacon names; this catches everything else, aged past the 12h marker
+# TTL (the same constant lib.sh's bp_continuity_ttl_hours uses, so a
+# tombstone does not outlive what every other artifact in this registry
+# considers stale). Best-effort: a failure to sweep is a stat, never an
+# error this command reports.
+#
+# ALSO sweeps stray `.claim-error`/`.claim-error-<sid>` files at the
+# registry root past the same cutoff (MEDIUM-2/LOW-3 folded together --
+# a session that stops arming, or whose keyed file's owner never arms
+# again, must not leave that record on disk forever either).
+sub sweep_old_tombstones {
+    my ($dir) = @_;
+    my $cutoff = 12 * 3600;
+    my $now = time();
+
+    my $unbound_dir = "$dir/unbound";
+    if (-d $unbound_dir && opendir(my $dh, $unbound_dir)) {
+        for my $f (readdir $dh) {
+            next if $f =~ /^\.\.?$/;
+            my $path = "$unbound_dir/$f";
+            next unless -f $path;
+            my $mt = (stat $path)[9];
+            next unless defined $mt;
+            unlink $path if ($now - $mt) >= $cutoff;
+        }
+        closedir $dh;
+    }
+
+    if (-d $dir && opendir(my $rdh, $dir)) {
+        for my $f (readdir $rdh) {
+            next unless $f =~ /^\.claim-error(?:-|$)/;
+            my $path = "$dir/$f";
+            next unless -f $path;
+            my $mt = (stat $path)[9];
+            next unless defined $mt;
+            unlink $path if ($now - $mt) >= $cutoff;
+        }
+        closedir $rdh;
+    }
+}
 
 # write_marker_atomic($path, $content) -> 1 on success, 0 on failure.
 # temp-file + rename, so a reader never sees a half-written marker. See the

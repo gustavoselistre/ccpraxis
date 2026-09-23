@@ -319,6 +319,188 @@ match_any() {
 
 marker_path() { printf '%s\n' "$BP_DIR/runs/${BP_PACKAGE:-pkg}.active-worker"; }
 
+# ---------------------------------------------------------------------------
+# 11-parallel-tree-interlock: shared marker-freshness / writer-classification
+# / hatch-TTL / tree-scan primitives. See
+# specs/11-parallel-tree-interlock-spec.md SS2.1-SS2.4. None of these ever
+# exit, write to stderr, or mutate caller state beyond the documented hatch
+# rm -f. All are safe under `set -u`.
+# ---------------------------------------------------------------------------
+
+# bp_marker_is_fresh MARKER STALE_MIN [UNKNOWN_AGE_POLICY] [NOW] -- the single
+# definition of "this marker is live and recent enough to count".
+# UNKNOWN_AGE_POLICY is "fresh" (default) or "stale": governs the verdict
+# when the age cannot be computed (date/bp_mtime failure). A future-dated
+# mtime yields a negative age, which is naturally "< STALE_MIN" and so
+# already fresh under policy fresh (today's byte-for-byte behavior); policy
+# stale additionally REQUIRES mtime <= now before computing that age.
+# NOW (11-parallel-tree-interlock SS2.1) is an optional 4th, caller-supplied
+# epoch-seconds value. When passed (a non-empty, all-digit string), it is
+# used instead of forking `date +%s` internally -- bp_tree_writer_marker
+# forks `date` once per hook invocation and passes it here, so a scan of up
+# to 32 candidates costs one `date` fork, not 32. Omitted, empty, or
+# non-numeric -> unchanged behavior: the function forks its own. Every
+# existing 3-arg caller (bp_hatch_active does not call this at all; check
+# (a)'s own call site in guard-validation-interlock.sh) is unaffected.
+bp_marker_is_fresh() {
+  local marker="$1" stale="$2" policy="${3:-fresh}" now_arg="${4:-}"
+  case "$stale" in ''|*[!0-9]*) stale=180 ;; esac
+  [ "$stale" -gt 0 ] 2>/dev/null || stale=180
+  [ -s "$marker" ] || return 1
+  case "$now_arg" in ''|*[!0-9]*) now_arg="" ;; esac
+  local NOW MTIME
+  if [ -n "$now_arg" ]; then
+    NOW="$now_arg"
+  else
+    NOW=$(date +%s 2>/dev/null || echo 0)
+  fi
+  MTIME=$(bp_mtime "$marker")
+  if [ "$NOW" -gt 0 ] && [ "$MTIME" -gt 0 ]; then
+    if [ "$policy" = stale ] && [ "$MTIME" -gt "$NOW" ]; then
+      return 1
+    fi
+    local age=$(( (NOW - MTIME) / 60 ))
+    [ "$age" -lt "$stale" ] && return 0
+    return 1
+  fi
+  # Age undeterminable.
+  [ "$policy" = fresh ] && return 0
+  return 1
+}
+
+# bp_marker_is_writer CONTENT -- rc 0 iff CONTENT names one of the three
+# write-capable worker roles. Same closed set the pre-existing case
+# statements in this hook and track-dispatch.sh's is_writer() use.
+bp_marker_is_writer() {
+  case "$1" in
+    *bp-implementer*|*bp-test-writer*|*bp-ui-prober*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# bp_hatch_active HATCH_PATH TTL_MIN -- the single definition of the file-form
+# escape-hatch TTL rule, lifted verbatim in semantics from bp_driver_context's
+# own file-hatch step (below). rc 1 if the hatch does not exist. TTL_MIN is
+# normalized: empty/non-digit/<=0 -> 60; > 1440 -> 1440 (redteam MINOR-2 cap).
+# An undeterminable age (clock/stat failure) -> rc 0 (hatch honoured -- fail
+# toward the hatch staying honoured, never toward silently re-enforcing). A
+# future-dated mtime is treated as already-expired (redteam MINOR-1). Past
+# TTL, or future-dated: best-effort rm -f, then rc 1.
+bp_hatch_active() {
+  local hatch="$1" ttl="$2"
+  [ -e "$hatch" ] || return 1
+  case "$ttl" in ''|*[!0-9]*) ttl=60 ;; esac
+  [ "$ttl" -gt 0 ] 2>/dev/null || ttl=60
+  [ "$ttl" -le 1440 ] 2>/dev/null || ttl=1440
+  local now mt age
+  now=$(date +%s 2>/dev/null || echo 0)
+  mt=$(bp_mtime "$hatch")
+  if [ "$now" -gt 0 ] && [ "$mt" -gt 0 ]; then
+    if [ "$mt" -le "$now" ]; then
+      age=$(( (now - mt) / 60 ))
+      if [ "$age" -lt "$ttl" ]; then
+        return 0
+      fi
+    fi
+    rm -f "$hatch" 2>/dev/null
+    return 1
+  fi
+  return 0
+}
+
+# bp_tree_writer_marker BLUEPRINTS_ROOT SELF_MARKER STALE_MIN -- the
+# tree-wide scan. Enumerates every coordinator marker under BLUEPRINTS_ROOT
+# and reports the first that belongs to someone else and is a live, fresh
+# writer. Output: one TAB-separated line "blueprint\tpackage\tworker\tpath".
+# rc 1 (nothing printed) when no such marker is found, the root is missing,
+# or the bounded scan cap (32 non-self candidates) is exhausted with no match.
+#
+# REVISED POST-REDTEAM (11-parallel-tree-interlock spec SS2.4, "Revision
+# note" -- supersedes an earlier version of this function that counted ALL
+# candidates up front, before self-exclusion and before classification, and
+# stood aside whenever that count exceeded the cap REGARDLESS of whether an
+# examined candidate had already matched). Red-team measured that inverted
+# the safety property it exists to provide: 300 one-byte junk files under any
+# blueprints/*/runs/ path -- creatable by any Bash call, no writer content
+# required -- silently disabled the entire tree-wide interlock, fleet-wide,
+# indefinitely (report 20260916-231127-6e45 reopened by a different trigger).
+#
+# THE CORRECTED RULE, classify-in-order-then-decide: self-exclusion happens
+# FIRST, by exact string equality against SELF_MARKER, before any counting or
+# I/O -- a candidate that IS self is never counted or classified at all. Then
+# at most 32 OTHER candidates are classified in deterministic (lexicographic
+# glob) order; a match found within that window denies (rc 0) IMMEDIATELY,
+# however many further candidates exist beyond the cap. Only once 32 non-self
+# candidates have been examined with no match does the function stand aside
+# (rc 1 = allow). This bounds the WORK (never more than 32 classifications,
+# ~106ms each measured empirically by red-team, comfortably under the hook's
+# 15s registered timeout) without letting an unbounded pile of harmless
+# markers manufacture a false "no writer present" verdict.
+#
+# The cap dropped from 256 to 32 as a direct consequence of this ordering:
+# under the OLD pre-count design the cap bounded nothing (candidates past it
+# were never classified either way), so its value was arbitrary; under this
+# design every candidate up to the cap is unconditionally classified on the
+# allow path, so the cap IS the hook's worst-case latency budget.
+#
+# `now` is computed ONCE per invocation and passed as bp_marker_is_fresh's
+# optional 4th arg, so a scan of up to 32 candidates costs one `date` fork,
+# not 32 (review LOW-2 / red-team HIGH-2).
+#
+# Content, blueprint and package are sanitized to [A-Za-z0-9:_-] and
+# truncated to 64 bytes BEFORE the TAB-separated line is ever printed (spec
+# SS2.9, red-team HIGH-3): this string crosses into a DIFFERENT coordinator's
+# transcript, verbatim, as the body of an authoritative-looking guard denial
+# -- an untrusted, cross-session data flow that did not exist before this
+# package. This also closes the TAB/newline field-corruption hazard (review
+# LOW-3/LOW-4) in the same stroke.
+#
+# No intermediate array is ever built -- a single streaming loop over the
+# glob -- which structurally eliminates the bash-<4.4 `set -u` trap around
+# expanding an empty "${arr[@]}" (review HIGH-1): there is no array to expand.
+bp_tree_writer_marker() {
+  local root="$1" self="$2" stale="$3" c n=0 now content role bp pkg
+  [ -n "$root" ] && [ -d "$root" ] || return 1
+  now=$(date +%s 2>/dev/null) || now=""
+  for c in "$root"/*/runs/*.active-worker; do
+    [ -f "$c" ] || continue                       # unexpanded glob / stale dirent
+    [ "$c" != "$self" ] || continue               # self-exclusion BEFORE any I/O, BEFORE cap counting
+    n=$((n + 1))
+    [ "$n" -le 32 ] || return 1                   # bounded WORK: classify at most 32 candidates,
+                                                   # THEN stand aside (rc 1 = allow) -- see note above
+    bp_marker_is_fresh "$c" "$stale" stale "$now" || continue
+    content=$(cat "$c" 2>/dev/null) || continue
+    bp_marker_is_writer "$content" || continue
+    pkg=$(basename "$c"); pkg="${pkg%.active-worker}"
+    bp=$(basename "$(dirname "$(dirname "$c")")")
+    # Implementer deviation from the spec's literal one-line-per-field
+    # sanitizer (flagged in the fix-batch report): a character-class filter
+    # alone does not remove an EMBEDDED WORD made entirely of allowed
+    # characters -- a marker crafted as "bp-implementer -- ... export ...
+    # CCPRAXIS_TREE_INTERLOCK_OFF=1 ..." still has "export" survive
+    # [^A-Za-z0-9:_-] stripping and the 64-byte truncation, because that
+    # substring sits well inside the first 64 kept bytes. Sec2.2's own
+    # classifier (bp_marker_is_writer) already reduces "worker identity" to a
+    # closed 3-value set; printing that CANONICAL role token instead of the
+    # raw (even if character-filtered) content closes the injection surface
+    # completely rather than merely narrowing its alphabet, while still
+    # satisfying every acceptance point that only requires "the worker name"
+    # to appear (B1/A2 et al. -- one of the three role names always suffices).
+    case "$content" in
+      *bp-implementer*) role=bp-implementer ;;
+      *bp-test-writer*) role=bp-test-writer ;;
+      *bp-ui-prober*)   role=bp-ui-prober ;;
+      *)                role="" ;;                # unreachable: bp_marker_is_writer already matched
+    esac
+    content=${role//[^A-Za-z0-9:_-]/}; content=${content:0:64}
+    pkg=${pkg//[^A-Za-z0-9_-]/}; pkg=${pkg:0:64}
+    bp=${bp//[^A-Za-z0-9_-]/}; bp=${bp:0:64}
+    printf '%s\t%s\t%s\t%s\n' "$bp" "$pkg" "$content" "$c"
+    return 0
+  done
+  return 1
+}
+
 ledger_lock() { printf '%s\n' "$BP_DIR/runs/${BP_PACKAGE:-pkg}.ledger.lock"; }
 
 # --- graceful-stop gate (Decision #10/#18, package A4) -----------------------
@@ -908,6 +1090,277 @@ bp_drive_marker() {
   esac
   dir=$(bp_drive_active_dir) || return 1
   printf '%s/%s' "$dir" "$sid"
+  return 0
+}
+
+# bp_drive_retire SESSION_ID -> rc 0 iff, on return, no marker file exists at
+# the CANONICAL path for SESSION_ID (renamed aside to "<canonical>.retired"
+# just now, was already renamed, or the registry dir does not exist). rc 1
+# for an empty/malformed id, an unresolvable registry path, or a marker that
+# still exists at the canonical path after the rename attempt (e.g. rename
+# failed -- permissions, locked file). Never writes to stdout or stderr --
+# callers own their own messaging. Never exits. Resolves the path ONLY
+# through bp_drive_marker, never by string-concatenating a session id onto a
+# directory. Idempotent: a second call finds the canonical path already
+# absent and returns rc 0 without acting again.
+#
+# Deliberately a RENAME, never an rm. bp_drive_any_active's reap loop
+# (lib.sh:1023-1080, out of scope for this package) globs every entry in the
+# registry directory and applies its existing two-clause TTL rule per entry,
+# unmodified. Because the rename keeps the marker's content and mtime sitting
+# in the same directory that loop already scans, the renamed-aside marker
+# keeps being counted exactly as before retirement, until it ages out under
+# the pre-existing TTL rule -- same as any other marker. Retiring one
+# session's marker therefore changes nothing about what bp_drive_any_active
+# reports to any OTHER session, or to any consumer hook that calls it. An
+# earlier `rm -f` version of this function made every session's aggregate
+# liveness signal flip the instant any one session retired -- CRITICAL-1.
+bp_drive_retire() {
+  local sid="${1:-}" m
+  m=$(bp_drive_marker "$sid" 2>/dev/null) || return 1
+  [ -e "$m" ] && mv -f "$m" "$m.retired" 2>/dev/null
+  [ -e "$m" ] && return 1
+  return 0
+}
+
+# bp_drive_retire_sentinel -> prints the ONE canonical sentinel command
+# (no trailing newline), rc 0. mark-wakeup.sh and drive-solo/SKILL.md must
+# both derive from or exactly match this string, so the trigger and the
+# documentation cannot drift apart.
+bp_drive_retire_sentinel() {
+  printf '%s' 'echo butler-drive-solo-retire'
+}
+
+# ---------------------------------------------------------------------------
+# 07-guards-reach-the-driver: bp_driver_context — the ONE definition of "a
+# butler run is in progress, whoever is driving it, and what is its current
+# package context". See specs/07-guards-reach-the-driver-spec.md §2.2 for the
+# normative 15-step resolution order this mirrors exactly. No hook may
+# re-implement any part of it (registry-path-one-rule.t exists because that
+# duplication already happened here once).
+#
+# bp_driver_context [CWD] -> rc 0 with BP_DRIVER_SESSION / BP_DATA_DIR /
+# BP_PROJECT_ROOT / BP_BLUEPRINT / BP_DIR / BP_PACKAGE / BP_WRITE_SET /
+# BP_TEST_PATHS / BP_DRIVER_ROLE set as plain (never exported) shell globals;
+# or rc 1 with every one of those globals left UNTOUCHED (no partial
+# population -- a half-set BP_WRITE_SET would be a live landmine for any
+# later reader). NEVER exits. NEVER writes to stdout or stderr. NEVER sets
+# BP_LEDGER -- that would satisfy bp_hook_gate in any hook that later ran in
+# the same process, exactly the widening done criterion 3 forbids.
+#
+# Mutually exclusive with bp_hook_gate BY CONSTRUCTION (step 1): a worker
+# session (BP_LEDGER set) always rc 1s here, so no session can take both
+# activation paths.
+bp_driver_context() {
+  local cwd="${1:-$PWD}"
+
+  # 1. Worker sessions belong to bp_hook_gate.
+  [ -z "${BP_LEDGER:-}" ] || return 1
+
+  # 2. Session-wide escape hatch (env form).
+  [ "${CCPRAXIS_DRIVER_GUARDS_OFF:-}" != "1" ] || return 1
+
+  # 3. The cheap liveness pre-check -- already reaps stale markers and
+  # consults the session transcript; not re-derived here.
+  bp_drive_any_active 2>/dev/null || return 1
+
+  # 4. Data dir (honours CCPRAXIS_DATA_DIR).
+  local data_dir
+  data_dir=$(bp_find_data_dir "$cwd" 2>/dev/null) || return 1
+  [ -n "$data_dir" ] || return 1
+
+  # 5. Project root, must be absolute.
+  local project_root
+  project_root=$(dirname "$data_dir" 2>/dev/null) || return 1
+  bp_is_absolute_path "$project_root" || return 1
+
+  # 6. File-form escape hatch, TTL-bounded (default 60 min), re-expressed as
+  # a call to bp_hatch_active (11-parallel-tree-interlock SS2.3) -- the
+  # single definition of this TTL rule, shared with the tree-wide guard's own
+  # hatch. Externally observable behavior is unchanged: past-TTL is
+  # best-effort removed and enforcement resumes; an age that cannot be
+  # determined (clock or stat failure) is treated as within-TTL -- fail
+  # toward the hatch staying honoured, never toward silently re-enforcing.
+  # NOTE the inversion at this call site: bp_hatch_active's rc 0 means "the
+  # hatch is active" (a fact), which for bp_driver_context means "guards are
+  # off for this session" -> return 1 (not driving).
+  local hatch="$data_dir/.drive-solo/.driver-guards-off"
+  bp_hatch_active "$hatch" "${CCPRAXIS_DRIVER_GUARDS_OFF_TTL_MIN:-60}" && return 1
+
+  # 7. The current-package pointer. Absent/unreadable -> rc 1. bp_json_get
+  # returns rc 2 (no parser) -> rc 1 here too, which is the correct fail-open.
+  local cj="$data_dir/.drive-solo/current.json"
+  [ -f "$cj" ] || return 1
+  local cj_content
+  cj_content=$(cat "$cj" 2>/dev/null) || return 1
+  local blueprint package jg_rc
+  blueprint=$(bp_json_get "$cj_content" blueprint 2>/dev/null); jg_rc=$?
+  [ "$jg_rc" -eq 0 ] || return 1
+  package=$(bp_json_get "$cj_content" package 2>/dev/null); jg_rc=$?
+  [ "$jg_rc" -eq 0 ] || return 1
+  [ -n "$blueprint" ] && [ -n "$package" ] || return 1
+
+  # 7b. Pointer-freshness TTL (redteam MAJOR-1, driver decision recorded in
+  # the package ledger 2026-09-22: pointer-freshness over session-identity
+  # narrowing, because narrowing depends on an unverified assumption about
+  # whether a Task subagent's PreToolUse payload carries its parent driver's
+  # session_id). The driver rewrites current.json on every run-package, and
+  # this blueprint's own /butler:drive-solo dispatches routinely run
+  # 30-50 minutes per worker -- CCPRAXIS_DRIVER_POINTER_STALE_MIN defaults to
+  # 240 (4h), generously above that, so a legitimately long-running package
+  # is never false-negatived. A pointer older than the TTL, or one whose
+  # recorded_at is missing/non-numeric/in the future, cannot be proven fresh
+  # -> treated exactly like an absent pointer (F1-equivalent): rc 1, inert.
+  # This is the SAFE fail direction throughout this predicate: rc 1 means the
+  # guard does not enforce a stale package's write set on an unrelated
+  # session, never the reverse.
+  local recorded_at p_ttl p_now p_age
+  recorded_at=$(bp_json_get "$cj_content" recorded_at 2>/dev/null); jg_rc=$?
+  [ "$jg_rc" -eq 0 ] || return 1
+  case "$recorded_at" in ''|*[!0-9]*) return 1 ;; esac
+  p_ttl="${CCPRAXIS_DRIVER_POINTER_STALE_MIN:-240}"
+  case "$p_ttl" in ''|*[!0-9]*) p_ttl=240 ;; esac
+  [ "$p_ttl" -gt 0 ] 2>/dev/null || p_ttl=240
+  p_now=$(date +%s 2>/dev/null || echo 0)
+  [ "$p_now" -gt 0 ] || return 1
+  p_age=$(( (p_now - recorded_at) / 60 ))
+  [ "$p_age" -ge 0 ] || return 1
+  [ "$p_age" -lt "$p_ttl" ] || return 1
+
+  # 8. Name validation, BEFORE either value touches a path: reject empty,
+  # anything with '/', '\', a leading '.', '..' anywhere, or any character
+  # outside [A-Za-z0-9._-]. A pointer file is data; it must not address
+  # another directory.
+  local _n
+  for _n in "$blueprint" "$package"; do
+    case "$_n" in
+      ''|*/*|*\\*|.*|*..*) return 1 ;;
+    esac
+    case "$_n" in
+      *[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+  done
+
+  # 9. Blueprint dir + package ledger must exist.
+  local bp_dir="$data_dir/blueprints/$blueprint"
+  local ledger="$bp_dir/packages/$package.md"
+  [ -d "$bp_dir" ] || return 1
+  [ -f "$ledger" ] || return 1
+
+  # 9b. redteam BLOCKER-2(e), defense-in-depth: $bp_dir may be reached via a
+  # symlinked blueprints/<name> pointing outside <data>/blueprints/, which
+  # would source write_set/test_paths from an attacker-controlled tree even
+  # though name validation (step 8) rejected traversal BY NAME, not by
+  # resolved target. Resolve the real path and require it stays a
+  # prefix-child of $data_dir/blueprints/. Not reachable via the Edit/Write
+  # tool surface this predicate governs (creating a symlink needs Bash,
+  # already unconstrained by write-set containment per established
+  # coordinator-protocol doctrine), so no blocking oracle test pins this --
+  # defense in depth only.
+  local bp_dir_real blueprints_real
+  bp_dir_real=$(cd "$bp_dir" 2>/dev/null && pwd -P) || return 1
+  blueprints_real=$(cd "$data_dir/blueprints" 2>/dev/null && pwd -P) || return 1
+  case "$bp_dir_real" in
+    "$blueprints_real"/*) ;;
+    *) return 1 ;;
+  esac
+
+  # 10. Single-pass frontmatter read of $ledger, matching BpOrch::ledger_fm /
+  # BpDrive::ledger_fm exactly: line 1 must be exactly '---' (trailing \r
+  # tolerated); reading stops at the next '---' line or after 200 lines,
+  # whichever comes first; a key matches ^<key>: with the value trimmed of
+  # leading/trailing whitespace; first occurrence wins. No file is read
+  # twice; no subprocess is spawned for this step.
+  local status="" write_set="" test_paths=""
+  local have_status=0 have_ws=0 have_tp=0
+  local lineno=0 line
+  while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno + 1))
+    line="${line%$'\r'}"
+    if [ "$lineno" -eq 1 ]; then
+      [ "$line" = "---" ] || return 1
+      continue
+    fi
+    [ "$line" = "---" ] && break
+    [ "$lineno" -gt 200 ] && break
+    case "$line" in
+      status:*)
+        if [ "$have_status" -eq 0 ]; then
+          status="${line#status:}"
+          status="${status#"${status%%[![:space:]]*}"}"
+          status="${status%"${status##*[![:space:]]}"}"
+          have_status=1
+        fi
+        ;;
+      write_set:*)
+        if [ "$have_ws" -eq 0 ]; then
+          write_set="${line#write_set:}"
+          write_set="${write_set#"${write_set%%[![:space:]]*}"}"
+          write_set="${write_set%"${write_set##*[![:space:]]}"}"
+          have_ws=1
+        fi
+        ;;
+      test_paths:*)
+        if [ "$have_tp" -eq 0 ]; then
+          test_paths="${line#test_paths:}"
+          test_paths="${test_paths#"${test_paths%%[![:space:]]*}"}"
+          test_paths="${test_paths%"${test_paths##*[![:space:]]}"}"
+          have_tp=1
+        fi
+        ;;
+    esac
+  done < "$ledger" 2>/dev/null
+
+  # 11. status missing -> rc 1 (malformed). Terminal -> rc 1 (stale pointer).
+  # Any other value (including unrecognised) -> continue.
+  [ "$have_status" -eq 1 ] || return 1
+  case "$status" in
+    done|blocked|parked|dropped) return 1 ;;
+  esac
+
+  # 12. write_set missing or empty after trimming -> rc 1 (load-bearing, not
+  # defensive: an empty BP_WRITE_SET would deny every write outside BP_DIR/tmp).
+  [ "$have_ws" -eq 1 ] && [ -n "$write_set" ] || return 1
+
+  # 13. test_paths missing -> "" (not an error; a package may have no oracle).
+
+  # 14. BP_DRIVER_ROLE: read the existing solo marker. Absent/empty/unreadable/
+  # unrecognised, or older than CCPRAXIS_SOLO_WORKER_STALE_MIN minutes (default
+  # 180, sanitised) -> "" (the driver itself). Substring match, as
+  # guard-validation-interlock.sh:110-113 does.
+  local role="" marker="$data_dir/.drive-solo/.active-worker"
+  if [ -f "$marker" ]; then
+    local m_content m_stale m_now m_mt m_age m_fresh=1
+    m_content=$(cat "$marker" 2>/dev/null)
+    m_stale="${CCPRAXIS_SOLO_WORKER_STALE_MIN:-180}"
+    case "$m_stale" in ''|*[!0-9]*) m_stale=180 ;; esac
+    [ "$m_stale" -gt 0 ] 2>/dev/null || m_stale=180
+    m_now=$(date +%s 2>/dev/null || echo 0)
+    m_mt=$(bp_mtime "$marker")
+    if [ "$m_now" -gt 0 ] && [ "$m_mt" -gt 0 ]; then
+      m_age=$(( (m_now - m_mt) / 60 ))
+      [ "$m_age" -ge "$m_stale" ] && m_fresh=0
+    fi
+    if [ "$m_fresh" -eq 1 ]; then
+      case "$m_content" in
+        *bp-implementer*) role="bp-implementer" ;;
+        *bp-test-writer*) role="bp-test-writer" ;;
+        *bp-ui-prober*)   role="bp-ui-prober" ;;
+        *)                role="" ;;
+      esac
+    fi
+  fi
+
+  # 15. Set every global; rc 0.
+  BP_DRIVER_SESSION=1
+  BP_DATA_DIR="$data_dir"
+  BP_PROJECT_ROOT="$project_root"
+  BP_BLUEPRINT="$blueprint"
+  BP_DIR="$bp_dir"
+  BP_PACKAGE="$package"
+  BP_WRITE_SET="$write_set"
+  BP_TEST_PATHS="$test_paths"
+  BP_DRIVER_ROLE="$role"
   return 0
 }
 

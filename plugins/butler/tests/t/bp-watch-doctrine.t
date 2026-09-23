@@ -285,12 +285,19 @@ sub run_watch_env {
 }
 
 # ===========================================================================
-# F. --self-pause — the watch registers ITSELF as the guard-subagent-stall.sh
-#    watcher, in-process, via BpRunState::pause, with no separate `ps`/pause
-#    dance required of the caller. Root-cause fix for a real incident: a
-#    driver session, instead of arming bp-watch.pl at all, wrote its own
-#    throwaway sleep-loop watcher on an arbitrary short interval unrelated to
-#    any dispatch's actual duration.
+# F. --self-pause — DELETED, not left inert (package 03-retire-runstate,
+#    spec §1 "Resolutions recorded"/§5.1 bp-watch-doctrine.t section F entry).
+#
+#    F1-F5 and the F6 counter-fixture RETIRED IN FULL: they pinned the flag
+#    registering itself as the guard-subagent-stall.sh watcher via
+#    BpRunState::pause, a function that no longer exists. "Inert" was never
+#    an option once the function it called is gone -- the only choice left
+#    was between deleting the flag outright and leaving a flag that silently
+#    does nothing, and a silently-inert flag is the worse failure (a caller
+#    who passes it believes a declaration was made). One assertion is
+#    MIGRATED in the flag's place, preserving the section's real intent
+#    ("the flag's effect is attributable to the flag"): the deletion is now
+#    proved from the OUTSIDE, not assumed.
 # ===========================================================================
 {
     my $root = tempdir(CLEANUP => 1);
@@ -303,32 +310,13 @@ sub run_watch_env {
                                     '--poll', '1', '--self-pause', '--reason', 'F-fixture',
                                     '--data', $data);
 
-    like($out, qr/--self-pause: paused until \d+, watched by pid \d+/,
-         'F1: --self-pause prints confirmation naming a real watcher pid');
-
-    my $state_path = "$data/.subagent-guard/run-state.json";
-    ok(-f $state_path, 'F2: the pause landed in THIS FIXTURE\'s data root (--data honoured), '
-                      . 'not the real project\'s run-state — the root-cause bug this test guards');
-    my $json = do { local (@ARGV, $/) = ($state_path); <> };
-    my $rec  = JSON::PP->new->decode($json);
-    is($rec->{state}, 'paused', 'F3: state is paused');
-    like($rec->{reason}, qr/F-fixture/, 'F4: the --reason text was recorded');
-    like($rec->{watching}, qr/bpx\/p1/, 'F5: --watching names the watched package');
-}
-{
-    # Counter-fixture: without --self-pause, nothing is written to run-state
-    # at all — proves F1-F5 are attributable to the flag.
-    my $root = tempdir(CLEANUP => 1);
-    my $data = "$root/.ccpraxis-local-data";
-    my $bp   = "$data/blueprints/bpx";
-    make_path("$bp/packages");
-    write_ledger($bp, 'p1', 'status: running');
-
-    run_watch_env('--arm', '--package', 'bpx/p1', '--max-seconds', '3', '--poll', '1',
-                  '--reason', 'test fixture, fast resolution expected', '--data', $data);   # no --self-pause
-
+    is($rc, 64, 'F1 MIGRATED CANONICAL (-> AC-6/B3): --self-pause is an unknown option -- '
+              . 'exits 64, the usage-error code, distinguishable from a real verdict');
+    like($out, qr/unknown option/i,
+        'F2 MIGRATED: ...and the message says so in those words');
     ok(!-f "$data/.subagent-guard/run-state.json",
-       'F6 counter-fixture: WITHOUT --self-pause, no run-state file is written at all');
+       'F3 MIGRATED: ...and no run-state.json is written anywhere -- the deletion left nothing '
+     . 'behind for a caller to mistake for a declaration');
 }
 
 done_testing();

@@ -101,10 +101,17 @@ my $T = "$Bin";
     # skip` lines either way — so the plan count does not move with the
     # environment and a tight floor cannot go red on a machine that lacks
     # bp-runstate.pl.
+    #
+    # RE-BASELINED AGAIN 2026-09-22 (blueprint butler-gate-ergonomics, package
+    # 02-gates-use-the-probe): 39 -> 64. Package 02 migrates t/94's sections H
+    # and E off bp-runstate.pl/the director onto package 01's live-process
+    # probe, per that package's spec §4.8, and adds new AC1-AC22 probe/marker
+    # acceptance criteria. AC26 requires this floor to move UP with the file's
+    # actual count, never down.
     my ($plan) = $out =~ /^1\.\.(\d+)\s*$/m;
-    cmp_ok($plan, '>=', 39,
-       'A2 CANONICAL: t/94\'s own test PLAN count is at least 39 — its count as re-baselined, '
-     . 'from a pre-package baseline of 33. Assertions may be ADDED; losing one is '
+    cmp_ok($plan, '>=', 64,
+       'A2 CANONICAL: t/94\'s own test PLAN count is at least 64 — its count as re-baselined, '
+     . 'from a pre-package-02 baseline of 39. Assertions may be ADDED; losing one is '
      . 'the regression, and a silent skip shows up here as a shortfall.');
 
     my @not_ok = ($out =~ /^not ok /mg);
@@ -123,10 +130,26 @@ my $T = "$Bin";
 # RE-BASELINED 2026-08-26 to each file's actual count (112: 51 -> 67; 120 and 137
 # were already tight at 21 and 12). See the note on A2 for why this is safe with
 # respect to SKIP blocks, and the "honest cost" note below for why it was needed.
+#
+# RE-BASELINED AGAIN 2026-09-22 (blueprint butler-gate-ergonomics, package
+# 02-gates-use-the-probe), per that package's spec AC26: 112 (subagent-stall-
+# guard.t): 67 -> 93; 137 (drive-loop-runstate-fold.t): 12 -> 13.
+# mark-wakeup-agent-dispatch.t (120) is untouched by package 02 and stays at
+# 21.
+#
+# RE-BASELINED AGAIN 2026-09-23 (blueprint butler-gate-ergonomics, package
+# 03-retire-runstate): 93 -> 83. This is a legitimate DECREASE, not loss the
+# floor exists to catch -- package 03's own assertion contract (its ledger's
+# "THE ASSERTION CONTRACT FOR THIS PACKAGE" section, Decision 18) required
+# retiring subagent-stall-guard.t's "THE STATE MACHINE" section wholesale
+# (a direct bp-runstate.pl state-machine test with no probe-based successor,
+# since the state machine itself was deleted, not relocated) and migrating
+# AC19a/AC19b off the legacy finish/pause verbs. Every retirement is recorded
+# with a reason in package 03's ledger; nothing was silently dropped.
 my %baseline = (
-    'subagent-stall-guard.t'      => 67,
+    'subagent-stall-guard.t'      => 83,
     'mark-wakeup-agent-dispatch.t'=> 21,
-    'drive-loop-runstate-fold.t'  => 12,
+    'drive-loop-runstate-fold.t'  => 13,
 );
 
 for my $name (sort keys %baseline) {

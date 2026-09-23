@@ -420,6 +420,95 @@ sub open_test_store {
 }
 
 # =============================================================================
+# FIXBATCH-1 (review CRITICAL-1) -- insert_last lands the new record after
+# the true maximum RANKED record, even when an unranked record exists (and
+# therefore sits last in list()'s own display order). Before the fix,
+# $list->[-1]{rank} was undef whenever any unranked record existed, and
+# rank_between(undef,undef) minted a rank near the MIDDLE of the rank
+# space instead of after the maximum.
+# =============================================================================
+{
+    my ($root, $store, $err) = open_test_store();
+    ok(defined $store, 'FIXBATCH-1 fixture: store handle opens') or diag("error: $err");
+    my $a1 = eval { $store->insert_last(id => 'fb1-a1', fields => { t => '1' }, order => ['t']) } if defined $store;
+    my $a2 = eval { $store->insert_last(id => 'fb1-a2', fields => { t => '2' }, order => ['t']) } if defined $store;
+    my $u  = eval { $store->create(id => 'fb1-unranked', fields => { t => 'u' }, order => ['t']) } if defined $store;
+    ok(defined($a1) && defined($a2) && defined($u), 'FIXBATCH-1 fixture: two ranked records and one unranked record exist')
+        or diag('error: ' . ($@ // ''));
+
+    my $a3 = eval { $store->insert_last(id => 'fb1-a3', fields => { t => '3' }, order => ['t']) } if defined $store;
+    ok(defined $a3, 'FIXBATCH-1: insert_last succeeds with an unranked record already present') or diag('error: ' . ($@ // ''));
+
+    my $list = eval { $store->list() } if defined $store;
+    if (ref($list) eq 'ARRAY') {
+        my @ranked_ids = map { $_->{id} } grep { defined $_->{rank} } @$list;
+        is_deeply(\@ranked_ids, ['fb1-a1', 'fb1-a2', 'fb1-a3'],
+            'FIXBATCH-1: insert_last lands after the true maximum RANKED record, not mid-list');
+    } else {
+        fail('FIXBATCH-1: insert_last lands after the true maximum RANKED record, not mid-list');
+    }
+}
+
+# =============================================================================
+# FIXBATCH-2 (review MUST-2 / redteam HIGH-4) -- insert_before and
+# insert_after against an UNRANKED reference no longer contradict each
+# other: a before-call against a given unranked ref sorts strictly ahead
+# of a LATER after-call against the same ref (previously it was the
+# reverse: after1 < before1). AC-16/AC-17 above remain the binding oracle
+# for the front-stacking convention itself; this block pins the
+# before-vs-after consistency specifically.
+# =============================================================================
+{
+    my ($root, $store, $err) = open_test_store();
+    ok(defined $store, 'FIXBATCH-2 fixture: store handle opens') or diag("error: $err");
+    my $anchor = eval { $store->create(id => 'fb2-anchor', fields => { t => 'a' }, order => ['t']) } if defined $store;
+    ok(defined $anchor, 'FIXBATCH-2 fixture: an unranked anchor record exists') or diag('error: ' . ($@ // ''));
+
+    my $after1  = eval { $store->insert_after('fb2-anchor',  id => 'fb2-after1',  fields => { t => '1' }, order => ['t']) } if defined $anchor;
+    my $before1 = eval { $store->insert_before('fb2-anchor', id => 'fb2-before1', fields => { t => '2' }, order => ['t']) } if defined $anchor;
+    ok(defined($after1) && defined($before1), 'FIXBATCH-2: insert_after and insert_before against an unranked ref both succeed')
+        or diag('error: ' . ($@ // ''));
+
+    if (defined($after1) && defined($before1)) {
+        ok($before1->{rank} lt $after1->{rank},
+           'FIXBATCH-2: a later insert_before sorts strictly ahead of an earlier insert_after against the same unranked ref')
+            or diag('after1 rank=' . $after1->{rank} . ' before1 rank=' . $before1->{rank});
+    } else {
+        fail('FIXBATCH-2: a later insert_before sorts strictly ahead of an earlier insert_after against the same unranked ref');
+    }
+}
+
+# =============================================================================
+# FIXBATCH-3 (review MUST-3) -- reorder(\@ids) with a DUPLICATE id (same
+# cardinality mismatch, set matches) dies reorder_mismatch instead of
+# silently discarding the caller's intent.
+# =============================================================================
+{
+    my ($root, $store, $err) = open_test_store();
+    ok(defined $store, 'FIXBATCH-3 fixture: store handle opens') or diag("error: $err");
+    my $ok_create = defined($store) ? 1 : 0;
+    if (defined $store) {
+        for my $id (qw(fb3-p fb3-q)) {
+            my $r = eval { $store->insert_last(id => $id, fields => { t => '1' }, order => ['t']) };
+            $ok_create = 0 unless defined $r;
+        }
+    }
+    ok($ok_create, 'FIXBATCH-3 fixture: two ranked records exist');
+
+    my $r = eval { $store->reorder(['fb3-p', 'fb3-q', 'fb3-q']) } if defined $store;
+    is(err_kind($@), 'reorder_mismatch', 'FIXBATCH-3: reorder([p,q,q]) (a duplicate id) dies reorder_mismatch')
+        or diag('got: ' . (ref($@) ? "$@" : $@));
+
+    my $list = eval { $store->list() } if defined $store;
+    if (ref($list) eq 'ARRAY') {
+        is_deeply([sort map { $_->{id} } @$list], ['fb3-p', 'fb3-q'],
+            'FIXBATCH-3: the store still holds exactly the original two records after the refused reorder');
+    } else {
+        fail('FIXBATCH-3: the store still holds exactly the original two records after the refused reorder');
+    }
+}
+
+# =============================================================================
 # Live-store sanity, again, at the end.
 # =============================================================================
 {

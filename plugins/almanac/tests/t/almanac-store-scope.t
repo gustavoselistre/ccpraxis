@@ -152,6 +152,27 @@ ok($HAVE_STORE, 'Almanac::Store requires cleanly') or diag("load error: $@");
     my $seed = eval { $host_store->create(id => 'seed', fields => { title => 'orig' }, order => ['title']) } if defined $host_store;
     ok(defined $seed, 'AC-31 fixture: a seed record exists in the global store') or diag('error: ' . ($@ // ''));
 
+    # FIXBATCH (redteam HIGH-3 / review SHOULD-6): stage a pending-reorder
+    # journal BEFORE opening the read-only-scoped handle, so the
+    # read-only list() below is actually exercised against a store that
+    # HAS recovery work to do -- AC-31 previously passed vacuously here
+    # because its fixture carried no journal, so a list()/recover() that
+    # attempted a write was never actually reached.
+    my $dir_for_journal = eval { $host_store->dir } if defined $host_store;
+    my $journal_path    = defined $dir_for_journal ? "$dir_for_journal/.reorder-journal.json" : undef;
+    my $store_lock_path = defined $dir_for_journal ? "$dir_for_journal/.store.lock" : undef;
+    if (defined $journal_path) {
+        require JSON::PP;
+        open(my $jfh, '>:raw', $journal_path) or die "fixture: cannot write $journal_path: $!";
+        print {$jfh} JSON::PP->new->canonical->encode({
+            version => 1, writer => 'fixture', started_at => time(),
+            entries => { seed => { prev_rank => undef, next_rank => undef } },
+        });
+        close $jfh;
+    }
+    ok(defined $journal_path && -f $journal_path, 'AC-31 fixture: a pending-reorder journal is staged before the read-only open()');
+    ok(defined $store_lock_path && !-f $store_lock_path, 'AC-31 fixture: no .store.lock exists yet');
+
     # Referencing a fully-qualified package global (even one belonging to a
     # module that has not been `require`d) is always safe in Perl -- it
     # autovivifies an empty symbol-table entry rather than dying -- so this
@@ -167,6 +188,23 @@ ok($HAVE_STORE, 'Almanac::Store requires cleanly') or diag("load error: $@");
     ok(defined $baseline, 'AC-31: read() succeeds under the localized policy') or diag('error: ' . ($@ // ''));
     my $list_ok = eval { $c_store->list(); 1 } if defined $c_store;
     ok($list_ok, 'AC-31: list() succeeds under the localized policy') or diag('error: ' . ($@ // ''));
+
+    # FIXBATCH (redteam HIGH-3 / review SHOULD-6): list() on this
+    # read-only-scoped handle must not have attempted recovery -- the
+    # journal staged above is still exactly as it was, and no .store.lock
+    # sidecar was ever created, even though a real journal was present.
+    ok(defined($journal_path) && -f $journal_path,
+       'AC-31: list() under the read-only policy did NOT consume/rewrite the pending journal');
+    ok(defined($store_lock_path) && !-f $store_lock_path,
+       'AC-31: list() under the read-only policy never created .store.lock (no write was attempted)');
+
+    # And recover() called directly is likewise refused outright rather
+    # than attempting (and presumably failing) an actual write.
+    my $recover_rv = eval { $c_store->recover() } if defined $c_store;
+    is($recover_rv, 0, 'AC-31: recover() on the read-only-scoped handle returns 0 rather than attempting a write')
+        or diag('error: ' . ($@ // ''));
+    ok(defined($journal_path) && -f $journal_path,
+       'AC-31: ...and the journal is still untouched afterward');
 
     my @mutations = (
         ['create',        sub { $c_store->create(id => 'ac31-new', fields => { a => '1' }, order => ['a']) }],

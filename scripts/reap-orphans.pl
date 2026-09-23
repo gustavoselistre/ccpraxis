@@ -53,7 +53,7 @@
 # If they ever do need bounding, bound them by age with the same report-first
 # discipline as the process path -- do not fold it into this script's --kill.
 # SHAPE: a pure selection library plus a thin CLI, the convention this repo
-# already uses (bp-dispatch-log.pl, bp-runstate.pl). The point is testability
+# already uses (bp-dispatch-log.pl). The point is testability
 # WITHOUT SPAWNING ANYTHING: select_orphans takes a process list as data, so the
 # oracle feeds it synthetic processes instead of creating real orphans and real
 # kills inside the suite. A test for a process reaper that reaps is a test that

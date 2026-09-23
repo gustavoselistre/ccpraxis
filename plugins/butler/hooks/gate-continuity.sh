@@ -61,6 +61,43 @@ HOOK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib.sh
 source "$HOOK_DIR/lib.sh" 2>/dev/null || exit 0
 
+# --- MAJOR-6 (redteam-step6.md) -------------------------------------------
+#
+# Four Stop hooks fire on one Stop event; only guard-subagent-stall.sh and
+# gate-drive-loop.sh (package 02) read the operator's one-shot
+# .drive-solo/.run-finished marker. On a session that is BOTH continuity-
+# armed AND drive-solo-active, those two consume the marker and allow --
+# and THIS gate, knowing nothing about it, still denies on its own terms.
+# The turn does not end, and the operator's marker is already spent on a
+# stop that never happened -- the same "token spent for nothing" defect
+# gate-drive-loop.sh's own .stop-ok carry exists to fix, reintroduced here
+# for the operator's PRIMARY lever.
+#
+# FINISH_GRACE_S / _bp_continuity_finish_present -- a LOCAL, NON-MUTATING
+# copy of gate-drive-loop.sh's own _bp_finish_present (MINOR-1) plus its
+# lower-bounded grace window (MAJOR-2). Write-set boundary, this whole
+# hook family's own convention (see this file's header on why there is no
+# shared bp_hook_gate call): duplicated rather than sourced from a sibling
+# package's file. NON-MUTATING is deliberate -- the two sibling hooks
+# already consume (rename) the marker on this same Stop event; this gate
+# only needs to recognise a fresh-or-just-consumed one as "the operator is
+# ending this run", never spend it a second time.
+FINISH_GRACE_S=15
+_bp_continuity_finish_present() {
+    local _cfp_ds="$1"
+    [ -f "$_cfp_ds/.run-finished" ] && return 0
+    if [ -f "$_cfp_ds/.run-finished.consumed" ]; then
+        local _cfp_now _cfp_mt
+        _cfp_now=$(date +%s 2>/dev/null || echo 0)
+        _cfp_mt=$(bp_mtime "$_cfp_ds/.run-finished.consumed")
+        if [ "$_cfp_now" -gt 0 ] && [ "$_cfp_mt" -gt 0 ] \
+           && [ $(( _cfp_now - _cfp_mt )) -ge 0 ] \
+           && [ $(( _cfp_now - _cfp_mt )) -lt "$FINISH_GRACE_S" ]; then
+            return 0
+        fi
+    fi
+    return 1
+}
 
 # Coordinators are gate-stop.sh's business, and arm itself already refuses
 # BP_LEDGER at the source (spec SS2.2). This is defense in depth, independent
@@ -115,7 +152,65 @@ SID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
 # facts agreeing, which is what makes it safe for any number of concurrent
 # sessions sharing one registry.
 if [ "$HAVE_PENDING" -eq 1 ]; then
-  perl "$HOOK_DIR/../scripts/bp-session.pl" claim --session "$SID" >/dev/null 2>&1 || true
+  CLAIM_OUT=$(perl "$HOOK_DIR/../scripts/bp-session.pl" claim --session "$SID" 2>&1)
+  CLAIM_RC=$?
+
+  _NOW_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)
+  _UNBOUND_N=""
+
+  if [ "$CLAIM_RC" -ne 0 ]; then
+    # claim itself failed (bad registry, bad session id, perl error). Today
+    # this is the most silent failure of all: the exit code was discarded.
+    if [ -n "${CONT_DIR:-}" ]; then
+      # MEDIUM-2 (redteam): key the record per session so a second, unrelated
+      # failing claim (any session sharing this registry) cannot clobber or
+      # be misattributed to this one. Fall back to the legacy unkeyed name
+      # only when $SID itself is not safe to use as a filename suffix -- the
+      # same refusal set bp_continuity_marker already applies to a session id.
+      _CE_FILE="$CONT_DIR/.claim-error"
+      case "$SID" in
+        */*|*\\*|*\**|.|..|*..*|*.*) ;;
+        *) _CE_FILE="$CONT_DIR/.claim-error-$SID" ;;
+      esac
+      # LOW-4 (redteam): keep the actual reason, not only the rc -- the
+      # first line of claim's own captured output, newline-collapsed. Pure
+      # shell (no subprocess) to match this file's own doctrine.
+      _CE_LINE1=${CLAIM_OUT%%$'\n'*}
+      _CE_LINE1=${_CE_LINE1%$'\r'}
+      printf '%s %s %s %s\n' "$CLAIM_RC" "$_NOW_ISO" "$SID" "$_CE_LINE1" > "$_CE_FILE" 2>/dev/null || true
+    fi
+    echo "butler continuity-gate: bp-session.pl claim exited $CLAIM_RC for session $SID -- this session is not armed and nothing was gated." >&2
+  fi
+
+  # Each EXPIRED line is a ticket that reached its binding deadline and will
+  # never bind. Record it; this is the state that had no name.
+  while IFS= read -r _cl; do
+    case "$_cl" in
+      "EXPIRED: "*)
+        _n=${_cl#EXPIRED: }
+        case "$_n" in
+          ccpx-sess-*) ;;                      # cheap prefilter
+          *) continue ;;
+        esac
+        # strict validation before using it as a path
+        printf '%s' "$_n" | grep -Eq '^ccpx-sess-[0-9a-f]{24}-[0-9]+$' || continue
+        if [ -n "${CONT_DIR:-}" ]; then
+          mkdir -p "$CONT_DIR/unbound" 2>/dev/null || true
+          printf 'expired %s %s\n' "$_NOW_ISO" "$SID" > "$CONT_DIR/unbound/$_n" 2>/dev/null || true
+        fi
+        _UNBOUND_N="$_n"
+        ;;
+    esac
+  done <<< "$CLAIM_OUT"
+
+  if [ -n "$_UNBOUND_N" ]; then
+    # LOW-2 (redteam): the write above is best-effort and can silently fail
+    # (read-only registry, ENOSPC) -- dropped the "has been recorded as
+    # unbound" claim rather than assert a side effect that may not have
+    # happened (the oracle's required substrings, spec SS2.2.1, never
+    # included that phrase).
+    echo "butler continuity-gate: an arming ticket did NOT bind (nonce $_UNBOUND_N): it passed its binding window before any Stop of the arming session could claim it (CCPRAXIS_CONTINUITY_TICKET_TTL_S, default 3600s -- a SEPARATE and much shorter TTL than the 12h marker TTL). This session is not armed and nothing was gated. Re-arm from the main session." >&2
+  fi
 fi
 
 MARK=$(bp_continuity_marker "$SID" 2>/dev/null) || exit 0
@@ -211,6 +306,24 @@ if [ -f "$MARK.stop-ok" ]; then
   exit 0
 fi
 
+# --- MAJOR-6: the operator's drive-solo .run-finished marker, for THIS ------
+# session, also ends an armed continuity turn -- see the header comment on
+# _bp_continuity_finish_present above for why this must be checked here and
+# why it is non-mutating. bp_drive_marker resolves this SID's OWN
+# drive-solo marker (never another session's); its content's first line is
+# the data dir a real drive-solo run recorded, same convention
+# gate-drive-loop.sh itself reads.
+_CFM_DRIVE_MARK=$(bp_drive_marker "$SID" 2>/dev/null) || _CFM_DRIVE_MARK=""
+if [ -n "$_CFM_DRIVE_MARK" ] && [ -f "$_CFM_DRIVE_MARK" ]; then
+  _CFM_DATA=$(head -n 1 "$_CFM_DRIVE_MARK" 2>/dev/null || true)
+  if [ -n "$_CFM_DATA" ] && [ -d "$_CFM_DATA/.drive-solo" ] \
+     && _bp_continuity_finish_present "$_CFM_DATA/.drive-solo"; then
+    rm -f "$MARK.stop-blocks" 2>/dev/null
+    echo "butler continuity-gate: allowing this stop -- the operator's .run-finished marker (drive-solo, this session) already ended this run; not spending it a second time." >&2
+    exit 0
+  fi
+fi
+
 # --- a wake-up is already scheduled: this turn end is legitimate -----------
 # mark-wakeup.sh's extended write (independent of .drive-solo) wrote this on
 # a Task/Agent dispatch or a backgrounded Bash call. CONSUME it.
@@ -241,14 +354,15 @@ if [ -f "$MARK.wakeup-pending" ]; then
   #
   # This used to parse the marker in awk and decide in shell: bounded? deadline
   # ahead? pid alive? Two of those three were subtly wrong, and both had already
-  # been solved in bp-runstate.pl -- kill -0 reports a healthy native Windows
+  # been solved in BpResumption.pm -- kill -0 reports a healthy native Windows
   # process as dead, and a live pid is not the SAME pid once the holding process
   # has exited and the OS recycled the number. `hold` exits at its deadline BY
   # DESIGN, so pid reuse is the ordinary case here, not an exotic one.
   #
   # Shell cannot compute a process fingerprint, so translating the rules here a
   # second time could only reproduce that gap. bp-resumption.pl answers instead,
-  # over the same module bp-runstate.pl uses. The marker is consumed either way,
+  # over `BpResumption.pm` -- one implementation of these two rules, not a
+  # second translation. The marker is consumed either way,
   # so a stale one can never be spent twice.
   # THE RECORD ON DISK IS ALWAYS THE EXPIRED ONE AT THIS MOMENT, AND THAT IS
   # STRUCTURAL RATHER THAN UNLUCKY.

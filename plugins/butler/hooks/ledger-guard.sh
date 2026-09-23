@@ -42,8 +42,35 @@ set -u
 HOOK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib.sh
 source "$HOOK_DIR/lib.sh"
-bp_hook_gate                        # inert outside a coordinator session, at zero cost
-bp_hook_require_json_parser                  # fail-CLOSED (lib.sh:15-21), as guard-writes.sh:20
+
+# 07-guards-reach-the-driver: two activation paths, one body, exactly like
+# guard-writes.sh (spec §2.4). The fail-open/fail-closed split is deliberate
+# and not a contradiction: the ACTIVATION question ("is a driver run in
+# progress and what is its context") fails OPEN on any internal error --
+# any error here -> the predicate returns rc 1 -> exit 0, precisely today's
+# (inert) driver-session behaviour, so nothing can regress. The VERDICT
+# question ("would this write leave a corrupt ledger"), reached only once
+# activation succeeded, keeps its existing fail-CLOSED semantics byte for byte.
+DRIVER_LEDGER=""
+if [ -n "${BP_LEDGER:-}" ]; then
+  bp_hook_gate                        # inert outside a coordinator session, at zero cost
+  bp_hook_require_json_parser                  # fail-CLOSED (lib.sh:15-21), as guard-writes.sh:20
+else
+  bp_drive_any_active 2>/dev/null || exit 0
+  bp_read_payload open
+  _cwd=$(bp_json_get "$PAYLOAD" cwd 2>/dev/null || true)
+  bp_driver_context "${_cwd:-$PWD}" || exit 0
+  # fix-batch V6 (redteam BLOCKER-2a/2b remainder): the driver's own CURRENT
+  # package ledger is the one write the always-allow carve-out (guard-writes.sh)
+  # does not reach on its own -- ledgers legitimately live under <data>/ and
+  # must stay writable in general (bp-ledger.pl, workers, etc). Record its
+  # normalised path so the V6 check below can compare old vs. prospective
+  # write_set/test_paths ONLY for this exact file, and ONLY on the driver
+  # path -- workers never populate BP_DIR/BP_PACKAGE via the driver predicate
+  # above, so this branch (and DRIVER_LEDGER) is structurally unreachable on
+  # the worker path.
+  DRIVER_LEDGER=$(realpath -m "${BP_DIR:-}/packages/${BP_PACKAGE:-}.md" 2>/dev/null || true)
+fi
 
 # b19-ledger-timestamp-integrity: the last_updated: VALUE check (monotonicity +
 # future-skew) lives ONCE, in bp-ledger.pl (the b13 API), and this hook `require`s it
@@ -194,6 +221,18 @@ sub splice_bytes {
 
 sub truthy { my ($v) = @_; return $v ? 1 : 0 }
 
+# fm_block STRING -> the frontmatter block body (between the delimiters), or
+# undef if none. ledger_fm's own regex (bp-orchestrator.pl:481), verbatim, so
+# the guard agrees with the orchestrator by construction. Factored into one
+# sub so V2 and V6 (fix-batch) share the single definition rather than each
+# carrying its own copy of the pattern (AC-15's "no NEW inline frontmatter
+# regex" discipline).
+sub fm_block {
+    my ($s) = @_;
+    my ($fm) = $s =~ /\A---\s*\n(.*?)\n---/s;
+    return $fm;
+}
+
 # --- b19: require the shared last_updated_check() from bp-ledger.pl --------
 # FAIL CLOSED if it cannot be loaded, matching this guard's existing discipline for a
 # missing perl/jq (bp_hook_require_json_parser, lib.sh) -- an unenforced guard is worse than a
@@ -230,7 +269,7 @@ sub validate {
     # V2 frontmatter block — ledger_fm's own regex (bp-orchestrator.pl:481),
     # verbatim, so the guard agrees with the orchestrator by construction. .*?
     # is non-greedy, so a body-level "---" rule far below is harmless.
-    my ($FM) = $B =~ /\A---\s*\n(.*?)\n---/s;
+    my $FM = fm_block($B);
     unless (defined $FM) {
         deny(q{LEDGER-GUARD: BLOCKED } . "\xe2\x80\x94" . q{ the content this write would leave in } . $ABS . q{ has no parseable frontmatter block: it must begin at byte 0 with a line '---' and be closed by a later line '---' (the orchestrator's own reader is /\A---\s*\n(.*?)\n---/s, bp-orchestrator.pl:481). Broken frontmatter does not error } . "\xe2\x80\x94" . q{ ledger_fm returns undef for EVERY key and the orchestrator silently acts on a stale registry status (:1039) with an empty write_set (:1040). Restore the delimiters and retry.});
     }
@@ -279,6 +318,44 @@ sub validate {
              . ' drops required section heading(s): ' . join(', ', @gone)
              . '. Every ledger must carry ## Next action, ## Decisions & attempt log, ## Pipeline, ## Outputs and ## Escalation. '
              . q{bp-status.sh:32 locates the next action with a bare awk /^## Next action/ and renders a BLANK CELL rather than an error when it is gone, so the loss is invisible, and the protocol's resumption contract ("execute ## Next action") becomes unsatisfiable. Edit the section BODY; never delete the heading. Restore it and retry.});
+    }
+
+    # V6 (fix-batch, closes redteam BLOCKER-2a/2b remainder): while a driver
+    # session is active and $ABS IS the driver's own CURRENT package ledger
+    # ($BP_DIR/packages/$BP_PACKAGE.md on the driver path -- never on the
+    # worker path, where $ENV{LG_DRIVER_LEDGER} is always unset), the
+    # write_set: and test_paths: VALUES may not change relative to the
+    # on-disk original. V1-V5 only ever required these keys to be PRESENT,
+    # never checked their value, which is exactly how a driver-path actor
+    # could self-widen its own write_set or blank its own test_paths (and so
+    # unprotect its own oracle) via a structurally valid ledger write. This
+    # is deliberately narrow: it fires ONLY for the driver's own current
+    # package, never for another blueprint's ledger, never on the worker
+    # path, and never for any OTHER frontmatter key.
+    my $DRIVER_LEDGER = $ENV{LG_DRIVER_LEDGER};
+    if (defined $DRIVER_LEDGER && length($DRIVER_LEDGER) && $ABS eq $DRIVER_LEDGER
+        && defined $OLD && length($OLD)) {
+        my $OLD_FM = fm_block($OLD);
+        if (defined $OLD_FM) {
+            my @OLD_FML = split(/\n/, $OLD_FM, -1);
+            for my $k (qw(write_set test_paths)) {
+                my ($old_v) = (map { /^\Q$k\E:\s*(.*?)\s*$/ ? $1 : () } @OLD_FML);
+                my ($new_v) = (map { /^\Q$k\E:\s*(.*?)\s*$/ ? $1 : () } @FML);
+                $old_v = '' unless defined $old_v;
+                $new_v = '' unless defined $new_v;
+                if ($old_v ne $new_v) {
+                    deny('LEDGER-GUARD: BLOCKED ' . "\xe2\x80\x94"
+                        . ' the content this write would leave in ' . $ABS . ' changes '
+                        . $k . ': from "' . $old_v . '" to "' . $new_v
+                        . '" -- this is the driver\'s own CURRENTLY EXECUTING package, and its'
+                        . ' scope fields (write_set, test_paths) are not editable while current.'
+                        . ' A driver that can widen its own write set or blank its own test_paths'
+                        . ' makes the write-set containment and oracle-protection guards'
+                        . ' unfalsifiable. If the scope genuinely needs to change, escalate for a'
+                        . ' re-scope -- the orchestrator re-scopes packages, coordinators do not.');
+                }
+            }
+        }
     }
 
     # b19-ledger-timestamp-integrity: last_updated: VALUE monotonicity + future-skew,
@@ -389,5 +466,5 @@ exit 0;
 LG_PERL_PROGRAM
 )
 
-printf '%s' "$PAYLOAD" | LG_ABS="$ABS" LG_TOOL="$TOOL" LG_LEDGER_PL="$LEDGER_PL" perl -e "$VALIDATOR"
+printf '%s' "$PAYLOAD" | LG_ABS="$ABS" LG_TOOL="$TOOL" LG_LEDGER_PL="$LEDGER_PL" LG_DRIVER_LEDGER="$DRIVER_LEDGER" perl -e "$VALIDATOR"
 exit $?

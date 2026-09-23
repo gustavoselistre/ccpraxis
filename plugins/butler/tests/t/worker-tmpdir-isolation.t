@@ -264,7 +264,12 @@ sub run_worker {
 #    own top level again after the first write.
 # ===========================================================================
 {
-    require "$ROOT_SCRIPTS/bp-runstate.pl";
+    # Repointed to BpResumption.pm (package 03-retire-runstate, spec §2.9's
+    # entry for this file: "load BpResumption.pm, call
+    # BpResumption::pid_fingerprint"). bp-runstate.pl's own two-line wrapper
+    # already forwarded to this same implementation; only the require path
+    # changes here.
+    require "$ROOT_SCRIPTS/BpResumption.pm";
     my ($bp, $proj) = mk_bp();
     my $pkg = 'pkgE';
     add_pkg($bp, $pkg);
@@ -274,7 +279,7 @@ sub run_worker {
     write_file("$live_dir/inprogress.txt", "a live dispatch's scratch file\n");
     # Owned by THIS test process ($$) -- genuinely alive for the whole of this
     # block, exactly like a real bp-worker.pl parent waiting on its child.
-    my $fp = BpRunState::pid_fingerprint($$);
+    my $fp = BpResumption::pid_fingerprint($$);
     ok(defined $fp && length $fp,
        'E-setup: FIXTURE-SANITY -- this host can fingerprint its own pid '
      . '(if not, E1/E2 below cannot be meaningful and are skipped)')

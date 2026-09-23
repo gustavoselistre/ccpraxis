@@ -55,7 +55,7 @@ Call `bp-drive-next.pl next --scope <scope>` → dispatch the returned action **
 | `pause` (reason=`usage`) | Wait **token-cheaply** until `action.until_epoch` — **Monitor** with an until-condition, or **ScheduleWakeup** to the epoch under `/loop`; never busy-poll, never spin tokens. | `next` again (after the epoch) |
 | `stop` (reason=`token-refresh-failed`) | **Genuinely terminal:** the director already tried and failed to refresh the token (via `bp-token-keeper.pl`). Tell the user to `/login` and re-invoke `drive-solo`; add to the end-batch (Decision #15). NOT an auto-resume. | *(none — stop; user re-invokes)* |
 | `blueprint-done` | RE-EVALUATE the still-`pending` blueprints' validity (semantic Claude judgment, Decision #3/#4/#17); PARK the stale/moot ones. | `bp-drive-next.pl park <blueprint> <reason…>` for each stale bp, then `next` again |
-| `done` | Present ALL batched decisions/parks in ONE pass (Decision #5): per-blueprint done/total, every accumulated park with its one-line decision + verify command, any governance-degraded note, any relogin. | *(none — run settled; stop)* |
+| `done` | Present ALL batched decisions/parks in ONE pass (Decision #5): per-blueprint done/total, every accumulated park with its one-line decision + verify command, any governance-degraded note, any relogin. Then, as the LAST act before stopping, retire this session's driver marker by running the sentinel command verbatim: `echo butler-drive-solo-retire` (see "Retire the driver marker" below). | *(none — run settled; stop)* |
 
 > The **governor** verdict (`bp-usage-gate.pl verdict`) that produces a `pause` is fetched INTERNALLY by the director — the session never runs it (Decision #13).
 > **Keep-awake** is a director-managed side-effect, never a session action (Decision #7).
@@ -137,14 +137,35 @@ whenever a wakeup is already pending. It never creates a second, independent
 lease: if no lease is currently held, `--keepawake` is a no-op for that tick — the
 director remains the only thing that ever spawns the first one.
 
-**Step 3 — one `pause` call satisfies BOTH gates.** `guard-subagent-stall.sh`
-already blocks this turn's own Stop until you call `finish` or a verified `pause` on
-`bp-runstate.pl`, and its own denial text already spells out the exact
-`pause --watcher-pid <pid> --until <epoch>` call. That SAME call —
-`bp-runstate.pl pause --watcher-pid <the backgrounded watcher's own pid> --until
-<launch-epoch + N>` — is also the exact state `gate-drive-loop.sh`'s runstate fold
-(below) now reads on a LATER turn while the dispatch is still in flight. This is
-reuse, not new plumbing: w02 adds no new state machine.
+**Step 3 — Step 2's armed watcher IS what satisfies the gate; there is no
+declaration to make.** `guard-subagent-stall.sh` asks the **probe**
+(`bp-watch.pl probe`), not a record — a live `bp-watch.pl` for this project,
+armed the way Step 2 just did, is the whole proof. Nothing further to call.
+
+- **There is no verb that ends a run.** Only the operator's own marker does
+  (Decision 7/16):
+  `touch <project>/.ccpraxis-local-data/.drive-solo/.run-finished`
+- **`--keepawake` on the Step 2 arm is what keeps the machine awake across the
+  wait**, by REFRESHING the director's existing lease — it never creates one.
+
+### Retire the driver marker
+
+When the operator says stop **before** the director ever returns `done` (the
+early-stop case), run the same sentinel command as the last act of the turn:
+
+```
+echo butler-drive-solo-retire
+```
+
+`mark-wakeup.sh` observes this exact command on a `Bash` call and deregisters
+this session from the machine-level driver registry (`bp_drive_retire`,
+`lib.sh`). **Retirement is NOT a verb that ends a run** — it only deregisters
+*this session* from the driver registry, after the run has already ended some
+other way (the operator's word, here, or a presented `done`, above). The
+operator's `.run-finished` marker remains the only thing that ends a run
+(Decision 7/16). An operator holding a session id directly can run the
+equivalent from a shell:
+`bash -c 'source <hooks>/lib.sh; bp_drive_retire <session-id>'`.
 
 On exit `bp-watch.pl` prints one of five verdicts — act on it, don't just re-arm
 blindly:
@@ -196,14 +217,11 @@ exactly like success.
 `bp-watch.pl` observes and reports; it never kills anything and never writes into a
 blueprint. Remediation is a judgment call and stays with you.
 
-**The residual named by w01 is closed by the fold, contingent on `gate-drive-loop.sh`
-being in w02's write set.** A `BOUND` exit with a live, verified pause in place no
-longer risks a silent block-then-nag on the next Stop — `bp-runstate.pl status`
-reporting `paused` is exactly the signal `gate-drive-loop.sh`'s fold now consults. A
-`BOUND` exit with **no** verified pause (the watcher died, or nobody ever called
-`pause`) correctly still blocks: the gate cannot tell the difference between "forgot
-to re-arm" and "nothing was ever watching," and per `t/94` section H it must not
-guess in the permissive direction.
+**A `BOUND` exit means exactly what `bp-watch.pl` itself prints: the bound elapsed,
+subject liveness is UNKNOWN.** Re-arm with a fresh bound, or investigate — never
+treat it as dead or as done. The residual is closed by the fold: `gate-drive-loop.sh`'s
+fold reads the probe (a live `bp-watch.pl` for this project) directly, the same
+signal Step 3 above already relies on — there is no separate record left to consult.
 
 ## Lean-context
 

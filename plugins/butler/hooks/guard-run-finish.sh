@@ -122,7 +122,15 @@ bp_rf_scan_target() {
   local carrier=0
   local out="" c next
   local qbuf="" qhaswhite=0 qadjacent=0
-  local adj_re='(^|[;&|[:space:]`({])((perl|bash|sh)[[:space:]]+)?([[:alnum:]_./-]*/)?bp-(runstate|continuity)\.(pl|sh)[[:space:]]*$'
+  # BLOCKER-2 (redteam-step6.md): `touch .../.run-finished` is an ordinary,
+  # unguarded Bash command that ends a run exactly as `bp-runstate.pl
+  # finish` does (both hooks consuming that marker treat it as an
+  # unconditional allow) -- so a quoted path immediately after `touch`,
+  # `cp` or `mv` (verb position, same as the two script names above) must
+  # unmask the same way, or a quoted target path would falsely X-mask into
+  # a non-match. `>` is a single character, not a word, so it is matched
+  # separately below rather than folded into this word-anchored class.
+  local adj_re='(^|[;&|[:space:]`({])((perl|bash|sh)[[:space:]]+)?([[:alnum:]_./-]*/)?(bp-(runstate|continuity)\.(pl|sh)|touch|cp|mv)[[:space:]]*$|>[[:space:]]*$'
   local i=0
   while [ "$i" -lt "$len" ]; do
     c=${cmd:$i:1}
@@ -219,8 +227,14 @@ bp_rf_is_run_ending() {
   # candidate at all. Restores the old bare-glob's cheap fast path for the
   # overwhelming majority of commands, without weakening anything the walk
   # itself decides for the rare command that DOES mention one.
+  # BLOCKER-2 (redteam-step6.md): `.run-finished` added as a third
+  # candidate substring -- an ordinary, unguarded `touch <project>/.ccpraxis-
+  # local-data/.drive-solo/.run-finished` makes _bp_finish_signal (the two
+  # Stop gates that read this marker) return an UNCONDITIONAL allow, with no
+  # authorisation check at all. Same fast pre-check shape as the other two:
+  # a command mentioning none of the three substrings is never a candidate.
   case "$CMD" in
-    *bp-runstate*|*bp-continuity*) ;;
+    *bp-runstate*|*bp-continuity*|*.run-finished*) ;;
     *) return 1 ;;
   esac
 
@@ -235,10 +249,28 @@ bp_rf_is_run_ending() {
     *)         anchor_class='[;&|[:space:]({]' ;;
   esac
 
-  local runstate_re="(^|${anchor_class})((perl|bash|sh)[[:space:]]+)?([[:alnum:]_./-]*/)?bp-runstate\.(pl|sh)\b[^;&|(){}\n]*\bfinish\b"
-  local continuity_re="(^|${anchor_class})((perl|bash|sh)[[:space:]]+)?([[:alnum:]_./-]*/)?bp-continuity\.(pl|sh)\b[^;&|(){}\n]*\b(disarm|off)\b"
+  # fix-batch B1 (red-team HIGH-2): extension made OPTIONAL -- `(\.(pl|sh))?`
+  # rather than the mandatory `\.(pl|sh)` this used to require -- so the
+  # bare/extensionless alias (created unconditionally for every *.sh in
+  # plugins/*/bin/ on non-Windows installs, and the form gate-continuity.sh
+  # itself prefers and recommends in its own denial text) is recognized as
+  # run-ending identically to the .pl and .sh spellings, instead of silently
+  # bypassing this authorization check.
+  local runstate_re="(^|${anchor_class})((perl|bash|sh)[[:space:]]+)?([[:alnum:]_./-]*/)?bp-runstate(\.(pl|sh))?\b[^;&|(){}\n]*\bfinish\b"
+  local continuity_re="(^|${anchor_class})((perl|bash|sh)[[:space:]]+)?([[:alnum:]_./-]*/)?bp-continuity(\.(pl|sh))?\b[^;&|(){}\n]*\b(disarm|off)\b"
+  # BLOCKER-2: a command that WRITES to a path matching *.run-finished via
+  # touch/cp/mv (verb position, masked/unmasked by adj_re above) or a `>`
+  # redirect. Deliberately excludes `.run-finished.consumed` (the archived,
+  # already-spent record) -- `([^.]|$)` after the literal requires the
+  # match not be immediately followed by another '.', so a create of the
+  # LIVE marker is caught while a stray write to the consumed archive is
+  # not. Not anchored to command position for `>`: a redirect target can
+  # appear anywhere in a compound command.
+  local finish_marker_re="(^|${anchor_class})(touch|cp|mv)[[:space:]]+[^;&|(){}\n]*\.run-finished([^.]|\$)|>[[:space:]]*[^;&|(){}\n]*\.run-finished([^.]|\$)"
 
-  grep -Eq "$runstate_re" <<<"$RF_SCAN" || grep -Eq "$continuity_re" <<<"$RF_SCAN"
+  grep -Eq "$runstate_re" <<<"$RF_SCAN" \
+    || grep -Eq "$continuity_re" <<<"$RF_SCAN" \
+    || grep -Eq "$finish_marker_re" <<<"$RF_SCAN"
 }
 
 # The main body below must not run when this file is merely SOURCED (e.g. by

@@ -59,16 +59,15 @@ our $VERSION = '1.0';
 # ---------------------------------------------------------------------------
 package Almanac::Store::Error;
 
-# Stringification via overload, WITHOUT a `use overload` line: S2.0's import
-# allowlist for Almanac/Store.pm (checked by AC-47, a straight grep of every
-# `use`/`require` line in the file) does not list `overload`, even though
-# S2.5's error shape is defined with it. overload.pm is already loaded by
-# the time this runs -- Almanac::Record's own Error class `use overload`s,
-# and this file `use Almanac::Record ()`s above -- so calling its import()
-# directly, as a method call rather than a `use`/`require` statement,
-# reaches the exact same code `use overload` would have compiled to without
-# adding a second forbidden import line.
-BEGIN { overload->import('""' => sub { $_[0]->{message} }, fallback => 1); }
+# Stringification via overload. DRIVER AMENDMENT (2026-09-23), post-review
+# (SHOULD-7): `overload` was omitted from S2.0's original import allowlist
+# while S2.5's error shape requires it; the original workaround called
+# overload->import(...) at BEGIN time to route around the allowlist check,
+# which depended on Almanac::Record happening to `use overload` first and
+# being loaded first -- a load-order dependency across files with no visible
+# connection. `overload` is core Perl and S2.5 already mandates it, so the
+# allowlist now admits it and this is a plain, ordinary import.
+use overload '""' => sub { $_[0]->{message} }, fallback => 1;
 
 my %KEY_ORDER = (
     conflict          => [qw(id field winner expected_rev actual_rev path)],
@@ -84,6 +83,7 @@ my %KEY_ORDER = (
     lock_timeout      => [qw(id path waited_ms timeout_ms holder_pid holder_host)],
     io                => [qw(path errno)],
     usage             => [qw(detail)],
+    refused           => [qw(path detail)],
 );
 
 sub _tok {
@@ -246,16 +246,31 @@ sub surface {
         return $_[0]->{surface};
     }
     my (%opt) = @_;
+    # The explicit `surface` option is a first-class, documented API/testing
+    # seam: a caller passing it already has full code-execution privilege in
+    # this process (the same privilege that would let it monkey-patch
+    # %SCOPE_POLICY directly), so it is honoured in either direction.
     if (defined $opt{surface} && ($opt{surface} eq 'host' || $opt{surface} eq 'container')) {
         return $opt{surface};
     }
+
+    my $detected = -e '/run/.containerenv' ? 'container'
+                 : (-e '/.dockerenv'       ? 'container' : 'host');
+
+    # redteam MEDIUM-5: $ENV{ALMANAC_SURFACE} crosses process boundaries --
+    # unlike the `surface` option above, a parent process (or anything it
+    # spawns) can set it without the loading code ever having asked for it.
+    # Decision 7's whole point is that the party being constrained cannot
+    # turn off its own constraint, so the env var may only TIGHTEN a
+    # detected surface (host -> container), never loosen a detected
+    # container back to host.
     if (defined $ENV{ALMANAC_SURFACE}
-        && ($ENV{ALMANAC_SURFACE} eq 'host' || $ENV{ALMANAC_SURFACE} eq 'container')) {
-        return $ENV{ALMANAC_SURFACE};
+        && $ENV{ALMANAC_SURFACE} eq 'container'
+        && $detected eq 'host') {
+        return 'container';
     }
-    return 'container' if -e '/run/.containerenv';
-    return 'container' if -e '/.dockerenv';
-    return 'host';
+
+    return $detected;
 }
 
 # The policy table Decision 7 (as amended) reduces to: a single boolean
@@ -373,13 +388,28 @@ sub _require_writable {
 # =============================================================================
 # 2.6 -- ids, the record path, writer_id.
 # =============================================================================
-my $WRITER_ID = do {
+# DRIVER AMENDMENT (2026-09-23), post-review (SHOULD-8). "Computed once at
+# module load" was originally read literally -- a value frozen at `use`
+# time -- which gives a forked child the SAME writer_id as its parent,
+# collapsing DC2's winner: diagnostic (winner == loser, indistinguishable).
+# The property this package actually needs is "stable within a process",
+# not "frozen at load"; those coincide only for a process that never forks.
+# Corrected contract: mint lazily on first call and whenever the calling pid
+# has changed since the cached value was minted, caching against that pid.
+my ($WRITER_ID, $WRITER_PID);
+sub _mint_writer_id {
     my $host = eval { Sys::Hostname::hostname() };
     $host = 'unknown' unless defined $host && length $host;
     $host =~ s/[^A-Za-z0-9._-]/_/g;
-    sprintf('%s/%d/%04x', $host, $$, int(rand(0x10000)));
-};
-sub writer_id { return $WRITER_ID }
+    return sprintf('%s/%d/%04x', $host, $$, int(rand(0x10000)));
+}
+sub writer_id {
+    if (!defined $WRITER_ID || !defined $WRITER_PID || $WRITER_PID != $$) {
+        $WRITER_PID = $$;
+        $WRITER_ID  = _mint_writer_id();
+    }
+    return $WRITER_ID;
+}
 
 sub _record_path { return "$_[0]->{dir}/$_[1].md" }
 
@@ -392,7 +422,8 @@ sub _validate_id {
     unless (defined $id
         && length($id) <= 128
         && $id =~ /\A[A-Za-z0-9][A-Za-z0-9._-]*\z/
-        && $id !~ /\.\./) {
+        && $id !~ /\.\./
+        && $id !~ /\A(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])\z/i) {
         _die(kind => 'bad_id', id => (defined $id ? $id : undef));
     }
     return 1;
@@ -415,6 +446,7 @@ sub ids {
         my $id = $1;
         next if length($id) > 128;
         next if $id =~ /\.\./;
+        next if $id =~ /\A(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])\z/i;
         next unless -f "$dir/$entry";
         push @out, $id;
     }
@@ -488,16 +520,14 @@ sub read {
     return $self->_load_record($id, $self->_record_path($id));
 }
 
-# list() -- runs recovery first (S2.11), then parses every record. A
-# malformed record makes the WHOLE call die malformed (Decision 4: no
-# silent skip, no partial result). Total order is (rank, id): rank_cmp
-# first, ties (and unranked records) broken by id, unranked sorting after
-# all ranked records.
-sub list {
+# _list_records() -- the actual directory-scan-and-sort work, WITHOUT the
+# recovery step. Shared by list() (the public verb) and reorder() (which
+# already holds the store lock and must never re-enter it -- see MUST-4's
+# note on _list_records below). Total order is (rank, id): rank_cmp first,
+# ties (and unranked records) broken by id, unranked sorting after all
+# ranked records.
+sub _list_records {
     my ($self) = @_;
-    $self->_require_readable('list');
-    $self->recover;
-
     my $ids = $self->ids;
     my @records;
     for my $id (@$ids) {
@@ -519,6 +549,23 @@ sub list {
     } @records;
 
     return \@records;
+}
+
+# list() -- runs recovery first (S2.11), then parses every record. A
+# malformed record makes the WHOLE call die malformed (Decision 4: no
+# silent skip, no partial result).
+sub list {
+    my ($self) = @_;
+    $self->_require_readable('list');
+    # HIGH-3 / SHOULD-6: recovery is a WRITE (it rewrites records, creates
+    # .store.lock, deletes the journal). A readable-but-not-writable scope
+    # (the exact shape Decision 7's amendment path exists to support) must
+    # still be able to list() -- S2.11 already says an individual record is
+    # valid whichever of the two ranks it currently holds, so simply
+    # skipping recovery here is a legal (half-applied) order, not a
+    # correctness violation.
+    $self->recover if $self->{writable};
+    return $self->_list_records;
 }
 
 # _build_order(\%fields, \@caller_order, $has_rank) -> @order
@@ -578,6 +625,15 @@ sub create {
     my $rank = CORE::exists $args{rank} ? $args{rank} : undef;
     if (defined $rank) {
         _die(kind => 'bad_rank', rank => $rank) unless rank_valid($rank);
+    }
+    if (ref $args{fields} eq 'HASH') {
+        for my $k (keys %{ $args{fields} }) {
+            _die(kind => 'usage', detail => "create: fields->{$k} must be a scalar, not a reference")
+                if ref $args{fields}{$k};
+        }
+    }
+    if (CORE::exists $args{body} && ref $args{body}) {
+        _die(kind => 'usage', detail => 'create: body must be a scalar, not a reference');
     }
 
     my $path = $self->_record_path($id);
@@ -646,13 +702,15 @@ sub update {
     $self->_validate_id($id);
 
     my $expect = $args{expect};
-    unless (ref $expect eq 'HASH' && CORE::exists $expect->{rev} && ref $expect->{fields} eq 'HASH') {
+    unless (ref $expect eq 'HASH' && defined $expect->{rev} && ref $expect->{fields} eq 'HASH') {
         _die(kind => 'usage', detail => 'update requires expect => { rev, fields } from a previous read/create/update');
     }
     if (ref $args{set} eq 'HASH') {
         for my $k (keys %{ $args{set} }) {
             _die(kind => 'reserved_field', id => $id, field => $k)
                 if $k eq 'id' || $k eq 'rank' || $k eq 'writer';
+            _die(kind => 'usage', detail => "update: set->{$k} must be a scalar, not a reference")
+                if ref $args{set}{$k};
         }
     }
     if (ref $args{unset} eq 'ARRAY') {
@@ -664,8 +722,19 @@ sub update {
     if (CORE::exists $args{rank} && defined $args{rank}) {
         _die(kind => 'bad_rank', rank => $args{rank}) unless rank_valid($args{rank});
     }
+    if (CORE::exists $args{body} && ref $args{body}) {
+        _die(kind => 'usage', detail => 'update: body must be a scalar, not a reference');
+    }
 
     my $path = $self->_record_path($id);
+    # LOW-6: check existence CHEAPLY before creating directory structure or
+    # taking a lock for a record that never existed -- the authoritative
+    # check (inside the lock, below) still runs; this is only an early,
+    # cheap short-circuit so a bogus id does not litter the store with a
+    # directory tree plus permanent lock sidecars.
+    unless (-f $path) {
+        _die(kind => 'not_found', id => $id, path => $path);
+    }
     File::Path::make_path($self->{dir}) unless -d $self->{dir};
 
     my ($lock, $lock_err) = Almanac::Lock->acquire($path, verb => 'update');
@@ -738,11 +807,16 @@ sub delete {
     $self->_validate_id($id);
 
     my $expect = $args{expect};
-    unless (ref $expect eq 'HASH' && CORE::exists $expect->{rev} && ref $expect->{fields} eq 'HASH') {
+    unless (ref $expect eq 'HASH' && defined $expect->{rev} && ref $expect->{fields} eq 'HASH') {
         _die(kind => 'usage', detail => 'delete requires expect => { rev, fields } from a previous read/create/update');
     }
 
     my $path = $self->_record_path($id);
+    # LOW-6: see the matching comment in update() -- cheap existence
+    # short-circuit before make_path/lock-acquire litter the store.
+    unless (-f $path) {
+        _die(kind => 'not_found', id => $id, path => $path);
+    }
     File::Path::make_path($self->{dir}) unless -d $self->{dir};
 
     my ($lock, $lock_err) = Almanac::Lock->acquire($path, verb => 'delete');
@@ -786,16 +860,37 @@ our $ON_BEFORE_RENAME;   # TEST SEAM ONLY. undef on every product code path.
 
 sub _write_record {
     my ($self, $path, $record, $verb) = @_;
-    my $bytes = Almanac::Record::serialize({ %$record, path => $path });
-    my $tmp   = "$path.tmp." . _tmp_nonce();
-    CORE::open(my $fh, '>:raw', $tmp) or _die(kind => 'io', path => $path, errno => "$!");
-    print {$fh} $bytes;
-    close($fh) or _die(kind => 'io', path => $path, errno => "$!");
+    # MEDIUM-3: Almanac::Record::serialize dies with an Almanac::Record::Error
+    # on a structural refusal (bad field name, forbidden byte, non-UTF-8
+    # body/value). Wrapped and re-raised in Store's OWN error shape -- S2.5's
+    # kind namespaces must not collide, and every Store mutation must end
+    # with Store's machine-block contract, not Record's.
+    my $bytes = eval { Almanac::Record::serialize({ %$record, path => $path }) };
+    if (my $rerr = $@) {
+        my $detail = (ref($rerr) eq 'Almanac::Record::Error' && defined $rerr->{message})
+                   ? $rerr->{message} : "$rerr";
+        $detail =~ s/\s+\z//;
+        _die(kind => 'refused', path => $path, detail => $detail);
+    }
+    my $tmp = "$path.tmp." . _tmp_nonce();
+    # SHOULD-11: both I/O failures below are about $tmp, not $path -- $path
+    # may not even exist yet on a create(). Report the path that actually
+    # failed.
+    CORE::open(my $fh, '>:raw', $tmp) or _die(kind => 'io', path => $tmp, errno => "$!");
+    # MEDIUM-4: check print's return value alongside close's -- a short/
+    # failed print followed by a successful close would otherwise rename a
+    # truncated file over a good record (Lock.pm:487-493's own pattern).
+    my $printed = print {$fh} $bytes;
+    my $closed  = close($fh);
+    unless ($printed && $closed) {
+        unlink $tmp;
+        _die(kind => 'io', path => $tmp, errno => "$!");
+    }
     $ON_BEFORE_RENAME->($path, $tmp, $verb) if ref $ON_BEFORE_RENAME eq 'CODE';
-    my ($ok, $rerr) = Almanac::Lock::rename_with_retry($tmp, $path);
+    my ($ok, $rerr2) = Almanac::Lock::rename_with_retry($tmp, $path);
     unless ($ok) {
         unlink $tmp;
-        _die(kind => 'io', path => $path, errno => (ref $rerr eq 'HASH' ? $rerr->{errno} : "$rerr"));
+        _die(kind => 'io', path => $path, errno => (ref $rerr2 eq 'HASH' ? $rerr2->{errno} : "$rerr2"));
     }
     return Digest::SHA::sha256_hex($bytes);
 }
@@ -922,7 +1017,16 @@ sub insert_last {
     my ($self, %args) = @_;
     $self->_require_writable('insert_last');
     my $list = $self->list();
-    my $last = @$list ? $list->[-1]{rank} : undef;
+    # CRITICAL-1: $list->[-1] is only the true maximum RANK when the last
+    # entry in list()'s DISPLAY order is itself ranked. list() sorts
+    # unranked records after every ranked one (S2.10), so the instant any
+    # unranked record exists, $list->[-1] is that unranked record and its
+    # rank is undef -- which would mint near the MIDDLE of the rank space
+    # (rank_between(undef,undef)) instead of after the true maximum. Take
+    # the maximum over ranked records only; @$list is already rank-sorted,
+    # so a grep suffices (no re-sort needed).
+    my @ranked = grep { defined $_->{rank} } @$list;
+    my $last   = @ranked ? $ranked[-1]{rank} : undef;
     my $rank = rank_between($last, undef) . rank_jitter();
     return $self->create(%args, rank => $rank);
 }
@@ -950,24 +1054,46 @@ sub _insert_relative {
     # DISPLAY order. Those agree whenever ref_id itself carries a rank (the
     # common case) -- but list() deliberately sorts an unranked record
     # AFTER every ranked one (S2.10's total-order rule), so an unranked
-    # ref_id permanently drifts to the tail and "whatever list() puts right
-    # after it" is always nothing, regardless of how many records exist.
-    # Comparing by rank value instead makes insert_before/insert_after well
-    # defined even then: an item with no rank behaves like rank_between's
-    # own undef sentinel (S2.10) -- "before everything" -- so the record
-    # immediately after it is simply the smallest-ranked record in the
-    # store, not a position that can never be reached by walking the
-    # display list forward from the tail.
+    # ref_id permanently drifts to the tail, and NOTHING can ever sort
+    # literally "after" it in display order -- there is no rank value that
+    # would land past an unranked tail record.
     my @ranked = sort { $a->{rank} cmp $b->{rank} } grep { defined $_->{rank} } @$list;
+    my $first_ranked = @ranked ? $ranked[0]{rank} : undef;
 
+    # MUST-2 / HIGH-4: when ref_id itself carries no rank, insert_before and
+    # insert_after must agree with EACH OTHER, not land on opposite sides.
+    # The previous code split the difference inconsistently -- insert_after
+    # landed before every ranked record while insert_before landed after
+    # every ranked record -- so a before-call could end up sorting AFTER an
+    # after-call against the identical reference (redteam's repro:
+    # after1 < before1). Since "after the unranked tail" is structurally
+    # unreachable (list() always sorts unranked last, so nothing can beat
+    # it), the only convention where "before" and "after" do not swap is to
+    # treat an unranked ref as sitting before every ranked record for BOTH
+    # verbs: each new insert lands at the front of the ranked block, and
+    # (rank, id) plus call order then keeps a later insert_before strictly
+    # ahead of an earlier insert_after (and vice versa) against the same
+    # unranked ref -- correct relative ordering, even though neither can
+    # literally sandwich the unranked reference itself.
+    #
+    # This is also the ONLY convention consistent with AC-16/AC-17 (the
+    # immutable ordering oracle), which repeats insert_after against one
+    # unranked anchor 1000 times and requires LIFO stacking at the front
+    # (list order = exact reverse of insertion order) -- the "after
+    # everything ranked" convention the review/redteam reports suggest for
+    # BOTH verbs was tried first and breaks that oracle outright (it turns
+    # the LIFO stack into FIFO). Recorded as a deliberate deviation from
+    # the reports' literal suggestion, not an oversight.
     my ($lo, $hi);
-    if ($where eq 'insert_before') {
+    if (!defined $ref_rank) {
+        ($lo, $hi) = (undef, $first_ranked);
+    } elsif ($where eq 'insert_before') {
         $hi = $ref_rank;
-        my @less = defined $ref_rank ? (grep { $_->{rank} lt $ref_rank } @ranked) : @ranked;
+        my @less = grep { $_->{rank} lt $ref_rank } @ranked;
         $lo = @less ? $less[-1]{rank} : undef;
     } else {
         $lo = $ref_rank;
-        my @more = defined $ref_rank ? (grep { $_->{rank} gt $ref_rank } @ranked) : @ranked;
+        my @more = grep { $_->{rank} gt $ref_rank } @ranked;
         $hi = @more ? $more[0]{rank} : undef;
     }
     my $rank = rank_between($lo, $hi) . rank_jitter();
@@ -1006,6 +1132,14 @@ sub _write_journal {
 # ROLLBACK, NOT ROLL-FORWARD (DC5): the criterion is that a crash mid-
 # reorder leaves the PREVIOUS order intact, so every entry is rewritten back
 # to its prev_rank, never forward to next_rank.
+#
+# Return value: 1 iff every entry in the journal was confirmed already-
+# correct or successfully rewritten (and the journal was then removed); 0
+# if nothing was there to recover, the journal itself could not be
+# honoured (and was removed as a self-healing measure -- MEDIUM-1/MUST-4),
+# or ANY entry was skipped (HIGH-2/MUST-5: the journal is deliberately kept
+# in that case so a later call can retry -- retrying is idempotent by
+# design).
 sub _rollback_pending_journal {
     my ($self) = @_;
     my $journal_path = $self->_journal_path;
@@ -1019,45 +1153,82 @@ sub _rollback_pending_journal {
         $c;
     };
     my $data = eval { JSON::PP->new->decode($raw) };
-    return 0 unless ref $data eq 'HASH' && ref $data->{entries} eq 'HASH';
+    unless (ref $data eq 'HASH' && ref $data->{entries} eq 'HASH') {
+        # MUST-4 / MEDIUM-1: an undecodable/malformed journal carries no
+        # rollback information -- retaining it can only block every future
+        # list() (each one pays the store-lock acquire forever) and never
+        # help. Self-heal: unlink it and report nothing was recovered.
+        unlink($journal_path);
+        return 0;
+    }
 
+    my $incomplete = 0;
     for my $id (sort keys %{ $data->{entries} }) {
         my $entry     = $data->{entries}{$id};
         my $prev_rank = $entry->{prev_rank};
         my $path      = $self->_record_path($id);
+        # The record is simply gone (deleted after the crashed reorder) --
+        # there is nothing left to roll back TO, and no future retry can
+        # change that, so this is not "incomplete", it is genuinely done.
         next unless -f $path;
 
-        my $cur = eval { $self->_load_record($id, $path) };
-        next unless defined $cur;
-
-        my $cur_rank = $cur->{rank};
-        my $same = (defined $prev_rank && defined $cur_rank) ? ($prev_rank eq $cur_rank)
-                 : (!defined $prev_rank && !defined $cur_rank);
-        next if $same;
-
+        # HIGH-1: acquire the per-record lock FIRST, then re-read under it
+        # -- exactly reorder()'s own discipline (Store.pm _load_record call
+        # inside its per-record eval, below). The previous ordering read
+        # the record's state BEFORE the lock and wrote that stale snapshot
+        # after acquiring, silently overwriting a concurrent, legitimately-
+        # successful update() that landed in the window between the two.
         my ($rlock, $rlock_err) = Almanac::Lock->acquire($path, verb => 'recover');
-        next unless $rlock;
-        my %fields = %{ $cur->{fields} };
-        if (defined $prev_rank) { $fields{rank} = $prev_rank; } else { CORE::delete $fields{rank}; }
-        $fields{id}     = $id;
-        $fields{writer} = writer_id();
-        my @order = _build_order(\%fields, $cur->{order}, defined $prev_rank ? 1 : 0);
-        eval {
-            $self->_write_record($path, { fields => \%fields, order => \@order, body => $cur->{body} }, 'recover');
+        unless ($rlock) {
+            # HIGH-2/MUST-5: a merely-busy or timed-out lock is NOT the same
+            # as "nothing to do here" -- mark incomplete so the journal
+            # survives for a retry instead of being silently discarded.
+            $incomplete = 1;
+            next;
+        }
+
+        my $rok = eval {
+            my $cur      = $self->_load_record($id, $path);
+            my $cur_rank = $cur->{rank};
+            my $same = (defined $prev_rank && defined $cur_rank) ? ($prev_rank eq $cur_rank)
+                     : (!defined $prev_rank && !defined $cur_rank);
+            unless ($same) {
+                my %fields = %{ $cur->{fields} };
+                if (defined $prev_rank) { $fields{rank} = $prev_rank; } else { CORE::delete $fields{rank}; }
+                $fields{id}     = $id;
+                $fields{writer} = writer_id();
+                my @order = _build_order(\%fields, $cur->{order}, defined $prev_rank ? 1 : 0);
+                $self->_write_record($path, { fields => \%fields, order => \@order, body => $cur->{body} }, 'recover');
+            }
+            1;
         };
         $rlock->release;
+        $incomplete = 1 unless $rok;
     }
 
-    unlink($journal_path);
-    return 1;
+    unlink($journal_path) unless $incomplete;
+    return $incomplete ? 0 : 1;
 }
 
 sub recover {
     my ($self) = @_;
+    # HIGH-3 / SHOULD-6: recovery is a write; refuse it outright on a
+    # read-only scope rather than letting the caller's mistake surface as a
+    # confusing io error from what looks like a read.
+    return 0 unless $self->{writable};
     return 0 unless -e $self->_journal_path;
 
-    my ($lock, $lock_err) = Almanac::Lock->acquire("$self->{dir}/.store", verb => 'recover');
+    # MEDIUM-2: take the store lock NON-BLOCKING. A journal whose owner
+    # still holds the store lock (an in-flight reorder()) is by definition
+    # not abandoned -- it is not this call's job to wait out someone else's
+    # reorder, and S5.3 explicitly accepts a concurrent read seeing the
+    # current on-disk state as a non-failing degradation. Blocking here for
+    # the full default timeout turned "an insert_* concurrent with a
+    # reorder" into a lock_timeout die, which S5.3 never promised.
+    my ($lock, $lock_err) = Almanac::Lock->acquire("$self->{dir}/.store", verb => 'recover', timeout_ms => 0);
     unless ($lock) {
+        my $kind = (ref $lock_err eq 'HASH') ? $lock_err->{kind} : '';
+        return 0 if $kind eq 'timeout';   # busy, not abandoned -- proceed against current state
         $self->_die_from_lock_error(undef, "$self->{dir}/.store", $lock_err);
     }
     my $result = eval { $self->_rollback_pending_journal() };
@@ -1086,9 +1257,15 @@ sub reorder {
 
     my $records;
     my $ok = eval {
+        # MUST-4: use the recovery-free helper, not list() -- list() would
+        # unconditionally call recover(), which re-acquires the store lock
+        # THIS sub already holds, producing a 'reentrant' lock error every
+        # time a journal happens to still be on disk when this runs. The
+        # rollback above already ran directly (no re-acquire, AC-20), so
+        # the store lock is never re-entered anywhere in this call.
         $self->_rollback_pending_journal();
 
-        my $before      = $self->list();
+        my $before      = $self->_list_records();
         my @current_ids = map { $_->{id} } @$before;
         my %prev_rank   = map { $_->{id} => $_->{rank} } @$before;
         my %have        = map { $_ => 1 } @current_ids;
@@ -1096,11 +1273,19 @@ sub reorder {
 
         my @missing = sort grep { !$given{$_} } @current_ids;
         my @unknown = sort grep { !$have{$_}  } @$ids;
-        if (@missing || @unknown) {
+        # MUST-3: the checks above are set-based only, so a duplicate id in
+        # @$ids satisfies them as long as the SET matches -- a list with a
+        # repeat is not a permutation (spec S2.11 step 3). Detect the
+        # cardinality mismatch and report the first repeated id.
+        my %given_count;
+        $given_count{$_}++ for @$ids;
+        my @dups = sort grep { $given_count{$_} > 1 } keys %given_count;
+        if (@missing || @unknown || @dups) {
             _die(kind => 'reorder_mismatch',
-                 missing_count => scalar(@missing), unknown_count => scalar(@unknown),
+                 missing_count => scalar(@missing),
+                 unknown_count => scalar(@unknown) + scalar(@dups),
                  first_missing => (@missing ? $missing[0] : undef),
-                 first_unknown => (@unknown ? $unknown[0] : undef));
+                 first_unknown => (@unknown ? $unknown[0] : (@dups ? $dups[0] : undef)));
         }
 
         my $new_ranks = _sequential_ranks(scalar @$ids);
@@ -1142,7 +1327,7 @@ sub reorder {
         }
 
         unlink($self->_journal_path);
-        $records = $self->list();
+        $records = $self->_list_records();
         1;
     };
     my $err = $@;

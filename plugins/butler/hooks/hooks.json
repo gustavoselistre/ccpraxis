@@ -14,12 +14,42 @@
          {
             "hooks" : [
                {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/track-dispatch.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Task"
+         },
+         {
+            "hooks" : [
+               {
                   "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/untrack-worker-solo.sh\"",
                   "timeout" : 15,
                   "type" : "command"
                }
             ],
             "matcher" : "Task|Agent"
+         },
+         {
+            "hooks" : [
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/context-ceiling-guidance.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Task|Bash"
+         },
+         {
+            "hooks" : [
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch-discipline-nudge.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Bash|Read|Edit|Grep"
          }
       ],
       "PreToolUse" : [
@@ -160,6 +190,26 @@
                }
             ],
             "matcher" : "AskUserQuestion"
+         },
+         {
+            "hooks" : [
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/context-ceiling-flush.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Task|Bash"
+         },
+         {
+            "hooks" : [
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-ledger-create.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Edit|Write|MultiEdit|NotebookEdit"
          }
       ],
       "Stop" : [

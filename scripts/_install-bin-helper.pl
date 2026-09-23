@@ -18,9 +18,11 @@
 use strict;
 use warnings;
 use File::Basename qw(basename);
+use File::Glob qw(bsd_glob);
 # No `use utf8;` — literal bytes flow straight to a :raw stdout (and
 # we don't have Unicode literals in this file anyway).
 use MIME::Base64 qw(encode_base64);
+use POSIX qw(strftime);
 
 # Use raw byte mode for stdout — we deal in UTF-8 byte strings from $Bin
 # (Git Bash) and from base64-decoded PowerShell output; a :utf8 layer would
@@ -76,7 +78,12 @@ sub run_unix {
     }
 
     # Find candidate launchers and the symlinks we'd create.
-    my @launchers = glob("$bindir/*.sh");
+    # fix-batch B3 (red-team MEDIUM-4): bsd_glob, NOT the builtin glob() --
+    # the builtin word-splits its PATTERN on whitespace, so any install path
+    # containing a space (a common Windows shape, "C:\Users\John Smith\...")
+    # silently returned the wrong/empty result, disabling chmod and
+    # extensionless-alias creation for that whole install with no error.
+    my @launchers = bsd_glob("$bindir/*.sh");
     my @symlinks_needed;
     for my $launcher (@launchers) {
         my $name = basename($launcher);
@@ -171,6 +178,15 @@ sub run_windows {
     }
 
     # apply
+    # fix-batch B2 (red-team HIGH-3): snapshot the CURRENT User PATH to disk
+    # before the first registry write this run might make -- the safety net
+    # the ledger's own BINDING SAFETY CONSTRAINT and the user-global
+    # CLAUDE.md's "Modifying the Windows User PATH" section require. Taken
+    # unconditionally (even when already_path is true and this particular
+    # branch writes nothing) because PATHEXT below can still be the first
+    # write of the run.
+    snapshot_user_path_once($current_path);
+
     if ($already_path) {
         print "  PATH: $bindir_win already in user PATH\n";
     } else {
@@ -199,6 +215,31 @@ sub run_windows {
 # username) before we ever see them. We dodge the entire issue by having
 # PowerShell base64-encode the value (UTF-8 bytes) on its side and we
 # decode on ours — symmetric with ps_set_env.
+# fix-batch B2 (red-team HIGH-3), testability seam ONLY: if
+# CCPRAXIS_TEST_POWERSHELL_GET_ARGV / CCPRAXIS_TEST_POWERSHELL_SET_ARGV are
+# set (\x1f-separated argv), ps_get_env/ps_set_env exec that instead of the
+# real powershell.exe -- lets a test simulate a read failure, or intercept
+# a write, without ever touching this host's real registry or requiring a
+# fake native .exe. Unset (the default, every real install run) -> the
+# real powershell.exe command line, byte-for-byte as before this fix.
+
+# Read a registry-backed environment variable via powershell.exe. Returns
+# the value as a UTF-8 byte string or undef if nothing was set.
+#
+# PowerShell's stdout encoding defaults to the console codepage (often
+# CP437 / CP1252), which mangles non-ASCII bytes (e.g. a `é` in a Windows
+# username) before we ever see them. We dodge the entire issue by having
+# PowerShell base64-encode the value (UTF-8 bytes) on its side and we
+# decode on ours — symmetric with ps_set_env.
+#
+# fix-batch B2 (red-team HIGH-3): the child's exit status is now checked.
+# Previously a failed read (missing powershell.exe, a Restricted execution
+# policy, a garbled read) silently produced an empty string, which the only
+# caller (run_windows) laundered into "the user has no User PATH" -- and a
+# subsequent ps_set_env could then overwrite the ENTIRE User-scope PATH
+# with just the new bin dir, destroying every other entry, with no
+# snapshot. An unreadable PATH must abort the install, never be treated as
+# empty.
 sub ps_get_env {
     my ($name, $scope) = @_;
     require MIME::Base64;
@@ -206,15 +247,53 @@ sub ps_get_env {
             . 'if ($null -ne $v) { '
             .   '[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($v)) '
             . '}';
-    open my $fh, '-|', 'powershell.exe', '-NoProfile', '-NonInteractive', '-Command', $cmd
+    my @argv = $ENV{CCPRAXIS_TEST_POWERSHELL_GET_ARGV}
+        ? split(/\x1f/, $ENV{CCPRAXIS_TEST_POWERSHELL_GET_ARGV})
+        : ('powershell.exe', '-NoProfile', '-NonInteractive', '-Command', $cmd);
+    open my $fh, '-|', @argv
         or die "ERROR: cannot exec powershell.exe: $!\n";
     my $b64 = do { local $/; <$fh> };
     close $fh;
+    if ($?) {
+        die "ERROR: powershell.exe exited with status $? while reading $scope\\$name -- "
+          . "refusing to treat an unreadable PATH as empty (that would risk overwriting "
+          . "every existing PATH entry on the next write). Aborting.\n";
+    }
     return undef unless defined $b64;
     $b64 =~ s/\s+//g;
     return undef unless length $b64;
     my $bytes = MIME::Base64::decode_base64($b64);
     return length($bytes) ? $bytes : undef;
+}
+
+# fix-batch B2 (red-team HIGH-3): write a timestamped snapshot of the
+# CURRENT User PATH to disk before the first registry write this run might
+# make -- the safety net the ledger's BINDING SAFETY CONSTRAINT and the
+# user-global CLAUDE.md's "Modifying the Windows User PATH" section
+# require of any code that writes Windows registry PATH values. Fires at
+# most once per run (idempotent within a process). $HOME is honoured (not
+# hardcoded) so an isolated test run never touches the real snapshot dir.
+my $SNAPSHOT_TAKEN = 0;
+sub snapshot_user_path_once {
+    my ($current_path) = @_;
+    return if $SNAPSHOT_TAKEN;
+    $SNAPSHOT_TAKEN = 1;
+    my $home = $ENV{HOME};
+    return unless defined $home && length $home; # nothing sane to snapshot into
+    my $dir = "$home/.claude/.path-snapshots";
+    unless (-d $dir) {
+        require File::Path;
+        File::Path::make_path($dir);
+    }
+    my $ts   = strftime('%Y%m%dT%H%M%SZ', gmtime);
+    my $file = "$dir/$ts.txt";
+    if (open my $fh, '>:raw', $file) {
+        print $fh (defined $current_path ? $current_path : '');
+        close $fh;
+        print "  snapshot: current User PATH saved to $file\n";
+    } else {
+        warn "  WARNING: could not write PATH snapshot to $file: $!\n";
+    }
 }
 
 # Write a registry-backed environment variable via powershell.exe. The
@@ -234,6 +313,9 @@ sub ps_set_env {
             . "'$name', "
             . "[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$b64')), "
             . "'$scope')";
-    my $rc = system('powershell.exe', '-NoProfile', '-NonInteractive', '-Command', $cmd);
+    my @argv = $ENV{CCPRAXIS_TEST_POWERSHELL_SET_ARGV}
+        ? split(/\x1f/, $ENV{CCPRAXIS_TEST_POWERSHELL_SET_ARGV})
+        : ('powershell.exe', '-NoProfile', '-NonInteractive', '-Command', $cmd);
+    my $rc = system(@argv);
     die "ERROR: powershell.exe SetEnvironmentVariable failed (rc=$rc)\n" if $rc != 0;
 }

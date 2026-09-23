@@ -127,9 +127,10 @@ for my $sub (qw(record_path elapsed_seconds is_over_budget median read_history w
 }
 
 # B8: record_path — a plain, predictable path under .dispatch-log/, keyed by
-# id, ending .json. Not pinning the exact root computation (that is
-# bp-runstate.pl::state_dir's convention, reused, not w02's to reinvent) —
-# only the shape a caller can rely on.
+# id, ending .json. Not pinning the exact root computation (that convention
+# now lives in bp-continuity.pl's _resolve_project_root, reused, not w02's
+# to reinvent -- package 03-retire-runstate's spec §2.4) — only the shape a
+# caller can rely on.
 {
     my $got = eval { BpDispatchLog::record_path('/some/root', 'x1') };
     ok(defined $got, 'B8: record_path returns a defined path');

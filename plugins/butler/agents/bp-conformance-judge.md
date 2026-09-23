@@ -27,6 +27,13 @@ The dispatch gives you, completely:
 - Also check **methodology** claims the blueprint's Decisions require (e.g. a real emulator where one was mandated and a mock was forbidden). Report those as deviations too.
 - Run the project's own test/build commands only if you were given them, read-only in intent.
 - A means is honored only on **positive** evidence. Missing evidence, a placeholder, or a substitute implementation ⇒ report a deviation.
+- Run `perl "${CLAUDE_PLUGIN_ROOT}/scripts/bp-ledger.pl" claim-check --ledger <each packages/*.md>`
+  (read-only, exit 0, JSON on stdout) for every package. This is the last moment a
+  completion claim that contradicts its own evidence still matters and the first
+  moment nothing is in flight. Do not re-run any package's tests. Put each non-empty
+  `findings` entry into your own top-level `findings` array (never `deviations` — its
+  fixed shape doesn't fit a claim-check finding), one line per finding:
+  `<package>: <code>: <detail>`.
 
 ## Output contract
 

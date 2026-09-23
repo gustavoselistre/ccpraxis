@@ -1196,19 +1196,48 @@ sub context_tokens_from_usage {
          + $n->($usage->{cache_read_input_tokens});
 }
 
-# True if the given usage total is at/over ceiling. $t is an optional tunables
-# hashref (same shape _tunables_base() returns); falls back to
-# _ctx_ceiling_env() (validated BP_CONTEXT_CEILING_TOKENS, else the pinned
-# 300_000 default), same resolution order as creds_backoff_secs() (:1141-1150).
-# NOTE: an explicit $t->{ctx_ceiling} is intentionally NOT validated here --
-# a caller-supplied tunables hashref (including a deliberate 0, per spec §5's
-# documented degenerate case) is trusted as-is; only the raw env string, which
-# an operator can fat-finger, is validated (fix-batch step7 MEDIUM #2).
+# coordinator-context-discipline/02: the canonical two-tier ceiling table.
+# These two literals are the ONLY place either number is written in code
+# (spec §2.1). The old single-ceiling env var is GONE -- not read, not
+# honoured, not aliased (Decision 7: superseded, not run alongside).
+our %CTX_CEILING_DEFAULT = ( soft => 250_000, hard => 350_000 );
+our %CTX_CEILING_ENV     = ( soft => 'BP_CONTEXT_CEILING_SOFT_TOKENS',
+                             hard => 'BP_CONTEXT_CEILING_HARD_TOKENS' );
+
+# True if the given usage total is at/over the given tier's ceiling. $t is an
+# optional tunables hashref (same shape _tunables_base() returns); falls back
+# to _ctx_ceiling_env(TIER) (validated per-tier env var, else the pinned
+# default for that tier). $tier defaults to 'soft' when omitted or
+# unrecognized (spec §2.4) -- the conservative reading.
+# NOTE: an explicit $t->{"ctx_ceiling_$tier"} is intentionally NOT validated
+# here -- a caller-supplied tunables hashref (including a deliberate 0, per
+# spec §5's documented degenerate case) is trusted as-is; only the raw env
+# string, which an operator can fat-finger, is validated.
 sub context_growth_ceiling_breached {
-    my ($usage, $t) = @_;
-    my $ceiling = (ref $t eq 'HASH' ? $t->{ctx_ceiling} : undef)
-                // _ctx_ceiling_env();
+    my ($usage, $t, $tier) = @_;
+    $tier = 'soft' unless defined $tier && ($tier eq 'soft' || $tier eq 'hard');
+    my $ceiling = (ref $t eq 'HASH' ? $t->{"ctx_ceiling_$tier"} : undef)
+                // _ctx_ceiling_env($tier);
     return context_tokens_from_usage($usage) >= $ceiling ? 1 : 0;
+}
+
+# context_ceiling_tier($usage, $t) -> 'hard'|'soft'|'none' -- PURE, NEW
+# (spec §2.5/§5.3). Resolves each tier's own ceiling value (tunables > env >
+# default, same resolution order context_growth_ceiling_breached uses), then
+# compares usage against the numerically LARGER of the two as the "hard"
+# threshold and the smaller as the "soft" threshold -- so a misconfigured
+# hard < soft still yields a sane, monotone answer ("a usage above both reads
+# hard, between them reads soft", §5.3) rather than the smaller threshold
+# always winning regardless of which key it was assigned to.
+sub context_ceiling_tier {
+    my ($usage, $t) = @_;
+    my $soft_ceiling = (ref $t eq 'HASH' ? $t->{ctx_ceiling_soft} : undef) // _ctx_ceiling_env('soft');
+    my $hard_ceiling = (ref $t eq 'HASH' ? $t->{ctx_ceiling_hard} : undef) // _ctx_ceiling_env('hard');
+    my ($lo, $hi) = ($soft_ceiling <= $hard_ceiling) ? ($soft_ceiling, $hard_ceiling) : ($hard_ceiling, $soft_ceiling);
+    my $tokens = context_tokens_from_usage($usage);
+    return 'hard' if $tokens >= $hi;
+    return 'soft' if $tokens >= $lo;
+    return 'none';
 }
 
 # Given the parsed lines of a runs/<pkg>.jsonl (array of decoded hashrefs, already
@@ -2673,7 +2702,8 @@ sub _tunables_base {
         remediation_cap    => $ENV{BP_REMEDIATION_CAP}    // 6,    # b07: global rounds opened per run (SYN-7)
         min_relaunch => _min_relaunch_secs(),  # r01: floor between two watchdog
                                                 # relaunches of the SAME package
-        ctx_ceiling => _ctx_ceiling_env(),  # b-fca/pkg02: context-growth checkpoint ceiling, validated
+        ctx_ceiling_soft => _ctx_ceiling_env('soft'),  # coordinator-context-discipline/02: two-tier ceiling
+        ctx_ceiling_hard => _ctx_ceiling_env('hard'),
         death_thresh  => $ENV{BP_DEATH_THRESH}            // 5,     # 03-deaths-are-diagnosable, Decision 10
         death_bo_base => $ENV{BP_DEATH_BACKOFF_BASE_SECS} // 30,    # matches today's min_relaunch default
         death_bo_mult => $ENV{BP_DEATH_BACKOFF_MULT}      // 2,
@@ -2703,31 +2733,31 @@ sub _min_relaunch_secs {
     return 30;
 }
 
-# b-fca/pkg02 fix-batch step7 MEDIUM #2: same validation convention as
-# _min_relaunch_secs() above, applied to BP_CONTEXT_CEILING_TOKENS. Unvalidated,
-# a non-numeric or non-positive override silently coerces to 0 in numeric
-# comparison (`"abc" >= $tokens` warns but evaluates as 0 >= $tokens), which
-# breaches on every single check -- constant checkpoint thrashing, the same
-# failure shape _min_relaunch_secs() was written to prevent for its own
-# tunable. Only a strictly-positive integer is honoured; anything else falls
-# back to the documented default (300_000) and warns, naming the rejected
-# value.
+# coordinator-context-discipline/02 spec §2.2: same validation convention as
+# _min_relaunch_secs() above, now per-tier via %CTX_CEILING_DEFAULT/
+# %CTX_CEILING_ENV. Unvalidated, a non-numeric or non-positive override
+# silently coerces to 0 in numeric comparison (`"abc" >= $tokens` warns but
+# evaluates as 0 >= $tokens), which breaches on every single check --
+# constant checkpoint thrashing, the same failure shape _min_relaunch_secs()
+# was written to prevent for its own tunable. Only a strictly-positive
+# integer is honoured; anything else falls back to the documented default for
+# that tier and warns, naming the rejected value.
 #
-# 300_000, not the package's originally-measured 200_000 "knee": raised
-# 2026-09-19 by operator request, trading some of 200K's better cache-read
-# efficiency (37% of uncheckpointed cost, vs. 300K's 51%, per the table this
-# package measured) for fewer handovers -- each relaunch re-reads the ledger
-# and blueprint.md cold, a real cost the original table did not price in, and
-# the operator judged fewer, larger checkpoints the better trade in practice.
+# An unrecognized tier degrades to 'soft' (the lower, more conservative
+# ceiling), so a mis-call can only ever be stricter, never "no ceiling".
 sub _ctx_ceiling_env {
-    return 300_000 unless exists $ENV{BP_CONTEXT_CEILING_TOKENS};  # truly unset -> quiet default, no warning
-    my $raw = $ENV{BP_CONTEXT_CEILING_TOKENS};
+    my ($tier) = @_;
+    $tier = 'soft' unless defined $tier && ($tier eq 'soft' || $tier eq 'hard');
+    my $env = $CTX_CEILING_ENV{$tier};
+    my $default = $CTX_CEILING_DEFAULT{$tier};
+    return $default unless exists $ENV{$env};  # truly unset -> quiet default, no warning
+    my $raw = $ENV{$env};
     $raw = '' unless defined $raw;
     if ($raw =~ /^[0-9]+$/ && $raw > 0) { return $raw + 0; }
-    warn "bp-orchestrator: BP_CONTEXT_CEILING_TOKENS='$raw' is not a positive integer -- "
-       . "falling back to the default (300000 tokens). A malformed value here "
+    warn "bp-orchestrator: $env='$raw' is not a positive integer -- "
+       . "falling back to the default ($default tokens). A malformed value here "
        . "silently degrades to ceiling=0, causing constant checkpoint thrashing.\n";
-    return 300_000;
+    return $default;
 }
 
 # Build { pkg => {deps, write_set} } and { pkg => status } from disk.
@@ -4480,16 +4510,37 @@ sub run {
                             # re-derives the SAME ceiling check from the transcript directly,
                             # reusing the pure functions b-fca/pkg02 built but never wired to
                             # any caller: if the last coordinator-owned usage record was at or
-                            # over ctx_ceiling, force cold, exactly like the max_turns override.
+                            # over the ceiling, force cold, exactly like the max_turns override.
                             # Only bothers reading the tail when the generic verdict already
                             # said warm -- an already-cold relaunch needs no second check.
+                            # coordinator-context-discipline/02 spec §2.6: checks the SOFT
+                            # tier, not hard. Soft SUBSUMES hard (any usage >= hard is also
+                            # >= soft), so the flush's own cold-relaunch guarantee holds by
+                            # construction, with no second check and no second code path.
                             my $ctx_forced_cold = 0;
+                            my $ctx_forced_tier;
                             if ($mode eq 'warm') {
                                 my $usage = eval { last_coordinator_usage(_tail_jsonl_objs("$runs/$pkg.jsonl")) };
                                 if (defined $usage && context_growth_ceiling_breached($usage, $t)) {
                                     $mode = 'cold';
                                     $ctx_forced_cold = 1;
+                                    $ctx_forced_tier = context_ceiling_tier($usage, $t);
                                 }
+                            }
+                            # spec §2.6's table: ctx_flush_overrun is gated ONLY on the
+                            # overrun log existing and being non-empty, not on whether
+                            # THIS relaunch happened to be ceiling-forced (Review M-6) --
+                            # a coordinator that overran its flush and then died of
+                            # max_turns or a crash still deserves visibility.
+                            my $ctx_flush_overrun_lines;
+                            my $overrun_log = "$runs/$pkg.ctx-flush-overrun.log";
+                            if (-s $overrun_log) {
+                                my $n = 0;
+                                if (open my $fh, '<', $overrun_log) {
+                                    $n++ while <$fh>;
+                                    close $fh;
+                                }
+                                $ctx_flush_overrun_lines = $n if $n > 0;
                             }
                             my @args = ($mode eq 'warm') ? ('--resume-session', $sid->{$pkg}) : ();
                             # The widened budget rides on the relaunch. Only ever set
@@ -4508,6 +4559,8 @@ sub run {
                             _log($log, 'watchdog_relaunch', { package => $pkg, mode => $mode, age_min => $age,
                                 attempts => $att->{$pkg}, exit_reason => $tv->{verdict},
                                 ($ctx_forced_cold ? (ctx_ceiling_forced_cold => 1) : ()),
+                                ($ctx_forced_cold ? (ctx_ceiling_tier => $ctx_forced_tier) : ()),
+                                (defined $ctx_flush_overrun_lines ? (ctx_flush_overrun => $ctx_flush_overrun_lines) : ()),
                                 ($death ? (death_evidence => $death) : ()),
                                 ($death_exit_status ? (
                                     exit_status  => $death_exit_status->{classification},
@@ -5774,6 +5827,34 @@ unless (caller) {
         }
         my $tv = BpOrch::terminal_verdict(BpOrch::_last_jsonl_obj("$bpdir/runs", $pkg));
         print "$tv->{verdict}\n";
+        exit 0;
+    }
+    if (@ARGV && $ARGV[0] eq '--ctx-usage') {
+        # coordinator-context-discipline/02 spec §2.7: one CLI seam so both new
+        # hooks get the measurement and both ceilings from the SAME code the
+        # orchestrator itself uses, in ONE bounded tail-read.
+        shift @ARGV;
+        my ($bpdir, $pkg) = @ARGV;
+        unless (defined $bpdir && length $bpdir && defined $pkg && length $pkg) {
+            print STDERR "usage: bp-orchestrator.pl --ctx-usage <bp-dir> <pkg>\n";
+            exit 2;
+        }
+        my $t = BpOrch::_tunables_base();
+        my $tokens;
+        my $tier = 'unknown';
+        eval {
+            my $usage = BpOrch::last_coordinator_usage(BpOrch::_tail_jsonl_objs("$bpdir/runs/$pkg.jsonl"));
+            if (defined $usage) {
+                $tokens = BpOrch::context_tokens_from_usage($usage);
+                $tier = BpOrch::context_ceiling_tier($usage, $t);
+            }
+            1;
+        };
+        my $tokens_line = (defined $tokens) ? $tokens : 'unknown';
+        print "context_tokens: $tokens_line\n";
+        print "ceiling_soft: $t->{ctx_ceiling_soft}\n";
+        print "ceiling_hard: $t->{ctx_ceiling_hard}\n";
+        print "tier: $tier\n";
         exit 0;
     }
     my $bp = shift @ARGV;

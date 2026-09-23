@@ -218,6 +218,172 @@ already sitting on disk, a suite that was already green — the whole time it po
 result **once**. If it's there, proceed. If it isn't yet, end the turn and resume on the
 completion notification; never check again in the same turn, and never in a loop.
 
+### Every wait names its subject and its liveness proof
+
+A butler-launched coordinator has no completion-notification resumption available
+(`gate-headless-background.sh` denies `run_in_background` whenever `BP_LEDGER` is set, as this
+same file states below) — so the "Check the sentinel once" paragraph's "end the turn and resume
+on the completion notification" branch above does not apply to it. Arm a bounded watch instead.
+
+Three coordinators in about twenty minutes each blocked or parked on work that had already died or
+finished (`20260917-003158-949e`), and each queued a human decision that did not need one.
+
+**A wait is legal only if you can name two things: the SUBJECT and the LIVENESS PROOF.** The
+subject is the exact process, file or ledger you are waiting on. The liveness proof is a check that
+asks a live process, not one that reads bookkeeping. **A pid you recorded, a sentinel path and a
+report filename are bookkeeping; none of them is evidence that anything is still running.**
+
+**If you cannot name a liveness proof, the wait is not legal.** Do one of these instead, in order:
+(1) run the work in the FOREGROUND and read its result in this turn; (2) re-dispatch the subject so
+the wait has a live subject again; (3) write a concrete `## Next action` and stop. **Never park, and
+never queue a human decision, on a wait whose subject you never checked.**
+
+The `liveness proof` cell below draws only from this closed vocabulary:
+
+| token | means |
+|---|---|
+| `Task return` | the Task tool returned; the dispatch is over by construction |
+| `completion notification` | the `run_in_background` completion notification (interactive drivers only) |
+| `foreground exit code` | you ran it inline and read `$?` in the same turn |
+| `bp-watch --package` | Mode A ledger-status watch |
+| `bp-watch --artifact` | mtime advance on an explicitly named path |
+| `bp-watch --expect-pids` | one or more literal pids, checked every tick |
+| `bp-watch --pid-file` | a pid file, re-read every tick |
+| `pid_alive` | `BpResumption::pid_alive`, called directly |
+| `NONE` | no liveness proof exists for this shape — legal **only** on a `BANNED` row |
+
+The wait-shape table's columns are fixed:
+
+```
+| wait shape | subject | liveness proof | ruling |
+```
+
+The sanctioned and banned shapes:
+
+| wait shape | subject | liveness proof | ruling |
+|---|---|---|---|
+| Task worker dispatch, synchronous | the dispatched subagent | `Task return` | SANCTIONED |
+| backgrounded Bash job resumed on notification (interactive drivers only — denied whenever `BP_LEDGER` is set) | the backgrounded job | `completion notification` | SANCTIONED |
+| foreground validation run | the command you ran | `foreground exit code` | SANCTIONED |
+| package ledger status | the coordinator that owns that package | `bp-watch --package` | SANCTIONED |
+| dispatch report, mtime-advance checked | the worker you dispatched | `bp-watch --artifact` + `bp-watch --expect-pids` | SANCTIONED |
+| sentinel file, writer checked | the process that must write the sentinel | `bp-watch --artifact` + `bp-watch --expect-pids` | SANCTIONED |
+| a recorded pid, checked live | the process that pid names | `pid_alive` | SANCTIONED |
+| a pid file, re-read every tick | the process the file names | `bp-watch --pid-file` | SANCTIONED |
+| naked existence read as completion — test -f on a dispatch report | the worker you dispatched | `NONE` | BANNED |
+| naked sentinel wait — an absent sentinel read as "still running" | the process that must write the sentinel | `NONE` | BANNED |
+| naked pid-file read — a recorded pid read as a live process | the process that pid named | `NONE` | BANNED |
+
+The three `BANNED` rows come from real cases: the report-stub row is `06-l1-reaudit`, the sentinel
+row is `03-scorer-rich`, and the pid-file row is `02-rich-extraction`.
+
+#### The coordinator's arming recipe
+
+**This recipe applies only when you already hold a live pid for something still running.** Both
+of a coordinator's sanctioned dispatch shapes — `Task` and a foreground `bp-worker.pl` call — are
+synchronous and have already returned by the time you could arm a watch: `Task return` (the
+verdict table's first row) already proves the dispatch is over, and needs no watch at all. Reach
+for this recipe only in the rare case you hold a pid for a process that is genuinely still
+running.
+
+```bash
+perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-watch.pl --arm \
+     --package "$BP_BLUEPRINT/$BP_PACKAGE" \
+     --expect-pids <pid of the subject> \
+     --artifact "<the report or sentinel you are waiting on>" \
+     --max-seconds <sized to THIS dispatch> \
+     --reason "<why this bound>"
+```
+
+- **Mode A only.** `--blueprint` is the reporter's whole-blueprint settlement watch
+  (`reporter/SKILL.md`, pinned by `bp-watch-doctrine.t`, "the reporter arm command uses Mode B"),
+  never a coordinator's.
+- **Never `--keepawake`.** That lease belongs to drive-solo's director ("Arm the watcher" in
+  `drive-solo/SKILL.md`); a coordinator holds none and must not create one.
+- **Foreground, always.** `gate-headless-background.sh` (the `PreToolUse` denial on
+  `run_in_background` whenever `BP_LEDGER` is set) denies backgrounding for every butler-launched
+  coordinator. A single bounded `bp-watch.pl` call is not a wait-shape the guard denies — it
+  contains no loop and no `sleep` (`wait-shape-guard.sh`, the loop-plus-sleep matcher).
+- **`--max-seconds` must fit inside the Bash tool's own timeout (≤600s), with a matching
+  `timeout:` on the call — and must never be omitted.** The 2900s code default cannot complete in
+  a foreground call; a harness kill is not one of `bp-watch.pl`'s verdicts and maps to no row
+  below.
+- **`--reason` is unconditional, not just "if below the default".** Any bound under the 2900s
+  default requires it in code, so always pass one.
+- **At least one liveness axis.** With no `--expect-pids`, `--pid-file` or `--artifact`, you have
+  armed a timer, not a liveness check: `all_pids_alive` returns `undef` for an empty pid list and
+  the watch can only ever reach BOUND.
+- **`--package` names the subject the watch is scoped to — it is not itself a liveness proof.**
+  `resolve_condition` checks `terminal` status (which includes `blocked` and `parked`) before it
+  checks liveness, so arm this watch while your own status is still `running`, not after you have
+  already set it to a terminal value.
+
+#### The verdict → action table
+
+The verdict table's columns:
+
+```
+| exit | verdict | what you do |
+```
+
+A blueprint archived mid-watch (Mode B) is not a stale SETTLED — the packages dir disappearing
+mid-watch now reads as unverifiable and the watch keeps polling to BOUND, fail-open, rather than
+reporting a settlement that may no longer be true. No behavior change here, just documented.
+
+| exit | verdict | what you do |
+|---|---|---|
+| 0 | TERMINAL | wait ENDS. Verify the artifact on disk before believing it — see "Existence is not completion". |
+| 1 | BOUND | liveness is UNKNOWN. The subject is treated as ALIVE: re-arm once with a fresh bound, or write a concrete `## Next action` and stop. Never conclude dead. |
+| 2 | WORKERS-GONE | wait ENDS NOW. Read the report first — if its mtime advanced past the stub and it carries a real conclusion, the worker finished and then exited; accept it. Only an absent or stub-sized report means re-dispatch it per "A dead worker is not a worker that found nothing" — this is not a reason to sit still, and not one to hand to a person. |
+| 3 | ARTIFACT | wait ENDS. The watched path advanced; read it and judge completeness yourself. |
+| 4 | STATUS-CHANGE | wait ENDS for this arm. Note the change and re-arm or resume. |
+| 64 | USAGE | your command line is wrong. This is evidence about your invocation, never about the subject. Fix it and re-arm. |
+| 65 | UNVERIFIABLE | the check itself could not run. The subject is treated as ALIVE. Re-arm **once** with corrected arguments. If the second attempt is also 65, the subject is not checkable from here: write a concrete `## Next action` and stop. |
+
+#### Existence is not completion
+
+The worker dispatch contract itself mandates the report file be **created before the investigation
+and appended to as it goes** (`SKILL.md`, "CREATE THIS FILE EARLY, BEFORE THE INVESTIGATION, AND
+APPEND AS YOU GO"). So at dispatch start **every** report file already exists. `test -f <report>`
+therefore proves only that the dispatch *started*.
+
+**A wait on a dispatch report is satisfied only when the report's mtime advanced after the wait
+began AND no liveness axis reported the worker dead.** Use `--artifact <report>`; never a bare
+existence test. The `≤15-line` return is not the deliverable; the file is.
+
+`--artifact` fires on the **first** mtime advance, which for a dispatch report is the mandatory
+pre-investigation stub write itself. Exit 3 (ARTIFACT) means the worker started, not that it
+finished — re-read the file, and re-arm the watch if it is still stub-shaped.
+
+**A sentinel is the same rule with the polarity flipped:** a *missing* sentinel is not evidence that
+work is still running. Pair every sentinel wait with the writer's pid.
+
+This extends, and does not replace, the existing "Confirm the artifact exists on disk before
+accepting any worker's conclusion … If the file is absent or stub-sized, the work did not happen"
+rule (`SKILL.md`, the worker dispatch contract's rules): that one governs *accepting a
+conclusion*; this one governs *ending a wait*.
+
+#### Fail OPEN means the wait CONTINUES
+
+`guard-run-finish.sh` fails open toward **ALLOWING A STOP** (`guard-run-finish.sh:29-33`): it is a
+gate on the agent's own action, its subject is a whole session, and a gate that can never be
+satisfied wedges that session forever with nobody present to notice.
+
+**A wait is not a gate, and it has a bound.** Every `bp-watch`-shaped wait carries a bound
+(`--max-seconds`, defaulting to 2900s in code), so continuing one cannot wedge anything: the worst
+case is that the watch runs to BOUND and you make a recorded decision then. The `pid_alive` row is
+a single check, not a loop: one call, then decide. The two errors are therefore not symmetric:
+
+- Treating an **unverifiable** subject as **dead** ends the wait and triggers a re-dispatch of work
+  that may still be running — two write-capable workers in one write set, and a live worker
+  abandoned moments before it would have written its report.
+- Treating it as **alive** costs at most the remainder of one bound.
+
+So: **an undeterminable subject is ALIVE, and the wait continues.** Unknown is never dead. This is
+the opposite direction from `guard-run-finish.sh`, deliberately, because the thing being protected
+is different — and copying that hook's direction here would turn a fail-open into a fail-wrong.
+This is a deliberate asymmetry, not an inconsistency.
+
 ## Fast test I/O — heavy artifacts on container-native storage
 
 Your project dir is a **bind mount**. On Windows/WSL2 that is a 9p filesystem, and every per-file syscall costs an order of magnitude more than it does on the container's own overlay FS. `node_modules` is the pathological case — hundreds of thousands of small files, ~95% of them under `node_modules/.pnpm`. It is the difference between a 30-second install and a 15-minute one, on every attempt of your convergence loop.
@@ -386,7 +552,22 @@ Check off pipeline steps in the ledger as you go. Steps may be skipped only with
 same per-dispatch budget/elapsed-time mechanism `drive-solo/SKILL.md`'s "Arm the
 watcher" section documents for the interactive driver; both surfaces share the same
 blind spot — a dispatched worker has no elapsed-time signal independent of its own
-self-report, regardless of which one dispatched it):
+self-report, regardless of which one dispatched it). **This manual bracket is what
+gives you `--budget-seconds`/`elapsed`/the over-budget-interrupt-loop signal below —
+`track-dispatch.sh`'s automatic hook tracking (see "Checking what is outstanding"
+further down) does NOT provide that; it gives you `outstanding` instead, a
+different, weaker check.** If you bracket a dispatch manually here, do not also
+assume the hook leaves it alone: `track-dispatch.sh`'s `PostToolUse` half tries to
+resolve a matching `running` record automatically the moment the `Task` call
+returns, which fires **before** your own next turn's `finish` call ever runs — so
+by the time you call `finish`, the hook has typically already closed the record to
+`done`. `finish` does not check that a record is still `running` before closing
+it, so it re-closes the already-`done` record anyway: `ended_at`/`duration_seconds`
+get overwritten with a second, near-identical measurement, and a second
+`history.jsonl` line gets appended for the same dispatch. This is not a correctness
+problem for the record's final `done` state, but it IS a duplicate history entry —
+know that this double-bracketing is what produces it, rather than treating it as a
+bug in either mechanism.
 
 ```bash
 perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-dispatch-log.pl start \
@@ -422,6 +603,7 @@ Rules:
 - **One write-capable worker in flight** (implementer / test-writer / ui-prober) — hook-enforced *inside a `bp-launch.sh` coordinator only* (see "…but only inside a butler-LAUNCHED coordinator" above); elsewhere it is your discipline. Read-only workers may run in parallel.
 - A worker that returns garbage or dies: redispatch once with a sharpened prompt. Twice: log the attempt, then either change approach or block — don't loop.
 - You may make small glue edits inside your write set yourself (wiring an export, a one-line fix during validation). Anything resembling a step belongs to a worker.
+- That sentence is prose, and prose alone is not the enforcement — `dispatch-discipline-nudge.sh` measures the pattern it names against your own runs transcript via `bp-dispatch-log.pl ratio`, built after one sampled coordinator made 704 self-Bash calls against 3 dispatches in 1,561 total tool calls. It blocks nothing: it only attaches a hedged note to a tool result you were already going to receive, and it observes a ratio — it can neither prove nor disprove that any particular call belonged to a worker. Its two thresholds, `BP_DISPATCH_RATIO_MIN_CALLS` and `BP_DISPATCH_RATIO_MIN`, default from `bp-dispatch-log.pl`'s own `%RATIO_DEFAULT`, the canonical source for both numbers.
 
 ### Turn caps — two fields, one concept, and they are NOT the same field
 
@@ -495,6 +677,44 @@ Exit codes: `0` ok · `2` usage · `3` a write-capable worker is already in flig
 
 **Judges never port.** Harvest, conformance and resolve judges stay on Claude regardless of `worker_backend:`.
 
+### Checking what is outstanding, without asserting the answer
+
+`track-dispatch.sh`'s `PostToolUse` half resolves a worker's dispatch record automatically the
+moment its `Task` call returns — for a `Task` dispatch tracked only through the hook (i.e. not also
+manually bracketed per the "Worker dispatch contract" section above), you do not need to call
+`finish`/`resolve` yourself. The START half's `dispatch_key` correlation is what lets the completion
+half find the right record; see `track-dispatch.sh`'s own header comment (in this repo, not the
+blueprint's gitignored spec, which does not travel to a fresh clone) if you need the mechanism. What
+you get for free is a check, not a guarantee:
+
+```bash
+perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-dispatch-log.pl outstanding \
+     --root "$BP_PROJECT_ROOT" --blueprint "$BP_BLUEPRINT" --package "$BP_PACKAGE"
+```
+
+**Always scope with `--blueprint`/`--package` like this when the answer feeds an automated
+decision** (a stop, a gate, anything beyond an operator-facing report) — both env vars are already
+exported into your process. The unfiltered, whole-store form (omitting both flags) reports every
+outstanding record across every blueprint and package ever run against this store, including
+pre-existing keyless records this mechanism can never resolve; an unscoped automated stop condition
+built on it is permanently true. The unfiltered form stays useful for an operator-facing audit — just
+never as the input to an automatic decision.
+
+Read `outstanding_count:` from its stdout. If the line is absent or reads `unknown`, the answer is
+**unknown** — never treat that as zero. Every `summary:` line this verb can print is hedged
+deliberately: a dispatch **appears** to be outstanding, or none was detected — it is never asserted
+as settled, because the check only reflects what is recorded on disk, not whether a process is
+actually still alive. A crashed dispatch whose `PostToolUse` never fired stays outstanding forever;
+`outstanding` has no timeout that clears it. Use this to catch a false "nothing left to do" before
+you park or checkpoint — not to prove a negative on its own.
+
+**What this signal cannot claim (L1):** two dispatches identical in `subagent_type`, package and
+`dispatch_key` within 120 seconds of each other collapse to ONE record (the start half's own
+pre-existing dedup window, which cannot tell a double-stamped single dispatch from two genuinely
+concurrent same-key ones). `outstanding` can therefore read zero while a second, genuinely-running
+dispatch of that exact shape still exists — narrow, but real. See the "Worker dispatch contract"
+section above for the manual-bracket alternative this signal does not replace.
+
 ## Resumption
 
 If the ledger shows prior progress when you start: this is a resumption. Verify every artifact in `## Outputs` exists on disk, re-run the last recorded validation, then execute `## Next action`. Never redo verified work; never trust unverified claims — including your predecessor's.
@@ -513,66 +733,58 @@ The deterministic orchestrator can stop the fleet mid-package without killing yo
 
 In all three, `## Next action` must be concrete enough for a fresh coordinator (or your warm-resumed self) to pick up — the Stop gate enforces it. **Don't fight the gate**: keep trying denied work and you just burn the budget the pause exists to protect.
 
-## Context-growth checkpoint (self-initiated)
+## Context-growth checkpoint
 
-This is the same stop ritual as the usage/telemetry pause above (`## Graceful stop
-(orchestrator-initiated)`, "Usage / telemetry pause" bullet) — finish the step, write `## Next
-action`, leave `status:` non-terminal, stop — triggered on a different condition: your own context
-size, not an external quota. Unlike that pause, nothing external polls or gates you here: there is
-no `PreToolUse` deny, no `runs/.paused` signal file, no cheaper or more accurate observer of "how
-much context does this turn's request actually carry" than you. This is convention-level prose you
-follow on your own initiative.
+This is now a **two-tier, mostly mechanical** ritual (coordinator-context-discipline/02), not
+something you compute by hand. The canonical numbers live in exactly one place in code —
+`bp-orchestrator.pl`'s `%CTX_CEILING_DEFAULT` — and this section is a restatement of it, not a
+second source of truth: **soft = 250,000 tokens**, **hard = 350,000 tokens**. An operator overrides
+either independently via `BP_CONTEXT_CEILING_SOFT_TOKENS` / `BP_CONTEXT_CEILING_HARD_TOKENS` (the
+old single-ceiling variable this superseded no longer exists — superseded, not aliased).
 
-- **When to check**: at every natural pipeline-step boundary — after a dispatched worker (`Task` or
-  `bp-worker.pl`) returns, and before starting the next pipeline step or dispatching the next
-  worker; a ledger checkbox transition (`## Pipeline` step ticked) counts as a boundary even when no
-  worker was involved. **Also check during extended direct work** — a stretch of your own
-  Read/Grep/Bash tool calls with no worker dispatch in between (e.g. a review or fix-batch pass you
-  execute yourself, a long investigation) — at least every 20 of your own tool calls, or before
-  starting any `Bash`-heavy investigation expected to produce a lot of output, whichever comes
-  first. Never mid-tool-call, never inside a single worker's turn.
-- **How to check**: `runs/<pkg>.jsonl` (also read by `bp-spend.pl` for cost accounting) is a
-  transcript that only grows. A bare `Read` returns the file's **START**, not its end, so on any
-  transcript past ~2000 lines that's stale data and a false all-clear — use `Bash` instead:
-  1. `wc -l "runs/<pkg>.jsonl"` for the current total line count `N`.
-  2. `tail -c 200000 "runs/<pkg>.jsonl"` (last ~200KB is comfortably enough for the newest few
-     records; widen only if that slice doesn't contain a complete JSON line) — or equivalently
-     `Read` the file with `offset` near `N` (e.g. `N - 50`) and `limit` unset.
-  3. Parse each line of that tail slice as JSON (skip any partial first line — `tail -c` can cut
-     mid-line) and find the LAST record where `type == "assistant"` AND `parent_tool_use_id` is
-     absent/null — not merely "last assistant record," because interleaved subagent turns carry a
-     non-null `parent_tool_use_id`. Sum `input_tokens + cache_creation_input_tokens +
-     cache_read_input_tokens` from that record's `message.usage` (excluding `output_tokens`, which
-     is what you produced this turn, not what was resent as context).
-- **Ceiling**: compare that sum to the ceiling. Default: **300,000 tokens** — raised from the
-  package's originally-measured 200K "knee" (2026-09-19, operator request). Modelled cache-read
-  cost is $712 at 300K vs. $522 at 200K (against $1,399.88 with zero checkpointing): 300K trades
-  some of 200K's better read efficiency for meaningfully fewer handovers, since each handover means
-  a fresh coordinator re-reading `blueprint.md` and its own ledger cold before it can do anything
-  else. An operator overriding it sets `BP_CONTEXT_CEILING_TOKENS` for the orchestrator process
-  (mirrored in `bp-orchestrator.pl`'s `_tunables_base()` as `ctx_ceiling`) and communicates the
-  value to running coordinators the same way any other tunable is communicated today — there is no
-  live-push channel, so treat this section's stated default as authoritative unless told otherwise
-  by the ledger or the operator.
-- **At or above the ceiling**: checkpoint now. Finish the step you were mid-way through (do not
-  abandon it half-done), write a concrete `## Next action` describing exactly what to resume, leave
-  `status:` at `running`/`converging` (never `parked`/`done` for this reason alone), refresh
-  `last_updated`, and stop. Do **not** write `runs/.paused` — that file is the orchestrator's own
-  signal for a usage pause specifically, unrelated to this trigger. You write no signal file at all:
-  this checkpoint exits cleanly (structurally identical to an ordinary turn-end), and the
-  orchestrator independently re-derives the same ceiling check from your own transcript at relaunch
-  time — if your last usage record was at/over ceiling, it forces a COLD relaunch regardless of how
-  fresh the cache looks, exactly like its existing `max_turns` override
-  (`bp-orchestrator.pl`, the `watchdog_relaunch` site). Without that check, a same-session,
-  seconds-old checkpoint would otherwise resume WARM — cache-fresh, `--resume`d back into the exact
-  context you just tried to discard — which is the bug this package's own follow-up fix closed.
-- **Below the ceiling**: do nothing different — proceed to the next pipeline step normally. This
-  check must be cheap and silent when it doesn't fire; it must never itself become a source of extra
-  tool calls or state writes.
-- **If a worker turn itself grows context past the ceiling before returning**: the check happens
-  only after that worker returns, same as above — you cannot interrupt an in-flight worker (matching
-  the usage-pause ritual's own "in-flight workers can't be cancelled" stance). You may therefore stop
-  noticeably above the ceiling in this case; that's expected, not a defect.
-- **If this trigger and the usage/telemetry pause condition are both true at the same boundary**: no
-  ordering is prescribed — either one produces the identical stop mechanics, so firing "both"
-  collapses to firing the ritual once. Don't try to satisfy two separate stop procedures.
+You no longer measure your own context by hand — the old line-count-plus-tail recipe is gone. Two
+hooks do the measurement for you, from the same bounded tail-read of `runs/<pkg>.jsonl` the
+orchestrator itself uses:
+
+- **`context-ceiling-guidance.sh`** (`PostToolUse` on `Task`/`Bash`) — at or above the **soft**
+  ceiling, this attaches a short **guidance** reminder to a tool result you were already going to
+  receive. It is purely informational and blocks nothing: no new tool call is made on your behalf,
+  and the reminder rides on an existing turn rather than manufacturing one. It re-injects at most
+  once every 15 minutes while you stay at/above soft (so a single mention doesn't read as
+  "resolved"), and resets the moment you drop back below soft. The reminder's own dispatch-status
+  line quotes `bp-dispatch-log.pl outstanding` (scoped to your blueprint and package) verbatim — it
+  is not your own guess about what's still running.
+- **`context-ceiling-flush.sh`** (`PreToolUse` on `Task`/`Bash`) — at or above the **hard** ceiling,
+  this is the mandatory **flush**: it denies `Task` dispatch outright and denies any `Bash` command
+  that isn't exactly flush work. The allow-list is `bp-ledger.pl set-status|set-next-action|
+  tick-step|append-attempt|add-output|validate` and `bp-dispatch-log.pl outstanding` — `Read`,
+  `Edit`, `Grep` and `Write` are never gated by this hook at all, so you can still write the
+  `## Escalation` prose and re-read your ledger freely. The flush is capped at **5 turns**: use them
+  to run the scoped `bp-dispatch-log.pl outstanding` check, write a concrete `## Next action` with
+  `bp-ledger.pl set-next-action`, leave `status:` non-terminal, and stop — exactly the same stop
+  shape as the usage/telemetry pause above (`## Graceful stop (orchestrator-initiated)`, "Usage /
+  telemetry pause" bullet). If you cannot finish within 5 turns, the overrun is recorded to disk and
+  becomes visible to the orchestrator; at that point set `status: blocked` with a filled
+  `## Escalation` naming what is preventing completion, then stop — the established stuck-coordinator
+  path, not a new one.
+
+You write no signal file at either tier: a soft-tier checkpoint exits cleanly (structurally identical
+to an ordinary turn-end), exactly as the old ritual did. The orchestrator independently re-derives
+the **soft** check from your own transcript at relaunch time — if your last coordinator-owned usage
+record was at or above the soft ceiling, it forces a **COLD** relaunch regardless of how fresh the
+cache looks, exactly like its existing `max_turns` override (`bp-orchestrator.pl`, the
+`watchdog_relaunch` site). Checking soft (not just hard) here is deliberate: soft subsumes hard (any
+usage at/above hard is also at/above soft), so a flushed coordinator relaunching cold holds by
+construction — without that, a same-session, seconds-old checkpoint could resume WARM, `--resume`d
+back into the exact context you just tried to discard.
+
+**If a worker turn itself grows context past a ceiling before returning**: the guidance/flush check
+happens only after that worker returns, on its next `Task`/`Bash` call — you cannot interrupt an
+in-flight worker (matching the usage-pause ritual's own "in-flight workers can't be cancelled"
+stance). You may therefore be noticeably above a ceiling for one tool call before either hook fires;
+that's expected, not a defect (the figure the guidance hook reports may lag your true current context
+by up to one turn for the same reason).
+
+**If this trigger and the usage/telemetry pause condition are both true at the same boundary**: no
+ordering is prescribed — either one produces the identical stop mechanics, so firing "both" collapses
+to firing the ritual once. Don't try to satisfy two separate stop procedures.

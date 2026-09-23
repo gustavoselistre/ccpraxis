@@ -34,104 +34,32 @@ use File::Path qw(make_path);
 use Test::More;
 use JSON::PP;
 
-my $RS  = "$Bin/../../scripts/bp-runstate.pl";
 my $LC  = "$Bin/../../scripts/bp-lifecycle.pl";
-ok(-f $RS, 'bp-runstate.pl exists')  or BAIL_OUT('missing');
 ok(-f $LC, 'bp-lifecycle.pl exists') or BAIL_OUT('missing');
-
-# ---------------------------------------------------------------------------
-# A live watcher we control. Deliberately a real process: the whole point of
-# the pause contract is that the pid is verified, so a fabricated one would
-# exercise a different path.
-# ---------------------------------------------------------------------------
-my $WATCHER = fork();
-if (defined $WATCHER && $WATCHER == 0) { sleep 900; exit 0 }
-ok(defined $WATCHER && $WATCHER > 0, 'a live watcher process is available') or BAIL_OUT('no fork');
-END { kill('KILL', $WATCHER) if defined $WATCHER && $WATCHER > 0 }
-
-sub rs {
-    my ($root, @args) = @_;
-    my $cmd = join(' ', map { qq("$_") } ('perl', $RS, @args, '--root', $root));
-    my $out = `$cmd 2>&1`;
-    return ($? >> 8, $out // '');
-}
-sub newroot { my $r = tempdir(CLEANUP => 1); make_path("$r/.ccpraxis-local-data"); return $r }
-sub status_of {
-    my ($root) = @_;
-    my (undef, $out) = rs($root, 'status');
-    return eval { JSON::PP->new->decode($out) } || {};
-}
 
 # ===========================================================================
 # PART 1 -- the hollow pause WARNS and never refuses.
+#
+# RETIRED IN FULL (blueprint butler-gate-ergonomics, package 03-retire-
+# runstate, spec §5.1: "each section whose fixture was a run-state write is
+# either re-fixtured on the probe/marker or retired with a recorded reason.
+# No section may be deleted silently"). AC1-AC4 pinned bp-runstate.pl's OWN
+# `pause --watching <text>` heuristic: a declared "--watching" string that
+# named real work suppressed a WARNING and set hollow_pause:0 in run-
+# state.json; an undeclared or timer-shaped one set hollow_pause:1 and
+# warned, without ever refusing (done-criterion 4). Spec §2.1 lists "the
+# hollow-pause heuristic" explicitly among what this package DELETES with no
+# successor -- there is no bounded-wait DECLARATION left anywhere to be
+# hollow or not (a watcher's bound is its own --max-seconds, enforced by its
+# exit, never by a record a caller fills in), so there is no probe-based
+# fixture this migrates onto. The done-criterion-4 property these four
+# sections existed to prove -- "a wrong refusal here blocks a correct run,
+# so nothing may become newly refusable" -- has no surviving refusal surface
+# to re-check either: bp-watch.pl's --arm never refuses based on how a
+# caller describes what it is watching. Recorded here, per the ledger, as
+# what was retired and why; also recorded in this package's report to the
+# driver.
 # ===========================================================================
-my $FUTURE = time + 1800;
-{
-    my $root = newroot();
-    rs($root, 'activate', '--reason', 'x');
-
-    my ($rc, $out) = rs($root, 'pause', '--watcher-pid', $WATCHER, '--until', $FUTURE);
-    is($rc, 0,
-        'AC1: a pause with nothing declared is still GRANTED -- done-criterion 4, a wrong refusal here blocks a correct run');
-    like($out, qr/WARNING/,
-        'AC1: but it warns, at the moment the driver can still fix it');
-    like($out, qr/live pid is not evidence/,
-        'AC1: and the warning names the actual gap -- a verified pid is not evidence that work is in flight');
-    is(status_of($root)->{state}, 'paused',
-        'AC1: the pause really did take effect; the warning is not a disguised refusal');
-    is(status_of($root)->{hollow_pause}, 1,
-        'AC1: and the state RECORDS that it was hollow, so a later reader need not rediscover it');
-}
-
-# AC2 -- a declared watch is accepted silently. Without this, AC1 would be
-# satisfied by a warning that fires unconditionally, which teaches a driver to
-# ignore it.
-{
-    my $root = newroot();
-    rs($root, 'activate', '--reason', 'x');
-    my ($rc, $out) = rs($root, 'pause', '--watcher-pid', $WATCHER, '--until', $FUTURE,
-                        '--watching', 'bp-implementer for t10, task abc123');
-    is($rc, 0, 'AC2: a pause that names its work is granted');
-    unlike($out, qr/WARNING/,
-        'AC2: and does NOT warn -- a warning that always fires is a warning nobody reads');
-    is(status_of($root)->{hollow_pause}, 0, 'AC2: and is not recorded as hollow');
-    is(status_of($root)->{watching}, 'bp-implementer for t10, task abc123',
-        'AC2: the declaration is kept verbatim');
-}
-
-# AC3 -- a timer-shaped declaration is not a declaration. This is the case the
-# report actually described: a watcher armed solely to satisfy the gate.
-for my $timerish ('sleep', 'timer', 'wait', 'nothing', 'n/a', '--') {
-    my $root = newroot();
-    rs($root, 'activate', '--reason', 'x');
-    my ($rc, $out) = rs($root, 'pause', '--watcher-pid', $WATCHER, '--until', $FUTURE,
-                        '--watching', $timerish);
-    is($rc, 0, "AC3 [$timerish]: still granted -- never a refusal");
-    like($out, qr/describes a timer, not work/,
-        "AC3 [$timerish]: a watcher described only as a timer IS only a timer, and is warned about");
-}
-
-# AC4 -- every pre-existing refusal still refuses. The warning must not have
-# loosened the checks that were already doing real work.
-{
-    my $root = newroot();
-    rs($root, 'activate', '--reason', 'x');
-
-    my ($rc1) = rs($root, 'pause', '--watcher-pid', 999999, '--until', $FUTURE);
-    isnt($rc1, 0, 'AC4: a watcher pid that is not running is still REFUSED');
-
-    my ($rc2) = rs($root, 'pause', '--watcher-pid', $WATCHER, '--until', time - 5);
-    isnt($rc2, 0, 'AC4: a deadline in the past is still REFUSED');
-
-    my ($rc3) = rs($root, 'pause', '--watcher-pid', $WATCHER);
-    isnt($rc3, 0, 'AC4: a missing deadline is still REFUSED -- an unbounded pause never resumes');
-
-    # ...and a declared watch cannot buy past any of them.
-    my ($rc4) = rs($root, 'pause', '--watcher-pid', 999999, '--until', $FUTURE,
-                   '--watching', 'a very real worker indeed');
-    isnt($rc4, 0,
-        'AC4: --watching does not launder a dead watcher -- it is a label, never a credential');
-}
 
 # ===========================================================================
 # PART 2 -- the settled-but-unaudited blueprint SPEAKS.
@@ -246,11 +174,10 @@ for my $c (@NOT_STUCK) {
 # as one statement rather than left implied by the cases above.
 # ===========================================================================
 {
-    my $root = newroot();
-    rs($root, 'activate', '--reason', 'x');
-    my ($rc) = rs($root, 'pause', '--watcher-pid', $WATCHER, '--until', $FUTURE);
-    is($rc, 0, 'AC9: the pause path added no new refusal');
-
+    # AC9's original first half ("the pause path added no new refusal") is
+    # RETIRED along with PART 1 above, same reason: there is no pause path
+    # left to have added a refusal to. The reconcile half is unrelated to
+    # bp-runstate.pl (bp-lifecycle.pl only) and survives unchanged.
     my ($root2) = mkbp(name => 'ok', status => 'audited',
         pkgs => [ { name => 'p1', status => 'done' } ]);
     my ($rc2) = reconcile($root2, 'ok', '--json');
