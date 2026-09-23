@@ -520,6 +520,23 @@ sub _probe_read_file {
     return $txt;
 }
 
+# _probe_ppid($proc_dir, $pid) -> $ppid | undef.  IMPURE.
+# Cygwin/MSYS publishes /proc/<pid>/ppid, which reads in well under a
+# millisecond. /proc/<pid>/stat there costs 45-70ms per read, because the
+# emulation queries Windows for process times (measured 2026-09-24). The
+# self-exclusion walk read stat once per ancestor, which accounted for
+# most of the probe's ~200ms floor. Linux has no ppid file, and its stat
+# read is cheap, so it falls back to proc_ppid(stat) there.
+sub _probe_ppid {
+    my ($proc_dir, $pid) = @_;
+    my $txt = _probe_read_file("$proc_dir/$pid/ppid");
+    if (defined $txt && $txt =~ /^\s*(\d+)\s*$/) {
+        return $1;
+    }
+    my $stat_text = _probe_read_file("$proc_dir/$pid/stat");
+    return defined $stat_text ? proc_ppid($stat_text) : undef;
+}
+
 # _probe_candidate_cwd($proc_dir, $pid) -> $dir | undef.  IMPURE.
 # readlink first (the normal /proc/<pid>/cwd shape on this host's MSYS
 # emulation and on real Linux), falling back to Cwd::abs_path for anything
@@ -626,9 +643,7 @@ sub probe_scan {
         my %seen = ($self_pid => 1);
         my $cur  = $self_pid;
         for (1 .. $max_hops) {
-            my $stat_text = _probe_read_file("$proc_dir/$cur/stat");
-            last unless defined $stat_text;
-            my $ppid = proc_ppid($stat_text);
+            my $ppid = _probe_ppid($proc_dir, $cur);
             last unless defined $ppid;
             last if $ppid <= 1;
             last if $seen{$ppid};
