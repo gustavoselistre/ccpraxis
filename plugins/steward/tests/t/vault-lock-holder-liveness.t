@@ -34,12 +34,14 @@ my $SRC = do { local (@ARGV, $/) = ($VS); <> };
 # ===========================================================================
 # A. THE PROBE, EXTRACTED AND RUN AGAINST REAL PIDS.
 # ===========================================================================
-my ($fn) = ($SRC =~ /(sub lock_holder_is_dead \{.*?\n\})/s);
-ok(defined $fn, 'A0: lock_holder_is_dead is extractable');
+my ($fn)  = ($SRC =~ /(sub lock_holder_is_dead \{.*?\n\})/s);
+my ($fnl) = ($SRC =~ /(sub lock_holder_liveness \{.*?\n\})/s);
+ok(defined $fn,  'A0: lock_holder_is_dead is extractable');
+ok(defined $fnl, 'A0b: lock_holder_liveness is extractable (lock_holder_is_dead delegates to it)');
 
 SKIP: {
-    skip 'probe not extractable', 8 unless defined $fn;
-    my $ok = eval "package TLOCK; $fn 1";
+    skip 'probe not extractable', 8 unless defined $fn && defined $fnl;
+    my $ok = eval "package TLOCK; $fnl $fn 1";
     ok($ok, 'A1: the extracted probe evaluates') or diag($@);
     skip 'probe did not evaluate', 7 unless $ok;
 
@@ -124,5 +126,66 @@ is(scalar @bare, 0,
 my @rich = ($SRC =~ /emit_error\("Vault lock held by another session\." \. lock_refusal_detail\(\)\)/g);
 cmp_ok(scalar @rich, '>=', 5,
        'C6: every one of the five call sites carries the detail');
+
+# ===========================================================================
+# D. THE REFUSAL SAYS WHETHER THE HOLDER IS ALIVE, NOT JUST WHO/HOW-LONG.
+#
+# Bug report 20260922-212658-4e80: an operator staring at "Holder: pid X,
+# held for 27s" cannot tell a live transient holder from a leaked stale one
+# without reading this file's source -- lock_holder_is_dead() already makes
+# that call internally (a refusal is only ever reached on a NOT-provably-dead
+# holder), but the call sites never SAID which of "confirmed alive" and
+# "could not confirm either way" applied. acquire_lock now records a
+# three-way lock_holder_liveness() verdict alongside pid/age, and
+# lock_refusal_detail renders it into the message.
+# ===========================================================================
+ok(defined $fnl, 'D0: lock_holder_liveness is extractable (see A0b)');
+
+SKIP: {
+    skip 'probe not extractable', 6 unless defined $fnl;
+    my $ok = eval "package TLIVE; $fnl 1";
+    ok($ok, 'D1: the extracted three-way probe evaluates') or diag($@);
+    skip 'probe did not evaluate', 5 unless $ok;
+
+    is(TLIVE::lock_holder_liveness($$), 'alive',
+       'D2: this very process classifies as alive');
+
+    my $ghost = 999_999;
+    $ghost++ while kill(0, $ghost) && $ghost < 1_000_050;
+  SKIP: {
+        skip 'could not find a provably-absent pid on this host', 1 if kill(0, $ghost);
+        is(TLIVE::lock_holder_liveness($ghost), 'dead',
+           'D3: a provably absent PID classifies as dead');
+    }
+
+    is(TLIVE::lock_holder_liveness(undef), 'unknown',
+       'D4: an unusable pid classifies as unknown, never alive or dead outright');
+
+    # acquire_lock must record this verdict at the exact point of refusal
+    # (the branch this test cannot reach without a live second process --
+    # asserted structurally instead, against the real acquire_lock source).
+    like($acq, qr/liveness\s*=>\s*lock_holder_liveness\(\$info->\{pid\}\)/,
+         'D5: acquire_lock records the liveness verdict into %LAST_LOCK_REFUSAL on refusal');
+}
+
+SKIP: {
+    skip 'detail builder not extractable', 2 unless defined $detail;
+    my $ok = eval "package TDET2; our \$LOCK_STALE_SEC = 1800; our %LAST_LOCK_REFUSAL; $detail 1";
+    skip 'builder did not evaluate', 2 unless $ok;
+
+    {
+        no warnings 'once';
+        %TDET2::LAST_LOCK_REFUSAL = (pid => 111, age => 5, path => '/v/.lock', liveness => 'alive');
+    }
+    like(TDET2::lock_refusal_detail(), qr/confirmed still running/,
+         'D6: a confirmed-alive holder is named as such, not left implicit');
+
+    {
+        no warnings 'once';
+        %TDET2::LAST_LOCK_REFUSAL = (pid => 734928, age => 27, path => '/v/.lock', liveness => 'unknown');
+    }
+    like(TDET2::lock_refusal_detail(), qr/could not be confirmed/,
+         'D7: an unresolvable holder says so plainly -- never silently guessed as alive');
+}
 
 done_testing();
