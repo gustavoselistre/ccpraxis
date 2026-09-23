@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # model-effort-check.t -- oracle for plugins/butler/scripts/bp-model-check.pl, the AC-17
 # cross-file model/effort set-agreement check, and the bp-auditor.md / hooks.json /
 # .claude/settings.json documentation & registration assertions

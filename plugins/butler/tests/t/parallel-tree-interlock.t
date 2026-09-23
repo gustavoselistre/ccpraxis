@@ -687,8 +687,21 @@ my $guard_content = read_file($GUARD);
 # byte-unchanged by this package: diffed against the ledger's own recorded
 # BASE REF.
 # ===========================================================================
-{
-    my $ledger_text = read_file($LEDGER);
+# A scope check for the package's own run, so it applies only while that
+# ledger is live and not done. The ledger is gitignored (absent on a fresh
+# clone), the blueprint was later archived out of blueprints/, and
+# run-tests.pl has since been changed on purpose by other work (7e415fd):
+# once the package finished, "unchanged since its base ref" stopped being
+# a property of this package.
+my $a17_ledger = read_file($LEDGER);
+my ($a17_status) = $a17_ledger =~ /^status:\s*(\S+)/m;
+SKIP: {
+    skip('A17: package ledger absent (gitignored, or the blueprint is archived) -- '
+       . 'the out-of-scope check belongs to that package\'s live run', 1)
+        if $a17_ledger eq '';
+    skip("A17: package is $a17_status -- later work may change run-tests.pl", 1)
+        if defined $a17_status && $a17_status =~ /^(?:done|dropped|parked)$/;
+    my $ledger_text = $a17_ledger;
     if (my ($base_ref) = ($ledger_text =~ /BASE REF:\s*([0-9a-f]{7,40})/)) {
         my $diff = qx(git -C "$REPO_ROOT" diff --name-only $base_ref..HEAD -- scripts/run-tests.pl 2>&1);
         my $git_rc = $? >> 8;

@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # guard-ledger-create.t -- oracle for plugins/butler/hooks/guard-ledger-create.sh
 # (04-model-effort-ledger-validation).
 #
