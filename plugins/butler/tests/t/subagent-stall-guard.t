@@ -48,12 +48,16 @@ ok(-x $GUARD, 'guard-subagent-stall.sh is executable');
 
 my $J = JSON::PP->new->canonical;
 
+# The drive-solo marker registry is pinned inside each fixture root
+# (CCPRAXIS_DRIVE_ACTIVE_DIR), never the machine's real one: whether a real
+# drive happens to be running must not change what this file observes.
 sub fire {                    # feed a payload to the hook -> (exit, stderr)
-    my ($root, $payload) = @_;
+    my ($root, $payload, %env) = @_;
     my ($fh, $tmp) = File::Temp::tempfile('t112-XXXXXX', TMPDIR => 1);
     print {$fh} $J->encode($payload); close $fh;
     my $err = "$tmp.err";
-    my $rc  = system(qq{CLAUDE_PROJECT_DIR="$root" bash "$GUARD" < "$tmp" 2> "$err"});
+    my $envs = join(' ', map { qq{$_="$env{$_}"} } sort keys %env);
+    my $rc  = system(qq{$envs CLAUDE_PROJECT_DIR="$root" CCPRAXIS_DRIVE_ACTIVE_DIR="$root/.drive-active" bash "$GUARD" < "$tmp" 2> "$err"});
     my $se  = do { open my $f, '<', $err or return ($rc >> 8, ''); local $/; <$f> // '' };
     unlink $tmp, $err;
     return ($rc >> 8, $se);
@@ -71,7 +75,21 @@ sub bash_ev {
              tool_input=>{ command=>$cmd }, tool_response=>{ stdout=>($resp // '') } };
 }
 sub stop { { hook_event_name=>'Stop', session_id=>'sess-t112' } }
-sub newroot { my $r = tempdir(CLEANUP => 1); mkdir "$r/.ccpraxis-local-data"; return $r }
+# Every fixture session is a drive-solo DRIVER by default -- the gate applies
+# only to a session running the run -- so it holds its own marker.
+# newroot(driver => 0) builds a root where it does not.
+sub newroot {
+    my (%o) = @_;
+    my $r = tempdir(CLEANUP => 1);
+    mkdir "$r/.ccpraxis-local-data";
+    make_path("$r/.drive-active");
+    unless (defined $o{driver} && !$o{driver}) {
+        open my $m, '>', "$r/.drive-active/sess-t112" or die "marker: $!";
+        print {$m} "$r/.ccpraxis-local-data\n";
+        close $m;
+    }
+    return $r;
+}
 
 # ============================ THE STATE MACHINE ============================
 # RETIRED (blueprint butler-gate-ergonomics, package 03-retire-runstate,
@@ -317,6 +335,77 @@ sub finish_consumed_path { my ($r) = @_; return "$r/.ccpraxis-local-data/.drive-
     is($rc2, 2, 'counter-fixture: the same verdict from bp-drive-next.pl DOES record a '
               . 'pending dispatch, so the veto discriminates on producer rather than simply '
               . 'refusing everything');
+}
+
+{   # READING THE DIRECTOR'S SOURCE IS NOT CALLING IT (2026-09-23). The command
+    # names bp-drive-next.pl and the output contains the director's own header
+    # comment, {"action":"run-package",...} -- both halves of the old substring
+    # test matched, and the session was refused every later stop.
+    my $r = newroot();
+    fire($r, bash_ev('grep -n "sub \\|package =>" plugins/butler/scripts/bp-drive-next.pl',
+                     qq{27:#   {"action":"run-package","blueprint":B,"package":P} drive this package next\n}
+                   . qq{951:            my \$action = { action => 'run-package', blueprint => \$bp };}));
+    fire($r, bash_ev('sed -n 40,75p plugins/butler/scripts/bp-drive-next.pl; sed -n 1p plugins/butler/scripts/bp-drive-next.pl',
+                     qq{   {"action":"run-package","blueprint":"b","package":"p"}}));
+    my ($rc) = fire_with_probe($r, stop(), proc_dir_none());
+    is($rc, 0, 'grep/sed of the director source records nothing, even from a driver session');
+
+    # The anchors are not so tight that real invocations stop counting.
+    for my $cmd ('perl "${CLAUDE_PLUGIN_ROOT}/scripts/bp-drive-next.pl" next --scope all',
+                 'cd /x && perl plugins/butler/scripts/bp-drive-next.pl next',
+                 'bp-drive-next.sh next;') {
+        my $r2 = newroot();
+        fire($r2, bash_ev($cmd, qq{{"action":"run-package","blueprint":"bp","package":"p1"}\n}));
+        my ($rc2) = fire_with_probe($r2, stop(), proc_dir_none());
+        is($rc2, 2, "a real director call still activates: $cmd");
+    }
+    # A verb that cannot hand out a package does not activate.
+    my $r3 = newroot();
+    fire($r3, bash_ev('perl plugins/butler/scripts/bp-drive-next.pl park bp stale',
+                      '{"action":"run-package","blueprint":"bp","package":"p1"}'));
+    my ($rc3) = fire_with_probe($r3, stop(), proc_dir_none());
+    is($rc3, 0, 'park is not next: nothing recorded');
+}
+
+{   # THE GATE BELONGS TO THE SESSION RUNNING THE RUN (2026-09-23). A session
+    # that is not driving -- no marker of its own, no director hand-back, not
+    # a coordinator -- dispatched a background agent while ANOTHER session
+    # drove, and was told only the operator could end "the run".
+    #
+    # The idle exit ("no outstanding work anywhere") is switched off for this
+    # whole block: these fixtures have no blueprints, so it would allow every
+    # stop and hide which rule decided.
+    local $ENV{CCPRAXIS_STALL_SKIP_IDLE_EXIT} = 1;
+    my $r = newroot(driver => 0);
+    open my $m, '>', "$r/.drive-active/sess-someone-else" or die; close $m;
+    fire($r, dispatch(JSON::PP::true, 'research agent'));
+    my ($rc, $err) = fire_with_probe($r, stop(), proc_dir_none());
+    is($rc, 0, 'a non-driving session may stop with its own background agent pending');
+    my ($rc_again) = fire_with_probe($r, stop(), proc_dir_none());
+    is($rc_again, 0, '...and its pending set was cleared, not left to re-trigger');
+
+    my $r2 = newroot(driver => 0);
+    fire($r2, dispatch(JSON::PP::true, 'w'));
+    my ($rc2) = fire_with_probe($r2, stop(), proc_dir_none());
+    is($rc2, 0, 'counter-fixture baseline: same, no marker at all');
+
+    # Each of the three ways of driving turns the gate back on.
+    my $r3 = newroot(driver => 1);
+    fire($r3, dispatch(JSON::PP::true, 'w'));
+    my ($rc3) = fire_with_probe($r3, stop(), proc_dir_none());
+    is($rc3, 2, 'own driver marker: gated');
+
+    my $r4 = newroot(driver => 0);
+    fire($r4, bash_ev('perl plugins/butler/scripts/bp-drive-next.pl next',
+                      '{"action":"run-package","blueprint":"bp","package":"p1"}'));
+    my ($rc4) = fire_with_probe($r4, stop(), proc_dir_none());
+    is($rc4, 2, 'no marker, but this session\'s own director call handed back work: gated');
+
+    my $r5 = newroot(driver => 0);
+    fire($r5, dispatch(JSON::PP::true, 'w'));
+    local $ENV{BP_LEDGER} = "$r5/ledger.md";
+    my ($rc5) = fire_with_probe($r5, stop(), proc_dir_none());
+    is($rc5, 2, 'fleet coordinator (BP_LEDGER): gated');
 }
 
 {   # The two resolutions, end to end.
@@ -667,7 +756,7 @@ sub finish_consumed_path { my ($r) = @_; return "$r/.ccpraxis-local-data/.drive-
         local $ENV{BP_PROBE_PROC_DIR} = proc_dir_none();
         my ($fh, $tmp) = File::Temp::tempfile('t112-argv-XXXXXX', TMPDIR => 1);
         print {$fh} $J->encode(stop()); close $fh;
-        my $rcx = system(qq{CLAUDE_PROJECT_DIR="$r" bash "$GUARD" --finish < "$tmp" >/dev/null 2>&1});
+        my $rcx = system(qq{CLAUDE_PROJECT_DIR="$r" CCPRAXIS_DRIVE_ACTIVE_DIR="$r/.drive-active" bash "$GUARD" --finish < "$tmp" >/dev/null 2>&1});
         unlink $tmp;
         is($rcx >> 8, 2, 'AC19e: invoking the hook with extra argv (--finish) still DENIED');
     }
@@ -852,7 +941,7 @@ sub fire_isolated {                       # like fire(), but against a given hoo
     my ($fh, $tmp) = File::Temp::tempfile('t112-iso-XXXXXX', TMPDIR => 1);
     print {$fh} $J->encode($payload); close $fh;
     my $err = "$tmp.err";
-    my $rc  = system(qq{CLAUDE_PROJECT_DIR="$root" bash "$hook" < "$tmp" 2> "$err"});
+    my $rc  = system(qq{CLAUDE_PROJECT_DIR="$root" CCPRAXIS_DRIVE_ACTIVE_DIR="$root/.drive-active" bash "$hook" < "$tmp" 2> "$err"});
     my $se  = do { open my $f, '<', $err or return ($rc >> 8, ''); local $/; <$f> // '' };
     unlink $tmp, $err;
     return ($rc >> 8, $se);
