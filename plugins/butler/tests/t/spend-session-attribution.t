@@ -1049,8 +1049,11 @@ subtest 'AC18: --json top-level/row/attribution.agents key sets exact; library =
 
   SKIP: {
         skip 'AC18: report_session/CLI unavailable', 4 unless ($doc && $cli_doc);
-        is_deeply([sort keys %$doc], [sort qw(cost_basis price_source price_as_of by data_root rows totals attribution)],
-            'AC18: top-level key set is EXACTLY the eight keys of §2.7');
+        # data_root_source added 2026-09-23 with the session-cwd default: a
+        # defaulted data root now says which rule chose it.
+        is_deeply([sort keys %$doc], [sort qw(cost_basis price_source price_as_of by data_root data_root_source rows totals attribution)],
+            'AC18: top-level key set is EXACTLY the eight keys of §2.7 plus data_root_source');
+        is($doc->{data_root_source}, 'explicit', 'AC18: an explicit --data-root reports source explicit');
         my $bad_rows = 0;
         for my $r (@{ $doc->{rows} }) {
             $bad_rows++ unless join(',', sort keys %$r) eq join(',', sort (qw(role model tokens cost_usd unpriced_tokens)));

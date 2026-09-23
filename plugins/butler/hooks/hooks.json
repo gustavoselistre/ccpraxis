@@ -177,6 +177,11 @@
                   "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/track-worker-solo.sh\"",
                   "timeout" : 15,
                   "type" : "command"
+               },
+               {
+                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/record-dispatch-package.sh\"",
+                  "timeout" : 15,
+                  "type" : "command"
                }
             ],
             "matcher" : "Task|Agent"

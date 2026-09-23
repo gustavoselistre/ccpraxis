@@ -1686,20 +1686,82 @@ our $ATTRIBUTION_LEAD_SECONDS = 120;
 our @REPORT_TOKEN_TYPES = qw(input output cache_write_5m cache_write_1h cache_read cache_write_unsplit);
 
 # ---------------------------------------------------------------------------
-# resolve_data_root($explicit) -> slashified data-root path string. Never
-# creates or checks existence of anything (spec §2.3).
+# resolve_data_root($explicit, $session) -> ( slashified data-root path,
+# source ). In order:
+#   1. --data-root, verbatim                             -> 'explicit'
+#   2. the nearest .ccpraxis-local-data at or above the
+#      `cwd` the SESSION recorded                        -> 'session-cwd'
+#   3. $CLAUDE_PROJECT_DIR/.ccpraxis-local-data          -> 'CLAUDE_PROJECT_DIR'
+#   4. <this script>/../../../.ccpraxis-local-data       -> 'script-location'
+# Step 2 is first among the defaults because the question is "which project
+# did THIS session run in", and the session says so itself. Steps 3-4 were
+# the whole default before it, and step 4 is wrong in exactly the normal
+# case: run from the live install, it names the live install's own data dir,
+# so on 2026-09-23 report-session read 21 stray records there instead of the
+# project's 552 and attributed 0 of 605M subagent tokens. Only step 2 checks
+# the filesystem; steps 1, 3 and 4 never do (spec §2.3).
 # ---------------------------------------------------------------------------
 sub resolve_data_root {
-    my ($explicit) = @_;
+    my ($explicit, $session) = @_;
     if (defined $explicit && length $explicit) {
         (my $r = $explicit) =~ s{\\}{/}g;
         $r =~ s{/+\z}{};
-        return $r;
+        return wantarray ? ($r, 'explicit') : $r;
     }
-    my $root = $ENV{CLAUDE_PROJECT_DIR} // Cwd::abs_path("$DISPATCH_DIR/../../..") // '.';
-    (my $r = "$root/.ccpraxis-local-data") =~ s{\\}{/}g;
+    my ($root, $source);
+    if (defined(my $cwd = _session_recorded_cwd($session))) {
+        my ($d, $prev, $n) = ($cwd, '', 0);
+        while (length($d) && $d ne $prev && $n++ < 64) {
+            my $cand = ($d eq '/') ? '/.ccpraxis-local-data' : "$d/.ccpraxis-local-data";
+            if (-d $cand) { ($root, $source) = ($d, 'session-cwd'); last }
+            $prev = $d;
+            $d =~ s{/[^/]*\z}{};
+            $d = '/' if $d eq '' && $prev =~ m{\A/};
+        }
+    }
+    if (!defined $root && defined $ENV{CLAUDE_PROJECT_DIR} && length $ENV{CLAUDE_PROJECT_DIR}) {
+        ($root, $source) = ($ENV{CLAUDE_PROJECT_DIR}, 'CLAUDE_PROJECT_DIR');
+    }
+    if (!defined $root) {
+        ($root, $source) = (Cwd::abs_path("$DISPATCH_DIR/../../..") // '.', 'script-location');
+    }
+    (my $r = $root) =~ s{\\}{/}g;
     $r =~ s{/+\z}{};
-    return $r;
+    $r .= '/.ccpraxis-local-data';
+    return wantarray ? ($r, $source) : $r;
+}
+
+# ---------------------------------------------------------------------------
+# _session_recorded_cwd($session) -> the slashified `cwd` the session's main
+# transcript records, or undef. Claude Code stamps `cwd` on its records from
+# the first line on, so this reads at most the first 200 lines and skips any
+# line over 1 MiB rather than parsing a large one to find a small field.
+# ---------------------------------------------------------------------------
+sub _session_recorded_cwd {
+    my ($session) = @_;
+    return undef unless defined $session && length $session;
+    (my $main = $session) =~ s{[/\\]+\z}{};
+    $main .= '.jsonl' unless $main =~ /\.jsonl\z/;
+    open(my $fh, '<:raw', $main) or return undef;
+    my $cwd;
+    my $n = 0;
+    while (defined(my $line = <$fh>)) {
+        last if ++$n > 200;
+        next if length($line) > 1_048_576;
+        $line =~ s/\r?\n\z//;
+        my $members = _session_json_members($line) or next;
+        for my $m (@$members) {
+            next unless $m->[0] eq 'cwd';
+            my $v = eval { _session_json_scalar($m->[1]) };
+            $cwd = $v if defined($v) && !ref($v) && length($v);
+        }
+        last if defined $cwd;
+    }
+    close $fh;
+    return undef unless defined $cwd;
+    $cwd =~ s{\\}{/}g;
+    $cwd =~ s{/+\z}{} unless $cwd eq '/';
+    return $cwd;
 }
 
 # ---------------------------------------------------------------------------
@@ -1781,6 +1843,71 @@ sub load_dispatch_records {
         };
     }
     return \@records;
+}
+
+# ---------------------------------------------------------------------------
+# load_dispatch_attribution($data_root) -> { <tool_use_id> => { blueprint,
+# package, source } } (never dies), from the append-only records
+# hooks/record-dispatch-package.sh writes at dispatch time:
+# <data_root>/.dispatch-log/attribution.jsonl, plus its one rolled-over
+# predecessor attribution.jsonl.1. A tool_use_id recorded twice with
+# DIFFERENT packages maps to { conflict => 1 } and attributes nothing -- two
+# claims about one dispatch are not resolved by picking one. Names are held to
+# the hook's own rule ([A-Za-z0-9._-], no leading dot, no '..'), so a
+# hand-edited line cannot smuggle a control byte into a report row.
+# ---------------------------------------------------------------------------
+sub load_dispatch_attribution {
+    my ($data_root) = @_;
+    my %map;
+    my $name_ok = sub {
+        my ($v) = @_;
+        return defined($v) && !ref($v) && $v =~ /\A[A-Za-z0-9._-]{1,120}\z/
+            && $v !~ /\A\./ && $v !~ /\.\./;
+    };
+    for my $file ("$data_root/.dispatch-log/attribution.jsonl.1",
+                  "$data_root/.dispatch-log/attribution.jsonl") {
+        open(my $fh, '<:raw', $file) or next;
+        while (defined(my $line = <$fh>)) {
+            next if length($line) > 4096;
+            $line =~ s/\r?\n\z//;
+            my $members = _session_json_members($line) or next;
+            my %f;
+            for my $m (@$members) {
+                my $v = eval { _session_json_scalar($m->[1]) };
+                $f{ $m->[0] } = $v unless ref $v;
+            }
+            my $tuid = $f{tool_use_id};
+            next unless defined($tuid) && $tuid =~ /\A[A-Za-z0-9_-]{1,128}\z/;
+            next unless $name_ok->($f{blueprint}) && $name_ok->($f{package});
+            my $source = (defined($f{source}) && $f{source} =~ /\A[a-z-]{1,32}\z/) ? $f{source} : 'unknown';
+            my $prev = $map{$tuid};
+            if ($prev && ($prev->{conflict}
+                          || $prev->{blueprint} ne $f{blueprint} || $prev->{package} ne $f{package})) {
+                $map{$tuid} = { conflict => 1 };
+                next;
+            }
+            $map{$tuid} = { blueprint => $f{blueprint}, package => $f{package}, source => $source };
+        }
+        close $fh;
+    }
+    return \%map;
+}
+
+# ---------------------------------------------------------------------------
+# _session_agent_tool_use_id($agent_path) -> the `toolUseId` in the agent
+# file's `.meta.json` sidecar, or undef. Claude Code writes the id of the
+# Agent tool call that spawned the subagent there; it is the same id a
+# PreToolUse hook sees as `tool_use_id` (verified 2026-09-23: every sidecar
+# sampled matched a tool_use block `id` in its parent transcript).
+# ---------------------------------------------------------------------------
+sub _session_agent_tool_use_id {
+    my ($agent_path) = @_;
+    return undef unless defined($agent_path) && $agent_path =~ /\.jsonl\z/;
+    (my $meta_path = $agent_path) =~ s/\.jsonl\z/.meta.json/;
+    my $meta = _session_read_sidecar($meta_path);
+    return undef unless ref($meta) eq 'HASH';
+    my $id = $meta->{toolUseId};
+    return (defined($id) && !ref($id) && $id =~ /\A[A-Za-z0-9_-]{1,128}\z/) ? $id : undef;
 }
 
 # ---------------------------------------------------------------------------
@@ -1876,16 +2003,25 @@ sub _resolve_bp_pkg {
 
 # ---------------------------------------------------------------------------
 # attribute_session(doc => \%session_doc, records => \@records,
-# index => \%blueprint_index) -> \@attributions (spec §2.6). Pure function:
-# reads no file, no wall-clock. Entry 0 is always the driver (B6); the
-# description-heuristic second pass runs over every agent left unattributed
-# by the primary pass (B4).
+# index => \%blueprint_index, dispatch_hook => \%tool_use_id_map,
+# tool_use_ids => \@ids) -> \@attributions (spec §2.6). Pure function:
+# reads no file, no wall-clock. Entry 0 is always the driver (B6).
+#
+# An agent whose sidecar toolUseId ($tool_use_ids[$i]) has a
+# record-dispatch-package.sh record is attributed from that record, source
+# `dispatch-hook`: an exact key recorded when the dispatch happened, so it
+# goes before every inference below. The dispatch-log time-window match and
+# the description heuristic (B4) remain for sessions older than the hook,
+# and for dispatches it did not see. dispatch_hook and tool_use_ids are
+# optional; without them this is the spec §2.6 function unchanged.
 # ---------------------------------------------------------------------------
 sub attribute_session {
     my (%opts) = @_;
     my $doc     = $opts{doc}     // {};
     my $records = $opts{records} // [];
     my $index   = $opts{index}   // {};
+    my $hook    = $opts{dispatch_hook} // {};
+    my $tuids   = $opts{tool_use_ids}  // [];
 
     my @agents = @{ $doc->{agents} // [] };
     my @attrs;
@@ -1902,6 +2038,17 @@ sub attribute_session {
         }
 
         my $role = $agent->{role};
+
+        my $tuid = $tuids->[$i];
+        my $hk   = defined($tuid) ? $hook->{$tuid} : undef;
+        if ($hk && !$hk->{conflict}) {
+            push @attrs, {
+                path => $agent->{path}, role => $role, kind => 'attributed',
+                blueprint => $hk->{blueprint}, package => $hk->{package},
+                reason => undef, source => 'dispatch-hook',
+            };
+            next;
+        }
         if (defined $role && $role eq 'unknown-agent') {
             push @attrs, {
                 path => $agent->{path}, role => $role, kind => 'unattributed',
@@ -1960,7 +2107,8 @@ sub attribute_session {
     my %S;
     for my $a (@attrs) {
         $S{ $a->{blueprint} } = 1
-            if $a->{kind} eq 'attributed' && ($a->{source} eq 'record-fields' || $a->{source} eq 'record-id');
+            if $a->{kind} eq 'attributed'
+            && ($a->{source} eq 'record-fields' || $a->{source} eq 'record-id' || $a->{source} eq 'dispatch-hook');
     }
     if (%S) {
         for my $i (0 .. $#attrs) {
@@ -2016,12 +2164,15 @@ sub report_session {
     $by = [@REPORT_DEFAULT_BY] unless defined $by;
     die "report_session: invalid --by dimension list\n" unless _valid_by_list($by);
 
-    my $data_root = resolve_data_root($opts{data_root});
+    my ($data_root, $data_root_source) = resolve_data_root($opts{data_root}, $opts{session});
     my $records   = load_dispatch_records($data_root);
     my $index     = blueprint_index($data_root);
-    my $attrs     = attribute_session(doc => $doc, records => $records, index => $index);
-
-    my @agents = @{ $doc->{agents} };
+    my @agents    = @{ $doc->{agents} };
+    my @tuids     = map { $_ == 0 ? undef : _session_agent_tool_use_id($agents[$_]{path}) } 0 .. $#agents;
+    my $attrs     = attribute_session(
+        doc => $doc, records => $records, index => $index,
+        dispatch_hook => load_dispatch_attribution($data_root), tool_use_ids => \@tuids,
+    );
 
     my %rows;
     for my $i (0 .. $#agents) {
@@ -2093,6 +2244,7 @@ sub report_session {
         price_as_of  => $SESSION_PRICE_AS_OF,
         by           => [@$by],
         data_root    => $data_root,
+        data_root_source => $data_root_source,
         rows         => \@rows,
         totals       => $doc->{totals},
         attribution  => {
@@ -2417,7 +2569,7 @@ unless (caller) {
 
         print "report-session: notional as-if-API-billed cost equivalent, not an actual charge\n";
         print "session: $doc->{attribution}{agents}[0]{path}\n";
-        print "data-root: $doc->{data_root}\n";
+        print "data-root: $doc->{data_root} (from $doc->{data_root_source})\n";
         print "price-source: $doc->{price_source} (as-of $doc->{price_as_of})\n";
         print "by: " . join(',', @{ $doc->{by} }) . "\n";
 
