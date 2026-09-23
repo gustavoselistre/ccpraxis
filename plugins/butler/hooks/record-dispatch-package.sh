@@ -65,7 +65,7 @@ else
   MARKER=$(bp_drive_marker "$SID" 2>/dev/null) || exit 0
   [ -f "$MARKER" ] || exit 0
   CWD=$(bp_json_get "$PAYLOAD" cwd 2>/dev/null); CWD=${CWD:-$PWD}
-  bp_driver_context "$CWD" || exit 0
+  bp_driver_context "$CWD" "$SID" || exit 0
   BLUEPRINT="$BP_BLUEPRINT"; PACKAGE="$BP_PACKAGE"; DATA="$BP_DATA_DIR"
   SOURCE=driver-pointer
 fi

@@ -59,7 +59,8 @@ else
   bp_drive_any_active 2>/dev/null || exit 0
   bp_read_payload open
   _cwd=$(bp_json_get "$PAYLOAD" cwd 2>/dev/null || true)
-  bp_driver_context "${_cwd:-$PWD}" || exit 0
+  _sid=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
+  bp_driver_context "${_cwd:-$PWD}" "$_sid" || exit 0
   # fix-batch V6 (redteam BLOCKER-2a/2b remainder): the driver's own CURRENT
   # package ledger is the one write the always-allow carve-out (guard-writes.sh)
   # does not reach on its own -- ledgers legitimately live under <data>/ and
