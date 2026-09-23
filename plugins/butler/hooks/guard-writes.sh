@@ -123,6 +123,25 @@ case "$FP" in
 esac
 ABS=$(realpath -m "$ABS")
 
+# Windows/MSYS path-form landmine (same class as this repo's other documented
+# ones): the tool payload's cwd/file_path arrives in Windows drive-letter form
+# ("C:/Development/..."), while lib.sh's driver-context resolution (a
+# pure-bash/MSYS caller) produces "/c/Development/...". realpath -m does NOT
+# convert between the two -- it only canonicalises "."/".."/symlinks within
+# whichever form it is handed -- so every later literal-prefix `case` match
+# and `realpath --relative-to` against BP_DATA_DIR/BP_DIR/BP_PROJECT_ROOT
+# silently fails to match a real containment, and every glob match against a
+# still-absolute (never reduced to relative) $REL silently fails too. Both
+# failure directions land on "not in scope" -- a false BLOCKED, not a missed
+# guard, but a real one: it made a legitimate driver spec-file edit
+# indistinguishable from a genuine write-set violation. Normalize ONCE, here,
+# to the same MSYS form lib.sh already uses everywhere else in this file.
+# cygpath is Git-for-Windows/MSYS-only; on a non-Windows host both forms are
+# already the same POSIX spelling and this is a no-op passthrough.
+if command -v cygpath >/dev/null 2>&1; then
+  ABS_NORM=$(cygpath -u "$ABS" 2>/dev/null) && [ -n "$ABS_NORM" ] && ABS="$ABS_NORM"
+fi
+
 # fix-batch MAJOR-3: derive the driver/worker branch from whether the
 # lib.sh driver-context predicate actually populated BP_DATA_DIR, not from
 # BP_DRIVER_SESSION alone. BP_DRIVER_SESSION is an ordinary shell variable
