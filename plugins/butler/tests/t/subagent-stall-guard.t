@@ -36,6 +36,7 @@ use FindBin qw($Bin);
 use Test::More;
 use File::Temp qw(tempdir);
 use File::Path qw(make_path);
+use File::Copy qw(copy);
 use JSON::PP;
 
 (my $HOOKS   = "$Bin/../../hooks")   =~ s{\\}{/}g;
@@ -773,6 +774,457 @@ sub finish_consumed_path { my ($r) = @_; return "$r/.ccpraxis-local-data/.drive-
         my ($rc2) = fire($r, stop());
         is($rc2, 0, 'AC10d: guard-subagent-stall.sh ALSO allows on the SAME touch (fired second, reversed order)');
     }
+}
+
+# =========== PACKAGE 05 — DISPATCH-LOG CROSS-CHECK ON THE DENIAL (AC1-AC17) =
+#
+# Spec: 05-subagent-stall-guard-accuracy-spec.md. `_bp_outstanding_report`
+# (spec §2.1) runs ONLY on the denial path, cross-checking the pending set
+# against `bp-dispatch-log.pl outstanding` (package 01's own live/stale
+# tracking) and rendering one of three sections (§2.2) below the existing
+# `${PENDING:+...}` block, without ever changing the verdict (D-B).
+#
+# Fixtures write `<root>/.ccpraxis-local-data/.dispatch-log/<id>.json`
+# directly (spec §5 point 8) rather than going through `bp-dispatch-log.pl
+# start`'s write-guard/lock machinery.
+sub write_dispatch_record {
+    my ($root, $id, %f) = @_;
+    my $dir = "$root/.ccpraxis-local-data/.dispatch-log";
+    make_path($dir);
+    my %rec = (
+        id          => $id,
+        worker_type => ($f{worker_type} // 'implementer'),
+        status      => ($f{status} // 'running'),
+    );
+    $rec{started_at}     = $f{started_at}     if exists $f{started_at} && defined $f{started_at};
+    $rec{budget_seconds} = $f{budget_seconds} if exists $f{budget_seconds} && defined $f{budget_seconds};
+    for my $k (qw(blueprint package dispatch_key)) {
+        $rec{$k} = $f{$k} if exists $f{$k} && defined $f{$k};
+    }
+    open my $fh, '>', "$dir/$id.json" or die "write record $id: $!";
+    print {$fh} $J->encode(\%rec);
+    close $fh;
+    return "$dir/$id.json";
+}
+sub dispatch_log_dir { my ($r) = @_; return "$r/.ccpraxis-local-data/.dispatch-log" }
+
+# A denial fixture: one background dispatch pending, probe forced NONE, no
+# finish marker -> the Stop falls through to the DENIED path every time.
+sub denial_root {
+    my ($desc) = @_;
+    my $r = newroot();
+    fire($r, dispatch(JSON::PP::true, $desc // 'w05 worker'));
+    return $r;
+}
+sub deny { my ($r) = @_; return fire_with_probe($r, stop(), proc_dir_none()) }
+
+# An isolated copy of the hook + its companions, so a fixture can remove or
+# replace scripts/bp-dispatch-log.pl WITHOUT touching the real write-set
+# file. lib.sh and bp-watch.pl are self-contained (no further sourcing), so
+# copying them verbatim reproduces the real hook's environment exactly.
+# with_dispatch_log => 0 omits scripts/bp-dispatch-log.pl entirely (AC13,
+# "script not readable"); with_dispatch_log => 'garbage' installs a stub
+# that prints unparseable stdout (AC13, "output not understood").
+sub isolated_guard {
+    my (%opt) = @_;
+    my $iso = tempdir(CLEANUP => 1);
+    make_path("$iso/hooks", "$iso/scripts");
+    copy("$HOOKS/lib.sh", "$iso/hooks/lib.sh") or die "copy lib.sh: $!";
+    copy($GUARD, "$iso/hooks/guard-subagent-stall.sh") or die "copy guard: $!";
+    copy("$SCRIPTS/bp-watch.pl", "$iso/scripts/bp-watch.pl") or die "copy bp-watch.pl: $!";
+    if (!exists $opt{with_dispatch_log} || $opt{with_dispatch_log} eq 'real') {
+        copy("$SCRIPTS/bp-dispatch-log.pl", "$iso/scripts/bp-dispatch-log.pl")
+            or die "copy bp-dispatch-log.pl: $!";
+    }
+    elsif ($opt{with_dispatch_log} eq 'garbage') {
+        open my $fh, '>', "$iso/scripts/bp-dispatch-log.pl" or die $!;
+        print {$fh} "#!/usr/bin/env perl\nprint \"not the expected output shape at all\\n\";\n";
+        close $fh;
+    }
+    # 'absent' (or any other value): leave scripts/bp-dispatch-log.pl unwritten.
+    return "$iso/hooks/guard-subagent-stall.sh";
+}
+sub fire_isolated {                       # like fire(), but against a given hook path
+    my ($hook, $root, $payload, $procdir, $self_pid) = @_;
+    local $ENV{BP_PROBE_PROC_DIR} = $procdir if defined $procdir;
+    local $ENV{BP_PROBE_SELF_PID} = $self_pid if defined $self_pid;
+    local $ENV{BP_PROBE_CLK_TCK}  = 100 if defined $procdir;
+    my ($fh, $tmp) = File::Temp::tempfile('t112-iso-XXXXXX', TMPDIR => 1);
+    print {$fh} $J->encode($payload); close $fh;
+    my $err = "$tmp.err";
+    my $rc  = system(qq{CLAUDE_PROJECT_DIR="$root" bash "$hook" < "$tmp" 2> "$err"});
+    my $se  = do { open my $f, '<', $err or return ($rc >> 8, ''); local $/; <$f> // '' };
+    unlink $tmp, $err;
+    return ($rc >> 8, $se);
+}
+
+# ---- AC1/AC2 (B4, DC-1) — the most important behavioral claim: a STALE
+# record still blocks; it is labelled, never treated as completion (D-D). ----
+{
+    my $r = denial_root('ac1 worker');
+    write_dispatch_record($r, 'ac1-stale-dispatch',
+        started_at => time() - 10000, budget_seconds => 60);
+    my ($rc, $err) = deny($r);
+    is($rc, 2, 'AC1: a stale running record still DENIES the stop (D-D)');
+    like($err, qr/STALE/, 'AC1: ...stderr mentions STALE');
+    like($err, qr/(?i:cannot.{0,4}be told apart|cannot.?tell)/,
+        'AC1: ...and a "cannot tell apart from a dispatch that died" phrasing');
+    like($err, qr/(?i:not evidence)/, 'AC1: ...and a "not evidence [it] finished" phrasing');
+    like($err, qr/\bac1-stale-dispatch\b/, 'AC1: ...and the record\'s own id');
+
+    # AC2 — the same fixture must not read as a completion claim, and staleness
+    # alone must never be the thing that allows the stop.
+    is($rc, 2, 'AC2: the stop is not allowed on staleness alone');
+    unlike($err, qr/dispatch (?:is|was|has) (?:confirmed |verified )?finished/i,
+        'AC2: stderr never claims the dispatch finished');
+}
+
+# ---- AC3 (B3, DC-2/DC-1) — a genuinely live, in-budget record still blocks,
+# labelled LIVE, with no STALE sentence attached. ----
+{
+    my $r = denial_root('ac3 worker');
+    write_dispatch_record($r, 'ac3-live-dispatch',
+        started_at => time(), budget_seconds => 1800);
+    my ($rc, $err) = deny($r);
+    is($rc, 2, 'AC3: a live in-budget outstanding dispatch still DENIES, unchanged from today');
+    like($err, qr/LIVE \(within 4x budget\)/, 'AC3: ...row labelled LIVE');
+    like($err, qr/\bac3-live-dispatch\b/, 'AC3: ...and names the id');
+    unlike($err, qr/STALE means past 4x its own budget/,
+        'AC3: ...no STALE sentence when nothing is stale or unevaluable');
+}
+
+# ---- AC4/AC5 (B10, DC-2/DC-4) — zero-cost-on-allow-paths (D-A): the query
+# runs NEVER on any allow path, live/cannot-tell/finish-marker/force-stop/
+# empty-pending, even when outstanding records exist. ----
+{
+    my $r = newroot();
+    fire($r, dispatch(JSON::PP::true, 'ac4 worker'));
+    write_dispatch_record($r, 'ac4-record', started_at => time(), budget_seconds => 1800);
+    my ($procdir, $self_pid) = proc_dir_live("$r/.ccpraxis-local-data");
+    my ($rc, $err) = fire_with_probe($r, stop(), $procdir, $self_pid);
+    is($rc, 0, 'AC4: probe LIVE (verdict 0) allows even with outstanding dispatch-log records');
+    unlike($err, qr/Dispatch log/, 'AC4: ...and stderr contains no Dispatch log text at all');
+}
+{
+    # AC5a — probe cannot-tell (verdict 2).
+    my $r = newroot();
+    fire($r, dispatch(JSON::PP::true, 'ac5a worker'));
+    write_dispatch_record($r, 'ac5a-record', started_at => time(), budget_seconds => 1800);
+    my ($rc, $err) = fire_with_probe($r, stop(), proc_dir_cannot_tell());
+    is($rc, 0, 'AC5a: probe cannot-tell (2) allows with outstanding records present');
+    unlike($err, qr/Dispatch log/, 'AC5a: ...no Dispatch log text');
+}
+{
+    # AC5b — operator .run-finished marker.
+    #
+    # review NIT-6(b): this fixture must be attributable to the finish-marker
+    # signal it claims to exercise, not to the earlier "third exit" branch
+    # (bp_outstanding_work) firing first -- which it does today only because
+    # this repo's own blueprint state happens to have a non-terminal package
+    # when cwd is the repo. CCPRAXIS_STALL_SKIP_IDLE_EXIT=1 disables that
+    # earlier exit for this fixture so the assertion holds regardless of
+    # repo state.
+    local $ENV{CCPRAXIS_STALL_SKIP_IDLE_EXIT} = 1;
+    my $r = newroot();
+    fire($r, dispatch(JSON::PP::true, 'ac5b worker'));
+    write_dispatch_record($r, 'ac5b-record', started_at => time(), budget_seconds => 1800);
+    touch_finish_marker($r);
+    my ($rc, $err) = fire($r, stop());
+    is($rc, 0, 'AC5b: the operator finish marker allows with outstanding records present');
+    unlike($err, qr/Dispatch log/, 'AC5b: ...no Dispatch log text');
+}
+{
+    # AC5c — one-shot force-stop marker.
+    my $r = newroot();
+    fire($r, dispatch(JSON::PP::true, 'ac5c worker'));
+    write_dispatch_record($r, 'ac5c-record', started_at => time(), budget_seconds => 1800);
+    my $d = "$r/.ccpraxis-local-data/.subagent-guard";
+    make_path($d);
+    open my $f, '>', "$d/force-stop" or die $!; close $f;
+    my ($rc, $err) = fire($r, stop());
+    is($rc, 0, 'AC5c: force-stop allows with outstanding records present');
+    unlike($err, qr/Dispatch log/, 'AC5c: ...no Dispatch log text');
+}
+{
+    # AC5d — empty pending set (INERT).
+    my $r = newroot();
+    write_dispatch_record($r, 'ac5d-record', started_at => time(), budget_seconds => 1800);
+    my ($rc, $err) = fire($r, stop());
+    is($rc, 0, 'AC5d: an empty pending set allows (INERT) with outstanding records present');
+    unlike($err, qr/Dispatch log/, 'AC5d: ...no Dispatch log text');
+}
+
+# ---- AC6 (B1,B3,B11, DC-3) — every DENIAL carries a Dispatch log section, in
+# addition to the existing BLOCKED text. ----
+{
+    # B1: store absent entirely -> section (a).
+    my $r = denial_root('ac6a worker');
+    my ($rc, $err) = deny($r);
+    is($rc, 2, 'AC6a fixture: denied with no dispatch-log store at all');
+    like($err, qr/BLOCKED/, 'AC6a: ...still contains BLOCKED');
+    like($err, qr/Dispatch log/, 'AC6a: ...and a Dispatch log section');
+
+    # B3: one live record -> section (b).
+    my $r2 = denial_root('ac6b worker');
+    write_dispatch_record($r2, 'ac6b-record', started_at => time(), budget_seconds => 1800);
+    my ($rc2, $err2) = deny($r2);
+    is($rc2, 2, 'AC6b fixture: denied with one live record');
+    like($err2, qr/BLOCKED/, 'AC6b: ...still contains BLOCKED');
+    like($err2, qr/Dispatch log/, 'AC6b: ...and a Dispatch log section');
+
+    # B11: store path is a plain file -> unreadable -> section (c).
+    my $r3 = denial_root('ac6c worker');
+    make_path("$r3/.ccpraxis-local-data");
+    open my $fh, '>', dispatch_log_dir($r3) or die $!; print {$fh} 'x'; close $fh;
+    my ($rc3, $err3) = deny($r3);
+    is($rc3, 2, 'AC6c fixture: denied with an unreadable dispatch-log store');
+    like($err3, qr/BLOCKED/, 'AC6c: ...still contains BLOCKED');
+    like($err3, qr/Dispatch log/, 'AC6c: ...and a Dispatch log section');
+}
+
+# ---- AC7 (B3,B4,B6, DC-3) — every rendered row names its own record id. ----
+{
+    my $r = denial_root('ac7 worker');
+    write_dispatch_record($r, 'ac7-live', started_at => time(), budget_seconds => 1800);
+    write_dispatch_record($r, 'ac7-stale', started_at => time() - 10000, budget_seconds => 60);
+    my (undef, $err) = deny($r);
+    like($err, qr/\bac7-live\b/, 'AC7: the live row names its own id');
+    like($err, qr/\bac7-stale\b/, 'AC7: the stale row names its own id');
+}
+
+# ---- AC8 (B1,B7, DC-3/DC-2) — 0 outstanding records: says so, and says it is
+# NOT a resolution; still denied. Covers both "no store" (B1) and "records
+# exist but all finished" (B7). ----
+{
+    my $r = denial_root('ac8a worker');
+    my ($rc, $err) = deny($r);
+    is($rc, 2, 'AC8a: no dispatch-log store at all is still denied');
+    like($err, qr/0 records outstanding/, 'AC8a: ...stderr says 0 outstanding');
+    like($err, qr/NOT a resolution/, 'AC8a: ...and that this is NOT a resolution');
+}
+{
+    my $r = denial_root('ac8b worker');
+    write_dispatch_record($r, 'ac8b-finished', status => 'finished', started_at => time());
+    my ($rc, $err) = deny($r);
+    is($rc, 2, 'AC8b: a record that exists but is not status=running is still denied');
+    like($err, qr/0 records outstanding/, 'AC8b: ...stderr says 0 outstanding (finished records do not count)');
+    like($err, qr/NOT a resolution/, 'AC8b: ...and that this is NOT a resolution');
+}
+
+# ---- AC9 (B6, DC-1/DC-3) — mixed live+stale: both labels, correct counts. --
+{
+    my $r = denial_root('ac9 worker');
+    write_dispatch_record($r, 'ac9-live', started_at => time(), budget_seconds => 1800);
+    write_dispatch_record($r, 'ac9-stale', started_at => time() - 10000, budget_seconds => 60);
+    my (undef, $err) = deny($r);
+    like($err, qr/LIVE \(within 4x budget\)/, 'AC9: the live row is labelled LIVE');
+    like($err, qr/STALE \(cannot tell if alive\)/, 'AC9: the stale row is labelled STALE');
+    like($err, qr/2 outstanding \(1 live, 1 stale, 0 unevaluable, 0 unreadable\)/,
+        'AC9: the header counts read 1 live, 1 stale');
+}
+
+# ---- AC10 (B8, DC-3) — blueprint/package render '-' when absent, and their
+# real values when present; and (D-C, §3 B8's second sentence) a record from
+# an UNRELATED blueprint is still listed -- the query is unfiltered. ----
+{
+    my $r = denial_root('ac10 worker');
+    write_dispatch_record($r, 'ac10-bare', started_at => time(), budget_seconds => 1800);
+    write_dispatch_record($r, 'ac10-attributed', started_at => time(), budget_seconds => 1800,
+        blueprint => 'coordinator-context-discipline', package => '05-subagent-stall-guard-accuracy');
+    write_dispatch_record($r, 'ac10-unrelated', started_at => time(), budget_seconds => 1800,
+        blueprint => 'some-other-blueprint-entirely', package => 'zz-unrelated-package');
+    my (undef, $err) = deny($r);
+    like($err, qr/id=ac10-bare\s+worker_type=\S+\s+blueprint=-\s+package=-/,
+        'AC10a: a record with no blueprint/package renders "-" for both');
+    like($err,
+        qr/id=ac10-attributed\s+worker_type=\S+\s+blueprint=coordinator-context-discipline\s+package=05-subagent-stall-guard-accuracy/,
+        'AC10b: a record WITH blueprint/package renders the real values');
+    like($err, qr/\bac10-unrelated\b/,
+        'AC10c (D-C): a record from an unrelated blueprint is still listed -- the query is unfiltered');
+}
+
+# ---- AC11 (B9, DC-3) — >=6 outstanding records: exactly 5 rows rendered,
+# oldest first, plus a "+K more" overflow line with the right K. ----
+{
+    my $r = denial_root('ac11 worker');
+    my $now = time();
+    for my $i (1 .. 7) {
+        write_dispatch_record($r, "ac11-rec-$i",
+            started_at => $now - (7 - $i), budget_seconds => 1800);
+    }
+    my (undef, $err) = deny($r);
+    my @ids_in_order = ($err =~ /\bid=(ac11-rec-\d)\b/g);
+    is(scalar(@ids_in_order), 5, 'AC11: exactly 5 rows are rendered out of 7 outstanding records');
+    is_deeply(\@ids_in_order, ['ac11-rec-1', 'ac11-rec-2', 'ac11-rec-3', 'ac11-rec-4', 'ac11-rec-5'],
+        'AC11: ...oldest-first, by started_at');
+    like($err, qr/\(\+2 more/, 'AC11: ...followed by a "+2 more" overflow line');
+}
+
+# ---- AC12 (B5, DC-1) — a record with no usable start time renders
+# UNEVALUABLE and elapsed_seconds=unknown. ----
+{
+    my $r = denial_root('ac12 worker');
+    write_dispatch_record($r, 'ac12-record', budget_seconds => 1800);  # started_at omitted
+    my (undef, $err) = deny($r);
+    like($err, qr/UNEVALUABLE \(no usable start time\)/, 'AC12: the row is labelled UNEVALUABLE');
+    like($err, qr/id=ac12-record\b.*elapsed_seconds=unknown/,
+        'AC12: ...and elapsed_seconds reads "unknown"');
+}
+
+# ---- AC13 (B11, DC-4) — every unavailable-script/unparseable-output path
+# degrades gracefully: exit stays 2, "cross-check unavailable" + a reason,
+# and the full existing BLOCKED text survives. ----
+{
+    # (i) the dispatch-log store path is a plain file (already covered as
+    # AC6c's fixture; re-asserted here under its own AC number for the
+    # "unavailable" wording specifically).
+    my $r = denial_root('ac13a worker');
+    make_path("$r/.ccpraxis-local-data");
+    open my $fh, '>', dispatch_log_dir($r) or die $!; print {$fh} 'x'; close $fh;
+    my ($rc, $err) = deny($r);
+    is($rc, 2, 'AC13a: an unreadable dispatch-log store still DENIES (exit 2)');
+    like($err, qr/cross-check unavailable/, 'AC13a: ...stderr says cross-check unavailable');
+    like($err, qr/BLOCKED/, 'AC13a: ...and the full BLOCKED denial text survives');
+    like($err, qr/\.run-finished/, 'AC13a: ...including the operator remedy');
+    like($err, qr/force-stop/i, 'AC13a: ...and the force-stop lever');
+
+    # (ii) scripts/bp-dispatch-log.pl is entirely absent (an isolated hook
+    # copy, per spec §2.1 point 1: "not readable" -> unavailable section).
+    my $hook_no_script = isolated_guard(with_dispatch_log => 'absent');
+    my $r2 = newroot();
+    fire_isolated($hook_no_script, $r2, dispatch(JSON::PP::true, 'ac13b worker'));
+    my ($rc2, $err2) = fire_isolated($hook_no_script, $r2, stop(), proc_dir_none());
+    is($rc2, 2, 'AC13b: bp-dispatch-log.pl absent still DENIES (exit 2)');
+    like($err2, qr/cross-check unavailable/, 'AC13b: ...stderr says cross-check unavailable');
+    like($err2, qr/BLOCKED/, 'AC13b: ...and the full BLOCKED denial text survives');
+
+    # (iii) bp-dispatch-log.pl exists but its stdout is not the expected
+    # "outstanding_count: <digits>" shape (spec §2.1 point 3: unparseable
+    # output -> unavailable section).
+    my $hook_garbage = isolated_guard(with_dispatch_log => 'garbage');
+    my $r3 = newroot();
+    fire_isolated($hook_garbage, $r3, dispatch(JSON::PP::true, 'ac13c worker'));
+    my ($rc3, $err3) = fire_isolated($hook_garbage, $r3, stop(), proc_dir_none());
+    is($rc3, 2, 'AC13c: unparseable bp-dispatch-log.pl output still DENIES (exit 2)');
+    like($err3, qr/cross-check unavailable/, 'AC13c: ...stderr says cross-check unavailable');
+    like($err3, qr/BLOCKED/, 'AC13c: ...and the full BLOCKED denial text survives');
+}
+
+# ---- AC14 (B2, DC-4) — the dispatch-log store directory does not exist
+# before a denial, and still does not exist after it (no side-effect create).
+{
+    my $r = denial_root('ac14 worker');
+    ok(!-e dispatch_log_dir($r), 'AC14 precondition: the dispatch-log store does not exist yet');
+    my ($rc) = deny($r);
+    is($rc, 2, 'AC14 fixture: the stop is denied');
+    ok(!-e dispatch_log_dir($r),
+        'AC14: the dispatch-log store STILL does not exist after the denial -- a query is not a write');
+}
+
+# ---- AC15 (B12, DC-4) — the pending set file is byte-identical after a
+# denial that ran the cross-check. ----
+{
+    my $r = denial_root('ac15 worker');
+    write_dispatch_record($r, 'ac15-record', started_at => time(), budget_seconds => 1800);
+    my $state = "$r/.ccpraxis-local-data/.subagent-guard/sess-t112";
+    my $before = do { open my $f, '<', $state or die $!; local $/; <$f> };
+    my ($rc) = deny($r);
+    is($rc, 2, 'AC15 fixture: the stop is denied');
+    my $after = do { open my $f, '<', $state or die $!; local $/; <$f> };
+    is($after, $before, 'AC15: the pending set file is byte-identical before and after the denial');
+}
+
+# ---- AC17 (B13, DC-4) — no bp-runstate.pl reference is reintroduced, and no
+# new persisted state-machine file is created by the cross-check. ----
+{
+    my $src = do { open my $f, '<', $GUARD or die; local $/; <$f> };
+    my $code = join "\n", grep { !/^\s*#/ } split /\n/, $src;
+    unlike($code, qr/bp-runstate\.pl/,
+        'AC17a: bp-runstate.pl still appears nowhere in the executable part of the hook');
+
+    my $r = denial_root('ac17 worker');
+    write_dispatch_record($r, 'ac17-record', started_at => time(), budget_seconds => 1800);
+    deny($r);
+    ok(!-e "$r/.ccpraxis-local-data/.subagent-guard/run-state.json",
+        'AC17b: no run-state.json (or equivalent persisted state-machine file) is created');
+    my @after_dispatch = sort glob(dispatch_log_dir($r) . '/*');
+    is_deeply(\@after_dispatch, [dispatch_log_dir($r) . '/ac17-record.json'],
+        'AC17c: the cross-check creates no new dispatch-log record of its own');
+}
+
+# =========== FIX-BATCH 05 ADDITIVE — accuracy fix-batch regression guards ===
+#
+# Spec §7 DRIVER AMENDMENT / consolidated review+redteam findings. These three
+# fixtures are NEW (additive only, per the fix-batch's authorization) and do
+# not touch any assertion above.
+
+# ---- SHOULD-1 regression guard: an unreadable *.json record must not
+# silently suppress the STALE explanatory sentence, and its header count
+# lands in unreadable_count (not stale/unevaluable). ----
+{
+    my $r = denial_root('fb-unreadable worker');
+    my $dir = dispatch_log_dir($r);
+    make_path($dir);
+    open my $fh, '>', "$dir/broken.json" or die $!;
+    print {$fh} "x\n";
+    close $fh;
+    my ($rc, $err) = deny($r);
+    is($rc, 2, 'fix-batch: an unreadable *.json record still DENIES');
+    like($err, qr/1 outstanding \(0 live, 0 stale, 0 unevaluable, 1 unreadable\)/,
+        'fix-batch: the header counts the broken record as unreadable, not stale/unevaluable');
+    like($err, qr/UNEVALUABLE \(no usable start time\)/,
+        "fix-batch: the row itself still renders UNEVALUABLE (the verb's own label for stale=unknown)");
+    like($err, qr/STALE means past 4x its own budget/,
+        'fix-batch (SHOULD-1): the STALE sentence still appears for an unreadable-only record -- '
+      . 'the sentence gate now reads unreadable_count too, not just stale/unevaluable');
+}
+
+# ---- Items 1 and 6 together: a >=6-record fixture where the ONLY stale
+# record sorts past the 5-row cutoff. The STALE sentence must still appear
+# (proving the sentence gate reads the header counts, not the rendered
+# rows), and the overflow "+K more" must reflect the true header-derived
+# remainder even though the stale row itself is never rendered. ----
+{
+    my $r = denial_root('fb-cutoff worker');
+    my $now = time();
+    for my $i (1 .. 5) {
+        write_dispatch_record($r, "fb-cutoff-live-$i",
+            started_at => $now - (6000 - $i * 100), budget_seconds => 100000);
+    }
+    # The 6th record has the LARGEST (most recent) started_at of the six, so
+    # it sorts LAST -- past the 5-row cutoff -- yet it is the only
+    # stale/unevaluable one (tiny budget_seconds).
+    write_dispatch_record($r, 'fb-cutoff-stale',
+        started_at => $now - 500, budget_seconds => 10);
+    my (undef, $err) = deny($r);
+    unlike($err, qr/\bfb-cutoff-stale\b/,
+        'fix-batch: the stale record past the cutoff is NOT among the 5 rendered rows');
+    like($err, qr/6 outstanding \(5 live, 1 stale, 0 unevaluable, 0 unreadable\)/,
+        'fix-batch: ...the header counts are correct regardless');
+    like($err, qr/STALE means past 4x its own budget/,
+        'fix-batch (items 1+6): ...yet the STALE sentence still appears -- the gate reads the '
+      . 'header counts, not the rendered rows');
+    like($err, qr/\(\+1 more/,
+        'fix-batch (item 1): ...and the overflow "+1 more" reflects the true header-derived '
+      . 'remainder, not a count of rendered/parsed rows');
+}
+
+# ---- CRITICAL-1 regression guard: an oversized worker_type field must not
+# make the hook slow -- the capture cap engages, and the denial still
+# completes in low single digits of seconds (scaled down from redteam's
+# 10.2MB/68.2s repro; a few hundred KB is enough to prove the mechanism at
+# test speed). ----
+{
+    my $r = denial_root('fb-oversized worker');
+    write_dispatch_record($r, 'fb-oversized-record',
+        worker_type => ('x' x 300_000), started_at => time(), budget_seconds => 1800);
+    my $t0 = time();
+    my ($rc, $err) = deny($r);
+    my $elapsed = time() - $t0;
+    is($rc, 2, 'fix-batch (CRITICAL-1): an oversized worker_type field still DENIES');
+    ok($elapsed < 5,
+        "fix-batch (CRITICAL-1): ...and completes in ${elapsed}s, well under the 10s query bound -- "
+      . 'the capture cap engages rather than the bash-side parse scaling with input size');
 }
 
 done_testing();

@@ -455,6 +455,246 @@ case "$EVENT" in
         esac
     }
 
+    # THE DISPATCH-LOG CROSS-CHECK (spec 05-subagent-stall-guard-accuracy
+    # §2.1/§2.2). Called ONLY from the denial path below, between PENDING and
+    # the heredoc (D-A): every allow path above this point returns before
+    # this function is ever referenced, so it spawns nothing on the
+    # overwhelmingly common turn. Its stdout INFORMS the denial message; it
+    # NEVER moves the verdict in either direction (D-B) -- callers must not
+    # branch on its return code, and it always returns 0. A stale record
+    # still counts as outstanding and is labelled, never discounted (D-D).
+    # Every failure mode (missing script, missing perl, timeout, exit 4,
+    # unparseable output) degrades to the same "unavailable" section (D-F) --
+    # this function can change what the message says, never whether the stop
+    # is denied.
+    _bp_outstanding_report() {
+        local _or_root="$1"
+        local _or_script="$HOOK_DIR/../scripts/bp-dispatch-log.pl"
+
+        if [ ! -r "$_or_script" ]; then
+            echo "Dispatch log: cross-check unavailable (script not readable) -- the pending set above is the whole record."
+            return 0
+        fi
+        if ! command -v perl >/dev/null 2>&1; then
+            echo "Dispatch log: cross-check unavailable (no perl) -- the pending set above is the whole record."
+            return 0
+        fi
+
+        # MEDIUM-2 (redteam) -- a command-substitution PIPE waits for EOF, not
+        # for the query's own exit: a descendant that inherits stdout and
+        # survives past the `timeout`/SIGALRM kill can hold the pipe open and
+        # block this hook indefinitely (measured: a 3s bound blocked 25s
+        # against a stdout-holding grandchild). Redirecting to a regular file
+        # instead cannot block on a surviving writer the same way, so the
+        # query's output is captured there and read back afterward.
+        local _or_tmp
+        _or_tmp=$(mktemp 2>/dev/null) || _or_tmp=""
+        if [ -z "$_or_tmp" ]; then
+            echo "Dispatch log: cross-check unavailable (query failed or timed out) -- the pending set above is the whole record."
+            return 0
+        fi
+
+        local _or_rc
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 10 perl "$_or_script" outstanding --root "$_or_root" >"$_or_tmp" 2>/dev/null
+            _or_rc=$?
+        elif command -v gtimeout >/dev/null 2>&1; then
+            gtimeout 10 perl "$_or_script" outstanding --root "$_or_root" >"$_or_tmp" 2>/dev/null
+            _or_rc=$?
+        else
+            # Same fork+SIGALRM shape as _bp_probe_verdict, copied rather than
+            # reinvented: alarm() does not bound an exec'd child under
+            # Git-for-Windows perl (measured there).
+            perl -e '
+                my $pid = fork();
+                exit 127 unless defined $pid;
+                if ($pid == 0) { exec @ARGV; exit 127 }
+                my $killed = 0;
+                $SIG{ALRM} = sub { $killed = 1; kill 9, $pid };
+                alarm 10;
+                waitpid($pid, 0);
+                my $rc = $?;
+                alarm 0;
+                exit(124) if $killed;
+                exit($rc == 0 ? 0 : ($rc >> 8));
+              ' perl "$_or_script" outstanding --root "$_or_root" >"$_or_tmp" 2>/dev/null
+            _or_rc=$?
+        fi
+
+        # CRITICAL-1 (redteam) -- cap the read at 65536 bytes IMMEDIATELY,
+        # before any parsing touches it. Unbounded, a crafted multi-megabyte
+        # record drove the bash-side printf|grep|sed/while-read parse past
+        # the harness's own hook timeout (measured: ~2MB -> 14.4s wall time;
+        # 10.2MB -> 68.2s, past a 60s default timeout) -- a timeout CANCELS
+        # this hook before its `exit 2` runs, which is the exact DENY-to-
+        # ALLOW flip D-B forbids. Reading from the file (not the pipe) also
+        # closes MEDIUM-2 above.
+        local _or_out
+        _or_out=$(head -c 65536 "$_or_tmp" 2>/dev/null)
+        rm -f "$_or_tmp" 2>/dev/null
+
+        # SHOULD-2 (review) -- a timed-out query must be caught by EXIT CODE,
+        # not inferred from output shape: bp-dispatch-log.pl prints its
+        # count lines before any row, so a capture killed mid-stream can
+        # still contain a parseable outstanding_count and would otherwise
+        # render as a successful section (b) instead of the promised
+        # section (c). timeout/gtimeout and the fork+SIGALRM fallback all
+        # use exit code 124 for a timeout (D-F's rule that 0/1/4 are never
+        # used to classify is unaffected -- this only special-cases 124).
+        if [ "$_or_rc" = "124" ]; then
+            echo "Dispatch log: cross-check unavailable (query failed or timed out) -- the pending set above is the whole record."
+            return 0
+        fi
+
+        # Classification from here on is by PARSED OUTPUT ONLY (D-F / spec
+        # §2.1 step 2) -- exit 1 is the verb's own normal "something is
+        # outstanding" code, so it must never be mistaken for a failure. An
+        # empty capture is the one case with nothing to parse at all.
+        if [ -z "$_or_out" ]; then
+            echo "Dispatch log: cross-check unavailable (query failed or timed out) -- the pending set above is the whole record."
+            return 0
+        fi
+
+        local _or_count
+        _or_count=$(printf '%s\n' "$_or_out" | grep -m1 '^outstanding_count:' | sed 's/^outstanding_count:[[:space:]]*//')
+        case "$_or_count" in
+            ''|*[!0-9]*)
+                # Absent, non-numeric, or the literal "unknown" exit-4 prints
+                # all land here.
+                echo "Dispatch log: cross-check unavailable (output not understood) -- the pending set above is the whole record."
+                return 0
+                ;;
+        esac
+        # LOW-3 (redteam) -- strip leading zeros before every arithmetic
+        # test below. A value like "08" is invalid octal to `[ -gt ]`, which
+        # aborts the test silently (swallowed by the surrounding 2>/dev/null
+        # elsewhere in this function) and can suppress the STALE sentence
+        # without anyone noticing. Applied defensively to every count read
+        # out of the query's output.
+        _or_count=${_or_count#"${_or_count%%[!0]*}"}
+        [ -n "$_or_count" ] || _or_count=0
+
+        if [ "$_or_count" -eq 0 ]; then
+            echo "Dispatch log (bp-dispatch-log.pl outstanding): 0 records outstanding."
+            echo "  The pending entries above were never recorded there, or were resolved without this gate being"
+            echo "  told. That is NOT a resolution -- this gate's record is the pending set above, not the log."
+            return 0
+        fi
+
+        local _or_live _or_stale _or_uneval _or_unread
+        _or_live=$(printf '%s\n' "$_or_out" | grep -m1 '^live_count:' | sed 's/^live_count:[[:space:]]*//')
+        case "$_or_live" in ''|*[!0-9]*) _or_live=0 ;; esac
+        _or_live=${_or_live#"${_or_live%%[!0]*}"}; [ -n "$_or_live" ] || _or_live=0
+        _or_stale=$(printf '%s\n' "$_or_out" | grep -m1 '^stale_count:' | sed 's/^stale_count:[[:space:]]*//')
+        case "$_or_stale" in ''|*[!0-9]*) _or_stale=0 ;; esac
+        _or_stale=${_or_stale#"${_or_stale%%[!0]*}"}; [ -n "$_or_stale" ] || _or_stale=0
+        _or_uneval=$(printf '%s\n' "$_or_out" | grep -m1 '^unevaluable_count:' | sed 's/^unevaluable_count:[[:space:]]*//')
+        case "$_or_uneval" in ''|*[!0-9]*) _or_uneval=0 ;; esac
+        _or_uneval=${_or_uneval#"${_or_uneval%%[!0]*}"}; [ -n "$_or_uneval" ] || _or_uneval=0
+        _or_unread=$(printf '%s\n' "$_or_out" | grep -m1 '^unreadable_count:' | sed 's/^unreadable_count:[[:space:]]*//')
+        case "$_or_unread" in ''|*[!0-9]*) _or_unread=0 ;; esac
+        _or_unread=${_or_unread#"${_or_unread%%[!0]*}"}; [ -n "$_or_unread" ] || _or_unread=0
+
+        echo "Dispatch log (bp-dispatch-log.pl outstanding): $_or_count outstanding ($_or_live live, $_or_stale stale, $_or_uneval unevaluable, $_or_unread unreadable)."
+
+        # Rows are parsed by KEY=VALUE TOKEN, not by position (spec §2.2), and
+        # rendered oldest-first exactly as the verb already sorted them
+        # (:1482) -- up to 5, then an overflow line. Fed via process
+        # substitution, not a heredoc, so a hostile field value containing
+        # `$` or a backtick is never re-interpreted by the shell (edge case
+        # 4): it is captured once into $_or_out (now capped at 65536 bytes)
+        # and only ever handed to printf/read as data.
+        #
+        # NIT-2 (review): blueprint=/package= (unlike id=) are NOT
+        # shape-validated at the writer (bp-dispatch-log.pl validates id
+        # only) -- a value rendered below is untrusted display text, not a
+        # validated field. Do not mistake it for one when reading this.
+        #
+        # LOW-1 (redteam): `for tok in $rest` performs pathname expansion
+        # against THIS HOOK'S OWN CWD when a field value contains a glob
+        # character (e.g. worker_type="a *"). `set -f` brackets every such
+        # loop so no field value is ever glob-expanded.
+        local _or_shown=0
+        local _or_line _or_rest _or_tok _or_idcount
+        local _or_id _or_wt _or_bp _or_pkg _or_elapsed _or_stale_flag _or_label
+        while IFS= read -r _or_line; do
+            case "$_or_line" in
+                "outstanding: "*) ;;
+                *) continue ;;
+            esac
+            _or_rest="${_or_line#outstanding: }"
+
+            # MEDIUM-1(a)/(b) (redteam), partial shell-side hardening: reject
+            # any outstanding: line that does not carry EXACTLY ONE id=
+            # token. Closes the crudest forgeries (an injected line with
+            # zero or multiple id= tokens) -- it does NOT close a within-cap
+            # single-line field forgery (e.g. an embedded literal newline
+            # manufacturing a counterfeit stale=/id= token), which needs
+            # reader-side shape validation in bp-dispatch-log.pl itself and
+            # is recorded as an accepted residual in this package's spec §7
+            # driver amendment (out of this write set).
+            _or_idcount=0
+            set -f
+            for _or_tok in $_or_rest; do
+                case "$_or_tok" in
+                    id=*) _or_idcount=$((_or_idcount + 1)) ;;
+                esac
+            done
+            set +f
+            [ "$_or_idcount" -eq 1 ] || continue
+
+            _or_shown=$((_or_shown + 1))
+            # CRITICAL-1: break, not continue, once 5 rows have been
+            # rendered -- the overflow count below is derived from the
+            # header's own outstanding_count, never from a count of parsed/
+            # rendered lines, so there is no need to keep scanning the rest
+            # of the (now-capped) capture.
+            [ "$_or_shown" -gt 5 ] && break
+
+            _or_id="" _or_wt="" _or_bp="" _or_pkg="" _or_elapsed="" _or_stale_flag=""
+            set -f
+            for _or_tok in $_or_rest; do
+                case "$_or_tok" in
+                    id=*)              _or_id="${_or_tok#id=}" ;;
+                    worker_type=*)     _or_wt="${_or_tok#worker_type=}" ;;
+                    blueprint=*)       _or_bp="${_or_tok#blueprint=}" ;;
+                    package=*)         _or_pkg="${_or_tok#package=}" ;;
+                    elapsed_seconds=*) _or_elapsed="${_or_tok#elapsed_seconds=}" ;;
+                    stale=*)           _or_stale_flag="${_or_tok#stale=}" ;;
+                esac
+            done
+            set +f
+            case "$_or_stale_flag" in
+                false) _or_label="LIVE (within 4x budget)" ;;
+                true)  _or_label="STALE (cannot tell if alive)" ;;
+                *)     _or_label="UNEVALUABLE (no usable start time)" ;;
+            esac
+            echo "  $_or_label id=$_or_id worker_type=${_or_wt:--} blueprint=${_or_bp:--} package=${_or_pkg:--} elapsed_seconds=${_or_elapsed:-unknown}"
+        done < <(printf '%s\n' "$_or_out")
+
+        # CRITICAL-1 (item 3): the overflow count is derived from the
+        # header's own outstanding_count value, NOT from a count of parsed/
+        # rendered lines -- a forged extra row can no longer inflate the
+        # overflow number, since the header counts are printed and read
+        # before any row (D-B's existing structural guarantee).
+        if [ "$_or_count" -gt 5 ]; then
+            echo "  (+$((_or_count - 5)) more -- run: perl plugins/butler/scripts/bp-dispatch-log.pl outstanding)"
+        fi
+
+        # Emitted when at least one row is stale, unevaluable, OR unreadable
+        # (SHOULD-1: widened to include unreadable_count -- an unreadable
+        # dispatch-log record must not silently suppress this sentence, D-D's
+        # own point: a STALE/unreadable record still blocks, so the message
+        # must say which case applied rather than let staleness read as
+        # completion).
+        if [ "$_or_stale" -gt 0 ] || [ "$_or_uneval" -gt 0 ] || [ "$_or_unread" -gt 0 ]; then
+            echo "STALE means past 4x its own budget: it CANNOT be told apart from a dispatch that died, and it is"
+            echo "NOT evidence the work finished -- so it still blocks this stop."
+        fi
+
+        return 0
+    }
+
     _bp_probe_verdict "$ROOT/.ccpraxis-local-data"
     PV=$?
     case "$PV" in
@@ -476,6 +716,12 @@ case "$EVENT" in
     PENDING=""
     [ -s "$STATE" ] && PENDING=$(tr '\n' ';' < "$STATE" 2>/dev/null | sed 's/;$//')
 
+    # THE CROSS-CHECK RUNS HERE, AND ONLY HERE (D-A) -- every path above this
+    # line that could still allow the stop has already exited. Its output
+    # decorates the message below; it never changes the fact that we are
+    # about to exit 2 (D-B).
+    XCHECK=$(_bp_outstanding_report "$ROOT" 2>/dev/null) || XCHECK=""
+
     # KEEP THIS SHORT. It fires repeatedly in a long run, and an operator who
     # has read the rationale once does not need it again on every denial. The
     # argument for the gate lives in this file's header and in
@@ -486,6 +732,8 @@ case "$EVENT" in
     cat >&2 <<EOF
 BLOCKED: nothing will wake this session, and only the operator can end the run.
 ${PENDING:+Unresolved since the last resolved turn: $PENDING
+}
+${XCHECK:+$XCHECK
 }
 Two ways to end a turn, and no third:
 
