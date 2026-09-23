@@ -57,7 +57,7 @@ sub _decode_maybe {
     my ($s) = @_;
     return $s unless defined $s;
     return $s if utf8::is_utf8($s);
-    my $d = eval { Encode::decode('UTF-8', $s, Encode::FB_QUIET()) };
+    my $d = eval { Encode::decode('UTF-8', $s, Encode::FB_CROAK()) };
     return defined $d ? $d : $s;
 }
 
@@ -277,6 +277,13 @@ sub _cmd_create {
         }
     }
 
+    # Re-run the same title validation after the --set merge (redteam
+    # LOW-2): --set title=... legitimately overrides the computed title
+    # (package 11's migration needs it), but the override must still pass
+    # the bad_title rule the first assignment already enforced.
+    my $merged_title = defined $fields{title} ? _trim($fields{title}) : '';
+    _usage('bad_title') if $merged_title eq '' || $merged_title =~ /[\r\n]/;
+
     my @base_order = grep { exists $fields{$_} } qw(title status created completed_at tags);
     my %seen = map { $_ => 1 } @base_order;
     my @extra = sort grep { !$seen{$_} } @set_order;
@@ -304,6 +311,7 @@ sub _cmd_show {
     my ($scope, $o, $pos) = @_;
     my $id = $pos->[0];
     _usage('missing_id') unless defined $id && length $id;
+    _usage('extra_positional') if @$pos > 1;
     my $store = _open_store($scope, $o);
     my $rec   = $store->read($id);
     if ($o->{json}) { _print_show_json($rec) }
@@ -314,6 +322,7 @@ sub _cmd_edit {
     my ($scope, $o, $pos) = @_;
     my $id = $pos->[0];
     _usage('missing_id') unless defined $id && length $id;
+    _usage('extra_positional') if @$pos > 1;
 
     my %set;
     my @set_order;
@@ -369,6 +378,7 @@ sub _cmd_complete {
     my ($scope, $o, $pos) = @_;
     my $id = $pos->[0];
     _usage('missing_id') unless defined $id && length $id;
+    _usage('extra_positional') if @$pos > 1;
     my $store = _open_store($scope, $o);
     my $rec   = $store->read($id);
     if (defined($rec->{fields}{status}) && $rec->{fields}{status} eq 'done') {
@@ -388,6 +398,7 @@ sub _cmd_reopen {
     my ($scope, $o, $pos) = @_;
     my $id = $pos->[0];
     _usage('missing_id') unless defined $id && length $id;
+    _usage('extra_positional') if @$pos > 1;
     my $store = _open_store($scope, $o);
     my $rec   = $store->read($id);
     if (defined($rec->{fields}{status}) && $rec->{fields}{status} eq 'open') {
@@ -407,6 +418,7 @@ sub _cmd_delete {
     my ($scope, $o, $pos) = @_;
     my $id = $pos->[0];
     _usage('missing_id') unless defined $id && length $id;
+    _usage('extra_positional') if @$pos > 1;
     my $store = _open_store($scope, $o);
     my $rec   = $store->read($id);
     my %expect = (rev => $rec->{rev}, fields => $rec->{fields});
@@ -461,10 +473,36 @@ unless (caller) {
         my %VERBS = map { $_ => 1 } qw(create list show edit complete reopen delete count);
         _usage('unknown_verb') unless $VERBS{$cmd};
 
-        if ($cmd ne 'count') {
-            _usage('scope_conflict') if $o{project} && $o{global};
+        # Per-verb flag allowlist (redteam MEDIUM-3): an unknown flag --
+        # most dangerously a typo'd --expect-rev -- must fail closed rather
+        # than being silently dropped by the argv loop above.
+        my %ALLOWED_FLAGS = (
+            create   => [qw(title body body-file tags set id root home global project)],
+            list     => [qw(json root home global project)],
+            show     => [qw(json root home global project)],
+            edit     => [qw(title body body-file tags set unset expect-rev root home global project)],
+            complete => [qw(expect-rev root home global project)],
+            reopen   => [qw(expect-rev root home global project)],
+            delete   => [qw(expect-rev root home global project)],
+            count    => [qw(root home json global project)],
+        );
+        my %allowed = map { $_ => 1 } @{ $ALLOWED_FLAGS{$cmd} };
+        for my $k (keys %o) {
+            _usage('unknown_flag') unless $allowed{$k};
         }
-        my $scope = $o{global} ? 'global' : 'project';
+
+        # Value-taking flags fail OPEN when their value is missing (redteam
+        # MEDIUM-2): a bare --root/--home/--id/--tags/--body/--body-file/
+        # --expect-rev silently becomes the sentinel '1' instead of erroring.
+        # --title already has its own bespoke guard inside _cmd_create.
+        for my $k (qw(root home id tags body body-file expect-rev)) {
+            _usage('missing_flag_value') if $bool_default{$k};
+        }
+
+        if ($cmd ne 'count') {
+            _usage('scope_conflict') if exists($o{project}) && exists($o{global});
+        }
+        my $scope = exists($o{global}) ? 'global' : 'project';
 
         if    ($cmd eq 'create')   { _cmd_create($scope, \%o, \%bool_default) }
         elsif ($cmd eq 'list')     { _cmd_list($scope, \%o) }
