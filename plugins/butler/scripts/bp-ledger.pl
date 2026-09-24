@@ -1493,6 +1493,90 @@ sub op_set_next_action {
     run_op('set-next-action', $opt{ledger}, sub { return splice_set_next_action($_[0], $body) });
 }
 
+# =====================================================================================
+# `widen-write-set` -- ADD paths to a package ledger's write_set, and only when a
+# blueprint Decision names each one. This is how a Decision 29 re-scope reaches the
+# contract the write-guards enforce. Before this verb, a recorded re-scope had no typed
+# path into the ledger: guard-ledger-create.sh rightly refuses a hand edit, and
+# bp-answer-decision.pl's --widen-write-set is reachable only through the fleet's
+# decision queue, whose direct --package actions all change the package's status.
+#
+# Additive only, like bp-answer-decision.pl's widening: narrowing or replacing a
+# write_set is not a supported move (it could strand work already done under the old
+# scope). The Decision requirement keeps this from being a free "widen my own scope"
+# lever: the path must appear verbatim in a Decision row of the blueprint.md two
+# directories above the ledger, which is itself written only through bp-blueprint.pl.
+# The widening and its attempt-log line are one atomic splice under the ledger lock.
+# =====================================================================================
+
+sub _widen_path_error {
+    my ($p) = @_;
+    return 'an empty path'                         if $p eq '';
+    return "'$p' is absolute; repo-relative only"   if $p =~ m{\A(?:/|[A-Za-z]:(?:[\\/]|\z))};
+    return "'$p' contains ':', a pipe or a newline" if $p =~ /[:|\r\n]/;
+    return "'$p' contains '..'"                     if $p =~ m{(?:\A|/)\.\.(?:/|\z)};
+    return "'$p' is a pure wildcard or project-root scope"
+        if $p =~ m{\A(?:\*+|\*\*/\*|\.|\./)\z};
+    return undef;
+}
+
+# _decision_text($blueprint_bytes, $id) -> the Decision row's text, or undef.
+sub _decision_text {
+    my ($B, $id) = @_;
+    for my $line (split /\n/, $B) {
+        return $1 if $line =~ /^\|\s*\Q$id\E\s*\|(.*)\|\s*[^|]*\|\s*[^|]*\|\s*$/;
+    }
+    return undef;
+}
+
+sub op_widen_write_set {
+    my @args = @_;
+    my %opt = (path => []);
+    my $ok;
+    { local $SIG{__WARN__} = sub { };
+      $ok = GetOptionsFromArray(\@args, \%opt, 'ledger=s', 'path=s@', 'decision=s'); }
+    arg_error('widen-write-set', 'unrecognised option') unless $ok;
+    arg_error('widen-write-set', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
+    arg_error('widen-write-set', 'missing required --ledger') unless defined $opt{ledger};
+    arg_error('widen-write-set', 'missing required --path (repeatable)') unless @{ $opt{path} };
+    arg_error('widen-write-set', 'missing required --decision') unless defined $opt{decision};
+    arg_error('widen-write-set', "--decision '$opt{decision}' is not a positive integer")
+        unless $opt{decision} =~ /\A[1-9][0-9]*\z/;
+    for my $p (@{ $opt{path} }) {
+        my $err = _widen_path_error($p);
+        arg_error('widen-write-set', "--path $err") if defined $err;
+    }
+
+    my $bp = op_create_dirname(op_create_dirname($opt{ledger})) . '/blueprint.md';
+    open(my $bfh, '<:raw', $bp)
+        or arg_error('widen-write-set', "cannot read the blueprint for this ledger ($bp): $!");
+    my $bytes = do { local $/; <$bfh> };
+    close $bfh;
+    my $dtext = _decision_text($bytes // '', $opt{decision});
+    arg_error('widen-write-set', "Decision $opt{decision} not found in $bp") unless defined $dtext;
+    for my $p (@{ $opt{path} }) {
+        arg_error('widen-write-set', "Decision $opt{decision} does not name '$p' (verbatim) -- record the "
+            . 're-scope in blueprint.md first (bp-blueprint.pl add-decision)')
+            unless index($dtext, $p) >= 0;
+    }
+
+    my $entry = '- ' . iso_now() . " ${EMDASH} write_set widened per Decision $opt{decision}: "
+              . join(', ', @{ $opt{path} });
+    run_op('widen-write-set', $opt{ledger}, sub {
+        my ($B) = @_;
+        return (undef, 'no frontmatter block to update') unless $B =~ /\A---\s*\n(.*?)\n---/s;
+        my ($fs, $fe) = ($-[1], $+[1]);
+        my $cur = extract_frontmatter_value($B, 'write_set');
+        return (undef, 'write_set: key not found in frontmatter') unless defined $cur;
+        my @set  = grep { length } split /:/, $cur;
+        my %have = map { ($_ => 1) } @set;
+        push @set, grep { !$have{$_}++ } @{ $opt{path} };
+        my $new = replace_first_key_line($B, $fs, $fe, 'write_set', 'write_set: ' . join(':', @set));
+        return (undef, 'write_set: key not found in frontmatter') unless defined $new;
+        return splice_insert_entry($new, qr/^##\s+Decisions & attempt log\b/m, $entry);
+    });
+}
+
 sub op_add_output {
     my @args = @_;
     my %opt;
@@ -2548,6 +2632,7 @@ my %DISPATCH = (
     'tick-step'        => \&op_tick_step,
     'set-next-action'  => \&op_set_next_action,
     'add-output'       => \&op_add_output,
+    'widen-write-set'  => \&op_widen_write_set,
     'rotate'           => \&op_rotate,
     'validate'         => \&op_validate,
     'claim-check'      => \&op_claim_check,
