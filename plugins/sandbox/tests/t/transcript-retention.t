@@ -220,7 +220,11 @@ my $HOST_BASELINE = {
                 matcher => 'Bash',
                 hooks   => [
                     {
-                        command => 'perl "$HOME/.claude/ccpraxis/scripts/hooks/block-nul-redirect.pl"',
+                        # 2026-09-24 -- guarded form, declared on the operator's instruction:
+                        # a bare `perl <missing script>` exits 2, which blocks every Bash
+                        # call while the live install is absent (hook-continuity-remake 01
+                        # red-team H1). Pinned by global-config-perl-hook-guard.t.
+                        command => 'f="$HOME/.claude/ccpraxis/scripts/hooks/block-nul-redirect.pl"; [ -f "$f" ] || exit 0; exec perl "$f"',
                         type    => 'command',
                     },
                 ],
@@ -271,7 +275,8 @@ my $HOST_BASELINE = {
     showThinkingSummaries        => JSON::PP::true,
     skipAutoPermissionPrompt     => JSON::PP::true,
     statusLine => {
-        command => 'perl "$HOME/.claude/ccpraxis/scripts/statusline.pl"',
+        # 2026-09-24 -- same guarded form as the perl hooks (see block-nul-redirect above).
+        command => 'f="$HOME/.claude/ccpraxis/scripts/statusline.pl"; [ -f "$f" ] || exit 0; exec perl "$f"',
         type    => 'command',
     },
     useAutoModeDuringPlan => JSON::PP::true,
