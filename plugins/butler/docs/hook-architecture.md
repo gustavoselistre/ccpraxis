@@ -783,9 +783,9 @@ and records the read cost in the ledger.
 (seconds) are honoured only when `BUTLER_STATE_DIR` is also set. They can only shorten the hold, and
 no skill or message mentions them.
 
-**Prior art (Decision 44).** The untracked `plugins/butler/scripts/bp-hold.pl` is the stopped
-almanac-records session's prototype. Coordinators never edit, delete or commit it. Package 05 reads
-the copy at `reports/evidence/prior-art/bp-hold.pl`. Its debounce-and-reset idea is the extend
+**Prior art (Decision 44).** The stopped almanac-records session left a prototype, an untracked
+bp-hold.pl beside butler's scripts. It was removed from the working tree on 2026-09-24; its only
+copy is `reports/evidence/prior-art/bp-hold.pl`, which package 05 reads. Its debounce-and-reset idea is the extend
 choice here. Its `/proc/<pid>/stat` fingerprinting is replaced by the cheap cmdline fingerprint, and its
 exit-on-first-item is not carried over.
 

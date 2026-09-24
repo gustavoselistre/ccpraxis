@@ -157,9 +157,18 @@ my $SRC = do { local (@ARGV, $/) = ($LAUNCHER); <> };
     (my $code = $SRC) =~ s/^\s*#.*$//mg;
     like($code, qr/_container_sampler_start\s*\(/,  'D: the sampler is started');
     like($code, qr/_container_sampler_stop\s*\(/,   'D: ...and stopped');
-    my $releases = () = $code =~ /_container_sampler_release_global\(\)/g;
-    cmp_ok($releases, '>=', 3,
-        'D: the release hook is on the INT, TERM and END paths (>=3 call sites), like the other samplers');
+    # INT and TERM share one teardown by construction (4d61f45), so the release is reached through it
+    # rather than repeated once per signal; a raw call-site count cannot see that.
+    like($code, qr/\$SIG\{INT\}\s*=\s*sub\s*\{\s*_teardown_and_exit\(/,
+        'D: INT routes to the shared teardown');
+    like($code, qr/\$SIG\{TERM\}\s*=\s*sub\s*\{\s*_teardown_and_exit\(/,
+        'D: TERM routes to the shared teardown');
+    my ($teardown) = $code =~ /^sub _teardown_and_exit \{(.*?)^\}/ms;
+    like($teardown // '', qr/_container_sampler_release_global\(\)/,
+        'D: the shared INT/TERM teardown releases the container sampler');
+    my ($end) = $code =~ /^END \{([^\n]*)\}/m;
+    like($end // '', qr/_container_sampler_release_global\(\)/,
+        'D: END releases the container sampler, like the other samplers');
     like($code, qr/--container-sampler/, 'D: the child mode has a dispatch');
     like($code, qr/last unless kill\(0, \$owner_pid\)/,
         'D: the sampler loop self-exits when its owner goes away -- no orphan');

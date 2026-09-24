@@ -107,9 +107,12 @@ sub commands_matching {
 #    BEFORE THE FIX -- hooks.json today has no mention of either script.
 # ===========================================================================
 {
-    my @bash_blocks = bash_matcher_blocks($hooksjson);
+    # Only the plain "Bash" matcher counts here: context-ceiling-flush.sh's own "Task|Bash"
+    # block (dd39431, pinned by context-ceiling-flush.t) is a different feature's deliberate
+    # registration, not a second opening of this block.
+    my @bash_blocks = grep { ($_->{matcher} // '') eq 'Bash' } bash_matcher_blocks($hooksjson);
     is(scalar(@bash_blocks), 1,
-       'B1: hooks.json has exactly ONE PreToolUse block whose matcher covers Bash -- '
+       'B1: hooks.json has exactly ONE PreToolUse block whose matcher is plain Bash -- '
      . 'the spec requires appending into the existing block, never opening a third one '
      . '(a count of 2 here means a new block was opened instead of appending)')
         or diag('found ' . scalar(@bash_blocks) . ' Bash-matcher blocks');

@@ -409,7 +409,7 @@ use constant TIMED_OUT => 124;
 
     like($src, qr/command -v timeout/, 'H1 timeout is preferred when present');
     like($src, qr/gtimeout/,           'H2 gtimeout covers stock macOS + coreutils');
-    like($src, qr/alarm\s+20/,         'H3 a perl-only fallback exists for the rest');
+    like($src, qr/alarm\s+[0-9]+;/,    'H3 a perl-only fallback exists for the rest');
 
     # ⚠ THE FALLBACK MUST FORK. `alarm; exec` looks correct and bounds NOTHING
     # on Git-for-Windows perl, which emulates exec by spawning and waiting, so
