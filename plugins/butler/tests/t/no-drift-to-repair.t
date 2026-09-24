@@ -509,7 +509,8 @@ PERL
 {
     my $src = slurp($STATUS_SH);
     ok(defined $src, 'AC-14: bp-status.sh source readable') or BAIL_OUT("expected $STATUS_SH");
-    my @call_sites = ($src =~ /(reconcile\s+(?:--blueprint\s+"\$ONLY_BP"|--all)\s+\\\s*\n\s*--no-archive\s+--quiet)/g);
+    # 96e72f3 passes --data-dir "$DATA" ahead of the two flags; allow it, still demand both flags.
+    my @call_sites = ($src =~ /(reconcile\s+(?:--blueprint\s+"\$ONLY_BP"|--all)\s+\\\s*\n\s*(?:--data-dir\s+"\$DATA"\s+)?--no-archive\s+--quiet)/g);
     is(scalar(@call_sites), 2, 'AC-14: exactly two reconcile call sites found (named-blueprint and --all branches)');
     ok((!grep { $_ !~ /--no-archive/ || $_ !~ /--quiet/ } @call_sites),
        'AC-14: both call sites carry exactly --no-archive --quiet -- unchanged from before this package');
