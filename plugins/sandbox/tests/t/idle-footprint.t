@@ -251,20 +251,6 @@ pass('AC4: idle CPU reduction is an operational measurement, not automatable her
        scalar(@tick_interval_files) . ' files)');
     ok((grep { $_ eq 'input-latency.t' } @tick_interval_files) > 0,
        'AC5 (sanity): input-latency.t (explicit 0.25, named in the spec) is among the grepped files');
-
-    # Re-run one representative file (input-latency.t) as a subprocess and
-    # confirm it still passes unmodified -- proving the default-change is
-    # isolated to callers that OMIT tick_interval.
-    SKIP: {
-        skip 'input-latency.t not found', 1 unless -f "$T_DIR/input-latency.t";
-        my $out = `"$^X" "$T_DIR/input-latency.t" 2>&1`;
-        my $rc  = $? >> 8;
-        my @not_ok = ($out =~ /^not ok/mg);
-        is($rc == 0 && scalar(@not_ok) == 0 ? 1 : 0, 1,
-           'AC5: input-latency.t (explicit tick_interval=>0.25) passes unmodified under the new default ' .
-           '(exit ' . $rc . ', ' . scalar(@not_ok) . ' not-ok lines)')
-            or diag($out);
-    }
 }
 
 # ===========================================================================
@@ -356,25 +342,6 @@ pass('AC4: idle CPU reduction is an operational measurement, not automatable her
            'AC7 (negative): $SELECTION_FILE was NOT moved to $SAMPLER_TMPDIR');
     unlike($LSRC, qr/\$MANIFEST_FILE\s*=\s*"\$SAMPLER_TMPDIR/,
            'AC7 (negative): $MANIFEST_FILE was NOT moved to $SAMPLER_TMPDIR');
-}
-
-# ===========================================================================
-# PART H -- AC8 (spec sec 4, item 8; DC3): launcher-bind-mount-shape.t and
-# launcher-ro-protection.t continue to pass unmodified, with zero code
-# change in MountSpec.pm -- proving the whole-directory RO bind still
-# resolves even though 9 fewer files exist under $LAUNCHER_DIR.
-# ===========================================================================
-for my $sibling (qw(launcher-bind-mount-shape.t launcher-ro-protection.t)) {
-    my $path = "$T_DIR/$sibling";
-    SKIP: {
-        skip "$sibling not found", 1 unless -f $path;
-        my $out = `"$^X" "$path" 2>&1`;
-        my $rc  = $? >> 8;
-        my @not_ok = ($out =~ /^not ok/mg);
-        is($rc == 0 && scalar(@not_ok) == 0 ? 1 : 0, 1,
-           "AC8: $sibling continues to pass unmodified (exit $rc, " . scalar(@not_ok) . ' not-ok lines)')
-            or diag($out);
-    }
 }
 
 done_testing();

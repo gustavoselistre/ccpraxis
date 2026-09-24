@@ -315,16 +315,6 @@ sub plain {
 }
 sub frame_text { my ($f) = @_; return '' unless ref($f) eq 'ARRAY'; return join("\n", map { plain($_) } @$f) }
 
-# run_test_file($rel) -> ($rc, $out) -- run a sibling .t file standalone.
-sub run_test_file {
-    my ($rel) = @_;
-    my $path = File::Spec->rel2abs("$Bin/$rel");
-    return (undef, undef) unless -f $path;
-    my $out = `perl "$path" 2>&1`;
-    my $rc  = $? >> 8;
-    return ($rc, $out);
-}
-
 # ===========================================================================
 # Structure -- Decision 10's exact shape (AC1-AC7)
 # ===========================================================================
@@ -554,22 +544,6 @@ sub golden_table_row {
     is(scalar(@$cells), 5, 'AC10: _one_run_summary_cells returns exactly 5 cells for CF -- no tree fact became a table column');
 }
 
-# --- AC11 (D5, D11) ------------------------------------------------------
-{
-    for my $name (qw(paused-reason-and-triage.t blueprints-table.t no-rendered-colons.t
-                      run-panel-truth.t layout-flex-stability.t wrap-on-overflow.t
-                      wrap-width-regressions.t providers-panel.t)) {
-        my $path = File::Spec->rel2abs("$Bin/$name");
-        ok(-f $path, "AC11 precondition: $path exists");
-      SKIP: {
-            skip("$path not found", 2) unless -f $path;
-            my ($rc, $out) = run_test_file($name);
-            is($rc, 0, "AC11: $name exits 0 when run standalone, UNMODIFIED by this package") or diag(' tail: ' . substr($out, -1500));
-            my @notok = ($out =~ /^not ok.*$/mg);
-            is(scalar(@notok), 0, "AC11: $name has no 'not ok' lines") or diag(' ' . join("\n ", @notok));
-        }
-    }
-}
 
 # ===========================================================================
 # CF1 -- the orchestrator uptime gate (AC12-AC17)
@@ -1018,18 +992,6 @@ sub golden_table_row {
         } keys %$g;
         is(scalar(@collisions), 0, 'AC30: status.judge char is distinct from every other glyph in Theme::glyphs()')
             or diag(' collides with: ' . join(', ', @collisions));
-    }
-}
-
-# --- AC31 (D4, D9) ------------------------------------------------------------
-{
-    ok(-f File::Spec->rel2abs("$Bin/theme-tokens.t"), 'AC31 precondition: theme-tokens.t exists');
-  SKIP: {
-        skip('not found', 2) unless -f File::Spec->rel2abs("$Bin/theme-tokens.t");
-        my ($rc, $out) = run_test_file('theme-tokens.t');
-        is($rc, 0, 'AC31: theme-tokens.t exits 0 with the new glyph present') or diag(' tail: ' . substr($out, -2000));
-        my @notok = ($out =~ /^not ok.*$/mg);
-        is(scalar(@notok), 0, 'AC31: theme-tokens.t has zero not ok lines (B-E5/B-E7/B-E14a/b among them)') or diag(' ' . join("\n ", @notok));
     }
 }
 
@@ -1680,18 +1642,6 @@ sub golden_table_row {
             my @sec = ($line =~ /(\xA7)/g);
             is(scalar(@sec), 0, 'AC50: the status.judge declaration line itself contains no literal section-sign byte (0xA7)');
         }
-    }
-}
-
-# --- AC51 (D9, D10) ------------------------------------------------------------
-{
-    ok(-f File::Spec->rel2abs("$Bin/dashboard-screen.t"), 'AC51 precondition: dashboard-screen.t exists');
-  SKIP: {
-        skip('not found', 2) unless -f File::Spec->rel2abs("$Bin/dashboard-screen.t");
-        my ($rc, $out) = run_test_file('dashboard-screen.t');
-        is($rc, 0, 'AC51: dashboard-screen.t exits 0') or diag(' tail: ' . substr($out, -2000));
-        my @notok = ($out =~ /^not ok.*$/mg);
-        is(scalar(@notok), 0, 'AC51: dashboard-screen.t has zero not ok lines (AC-P2\'s clock class stays absent)') or diag(' ' . join("\n ", @notok));
     }
 }
 

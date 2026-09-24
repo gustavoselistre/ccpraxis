@@ -346,20 +346,6 @@ sub write_creds {
 }
 
 # ===========================================================================
-# AC7 (-> done criterion 2, regression guard). The keeper-level oracle test
-# must still pass unmodified.
-# ===========================================================================
-{
-    my $keeper_test = "$Bin/../../../butler/tests/t/token-alert-carries-diagnosis.t";
-    ok(-f $keeper_test, 'AC7 precondition: token-alert-carries-diagnosis.t exists on disk');
-  SKIP: {
-        skip 'token-alert-carries-diagnosis.t not found', 1 unless -f $keeper_test;
-        my $rc = system($^X, $keeper_test);
-        is($rc, 0, 'AC7: token-alert-carries-diagnosis.t still passes unmodified (the keeper-level oracle)');
-    }
-}
-
-# ===========================================================================
 # AC8-AC10 (-> done criterion 3). Per-tick busy-lease observed-mtime record.
 # ===========================================================================
 {

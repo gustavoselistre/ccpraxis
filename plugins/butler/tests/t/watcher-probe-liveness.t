@@ -304,15 +304,6 @@ sub run_cli {
     return ($? >> 8, $out);
 }
 
-sub run_suite {
-    my ($path) = @_;
-    return (undef, undef, '') unless -f $path;
-    my $out = `perl "$path" 2>&1`;
-    my $rc  = $? >> 8;
-    my $not_ok = () = ($out =~ /^not ok\b/mg);
-    return ($rc, $not_ok, $out);
-}
-
 # ===========================================================================
 # AC1 -- real live watcher on a non-terminal package -> probe exits 0, pid
 # printed as the bare first field.
@@ -619,10 +610,11 @@ sub run_suite {
 }
 
 # ===========================================================================
-# AC13 -- bp-watch.pl still requires cleanly as package BpWatch, every
+# AC13 -- bp-watch.pl still requires cleanly as package BpWatch, and every
 # pre-existing BpWatch:: sub from bp-watch-decision-core.t's A2 list is still
-# defined, and bp-watch-cli.t / bp-watch-decision-core.t / bp-watch-doctrine.t
-# all pass unchanged (not ok count 0).
+# defined. bp-watch-cli.t / bp-watch-decision-core.t / bp-watch-doctrine.t
+# passing unchanged is their own suites' concern, not re-run here
+# (tests-never-run-tests.t).
 # ===========================================================================
 {
     my $LOADED = eval { require $WATCH; 1 };
@@ -634,16 +626,6 @@ sub run_suite {
                     resolve_condition format_change_line)) {
         ok(defined &{"BpWatch::$sub"},
            "AC13b: pre-existing BpWatch::$sub is still defined (decision-core.t's own A2 list)");
-    }
-}
-{
-    for my $suite (qw(bp-watch-cli.t bp-watch-decision-core.t bp-watch-doctrine.t)) {
-        my $path = "$Bin/$suite";
-        my ($rc, $not_ok, $out) = run_suite($path);
-        is($rc, 0, "AC13c: $suite exits 0 (pre-existing suite unaffected by the probe addition)")
-            or diag(substr($out // '', -2000));
-        is($not_ok, 0, "AC13d: $suite reports zero 'not ok' lines")
-            or diag(substr($out // '', -2000));
     }
 }
 

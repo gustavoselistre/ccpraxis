@@ -28,7 +28,6 @@ use Test::More;
 use JSON::PP;
 
 my $SPEND_PL  = "$Bin/../../scripts/bp-spend.pl";
-my $ORACLE_T  = "$Bin/spend-derived-from-transcripts.t";
 ok(-f $SPEND_PL, 'bp-spend.pl exists') or BAIL_OUT('nothing to test');
 
 my $PERL = $^X;
@@ -721,19 +720,6 @@ subtest 'AC15 companion: two agent files each with one pair sum at the session l
 # AC16 (criterion 11 / DC11) — the fleet path is untouched; the fleet oracle
 # stays green; new/unknown-verb/derive-package behaviour is unaffected.
 # ===========================================================================
-subtest 'AC16: the fleet oracle (spend-derived-from-transcripts.t) is green and byte-unchanged' => sub {
-    ok(-f $ORACLE_T, 'AC16: the fleet oracle test file exists') or return;
-    my $cmd = qq("$PERL" "$ORACLE_T" 2>&1);
-    my $out = `$cmd`;
-    my $rc  = $? >> 8;
-    is($rc, 0, 'AC16: spend-derived-from-transcripts.t exits 0') or diag($out);
-    my @not_ok = grep { /^not ok/ } split(/\n/, $out);
-    is(scalar(@not_ok), 0, 'AC16: zero "not ok" lines in the fleet oracle run') or diag(join("\n", @not_ok));
-
-    my $diff = `git -C "$Bin/../../.." diff --stat -- "$ORACLE_T" 2>&1`;
-    is($diff, '', 'AC16: git diff --stat shows the fleet oracle file unchanged') or diag($diff);
-};
-
 subtest 'AC16 companion: derive-package still writes spend-derived.json; unknown verb still exits 2' => sub {
     my $dir = tempdir(CLEANUP => 1);
     my $sys_init = { type => 'system', subtype => 'init', session_id => 'sess-1', model => 'claude-sonnet-5' };

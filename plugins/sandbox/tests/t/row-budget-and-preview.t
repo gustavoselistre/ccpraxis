@@ -205,15 +205,6 @@ sub _sub_body {
     return undef;
 }
 
-sub run_test_file {
-    my ($rel) = @_;
-    my $path = File::Spec->rel2abs("$Bin/$rel");
-    return (undef, undef) unless -f $path;
-    my $out = `perl "$path" 2>&1`;
-    my $rc  = $? >> 8;
-    return ($rc, $out);
-}
-
 # base_state(%o) -- same shape as t/79/t/182's own base_state, plus `now`
 # (RULING AT-12's wired path -- every new state-level sub reads $now from
 # state, per S2.2's signatures).
@@ -1518,27 +1509,6 @@ for my $f (@AC1_FIXTURES) {
         my ($judge_row) = grep { row_text($_) =~ /zqxrj36/ } @$rows;
         like($judge_row->[1]{text}, qr/^\Q$marker\E/, 'AC31 (t/187 AC36 re-asserted): the judge run_agents row label begins with the judge marker') if $judge_row;
     }
-
-    ok(-f File::Spec->rel2abs("$Bin/blueprints-panel-tree.t"), 'AC31 precondition: t/187 exists');
-  SKIP: {
-        skip('t/187 not found', 2) unless -f File::Spec->rel2abs("$Bin/blueprints-panel-tree.t");
-        my ($rc, $out) = run_test_file('blueprints-panel-tree.t');
-        is($rc, 0, 'AC31: t/187 exits 0 after this package\'s changes') or diag(' tail: ' . substr($out // '', -2000));
-        my @notok = (($out // '') =~ /^not ok.*$/mg);
-        is(scalar(@notok), 0, 'AC31: t/187 has zero not-ok lines') or diag(' ' . join("\n ", @notok));
-    }
-}
-
-# --- AC32 --------------------------------------------------------------
-{
-    ok(-f File::Spec->rel2abs("$Bin/dashboard-screen.t"), 'AC32 precondition: t/66 exists');
-  SKIP: {
-        skip('not found', 2) unless -f File::Spec->rel2abs("$Bin/dashboard-screen.t");
-        my ($rc, $out) = run_test_file('dashboard-screen.t');
-        is($rc, 0, 'AC32: t/66 (eight-class purity contract) exits 0') or diag(' tail: ' . substr($out // '', -2000));
-        my @notok = (($out // '') =~ /^not ok.*$/mg);
-        is(scalar(@notok), 0, 'AC32: t/66 has zero not-ok lines') or diag(' ' . join("\n ", @notok));
-    }
 }
 
 # --- AC33 --------------------------------------------------------------
@@ -2031,21 +2001,5 @@ for my $case (
     }
 }
 
-# --- AC49 --------------------------------------------------------------
-{
-    for my $name (qw(layout-flex-stability.t wrap-on-overflow.t run-panel-truth.t
-                      theme-tokens.t dashboard-screen.t providers-panel.t
-                      paused-reason-and-triage.t blueprints-panel-tree.t)) {
-        my $path = File::Spec->rel2abs("$Bin/$name");
-        ok(-f $path, "AC49 precondition: $path exists");
-      SKIP: {
-            skip("$path not found", 2) unless -f $path;
-            my ($rc, $out) = run_test_file($name);
-            is($rc, 0, "AC49: $name exits 0 (no new failures)") or diag(' tail: ' . substr($out // '', -1500));
-            my @notok = (($out // '') =~ /^not ok.*$/mg);
-            is(scalar(@notok), 0, "AC49: $name has no 'not ok' lines") or diag(' ' . join("\n ", @notok));
-        }
-    }
-}
 
 done_testing();

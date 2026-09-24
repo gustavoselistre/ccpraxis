@@ -67,7 +67,6 @@ use POSIX qw(mkfifo);
 my $HOOK       = "$HOOKS/wait-shape-guard.sh";
 my $LIB        = "$HOOKS/lib.sh";
 my $HOOKSJSON  = "$HOOKS/hooks.json";
-my $SELFTEST_T = "$Bin/hooks-selftest.t";
 
 my $J    = JSON::PP->new->canonical;
 my $ROOT = tempdir(CLEANUP => 1);
@@ -862,20 +861,6 @@ is(action_of('0'),     'deny', 'AC-29 [pure]: bp_ws_action_of "0" -> DENY');
     # b26 was written to end.
     cmp_ok(scalar(grep { !exists $_->{matcher} } @$pre), '>=', 2,
        'AC-35(a): at least two PreToolUse blocks are matcher-less -- b10\'s and b15\'s');
-}
-
-# =====================================================================================
-# AC-36 [file] t/hooks-selftest.t stays green. Captured through a pipe so the child's TAP never
-# pollutes this file's stream. Per the 09:14Z ledger entry this criterion is NON-DISCRIMINATING --
-# t/14 never reads hooks.json -- so it is asserted for completeness only. AC-32..AC-35 are the
-# registration evidence.
-# =====================================================================================
-{
-    my $out14 = do { local %ENV = %CLEAN_ENV; `perl "$SELFTEST_T" 2>&1` };
-    my $rc14 = $? >> 8;
-    is($rc14, 0, 'AC-36: perl plugins/butler/tests/t/hooks-selftest.t exits 0');
-    my $notok = () = ($out14 // '') =~ /^not ok /mg;
-    is($notok, 0, 'AC-36: hooks-selftest.t emits zero "not ok" lines');
 }
 
 # =====================================================================================
