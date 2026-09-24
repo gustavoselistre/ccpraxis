@@ -704,17 +704,24 @@ sub probe_scan {
         next unless is_armed_watcher($argv);
 
         # --- matched behaviour 5: this pid is a real candidate now ---
-        my $stat_text = _probe_read_file("$proc_dir/$ent/stat");
-        my $ticks      = defined $stat_text ? proc_start_ticks($stat_text) : undef;
-        my $stat_ok    = defined $ticks ? 1 : 0;
-
         my ($max_secs, $max_err) = watcher_max_seconds($argv);
         if (!defined $max_secs && !defined $max_err) {
             $max_secs = $resolve_default_max->();
         }
-
         my ($data_status, $resolved_dir) =
             _probe_resolve_candidate_data_dir($argv, $proc_dir, $ent, $project_data_dir);
+
+        # stat only for a candidate of THIS project. classify_candidate returns
+        # 'foreign' before it looks at stat_ok, and an 'unresolvable' candidate
+        # is undecidable with or without it, so reading stat for them bought
+        # nothing -- and on MSYS each read costs 45-70ms, once per armed
+        # watcher of every other project on the machine (see _probe_ppid).
+        my ($stat_text, $ticks, $stat_ok) = (undef, undef, 0);
+        if ($data_status eq 'match') {
+            $stat_text = _probe_read_file("$proc_dir/$ent/stat");
+            $ticks     = defined $stat_text ? proc_start_ticks($stat_text) : undef;
+            $stat_ok   = defined $ticks ? 1 : 0;
+        }
 
         my $age;
         if ($stat_ok) {
