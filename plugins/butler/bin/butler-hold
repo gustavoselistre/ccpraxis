@@ -1,0 +1,16 @@
+#!/bin/bash
+# butler-hold -- extensionless shim (Decision 47). All logic lives in
+# ../scripts/butler-hold.pl; this only locates it and execs it.
+if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
+
+set -e
+
+BIN_DIR=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+SCRIPT="$BIN_DIR/../scripts/butler-hold.pl"
+
+if [ ! -f "$SCRIPT" ]; then
+  echo "butler-hold: butler-hold.pl not found."
+  exit 1
+fi
+
+exec perl "$SCRIPT" "$@"
