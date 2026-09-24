@@ -43,7 +43,7 @@ ok(run_ending(qq{touch "$repo/.ccpraxis-local-data/.drive-solo/.run-finished"}),
    'touch of .run-finished under this repo\x27s own path (contains n) is run-ending');
 ok(run_ending(qq{touch $repo/.ccpraxis-local-data/.drive-solo/.run-finished}),
    '...unquoted too');
-ok(run_ending(qq{perl $repo/plugins/butler/scripts/bp-runstate.pl --data $repo/.ccpraxis-local-data finish}),
+ok(run_ending(qq{perl $repo/tools/bin/bp-runstate.pl --data $repo/.ccpraxis-local-data finish}),
    'bp-runstate ... finish with arguments containing n is run-ending');
 ok(run_ending(qq{perl $repo/plugins/butler/scripts/bp-continuity.pl disarm --session nnn}),
    'bp-continuity ... disarm with arguments containing n is run-ending');
