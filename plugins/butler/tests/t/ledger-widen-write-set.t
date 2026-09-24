@@ -49,6 +49,7 @@ sub fixture {
     open my $w, '>:raw', "$bp/blueprint.md" or die;
     print $w "# demo-bp\n\n## Decisions\n\n| # | Decision | Decided by | Date |\n|---|---|---|---|\n"
            . "| 7 | Re-scope: package 01 also ships src/b.pm and bin/tool. | driver | 2026-09-24 |\n"
+           . "| 9 | Re-scope: package 01 also owns plugins/x/tests/t/extra-case.t. | driver | 2026-09-24 |\n"
            . "| 8 | Unrelated: nothing about paths. | driver | 2026-09-24 |\n";
     close $w;
     return $ledger;
@@ -99,6 +100,25 @@ subtest 'refuses anything a Decision does not authorise, leaving the ledger unto
         like($out, $re, "...and says why: $what");
     }
     is(slurp($l), $before, 'the ledger is byte-for-byte unchanged after every refusal');
+};
+
+subtest 'a widened test file joins test_paths too; a non-test path does not' => sub {
+    # guard-writes lets a test-writer write only under test_paths, so a
+    # re-scoped test file must reach both keys (hook-continuity-remake 06).
+    my $l = fixture();
+    my ($tp0) = slurp($l) =~ /^test_paths:[ \t]*(.*?)[ \t]*$/m;
+    my ($rc, $out) = run_cli('widen-write-set', '--ledger', $l, '--decision', '9',
+                             '--path', 'plugins/x/tests/t/extra-case.t');
+    is($rc, 0, 'exit 0') or diag($out);
+    like(write_set($l), qr{(?:\A|:)plugins/x/tests/t/extra-case\.t\z}, 'the test file is in write_set');
+    my ($tp1) = slurp($l) =~ /^test_paths:[ \t]*(.*?)[ \t]*$/m;
+    like($tp1, qr{(?:\A|:)plugins/x/tests/t/extra-case\.t\z}, '...and in test_paths');
+    like($tp1, qr/\A\Q$tp0\E/, 'the existing test_paths entries are kept, in order');
+    run_cli('widen-write-set', '--ledger', $l, '--decision', '7', '--path', 'src/b.pm');
+    my ($tp2) = slurp($l) =~ /^test_paths:[ \t]*(.*?)[ \t]*$/m;
+    is($tp2, $tp1, 'a non-test path leaves test_paths untouched');
+    my ($vrc, $vout) = run_cli('validate', '--ledger', $l);
+    is($vrc, 0, 'the ledger still validates') or diag($vout);
 };
 
 done_testing();
