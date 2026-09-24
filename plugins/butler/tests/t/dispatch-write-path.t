@@ -733,16 +733,6 @@ SKIP: {
 }
 
 # ===========================================================================
-# AC34 -- t/175 stays green, unmodified.
-# ===========================================================================
-{
-    my $f175 = "$Bin/hook-payload-read-bound.t";
-    my $out = `perl "$f175" 2>&1`;
-    my $rc = $? >> 8;
-    is($rc, 0, 'AC34: t/hook-payload-read-bound.t exits 0, unmodified') or diag($out);
-}
-
-# ===========================================================================
 # AC35 -- t/175's own patterns still match track-dispatch.sh specifically.
 # ===========================================================================
 {
@@ -751,16 +741,6 @@ SKIP: {
         'AC35: track-dispatch.sh still calls bp_read_payload open bare, on its own line');
     unlike($src, qr/^\s*[A-Za-z_][A-Za-z0-9_]*=\$\(\s*cat\s*(?:[)|]|\d?>)/m,
         'AC35: track-dispatch.sh has no argument-less $(cat)');
-}
-
-# ===========================================================================
-# AC36 -- t/graceful-stop-gate.t and t/155 pass unmodified.
-# ===========================================================================
-for my $f ('graceful-stop-gate.t', 'worker-backend-dispatcher.t') {
-    my $path = "$Bin/$f";
-    my $out = `perl "$path" 2>&1`;
-    my $rc = $? >> 8;
-    is($rc, 0, "AC36: $f exits 0, unmodified") or diag(substr($out, -2000));
 }
 
 # ===========================================================================
@@ -1108,40 +1088,11 @@ SKIP: {
 }
 
 # ===========================================================================
-# AC49 -- perl -c clean; existing judge suites pass unmodified.
+# AC49 -- perl -c clean.
 # ===========================================================================
 {
     my $out = `perl -c "$ORCH" 2>&1`;
     is($? >> 8, 0, "AC49: perl -c $ORCH exits 0") or diag($out);
-}
-# THESE FOUR RUN WITH AN ISOLATED CLAUDE_PROJECT_DIR, and that is a bug fix,
-# not scaffolding taste (almanac 20260911-185413-1eca).
-#
-# They were spawned with bare backticks, which inherit the AMBIENT environment
-# -- %CLEAN_ENV above is never applied to them. Each internally exercises the
-# orchestrator's judge dispatch, and bp-dispatch-log.pl resolves its store as
-# $CLAUDE_PROJECT_DIR // abs_path("$DIR/../../.."), so those dispatches wrote
-# real records into the REPO's own .ccpraxis-local-data/.dispatch-log. This
-# file's own FINAL SAFETY CHECK then caught the contamination it had itself
-# caused, which is why that assertion was the suite's one standing red.
-#
-# Measured before the fix: 111 stray jd-bp*.json fixture records in the real
-# store, blueprints named bp, bp1 .. bp25.
-#
-# Pointing each child at its own tempdir fixes the cause rather than the
-# symptom. It does NOT weaken AC49: the assertion is still "this suite exits 0,
-# unmodified", and if any of them depended on the ambient project root, that
-# would now fail loudly here instead of silently writing where it should not.
-for my $f ('judge-starvation.t', 'orphaned-judge-recovery.t', 'conformance-gate.t', 'escalation-resolve-wiring.t') {
-    my $path = "$Bin/$f";
-    if (!-f $path) { fail("AC49: $f exists at $path"); next; }
-    my $isolated = tempdir(CLEANUP => 1);
-    my $out = do {
-        local $ENV{CLAUDE_PROJECT_DIR} = $isolated;
-        `perl "$path" 2>&1`;
-    };
-    my $rc = $? >> 8;
-    is($rc, 0, "AC49: $f exits 0, unmodified") or diag(substr($out, -2000));
 }
 
 # ===========================================================================

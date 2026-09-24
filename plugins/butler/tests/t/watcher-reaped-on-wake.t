@@ -203,15 +203,6 @@ PAYLOAD_EOF`;
     return ($? >> 8, $out);
 }
 
-sub run_suite {
-    my ($path) = @_;
-    return (undef, undef, '') unless -f $path;
-    my $out = `perl "$path" 2>&1`;
-    my $rc  = $? >> 8;
-    my $not_ok = () = ($out =~ /^not ok\b/mg);
-    return ($rc, $not_ok, $out);
-}
-
 # ===========================================================================
 # AC15 -- arming a watcher through mark-wakeup.sh (a run_in_background Bash
 # payload naming bp-watch.pl --arm) creates <DATA>/.watchers/<SID> containing
@@ -476,18 +467,6 @@ PAYLOAD_EOF`;
     is($rc, 0, 'AC20b CANONICAL: mark-wakeup.sh still exits 0 when bp-watch.pl is absent from '
              . 'the expected relative location (../scripts/bp-watch.pl missing from the mirror)');
 }
-{
-    for my $suite (qw(mark-wakeup-agent-dispatch.t mark-wakeup-quoted-script-path.t
-                       bp-watch-doctrine.t)) {
-        my $path = "$Bin/$suite";
-        my ($rc, $not_ok, $out) = run_suite($path);
-        is($rc, 0, "AC20c: $suite exits 0 (pre-existing suite unaffected by the reap addition)")
-            or diag(substr($out // '', -2000));
-        is($not_ok, 0, "AC20d: $suite reports zero 'not ok' lines")
-            or diag(substr($out // '', -2000));
-    }
-}
-
 # ===========================================================================
 # FIXBATCH-STEP7 REGRESSION -- BLOCKER-1 (redteam-step6.md). Two sessions
 # arming the SAME subject means neither may reap (AC18c) -- but the OLD code

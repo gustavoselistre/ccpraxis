@@ -72,26 +72,6 @@ sub sweep {
     return $out // '';
 }
 
-# _run_perl_file($file) -> ($rc, $combined_output)
-# Real fork+exec(LIST) + a genuine temp file for captured output.
-sub _run_perl_file {
-    my ($file, @args) = @_;
-    my ($fh, $tmp) = File::Temp::tempfile();
-    close $fh;
-    my $pid = fork();
-    die "fork: $!" unless defined $pid;
-    if ($pid == 0) {
-        open(STDOUT, '>', $tmp) or POSIX::_exit(126);
-        open(STDERR, '>&', \*STDOUT) or POSIX::_exit(126);
-        exec($^X, $file, @args) or POSIX::_exit(127);
-    }
-    waitpid($pid, 0);
-    my $rc = $? >> 8;
-    open my $rfh, '<', $tmp or return ($rc, '');
-    local $/; my $out = <$rfh>; close $rfh; unlink $tmp;
-    return ($rc, $out // '');
-}
-
 # require the real classify_file() from scripts/run-tests.pl. lane-routing.t
 # (verified green, 129/129, at authoring time) already establishes that a
 # plain `require` of this file is safe today (it defines run_sweep() and
@@ -239,22 +219,6 @@ FIXTURE
       . "string classifies 'container', not 'host-serial' -- podman_bin is no longer part of the "
       . 'discriminator\'s vocabulary at all, in or out of a string');
     is($d->{serial}, 0, 'AC6: serial => 0 for the string-literal-trigger fixture');
-}
-
-# =============================================================================
-# AC7 [DC4]: lane-routing.t itself must stay green against the changed
-# scripts/run-tests.pl -- validated by running that file directly, never by
-# duplicating its own 129 assertions here.
-# =============================================================================
-{
-    my $lane_routing = "$ROOT/plugins/butler/tests/t/lane-routing.t";
-    ok(-f $lane_routing, 'AC7 setup: lane-routing.t exists on disk')
-        or diag("no such file: $lane_routing");
-    my ($rc, $out) = _run_perl_file($lane_routing);
-    is($rc, 0, 'AC7: perl plugins/butler/tests/t/lane-routing.t exits 0') or diag($out);
-    my @not_ok = grep { /^not ok\b/ } split /\n/, $out;
-    is(scalar(@not_ok), 0, 'AC7: lane-routing.t produces zero "not ok" lines')
-        or diag("not ok line(s):\n  " . join("\n  ", @not_ok));
 }
 
 # =============================================================================

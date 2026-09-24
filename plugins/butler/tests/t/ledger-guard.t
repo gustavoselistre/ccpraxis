@@ -58,7 +58,6 @@ use JSON::PP;
 (my $HOOKS = "$Bin/../../hooks") =~ s{\\}{/}g;
 my $HOOK      = "$HOOKS/ledger-guard.sh";
 my $HOOKSJSON = "$HOOKS/hooks.json";
-my $SELFTEST_T = "$Bin/hooks-selftest.t";
 
 my $J    = JSON::PP->new->canonical;
 my $ROOT = tempdir(CLEANUP => 1);
@@ -464,22 +463,6 @@ sub nonblank_lines { return grep { /\S/ } split /\n/, $_[0] }
 
     ok(-e $HOOK,  'AC-36: plugins/butler/hooks/ledger-guard.sh exists');
     ok(-s $HOOK,  'AC-36: plugins/butler/hooks/ledger-guard.sh is non-empty');
-}
-
-# =====================================================================================
-# AC-37 [file] hooks-selftest.t stays green. Needs no jq. Captured through a pipe so the
-# child's TAP never pollutes this file's stream. (Per spec §6-E5 this gates nothing -- that
-# suite never opens hooks.json -- but it is a stated done criterion, so it is asserted.)
-# =====================================================================================
-{
-    my $out14 = do {
-        local %ENV = %CLEAN_ENV;
-        `perl "$SELFTEST_T" 2>&1`;
-    };
-    my $rc14 = $? >> 8;
-    is($rc14, 0, 'AC-37: perl plugins/butler/tests/t/hooks-selftest.t exits 0');
-    my $notok = () = ($out14 // '') =~ /^not ok /mg;
-    is($notok, 0, 'AC-37: hooks-selftest.t emits zero "not ok" lines');
 }
 
 # =====================================================================================

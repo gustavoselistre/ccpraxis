@@ -19,8 +19,8 @@
 # THIS FILE IS THE PACKAGE'S ORACLE. It must not be weakened to make an
 # implementation's life easier. spend-drive-solo-session.t (package 01's
 # oracle) and spend-derived-from-transcripts.t (the fleet-path oracle) are
-# READ-ONLY from here — never edited, only re-run as evidence neither path
-# regressed (Decision 9, criterion 8 / AC17).
+# READ-ONLY from here, and their own suites are the evidence neither path
+# regressed (Decision 9, criterion 8 / AC17); this file does not re-run them.
 use strict;
 use warnings;
 use FindBin qw($Bin);
@@ -32,8 +32,6 @@ use JSON::PP;
 use POSIX qw(strftime);
 
 my $SPEND_PL = "$Bin/../../scripts/bp-spend.pl";
-my $ORACLE1  = "$Bin/spend-drive-solo-session.t";
-my $ORACLE2  = "$Bin/spend-derived-from-transcripts.t";
 ok(-f $SPEND_PL, 'bp-spend.pl exists') or BAIL_OUT('nothing to test');
 
 my $PERL = $^X;
@@ -985,24 +983,10 @@ subtest 'AC16: with no --data-root, CLAUDE_PROJECT_DIR (a synthetic tempdir) res
 };
 
 # ===========================================================================
-# AC17 (criterion 8 / DC8) -- package 01's oracle and the fleet oracle stay
-# green and byte-unchanged; unaffected fleet-path behaviours.
+# AC17 (criterion 8 / DC8) -- fleet-path behaviours are unaffected by the
+# new verb. Package 01's oracle and the fleet oracle are their own suites'
+# concern, not re-run here (tests-never-run-tests.t).
 # ===========================================================================
-subtest 'AC17: spend-drive-solo-session.t and spend-derived-from-transcripts.t are green and byte-unchanged' => sub {
-    ok(-f $ORACLE1, 'AC17: package 01 oracle file exists') or return;
-    ok(-f $ORACLE2, 'AC17: fleet oracle file exists') or return;
-    for my $oracle ($ORACLE1, $ORACLE2) {
-        my $cmd = qq("$PERL" "$oracle" 2>&1);
-        my $out = `$cmd`;
-        my $rc  = $? >> 8;
-        is($rc, 0, "AC17: $oracle exits 0") or diag($out);
-        my @not_ok = grep { /^not ok/ } split(/\n/, $out);
-        is(scalar(@not_ok), 0, "AC17: zero 'not ok' lines in $oracle") or diag(join("\n", @not_ok));
-        my $diff = `git -C "$Bin/../../.." diff --stat -- "$oracle" 2>&1`;
-        is($diff, '', "AC17: git diff --stat shows $oracle unchanged") or diag($diff);
-    }
-};
-
 subtest 'AC17: derive-session/derive-package fleet-path behaviours are unaffected by the new verb' => sub {
     my $dir = tempdir(CLEANUP => 1);
     my ($main) = session_paths($dir, 'sess-ac17');

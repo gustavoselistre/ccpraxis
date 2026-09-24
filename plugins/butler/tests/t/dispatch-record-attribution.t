@@ -895,21 +895,6 @@ subtest 'AC41: concurrent start on distinct ids' => sub {
 }
 
 # ===========================================================================
-# AC45 (DC6) -- t/bp-dispatch-log.t passes unmodified.
-# ===========================================================================
-{
-    my $t136 = "$Bin/bp-dispatch-log.t";
-    ok(-f $t136, 'AC45: t/bp-dispatch-log.t exists (immutable oracle for the earlier package)');
-    if (-f $t136) {
-        my $out = `perl "$t136" 2>&1`;
-        my $rc = $? >> 8;
-        is($rc, 0, 'AC45 (DC6): t/bp-dispatch-log.t passes unmodified -- exits 0');
-        unlike($out, qr/^not ok/m, 'AC45: t/136 output contains no "not ok" line')
-            or diag("t/136 output:\n$out");
-    }
-}
-
-# ===========================================================================
 # AC46 (D2 guard) -- no self-reported time field, no pid-based liveness,
 # anywhere in the source.
 # ===========================================================================

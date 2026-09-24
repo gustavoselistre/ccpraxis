@@ -468,23 +468,4 @@ else {
     }
 }
 
-# =============================================================================
-# AC22 -- validation-suite step: frontmatter-injection.t still passes,
-#         unchanged, because almanac-bug.pl is not touched by this package.
-# =============================================================================
-{
-    my $FI = "$Bin/frontmatter-injection.t";
-    if (ok(-f $FI, 'AC22: frontmatter-injection.t exists in this package\'s test_paths')) {
-        my $tmp = tempdir(CLEANUP => 1);
-        my ($out_f, $err_f) = ("$tmp/out", "$tmp/err");
-        system(qq{perl "$FI" > "$out_f" 2> "$err_f"});
-        my $rc  = ($? == -1) ? undef : ($? >> 8);
-        my $out = slurp_raw($out_f) // '';
-        my $err = slurp_raw($err_f) // '';
-        is($rc, 0, 'AC22: frontmatter-injection.t still exits 0, UNCHANGED by this package')
-            or diag("stdout:\n$out\nstderr:\n$err");
-        unlike($out, qr/^not ok/m, 'AC22: no "not ok" lines in frontmatter-injection.t output');
-    }
-}
-
 done_testing();

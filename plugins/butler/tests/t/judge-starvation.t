@@ -677,10 +677,6 @@ is(BpJudge::audit_outcome({ verdict=>'fail', corrective_attempts=>1, corrective_
         is($rc, 0, 'AC-38: perl plugins/butler/tests/t/judge-starvation.t exits 0');
         is($not_ok, 0, 'AC-38: perl plugins/butler/tests/t/judge-starvation.t produces zero not-ok lines');
     }
-    my ($out10, $rc10) = run_capture('perl', "$Bin/judge-decision-core.t");
-    my $not_ok10 = () = (($out10 // '') =~ /^not ok/mg);
-    is($rc10, 0, 'AC-38: perl plugins/butler/tests/t/judge-decision-core.t still exits 0');
-    is($not_ok10, 0, 'AC-38: perl plugins/butler/tests/t/judge-decision-core.t still produces zero not-ok lines');
 }
 
 {

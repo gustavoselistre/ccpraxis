@@ -627,24 +627,4 @@ sub frame_text { my ($f) = @_; return join("\n", map { plain($_) } @$f) }
     }
 }
 
-# ===========================================================================
-# AC17 (done criterion 4) -- providers-panel.t and run-panel-truth.t
-# both still exit 0 with no `not ok` lines, run UNMODIFIED. This file does
-# not touch either.
-# ===========================================================================
-{
-    for my $name (qw(providers-panel.t run-panel-truth.t)) {
-        my $path = File::Spec->rel2abs("$Bin/$name");
-        ok(-f $path, "AC17 precondition: $path exists");
-      SKIP: {
-            skip("$path not found", 2) unless -f $path;
-            my $out = `perl "$path" 2>&1`;
-            my $rc = $? >> 8;
-            is($rc, 0, "AC17: $name exits 0 when run standalone") or diag("  tail: " . substr($out, -1500));
-            my @notok = ($out =~ /^not ok.*$/mg);
-            is(scalar(@notok), 0, "AC17: $name has no 'not ok' lines") or diag('  ' . join("\n  ", @notok));
-        }
-    }
-}
-
 done_testing();
