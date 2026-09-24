@@ -432,6 +432,15 @@ refuse('no continuity state directory (set HOME, or an absolute BUTLER_STATE_DIR
 
 my ($SID, $AID, $BIND_TP, $BACKGROUND);
 
+# R6-M5 (red-team MEDIUM-5, Decision 51): for a ticket-bound call, whether
+# the --token's ownership gets CHECKED is deferred past the point where we
+# would refuse a foreground BECOME -- otherwise take_stop_token's one-shot
+# consumption burns the escape before the caller ever learns the call was
+# refused (the token would never be usable by a later, correct, background
+# retry). $DEFERRED_TOKEN_CHECK is resolved once is_alive/BACKGROUND are
+# both known, below.
+my $DEFERRED_TOKEN_CHECK = 0;
+
 my $ticket = BpHook::take_ticket('butler-hold', \@ARGV_RAW);
 
 if (ref $ticket eq 'HASH') {
@@ -439,13 +448,7 @@ if (ref $ticket eq 'HASH') {
     $AID        = $ticket->{agent_id};
     $BIND_TP    = $ticket->{transcript_path};
     $BACKGROUND = ($ticket->{background} ? 1 : 0);
-
-    if ($token_seen) {
-        my $s2 = BpHook::take_stop_token($token_val);
-        if (defined $s2 && $s2 ne $SID) {
-            refuse('the --token belongs to another session.');
-        }
-    }
+    $DEFERRED_TOKEN_CHECK = 1 if $token_seen;
 }
 elsif (!defined $ticket || $ticket eq 'ambiguous') {
     if ($token_seen) {
@@ -580,6 +583,21 @@ if (BpHook::latest_is_off($SID)) {
 
 my $existing = BpHook::holder($SID);
 my $is_alive = (ref $existing eq 'HASH') ? proc_alive($existing->{pid}, $existing->{fp}) : 0;
+
+# R6-M5: resolve the deferred ticket-bound --token check now -- but only
+# once we know this call will NOT be refused for lacking run_in_background
+# (is_alive, so it will EXTEND; or already BACKGROUND, so it may BECOME).
+# On the about-to-be-refused foreground/no-holder path the token is left
+# completely untouched, so it survives for a later, correct, retry.
+if ($DEFERRED_TOKEN_CHECK && ($is_alive || $BACKGROUND)) {
+    my $s2 = BpHook::take_stop_token($token_val);
+    if (defined $s2 && $s2 ne $SID) {
+        flock($almfh, LOCK_UN);
+        close $almfh;
+        unlock_and_close($lockfh);
+        refuse('the --token belongs to another session.');
+    }
+}
 
 if ($is_alive) {
     # -------------------------------------------------------------- EXTEND

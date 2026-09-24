@@ -284,8 +284,21 @@ sub store_root_for {
 }
 
 # new_store_active($root) -> 1 iff $root/armed/ holds a regular file whose
-# name matches a session id and whose mtime is within ttl_hours(). Never
-# deletes anything -- same non-reaping discipline as _legacy_any_active.
+# name matches a session id and is LIVE. Never deletes anything -- same
+# non-reaping discipline as _legacy_any_active.
+#
+# R6-D53 (Decision 53, hook-continuity-remake blueprint.md): "an idle armed
+# session keeps the machine awake for at most ONE HOUR... The lease counts
+# an armed session only while its transcript was written in the last hour,
+# and it no longer honours a 12-hour Stop-touch window." So when an arm
+# file names a determinable transcript_path, liveness is decided PURELY by
+# that transcript's own 1h freshness (_transcript_path_is_live) -- the arm
+# file's own mtime (what a Stop gate's G7 step refreshes on every Stop) no
+# longer gates it at all; a session active right now must not be excluded
+# just because nothing happened to touch its arm file for the last 12h.
+# Only when the arm file carries NO determinable transcript_path (missing,
+# unreadable, undecodable) does the legacy ttl_hours() mtime cutoff apply,
+# exactly as before.
 sub new_store_active {
     my ($root) = @_;
     return 0 unless defined $root && length $root;
@@ -298,8 +311,13 @@ sub new_store_active {
         next unless $e =~ /^[A-Za-z0-9_-]{1,128}$/;
         my $f = "$dir/$e";
         next unless -f $f;
-        next if ((stat($f))[9] // 0) < $cutoff;
-        next unless _arm_file_is_live($f);
+        my $tp = _arm_file_transcript_path($f);
+        if (defined $tp) {
+            next unless _transcript_path_is_live($tp);
+        }
+        else {
+            next if ((stat($f))[9] // 0) < $cutoff;
+        }
         closedir($dh);
         return 1;
     }
@@ -307,22 +325,20 @@ sub new_store_active {
     return 0;
 }
 
-# _arm_file_is_live($path) -- R4-M2 (redteam MEDIUM-2). Reads the arm
-# file's own transcript_path and applies the SAME rule and threshold as the
-# legacy _marker_is_live check (_transcript_path_is_live), reused rather
-# than duplicated. When the file cannot be read, does not decode, or
-# carries no transcript_path, this keeps TODAY'S legacy behaviour for that
-# case: undeterminable answers "live" (fail-open), exactly like
-# _marker_is_live's own undeterminable cases.
-sub _arm_file_is_live {
+# _arm_file_transcript_path($path) -> transcript_path string | undef.
+# undef covers every undeterminable case (unreadable, undecodable, no such
+# key, or a non-string value) -- new_store_active treats undef as "fall
+# back to the legacy mtime cutoff", exactly as _arm_file_is_live's old
+# fail-open comment described for those same cases.
+sub _arm_file_transcript_path {
     my ($path) = @_;
     my $raw = _slurp_small($path);
-    return 1 unless defined $raw && length $raw;
+    return undef unless defined $raw && length $raw;
     my $data = eval { JSON::PP->new->utf8->decode($raw) };
-    return 1 unless ref $data eq 'HASH';
+    return undef unless ref $data eq 'HASH';
     my $tp = $data->{transcript_path};
-    return 1 unless defined $tp && !ref($tp) && length $tp;
-    return _transcript_path_is_live($tp);
+    return undef unless defined $tp && !ref($tp) && length $tp;
+    return $tp;
 }
 
 sub _slurp_small {

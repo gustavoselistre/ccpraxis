@@ -1014,6 +1014,57 @@ SKIP: {
 }
 
 # ===========================================================================
+# R6-M5 (red-team MEDIUM-5, Decision 51 re-scope): a FOREGROUND butler-hold
+# (a ticket with background=>0, same shape as H10d) that ALSO carries a
+# --token from a Stop denial must be refused the SAME WAY H10d already is
+# ("start it with run_in_background: true."), but WITHOUT burning that
+# token. TODAY (butler-hold.pl ~437-448) take_stop_token runs unconditionally
+# whenever a --token is present in a ticket-bound call, to check the token's
+# owning session -- BEFORE the background=>0 refusal at line ~636 ever
+# fires. So a refused foreground call silently consumes the escape: the
+# token is gone, and no later background retry can use it. The token must
+# still be takeable (usable by a background butler-hold) after the refusal.
+# ===========================================================================
+{
+    my $sid = 'hold-r6m5-sid';
+    my $tp = transcript_path_for($sid);
+    write_transcript($tp);
+    my $tok = BpHook::mint_stop_token($sid, { hook_event_name => 'Stop' });
+    ok(defined $tok, 'R6-M5: precondition -- token minted');
+    SKIP: {
+        skip 'R6-M5: no token', 5 unless defined $tok;
+
+        my @argv_fg = ('--token', $tok, 'M5');
+        write_ticket_for($sid, \@argv_fg, transcript_path => $tp, background => 0);
+        my ($out, $err, $rc) = run_hold('R6-M5-foreground', \@argv_fg, {});
+        is($rc, 1, 'R6-M5: a foreground ticket (background=>0) carrying --token refuses to BECOME');
+        is($out, "butler-hold: start it with run_in_background: true.\n",
+            'R6-M5: the exact background-required line, same as H10d');
+        ok(!-f "$CONT_ROOT/holder/$sid.json",
+            'R6-M5: no holder record written by the refused foreground attempt');
+
+        ok(-e "$CONT_ROOT/stop-tokens/$tok",
+            'R6-M5: the stop-token file still exists after the refused foreground attempt (not burned)');
+        is(slurp("$CONT_ROOT/stop-tokens/$sid.current") // '', "$tok\n",
+            'R6-M5: ...and <sid>.current still points at it');
+
+        # Usable by a background butler-hold: a discriminating check, NOT
+        # via a fresh ticket (a ticket resolves $SID from ITSELF, so it
+        # would succeed even if the token had been burned -- that would not
+        # tell the fix apart from the bug). Instead reuse the SAME token
+        # with NO ticket at all, exactly the token-only path H10b exercises:
+        # that path can only resolve $SID by calling take_stop_token(tok),
+        # so it fails ("no session binding...") if (and only if) the first,
+        # refused, foreground attempt had already burned it.
+        my ($pid, $outf, $errf) = spawn_hold(['--token', $tok, 'M5b'], {});
+        push @KILL_PIDS, $pid;
+        my $h = wait_for_holder($sid, 10);
+        ok(defined $h, 'R6-M5: the SAME (never-burned) token still binds a genuine background BECOME afterward');
+        reap_and_log('R6-M5-cleanup', $pid, $outf, $errf);
+    }
+}
+
+# ===========================================================================
 # H11 (cross-session) -- extending one session leaves another byte-identical;
 # ambiguous identical-argv tickets refuse without --token.
 # ===========================================================================

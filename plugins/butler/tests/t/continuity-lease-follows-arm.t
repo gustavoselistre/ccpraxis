@@ -425,6 +425,92 @@ sub slurp {
 }
 
 # ===========================================================================
+# R6-D53 (Decision 53, hook-continuity-remake blueprint.md): "an idle armed
+# session keeps the machine awake for at most ONE HOUR. Idle means its
+# transcript has had no activity... The lease counts an armed session only
+# while its transcript was written in the last hour, and it no longer
+# honours a 12-hour Stop-touch window." TODAY new_store_active ANDs the
+# 1h transcript-liveness check with an OUTER ttl_hours() (12h) cutoff on the
+# arm file's OWN mtime -- the mtime a Stop gate's G7 step refreshes on every
+# Stop of an armed session. That outer cutoff is exactly the "12-hour
+# Stop-touch window" Decision 53 retires: a session that has been
+# genuinely, continuously active (fresh transcript right now) for MORE than
+# 12 hours, whose arm file was written once at session start and never
+# touched by any Stop since, is EXCLUDED today purely by that stale mtime,
+# even though its transcript proves it is alive this very second. (a) below
+# is that failing case. (b) and (c) are controls, already correct today
+# (R4-M2 above is (b)'s twin, with an explicit Stop-touch simulation added).
+# ===========================================================================
+{
+    # (a) FAILING today: arm-file mtime > 12h old (an arm() call from long
+    # ago, never refreshed by any Stop's G7 touch), transcript written
+    # within the last hour -> per Decision 53 this DOES hold the lease.
+    my $home = fresh_home();
+    local $ENV{BUTLER_STATE_DIR} = $home;
+    local $BpContinuityLease::STATE_ROOT = BpHook::state_dir();
+    my $root = BpHook::state_dir();
+
+    my $sid = 'd53a-old-arm-fresh-transcript';
+    my $tp = "$home/transcript-a.jsonl";
+    open my $fh, '>', $tp or die $!;
+    print {$fh} "x\n";
+    close $fh;    # transcript mtime is "now" -- well within the 1h window
+
+    ok(BpHook::arm($sid, role => 'manual', by => 'on', transcript_path => $tp),
+        'R6-D53(a) setup: arm succeeds');
+    my $armed_path = "$root/armed/$sid";
+    my $old_mtime = time() - 13 * 3600;    # > the 12h ttl_hours(), never Stop-touched since
+    utime($old_mtime, $old_mtime, $armed_path);
+
+    is(LZ('new_store_active', $root), 1,
+        'R6-D53(a): a >12h-stale arm-file mtime (never Stop-touched) must NOT exclude a session whose transcript was written within the last hour');
+}
+{
+    # (b) control, already correct today (R4-M2's twin, with the arm file's
+    # mtime EXPLICITLY refreshed to simulate a Stop gate's G7 touch, right
+    # now): a fresh arm-file mtime does not rescue a >1h-stale transcript.
+    my $home = fresh_home();
+    local $ENV{BUTLER_STATE_DIR} = $home;
+    local $BpContinuityLease::STATE_ROOT = BpHook::state_dir();
+    my $root = BpHook::state_dir();
+
+    my $sid = 'd53b-fresh-touch-stale-transcript';
+    my $tp = "$home/transcript-b.jsonl";
+    open my $fh, '>', $tp or die $!;
+    print {$fh} "x\n";
+    close $fh;
+    my $stale = time() - 3601;    # more than TRANSCRIPT_LIVENESS_SECONDS (1h)
+    utime($stale, $stale, $tp);
+
+    ok(BpHook::arm($sid, role => 'manual', by => 'on', transcript_path => $tp),
+        'R6-D53(b) setup: arm succeeds with a stale transcript');
+    my $armed_path = "$root/armed/$sid";
+    utime(undef, undef, $armed_path);    # simulate a Stop gate's G7 mtime touch, right now
+
+    is(LZ('new_store_active', $root), 0,
+        'R6-D53(b) control: a just-Stop-touched (fresh mtime) arm file with a >1h-stale transcript does NOT hold the lease');
+}
+{
+    # (c) control, already correct today: both fresh -> holds.
+    my $home = fresh_home();
+    local $ENV{BUTLER_STATE_DIR} = $home;
+    local $BpContinuityLease::STATE_ROOT = BpHook::state_dir();
+    my $root = BpHook::state_dir();
+
+    my $sid = 'd53c-both-fresh';
+    my $tp = "$home/transcript-c.jsonl";
+    open my $fh, '>', $tp or die $!;
+    print {$fh} "x\n";
+    close $fh;
+
+    ok(BpHook::arm($sid, role => 'manual', by => 'on', transcript_path => $tp),
+        'R6-D53(c) setup: arm succeeds with a fresh transcript');
+
+    is(LZ('new_store_active', $root), 1,
+        'R6-D53(c) control: a fresh arm-file mtime and a fresh transcript DOES hold the lease');
+}
+
+# ===========================================================================
 # R4-L-unreadable (redteam LOW-4) -- when the new store cannot positively
 # confirm an active arm, the wake-lock must not be released just because of
 # that read problem: with no legacy marker, any_active must fall back to
