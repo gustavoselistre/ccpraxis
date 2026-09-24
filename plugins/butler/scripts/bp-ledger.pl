@@ -1573,6 +1573,23 @@ sub op_widen_write_set {
         push @set, grep { !$have{$_}++ } @{ $opt{path} };
         my $new = replace_first_key_line($B, $fs, $fe, 'write_set', 'write_set: ' . join(':', @set));
         return (undef, 'write_set: key not found in frontmatter') unless defined $new;
+        # A widened TEST file is also an oracle path: guard-writes lets a
+        # test-writer write only under test_paths, so a re-scope that adds a
+        # tests/t/*.t to write_set alone leaves the test-writer refused
+        # (hook-continuity-remake 06, 2026-09-24). Add it to test_paths too.
+        my @tests = grep { m{(?:\A|/)tests/t/[^/]+\.t\z} } @{ $opt{path} };
+        if (@tests) {
+            $new =~ /\A---\s*\n(.*?)\n---/s;
+            my ($ts, $te) = ($-[1], $+[1]);
+            my $tcur = extract_frontmatter_value($new, 'test_paths');
+            if (defined $tcur) {
+                my @tp = grep { length } split /:/, $tcur;
+                my %thave = map { ($_ => 1) } @tp;
+                push @tp, grep { !$thave{$_}++ } @tests;
+                my $new2 = replace_first_key_line($new, $ts, $te, 'test_paths', 'test_paths: ' . join(':', @tp));
+                $new = $new2 if defined $new2;
+            }
+        }
         return splice_insert_entry($new, qr/^##\s+Decisions & attempt log\b/m, $entry);
     });
 }
