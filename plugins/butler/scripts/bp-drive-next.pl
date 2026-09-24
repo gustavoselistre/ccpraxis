@@ -1163,6 +1163,45 @@ sub _cmd_next {
             $dirty = 1 if $pruned;
             _write_inflight_set($dsdir, $inflight_entries, $now) if $dirty;
 
+            # Decision 65 / package 12 AC-20: reclaim a claimed-but-undriven
+            # in-flight entry, switch-on only. Carried from package 11's
+            # red-team M1/M4 (this ledger, 2026-09-24T12:50:48Z): with the
+            # switch on, an inflight.json entry can be claimed but never
+            # driven. Reclaiming means handing it out again -- a director
+            # act, done here rather than in the hook (spec sec 3.5).
+            if ($concurrency_on) {
+                my $bd_ok = eval {
+                    require "$DIR/BpHook/BindDispatch.pm"
+                        unless defined &BpHook::BindDispatch::bound_since;
+                    1;
+                };
+                if ($bd_ok) {
+                    my $reclaim_after = $opts->{reclaim_after} // 1800;
+                    my @reclaimable =
+                        sort { $a->{package} cmp $b->{package} }
+                        grep {
+                            $_->{blueprint} eq $bp
+                            && (($status->{ $_->{package} } // 'pending') eq 'pending')
+                            && (($now - $_->{since}) >= $reclaim_after)
+                            && !BpHook::BindDispatch::bound_since($data, $bp, $_->{package}, $_->{since})
+                        } @$inflight_entries;
+                    if (@reclaimable) {
+                        my $entry = $reclaimable[0];
+                        my $pkg   = $entry->{package};
+                        my $action = { action => 'run-package', blueprint => $bp, package => $pkg };
+                        _write_current_pointer($dsdir, $bp, $pkg, $now);
+                        _append_run_log($dsdir, "RECLAIM $bp/$pkg (no dispatch bound since $entry->{since})");
+                        _append_run_log($dsdir, "RUN $bp/$pkg");
+                        $entry->{since}  = $now;
+                        $entry->{ledger} = _ledger_str($data, $bp, $pkg);
+                        _write_inflight_set($dsdir, $inflight_entries, $now);
+                        print _encode_action($action), "\n";
+                        keepawake_apply('active', $dsdir, $opts);
+                        return 0;
+                    }
+                }
+            }
+
             if ($concurrency_on) {
                 my @here = map { $_->{package} } grep { $_->{blueprint} eq $bp } @$inflight_entries;
                 # Driver decision (Decision 31 / red-team H1 / review M2): a

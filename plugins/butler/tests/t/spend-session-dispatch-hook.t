@@ -235,4 +235,125 @@ subtest 'CLI: the text report names where the data root came from; nothing is wr
     is_deeply(snapshot($f->{root}), $before, 'no file created or modified anywhere in the fixture');
 };
 
+# ===========================================================================
+# AC-21 (package 12-dispatch-binding): report-session reads the new
+# .drive-solo/bindings.jsonl(.1) store too, ahead of the old attribution
+# store on a shared tool_use_id. Every existing subtest above is untouched.
+# ===========================================================================
+
+subtest 'AC-21: an agent found only in the bindings store is attributed from it' => sub {
+    my $f = fixture();
+    my $data = $f->{data};
+
+    # agent f: a subagent whose tool_use_id has NO record in attribution.jsonl
+    # at all, only in the new .drive-solo/bindings.jsonl store.
+    write_file("$f->{root}/transcripts/sess-1/subagents/agent-f.jsonl",
+        jsonl(assistant(uuid => 'uf', req => 'r-f', ts => '2026-09-23T10:06:00Z', input => 600)));
+    write_file("$f->{root}/transcripts/sess-1/subagents/agent-f.meta.json",
+        $J->encode({ agentType => 'butler:bp-implementer', description => 'agent f', toolUseId => 'toolu_F' }));
+
+    write_file("$data/.drive-solo/bindings.jsonl", jsonl(
+        { tool_use_id => 'toolu_F', blueprint => 'bp-one', package => '01-alpha', source => 'bind-dispatch', at => 1790157660 },
+        # an id present in BOTH stores, disagreeing on the package: store B wins.
+        { tool_use_id => 'toolu_A', blueprint => 'bp-two', package => '02-beta',  source => 'bind-dispatch', at => 1790157670 },
+    ));
+
+    # agent g: found only in the ROLLED-OVER bindings.jsonl.1.
+    write_file("$f->{root}/transcripts/sess-1/subagents/agent-g.jsonl",
+        jsonl(assistant(uuid => 'ug', req => 'r-g', ts => '2026-09-23T10:07:00Z', input => 700)));
+    write_file("$f->{root}/transcripts/sess-1/subagents/agent-g.meta.json",
+        $J->encode({ agentType => 'butler:bp-implementer', description => 'agent g', toolUseId => 'toolu_G' }));
+    write_file("$data/.drive-solo/bindings.jsonl.1", jsonl(
+        { tool_use_id => 'toolu_G', blueprint => 'bp-two', package => '02-beta', source => 'bind-dispatch', at => 1790157600 },
+    ));
+
+    my $doc = BpSpend::Derive::report_session(session => $f->{main}, data_root => $data, by => [qw(blueprint package)]);
+
+    my $fa = by_path($doc, 'f');
+    is($fa->{kind}, 'attributed', 'AC-21: agent f (bindings-store-only) is attributed');
+    is($fa->{source}, 'dispatch-hook', 'AC-21: source is still dispatch-hook');
+    is("$fa->{blueprint}/$fa->{package}", 'bp-one/01-alpha', 'AC-21: with its bindings-store package');
+
+    my $aa = by_path($doc, 'a');
+    is("$aa->{blueprint}/$aa->{package}", 'bp-two/02-beta',
+        'AC-21: an id present in both stores takes the bindings store (B) entry');
+
+    my $ga = by_path($doc, 'g');
+    is($ga->{source}, 'dispatch-hook', 'AC-21: agent g (rolled-over bindings.jsonl.1 only) is attributed');
+    is("$ga->{blueprint}/$ga->{package}", 'bp-two/02-beta', 'AC-21: with its rolled-over package');
+};
+
+subtest 'AC-21: load_dispatch_attribution merges both stores, B winning on a shared id' => sub {
+    my $f = fixture();
+    my $data = $f->{data};
+    write_file("$data/.drive-solo/bindings.jsonl", jsonl(
+        { tool_use_id => 'toolu_A',  blueprint => 'bp-two', package => '02-beta',  source => 'bind-dispatch', at => 1790157670 },
+        { tool_use_id => 'toolu_F2', blueprint => 'bp-one', package => '01-alpha', source => 'bind-dispatch', at => 1790157680 },
+    ));
+    my $m = BpSpend::Derive::load_dispatch_attribution($data);
+    is_deeply($m->{toolu_A}, { blueprint => 'bp-two', package => '02-beta', source => 'bind-dispatch' },
+        'AC-21: toolu_A is overridden by the bindings-store entry');
+    is_deeply($m->{toolu_F2}, { blueprint => 'bp-one', package => '01-alpha', source => 'bind-dispatch' },
+        'AC-21: an id present only in the bindings store is found');
+};
+
+subtest 'AC-21: with no .drive-solo directory, load_dispatch_attribution is exactly today\'s map' => sub {
+    my $f = fixture();
+    my $m = BpSpend::Derive::load_dispatch_attribution($f->{data});
+    is_deeply($m->{toolu_A}, { blueprint => 'bp-one', package => '01-alpha', source => 'driver-pointer' },
+        'AC-21: toolu_A unaffected with no .drive-solo directory');
+    is_deeply($m->{toolu_C}, { conflict => 1 }, 'AC-21: toolu_C conflict marker unaffected');
+    ok(!exists $m->{toolu_E}, 'AC-21: toolu_E is still absent (unsafe names)');
+};
+
+subtest 'AC-21: CLI -- a .drive-solo store present still creates nothing' => sub {
+    my $f = fixture();
+    my $data = $f->{data};
+    write_file("$data/.drive-solo/bindings.jsonl", jsonl(
+        { tool_use_id => 'toolu_A', blueprint => 'bp-two', package => '02-beta', source => 'bind-dispatch', at => 1790157670 },
+    ));
+    my $before = snapshot($f->{root});
+    my $out = `"$^X" "$SPEND_PL" report-session --session "$f->{main}" --by blueprint,package 2>&1`;
+    is($? >> 8, 0, 'AC-21: exit 0');
+    is_deeply(snapshot($f->{root}), $before, 'AC-21: no file created or modified anywhere, with a .drive-solo store present');
+};
+
+# ===========================================================================
+# FIX-ROUND REGRESSIONS (12-dispatch-binding, review MINOR gaps m3/m4).
+# ===========================================================================
+
+subtest 'R9-m3: load_dispatch_attribution merge is exactly the full expected map, nothing spurious' => sub {
+    my $f = fixture();
+    my $data = $f->{data};
+    write_file("$data/.drive-solo/bindings.jsonl", jsonl(
+        { tool_use_id => 'toolu_F2', blueprint => 'bp-one', package => '01-alpha', source => 'bind-dispatch', at => 1790157680 },
+    ));
+    my $m = BpSpend::Derive::load_dispatch_attribution($data);
+    is_deeply($m, {
+        toolu_A  => { blueprint => 'bp-one', package => '01-alpha', source => 'driver-pointer' },
+        toolu_C  => { conflict => 1 },
+        toolu_D  => { blueprint => 'bp-two', package => '02-beta',  source => 'coordinator-env' },
+        toolu_F2 => { blueprint => 'bp-one', package => '01-alpha', source => 'bind-dispatch' },
+    }, 'R9-m3: the merged map has exactly these keys and values -- no id added or dropped by mistake');
+};
+
+subtest 'R9-m4: a store-B conflict marker overrides a valid store-A entry' => sub {
+    my $f = fixture();
+    my $data = $f->{data};
+    # toolu_A resolves cleanly in store A (fixture()); store B has two
+    # disagreeing lines for that same id, which is a conflict within B.
+    write_file("$data/.drive-solo/bindings.jsonl", jsonl(
+        { tool_use_id => 'toolu_A', blueprint => 'bp-two', package => '02-beta',  source => 'bind-dispatch', at => 1790157670 },
+        { tool_use_id => 'toolu_A', blueprint => 'bp-one', package => '01-alpha', source => 'bind-dispatch', at => 1790157671 },
+    ));
+    my $m = BpSpend::Derive::load_dispatch_attribution($data);
+    is_deeply($m->{toolu_A}, { conflict => 1 },
+        "R9-m4: store B's conflict marker wins over store A's otherwise-clean entry for the same id");
+
+    my $doc = BpSpend::Derive::report_session(session => $f->{main}, data_root => $data, by => [qw(blueprint package)]);
+    my $aa = by_path($doc, 'a');
+    isnt($aa->{source}, 'dispatch-hook',
+        'R9-m4: agent a is no longer attributed by the hook map once B marks the id a conflict');
+};
+
 done_testing();

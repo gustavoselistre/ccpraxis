@@ -1965,16 +1965,15 @@ sub load_dispatch_records {
 # the hook's own rule ([A-Za-z0-9._-], no leading dot, no '..'), so a
 # hand-edited line cannot smuggle a control byte into a report row.
 # ---------------------------------------------------------------------------
-sub load_dispatch_attribution {
-    my ($data_root) = @_;
+sub _load_attribution_files {
+    my (@files) = @_;
     my %map;
     my $name_ok = sub {
         my ($v) = @_;
         return defined($v) && !ref($v) && $v =~ /\A[A-Za-z0-9._-]{1,120}\z/
             && $v !~ /\A\./ && $v !~ /\.\./;
     };
-    for my $file ("$data_root/.dispatch-log/attribution.jsonl.1",
-                  "$data_root/.dispatch-log/attribution.jsonl") {
+    for my $file (@files) {
         open(my $fh, '<:raw', $file) or next;
         while (defined(my $line = <$fh>)) {
             next if length($line) > 4096;
@@ -2000,6 +1999,28 @@ sub load_dispatch_attribution {
         close $fh;
     }
     return \%map;
+}
+
+# package 12-dispatch-binding: bp-spend now reads TWO append-only stores with
+# the one line parser/rule set above -- store A (hooks/record-dispatch-
+# package.sh, pre-existing) and store B (hooks/next/bind-dispatch.sh's
+# .drive-solo/bindings.jsonl(.1), package 12). Within one store the existing
+# conflict rule applies unchanged; across stores, a tool_use_id present in
+# store B's map (a valid entry OR a {conflict=>1} marker) replaces store A's
+# entry for that id. An id only in A keeps A's entry untouched.
+sub load_dispatch_attribution {
+    my ($data_root) = @_;
+    my $map_a = _load_attribution_files(
+        "$data_root/.dispatch-log/attribution.jsonl.1",
+        "$data_root/.dispatch-log/attribution.jsonl",
+    );
+    my $map_b = _load_attribution_files(
+        "$data_root/.drive-solo/bindings.jsonl.1",
+        "$data_root/.drive-solo/bindings.jsonl",
+    );
+    my %merged = %$map_a;
+    $merged{$_} = $map_b->{$_} for keys %$map_b;
+    return \%merged;
 }
 
 # ---------------------------------------------------------------------------
