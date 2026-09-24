@@ -829,10 +829,21 @@ sub _strip_heredocs {
     my $n = scalar @lines;
     while ($i < $n) {
         my $line = $lines[$i];
-        if ($line =~ /(?<!<)<<(?!<)(-)?(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/) {
-            my ($dash, $word) = ($1, $3);
-            push @out, $line;
-            $i++;
+        my @ops;
+        # R8-RTM1 (review M1): the delimiter may be preceded by whitespace
+        # (<< 'EOF', << EOF), and there may be more than one heredoc
+        # operator on one line -- collect ALL of them, in order, and
+        # consume their bodies in that same order. '<<<' (here-string, not
+        # a heredoc) is excluded by the <</<< lookaround.
+        while ($line =~ /(?<!<)<<(?!<)(-)?[ \t]*(?:'([^'\n]*)'|"([^"\n]*)"|([A-Za-z_][A-Za-z0-9_.-]*))/g) {
+            my $dash = $1;
+            my $word = defined $2 ? $2 : defined $3 ? $3 : $4;
+            push @ops, [$dash, $word] if defined $word && length $word;
+        }
+        push @out, $line;
+        $i++;
+        for my $op (@ops) {
+            my ($dash, $word) = @$op;
             while ($i < $n) {
                 my $body = $lines[$i];
                 my $check = $body;
@@ -840,10 +851,7 @@ sub _strip_heredocs {
                 if ($check eq $word) { $i++; last }
                 $i++;
             }
-            next;
         }
-        push @out, $line;
-        $i++;
     }
     return join("\n", @out);
 }
@@ -881,6 +889,20 @@ sub _segments {
             pop @stack;
             $i++;
             next;
+        }
+        # R8-RTM1 (review M1): a '#' at word start (start of text, or right
+        # after whitespace/;/|/&/() outside quotes starts a comment that
+        # runs to end of line. Its text (backticks, $(...), ; and all) must
+        # never be re-parsed for $( )/backtick command substitution -- skip
+        # it wholesale, unlike the default per-character walk below.
+        if ($c eq '#') {
+            my $buf = $frame->{buf};
+            if ($buf eq '' || substr($buf, -1, 1) =~ /[ \t;|&(]/) {
+                push @segs, $buf;
+                $frame->{buf} = '';
+                while ($i < $len && substr($text, $i, 1) ne "\n") { $i++ }
+                next;
+            }
         }
         if ($c eq "'") { $quote = "'"; $frame->{buf} .= $c; $i++; next }
         if ($c eq '"') { $quote = '"'; $frame->{buf} .= $c; $i++; next }
@@ -946,7 +968,9 @@ sub _tokenize_words {
     while ($i < $len) {
         my $c = substr($seg, $i, 1);
         if ($c eq ' ' || $c eq "\t") { $i++; next }
+        my $word_start = $i;
         my $value = '';
+        my @flags; # per-character: 1 iff that character of $value is unpredictable
         my $unpredictable = 0;
         my $first = 1;
         while ($i < $len) {
@@ -954,7 +978,11 @@ sub _tokenize_words {
             last if $cc eq ' ' || $cc eq "\t";
             if ($cc eq "'") {
                 $i++;
-                while ($i < $len && substr($seg, $i, 1) ne "'") { $value .= substr($seg, $i, 1); $i++ }
+                while ($i < $len && substr($seg, $i, 1) ne "'") {
+                    $value .= substr($seg, $i, 1);
+                    push @flags, 0;
+                    $i++;
+                }
                 $i++ if $i < $len;
                 $first = 0;
                 next;
@@ -966,11 +994,14 @@ sub _tokenize_words {
                     if ($c2 eq '\\' && $i + 1 < $len) {
                         $unpredictable = 1;
                         $value .= substr($seg, $i + 1, 1);
+                        push @flags, 1;
                         $i += 2;
                         next;
                     }
-                    if ($c2 eq '$' || $c2 eq '`') { $unpredictable = 1 }
+                    my $f = ($c2 eq '$' || $c2 eq '`') ? 1 : 0;
+                    $unpredictable = 1 if $f;
                     $value .= $c2;
+                    push @flags, $f;
                     $i++;
                 }
                 $i++ if $i < $len;
@@ -979,6 +1010,7 @@ sub _tokenize_words {
             }
             if ($cc eq '\\' && $i + 1 < $len) {
                 $value .= substr($seg, $i + 1, 1);
+                push @flags, 0;
                 $i += 2;
                 $first = 0;
                 next;
@@ -986,6 +1018,7 @@ sub _tokenize_words {
             if ($cc eq '$' || $cc eq '`' || $cc eq '*' || $cc eq '?' || $cc eq '[' || $cc eq '{') {
                 $unpredictable = 1;
                 $value .= $cc;
+                push @flags, 1;
                 $i++;
                 $first = 0;
                 next;
@@ -993,11 +1026,13 @@ sub _tokenize_words {
             if ($cc eq '~' && $first) {
                 $unpredictable = 1;
                 $value .= $cc;
+                push @flags, 1;
                 $i++;
                 $first = 0;
                 next;
             }
             $value .= $cc;
+            push @flags, 0;
             $i++;
             $first = 0;
         }
@@ -1005,7 +1040,31 @@ sub _tokenize_words {
         # grouping token, not brace expansion, so it is always a literal
         # (RV-M3/RT-M4: '{ butler-continuity status; }' must be recognised).
         if ($value eq '{' || $value eq '}') { $unpredictable = 0 }
-        push @words, { literal => ($unpredictable ? undef : $value) };
+        # R8-B1 (Decision 55, review B1/redteam H1): a word with an
+        # unexpandable prefix (~/..., $HOME/..., ${VAR}/..., $VAR/...) still
+        # carries a fully literal basename after its LAST unquoted '/' or
+        # '\'. Record that basename as 'tail' whenever every character after
+        # that last slash is itself predictable -- so a variable or glob
+        # inside the basename itself (not just the directory) still leaves
+        # tail undef, per spec.
+        my $tail;
+        {
+            my $lastslash = -1;
+            for (my $k = 0; $k < length($value); $k++) {
+                my $ch = substr($value, $k, 1);
+                if ($ch eq '/' || $ch eq '\\') { $lastslash = $k }
+            }
+            if ($lastslash >= 0) {
+                my $tailstr = substr($value, $lastslash + 1);
+                if (length($tailstr)) {
+                    my $ok = 1;
+                    for my $k ($lastslash + 1 .. $#flags) { $ok = 0 if $flags[$k] }
+                    $tail = $tailstr if $ok;
+                }
+            }
+        }
+        my $raw = substr($seg, $word_start, $i - $word_start);
+        push @words, { literal => ($unpredictable ? undef : $value), tail => $tail, raw => $raw };
     }
     return \@words;
 }
@@ -1057,10 +1116,18 @@ sub _reduce_and_match {
     my $progress = 1;
     while ($progress) {
         $progress = 0;
-        while ($i < $n && defined $words->[$i]{literal}) {
+        while ($i < $n) {
             my $lit = $words->[$i]{literal};
-            if ($lit =~ /^[A-Za-z_][A-Za-z0-9_]*=/) { $i++; $progress = 1; next }
-            if ($lit =~ /^[0-9]*(?:>>?|<|>&|<&|&>)(.*)$/) {
+            my $raw = $words->[$i]{raw};
+            if (defined $lit && $lit =~ /^[A-Za-z_][A-Za-z0-9_]*=/) { $i++; $progress = 1; next }
+            # R8-M2 (redteam M2): an env-assignment prefix whose VALUE
+            # contains an expansion ($PWD/a, etc) makes the whole word
+            # unpredictable (literal undef), but the assignment's NAME= part
+            # is never itself expanded, so it is still a transparent prefix
+            # regardless of how unpredictable its value is. Detected off the
+            # raw (unquoted) text, since quoting never touches the name.
+            if (!defined $lit && defined $raw && $raw =~ /^[A-Za-z_][A-Za-z0-9_]*=/) { $i++; $progress = 1; next }
+            if (defined $lit && $lit =~ /^[0-9]*(?:>>?|<|>&|<&|&>)(.*)$/) {
                 my $rest = $1;
                 $i++;
                 if ($rest eq '') { $i++ if $i < $n }
@@ -1074,7 +1141,20 @@ sub _reduce_and_match {
         if ($lit eq 'timeout') {
             $i++;
             $progress = 1;
-            while ($i < $n && defined $words->[$i]{literal} && $words->[$i]{literal} =~ /^-/) { $i++ }
+            while ($i < $n && defined $words->[$i]{literal} && $words->[$i]{literal} =~ /^-/) {
+                my $opt = $words->[$i]{literal};
+                if ($opt =~ /^(?:--kill-after=|--signal=)/) {
+                    $i++;
+                }
+                elsif ($opt eq '-k' || $opt eq '-s' || $opt eq '--kill-after' || $opt eq '--signal') {
+                    $i++;
+                    $i++ if $i < $n;
+                }
+                else {
+                    # --preserve-status, --foreground, -v, or an unknown flag
+                    $i++;
+                }
+            }
             $i++ if $i < $n;
         }
         elsif ($lit eq 'env') {
@@ -1107,6 +1187,12 @@ sub _reduce_and_match {
 
     return undef unless $i < $n;
     my $cmd = $words->[$i]{literal};
+    # R8-B1 (Decision 55, review B1/redteam H1): the command word itself may
+    # be unpredictable (~/..., $HOME/..., ${VAR}/..., $VAR/...) while its
+    # basename after the last unquoted '/' or '\' is fully literal -- fall
+    # back to that literal basename ONLY at this, the command-word position.
+    # Argv words never consult 'tail'.
+    $cmd = $words->[$i]{tail} unless defined $cmd;
     return undef unless defined $cmd;
     my $base = $cmd;
     $base =~ s{.*[/\\]}{};
@@ -1282,6 +1368,15 @@ sub _append_hook_error {
 
 sub main {
     my ($module, @args) = @_;
+    # R8-RVM1 (review M1): track whether the warn handler actually fired
+    # for THIS invocation, not whether payload_ok() is true -- payload_ok()
+    # is also false for a JSON array/null payload and for a
+    # BP_PAYLOAD_TRUNCATED=1 truncation of an otherwise well-formed payload,
+    # and load_payload() never warns in any of those cases, so gating on
+    # payload_ok() alone left a missing/require-failing module unlogged in
+    # exactly those cases.
+    my $decode_warned = 0;
+    local $SIG{__WARN__} = sub { $decode_warned = 1; _append_hook_error($module, $_[0]) };
     my $raw = _read_stdin_bulk();
     load_payload($raw);
 
@@ -1290,11 +1385,24 @@ sub main {
     my $relpath = $module;
     $relpath =~ s{::}{/}g;
 
-    local $SIG{__WARN__} = sub { _append_hook_error($module, $_[0]) };
+    my $require_ok = eval {
+        require "BpHook/$relpath.pm";
+        1;
+    };
+    unless ($require_ok) {
+        # Only skip this when a payload-decode failure has ALREADY been
+        # recorded (via the $SIG{__WARN__} handler above) for this same
+        # invocation -- a missing module on top of unparseable input adds
+        # no information beyond "nothing ran", and R7-warn requires exactly
+        # one hook-errors.log line per malformed payload. Otherwise (no
+        # decode warning fired -- payload was valid JSON, just not usable,
+        # or truncated) the missing module IS the only thing worth logging.
+        _append_hook_error($module, $@) unless $decode_warned;
+        return 0;
+    }
 
     my $ret;
     my $ok = eval {
-        require "BpHook/$relpath.pm";
         my $fn = "BpHook::${module}::run";
         no strict 'refs';
         $ret = &$fn(payload(), @args);

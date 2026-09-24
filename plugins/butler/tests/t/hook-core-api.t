@@ -1424,5 +1424,307 @@ $SIG{$_} = sub { exit 1 } for qw(TERM INT HUP);
     }
 }
 
+# ===========================================================================
+# R7-warn -- main() reads STDIN and calls load_payload() BEFORE it installs
+# $SIG{__WARN__} (BpHook.pm:1283-1293: load_payload($raw) at line 1286 runs
+# ahead of the "local $SIG{__WARN__} = ..." at line 1293). A malformed
+# payload makes load_payload()'s decode fail and warn() (BpHook.pm:1218,
+# "BpHook: payload decode failed: ...") fires with no handler installed yet,
+# so the message leaks to real STDERR instead of being captured into
+# <state>/continuity/hook-errors.log. Every hook wrapper's contract (AC17)
+# is that stdout/stderr from a malformed payload are empty; this is the
+# in-process seam where that leak actually originates.
+# ===========================================================================
+{
+    local %ENV = %ENV; scrub_env();
+    my $root = fresh_state_root();
+    $ENV{BUTLER_STATE_DIR} = $root;
+    my $continuity = "$root/continuity";
+
+    my ($fh, $stdin_path) = tempfile();
+    print {$fh} '{not json';
+    close $fh;
+
+    my ($errfh, $errpath) = tempfile();
+    close $errfh;
+
+    my $before_log = read_bytes("$continuity/hook-errors.log") // '';
+
+    {
+        local *STDIN;
+        open(STDIN, '<', $stdin_path) or die $!;
+        local *STDERR;
+        open(STDERR, '>', $errpath) or die $!;
+        H('main', 'NoSuchFixtureForR7Warn');
+        close STDERR;
+        close STDIN;
+    }
+
+    my $stderr_out = read_bytes($errpath) // '';
+    is($stderr_out, '',
+        'R7-warn: main() with a malformed payload writes NOTHING to STDERR');
+
+    my $after_log = read_bytes("$continuity/hook-errors.log") // '';
+    cmp_ok(length($after_log), '>', length($before_log),
+        'R7-warn: ...and the decode failure is appended to hook-errors.log instead');
+    my @new_lines = grep { length } split /\n/, substr($after_log, length($before_log));
+    is(scalar(@new_lines), 1,
+        'R7-warn: exactly one hook-errors.log line is added for the one decode failure');
+    like($new_lines[0] // '', qr/\tNoSuchFixtureForR7Warn\tBpHook: payload decode failed:/,
+        'R8-m2: the one logged line is the decode-failure warning itself, not merely any one line '
+      . '(review m2: an implementation that dropped the decode warning and logged only a require '
+      . 'failure would also produce one line and pass the count-only assertion above)');
+}
+
+# ===========================================================================
+# R7-timeout -- invocations() wrapped in `timeout` with a short-form flag
+# that takes its OWN argument as a separate word (-k SECS, -s SIGNAL) must
+# still find the wrapped command. BpHook.pm's timeout-prefix skip
+# (_reduce_and_match, around the "if ($lit eq 'timeout')" branch) skips
+# every leading '-'-prefixed flag token, then unconditionally treats the
+# NEXT word as the timeout duration -- but for `-k 5` or `-s KILL`, that
+# next word is the flag's OWN value ("5"/"KILL"), not the duration, so the
+# real duration ("60"/"30") is what gets skipped and parsing desyncs onto
+# the wrong word, and invocations() finds nothing. `--signal=TERM` (a
+# single '='-joined token) and a bare `timeout 10 X` (no flags at all) are
+# both unaffected by that desync and must keep working exactly as today.
+# ===========================================================================
+{
+    my @timeout_cases = (
+        ['timeout -k 5 60 X', 'X', 1, [],
+         '-k with a separate SECS argument (the repro)'],
+        ['timeout -s KILL 30 X', 'X', 1, [],
+         '-s with a separate SIGNAL argument'],
+        ['timeout --signal=TERM 5 X', 'X', 1, [],
+         '--signal=TERM as one =-joined token (must keep working)'],
+        ['timeout 10 X', 'X', 1, [],
+         'a bare duration with no flags (must keep working)'],
+        ['timeout --kill-after 5 60 X', 'X', 1, [],
+         'R8-m3: --kill-after with a separate-argument long form (review m3, untested branch)'],
+        ['timeout -p 60 X', 'X', 1, [],
+         'R8-m3: a flag-only short option (-p, preserve-status) before the duration'],
+        ['timeout -f 60 X', 'X', 1, [],
+         'R8-m3: a flag-only short option (-f, foreground) before the duration'],
+        ['timeout -v 60 X', 'X', 1, [],
+         'R8-m3: a flag-only short option (-v, verbose) before the duration'],
+        ['timeout --preserve-status 60 X', 'X', 1, [],
+         'R8-m3: a flag-only long option (--preserve-status) before the duration'],
+        ['timeout --foreground 60 X', 'X', 1, [],
+         'R8-m3: a flag-only long option (--foreground) before the duration'],
+        ['timeout -- 60 X', 'X', 1, [],
+         'R8-m3: a bare -- option terminator before the duration'],
+    );
+    for my $c (@timeout_cases) {
+        my ($cmd, $name, $n, $argv, $why) = @$c;
+        my @res = HL('invocations', $cmd, $name);
+        is(scalar(@res), $n, "R7-timeout: invocations('$cmd', '$name') returns $n match(es) ($why)");
+        if ($n && @res) {
+            is_deeply($res[0], $argv, "R7-timeout: ...with argv " . (@$argv ? join(',', @$argv) : '[]') . " ($why)");
+        }
+    }
+
+    # The literal real-world command this package guards against: a
+    # bp-drive-next.pl launch wrapped in `timeout -k 5 60`, run through
+    # perl. invocations() searches for the script itself ('bp-drive-next');
+    # BpHook.pm's own perl/bash/sh interpreter-skip (already covered by A12)
+    # steps over the 'perl' word once the timeout desync above is fixed, so
+    # the match lands on the script and 'next' survives into argv.
+    my $real_cmd = 'timeout -k 5 60 perl /x/bp-drive-next.pl next';
+    my @real_res = HL('invocations', $real_cmd, 'bp-drive-next');
+    is(scalar(@real_res), 1,
+        "R7-timeout: invocations('$real_cmd', 'bp-drive-next') finds the perl /x/bp-drive-next.pl next invocation");
+    if (@real_res && ref($real_res[0]) eq 'ARRAY') {
+        is($real_res[0][0], 'next',
+            "R7-timeout: ...and its argv carries 'next'");
+    } else {
+        fail("R7-timeout: (placeholder) argv carries 'next' -- no arrayref returned");
+    }
+}
+
+# ===========================================================================
+# R8-B1 -- Decision 55 (review B1, redteam H1): invocations() must find a
+# director call whose command word carries an unexpandable prefix (~/...,
+# $HOME/..., ${CLAUDE_PLUGIN_ROOT}/..., $VAR/...) by falling back, at the
+# command-word position only, to the literal basename after the last
+# unquoted / or \. Argv words are unaffected: 'next' must still be literal.
+# This is the dominant real-world shape (per the redteam's own transcript
+# citation), so a tokenizer that never falls back to the basename leaves
+# the arm-on-entry hook inert for almost every real drive-solo call.
+# ===========================================================================
+{
+    my @cases = (
+        ['perl ~/.claude/ccpraxis/plugins/butler/scripts/bp-drive-next.pl next', 'bp-drive-next'],
+        ['perl "${CLAUDE_PLUGIN_ROOT}/scripts/bp-drive-next.pl" next', 'bp-drive-next'],
+        ['perl $HOME/x/bp-drive-next.pl next', 'bp-drive-next'],
+        ['perl "$P/bp-drive-next.pl" next', 'bp-drive-next'],
+        ['bash ~/.claude/ccpraxis/plugins/butler/bin/bp-drive-next.sh next', 'bp-drive-next'],
+    );
+    for my $c (@cases) {
+        my ($cmd, $name) = @$c;
+        my @res = HL('invocations', $cmd, $name);
+        is(scalar(@res), 1,
+            "R8-B1: invocations('$cmd', '$name') finds the call despite the unexpandable prefix");
+        if (@res && ref($res[0]) eq 'ARRAY') {
+            is($res[0][0], 'next', "R8-B1: ...and argv[0] is 'next' for [$cmd]");
+        } else {
+            fail("R8-B1: (placeholder) argv[0] is 'next' -- no match returned for [$cmd]");
+        }
+    }
+}
+
+# ===========================================================================
+# R8-M2 -- Decision 55 (redteam M2): an env-assignment prefix whose VALUE
+# contains an expansion ($PWD, etc) must not make the prefix-skip loop treat
+# the assignment word itself as the (unpredictable) command word -- the
+# assignment's raw text still matches NAME=... unquoted, so it stays a
+# transparent prefix regardless of how unpredictable its value is.
+# ===========================================================================
+{
+    my $cmd = 'X="$PWD/a" perl /x/bp-drive-next.pl next';
+    my @res = HL('invocations', $cmd, 'bp-drive-next');
+    is(scalar(@res), 1,
+        "R8-M2: invocations() finds the call behind an env-assignment prefix with a \$-bearing value [$cmd]");
+    if (@res && ref($res[0]) eq 'ARRAY') {
+        is($res[0][0], 'next', 'R8-M2: ...and argv[0] is next');
+    } else {
+        fail('R8-M2: (placeholder) argv[0] is next -- no match returned');
+    }
+}
+
+# ===========================================================================
+# R8-RTM1 -- Decision 55 (review M1): a heredoc body must never be parsed as
+# a live invocation regardless of the exact delimiter spelling (a space
+# before a quoted word, an unquoted bare word, or the <<- dash form), and a
+# '#' comment must never be parsed as live even when its text holds
+# backticks or $( ) that would otherwise look executable.
+# ===========================================================================
+{
+    my @cases = (
+        ["cat > f << 'EOF'\nperl /x/bp-drive-next.pl next\nEOF\n",
+         q{<< 'EOF' with a space before the quoted delimiter}],
+        ["cat > f << EOF\nperl /x/bp-drive-next.pl next\nEOF\n",
+         '<< EOF with a space before an unquoted delimiter'],
+        ["cat > f <<-EOF\nperl /x/bp-drive-next.pl next\nEOF\n",
+         '<<-EOF (the dash/tab-strip form)'],
+        ['ls  # perl /x/bp-drive-next.pl next; echo', 'a # comment holding a live-looking ; tail'],
+        ['ls  # `perl /x/bp-drive-next.pl next`', 'a # comment holding backticks'],
+        ['ls  # $(perl /x/bp-drive-next.pl next)', 'a # comment holding $( )'],
+    );
+    for my $c (@cases) {
+        my ($cmd, $why) = @$c;
+        my @res = HL('invocations', $cmd, 'bp-drive-next');
+        (my $label = $cmd) =~ s/\n/\\n/g;
+        is(scalar(@res), 0, "R8-RTM1: invocations() on [$label] finds nothing ($why)");
+    }
+}
+
+# ===========================================================================
+# R8-RVM1 -- review M1: BpHook::main must log a missing/require-failing
+# module to hook-errors.log even when the payload decodes to something
+# other than a hash (a JSON array, JSON null, or a BP_PAYLOAD_TRUNCATED=1
+# truncation of an otherwise well-formed payload) -- payload_ok() is false
+# in every one of those cases too, but load_payload() never fires a decode
+# warning for any of them, so BpHook.pm:1317's "log the require failure only
+# if payload_ok()" guard leaves the require failure unlogged EVERYWHERE.
+# And when the payload IS malformed AND the module IS present and loadable,
+# main() must still log EXACTLY ONE line (R7-warn's existing rule, pinned
+# here again with a real, loadable module so this sub-case cannot be
+# satisfied by an implementation that merely stops logging the require
+# failure at all).
+# ===========================================================================
+{
+    my $inc_dir = tempdir(CLEANUP=>1);
+    make_path("$inc_dir/BpHook");
+    open my $fh, '>', "$inc_dir/BpHook/R8Ok.pm" or die $!;
+    print {$fh} "package BpHook::R8Ok;\nsub run { return 0 }\n1;\n";
+    close $fh;
+    local @INC = ($inc_dir, @INC);
+
+    local %ENV = %ENV; scrub_env();
+    my $root = fresh_state_root();
+    $ENV{BUTLER_STATE_DIR} = $root;
+    my $continuity = "$root/continuity";
+
+    my $run_main_stdin = sub {
+        my ($raw, @args) = @_;
+        my ($fh2, $path) = tempfile();
+        print {$fh2} $raw if defined $raw;
+        close $fh2;
+        local *STDIN;
+        open(STDIN, '<', $path) or die $!;
+        my $ret = H('main', @args);
+        close STDIN;
+        return $ret;
+    };
+
+    for my $case (
+        ['[]',   'NoSuchModuleR8A', 'a JSON array payload'],
+        ['null', 'NoSuchModuleR8B', 'a JSON null payload'],
+    ) {
+        my ($raw, $mod, $why) = @$case;
+        my $before = read_bytes("$continuity/hook-errors.log") // '';
+        $run_main_stdin->($raw, $mod);
+        my $after = read_bytes("$continuity/hook-errors.log") // '';
+        cmp_ok(length($after), '>', length($before),
+            "R8-RVM1: main() logs the missing module '$mod' to hook-errors.log even with $why");
+    }
+
+    {
+        local $ENV{BP_PAYLOAD_TRUNCATED} = 1;
+        my $before = read_bytes("$continuity/hook-errors.log") // '';
+        $run_main_stdin->('{"session_id":"R8T"}', 'NoSuchModuleR8C');
+        my $after = read_bytes("$continuity/hook-errors.log") // '';
+        cmp_ok(length($after), '>', length($before),
+            'R8-RVM1: main() logs the missing module even when BP_PAYLOAD_TRUNCATED=1 truncates '
+          . 'an otherwise well-formed payload');
+    }
+
+    {
+        my $before = read_bytes("$continuity/hook-errors.log") // '';
+        $run_main_stdin->('{not json', 'R8Ok');
+        my $after = read_bytes("$continuity/hook-errors.log") // '';
+        my @new_lines = grep { length } split /\n/, substr($after, length($before));
+        is(scalar(@new_lines), 1,
+            'R8-RVM1: a malformed payload with a present, loadable module logs exactly one '
+          . 'hook-errors.log line (R7-warn\'s rule, pinned against a real module)');
+    }
+}
+
+# ===========================================================================
+# R8-L3 -- redteam L3: when no state root can be resolved at all (BUTLER_
+# STATE_DIR/HOME/USERPROFILE all unset or unusable), a malformed payload's
+# decode failure must still never leak to STDERR -- _append_hook_error()
+# returns silently when state_dir() is undef, so the chosen fallback here is
+# "silent exit 0, nowhere to log, nothing on stderr" (the other option named
+# in the package brief, an explicit STDERR fallback, is NOT chosen: AC17's
+# "empty stdout/stderr on fail-open" contract applies with or without a
+# resolvable root, so staying silent keeps that contract uniform rather than
+# carving out an exception for the no-root case).
+# ===========================================================================
+{
+    local %ENV = %ENV; scrub_env();
+    delete $ENV{BUTLER_STATE_DIR}; delete $ENV{HOME}; delete $ENV{USERPROFILE};
+
+    my ($fh, $stdin_path) = tempfile();
+    print {$fh} '{not json';
+    close $fh;
+    my ($errfh, $errpath) = tempfile();
+    close $errfh;
+
+    {
+        local *STDIN;
+        open(STDIN, '<', $stdin_path) or die $!;
+        local *STDERR;
+        open(STDERR, '>', $errpath) or die $!;
+        my $ret = H('main', 'NoSuchFixtureForR8L3');
+        close STDERR;
+        close STDIN;
+        is($ret, 0, 'R8-L3: main() with no resolvable state root and a malformed payload returns 0');
+    }
+    my $stderr_out = read_bytes($errpath) // '';
+    is($stderr_out, '',
+        'R8-L3: ...and writes NOTHING to STDERR (chosen fallback: silent, not a STDERR leak)');
+}
+
 $? = 0;
 done_testing();
