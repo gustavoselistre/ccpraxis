@@ -7,7 +7,7 @@
 | (a) payload fields | ANSWERED | PreToolUse/PostToolUse/Stop field sets captured for parent and subagent context; `tool_use_id` and `agent_id`/`agent_type` present on tool events, `stop_hook_active` present on Stop, absent elsewhere observed | 2.1.280 |
 | (b) subagent vs parent session_id | ANSWERED | A subagent's own tool-call payloads carry the **same** `session_id` as the parent, matching the stream-json init id and the subagent transcript's `sessionId` | 2.1.280 |
 | (c) meta.json at subagent's first PreToolUse | ANSWERED | Present, not racy, for one auto-backgrounded (`requestShape: background`) dispatch in headless -p: `agent-<id>.meta.json` and `agent-<id>.jsonl` already existed (created at Agent-tool dispatch) roughly 3.4 s before the subagent's own first PreToolUse. A foreground (synchronous) dispatch was not measured | 2.1.280 |
-| (d) session ids across --resume, /compact, /clear, carry-over | PARTIAL -- see NEEDS-OPERATOR D-1, D-2, D-3 | `--resume` keeps the id (ANSWERED); `/compact` keeps the id headlessly (session_id unchanged across the compact call and the following resumed call); `/clear` allocates a brand new id headlessly; the in-process (`$CLAUDE_CODE_SESSION_ID` inside one still-running interactive process) part of all three, plus the carry-over-style clear, is NEEDS-OPERATOR | 2.1.280 |
+| (d) session ids across --resume, /compact, /clear, carry-over | ANSWERED (interactive, 2026-09-24) -- see "Operator results" under NEEDS-OPERATOR | `--resume` keeps the id (ANSWERED); `/compact` keeps the id headlessly (session_id unchanged across the compact call and the following resumed call); `/clear` allocates a brand new id headlessly; the in-process (`$CLAUDE_CODE_SESSION_ID` inside one still-running interactive process) part of all three, plus the carry-over-style clear, is NEEDS-OPERATOR | 2.1.280 |
 | (e) background completion waking an idle session | ANSWERED (interactive) | An idle **interactive** session (this package's own driver session, mid-run) was woken with no further input by all three completion types: a background Agent completion, a background Bash task killed by SIGTERM (correctly reported "failed with exit code 143"), and a background Bash task exiting normally -- see `interactive-wakes-abb7e549.jsonl`. Headless -p is supplementary only: it shows the CLI kills a still-running background Bash task a few seconds after its own final result (no new turn), which is a **timing artifact** of when the task ends relative to the CLI's exit, not a normal-exit-vs-killed distinction | 2.1.280 |
 | (f) Stop exit 2 headless | ANSWERED | Each exit-2 Stop is retried: the model sees the stderr text, delivered as a synthetic `isSynthetic:true` user message quoting the hook command and its stderr verbatim (it also appears nowhere else in stream-json), and replies with the requested `CONTINUEDn`; `stop_hook_active` is `false` on the first Stop and `true` on every re-entry, and resets to `false` after a task-notification wake, so it is not a reliable block counter; the run ends when the hook itself stops returning exit 2 (f1: 1 block, `num_turns=2`; f2: 5 blocks, `num_turns=6`, `terminal_reason=completed`). No upper bound on retries, and no crash/timeout/invalid-JSON case was measured -- see the design-constraints paragraph below | 2.1.280 |
 | (g) wall cost of a bash hook with one perl parse | ANSWERED | Floor (bash hook, no parse) median ~30.6 ms over 2 runs; +1 perl JSON::PP parse median ~77-78 ms; delta ~46-47 ms | 2.1.280 |
@@ -921,6 +921,24 @@ Rewritten by the fix-batch (MAJOR-5) so each checklist is followable, unaided, f
    ```
 
 The ID-PROMPT referenced below is, verbatim: `Run the Bash command \`echo ENV-SID=$CLAUDE_CODE_SESSION_ID\` and stop.`
+
+### Operator results (2026-09-24, Claude Code 2.1.280 and 2.1.282)
+
+- **D-1, /compact:** the id is KEPT. The driving session abb7e549 survived two automatic
+  compactions (2026-09-23 21:06Z and 2026-09-24 11:19Z; `compact_boundary` records in its own
+  transcript) with the same session id, its continuity arm verified and its background work
+  still running.
+- **D-2, /clear:** a NEW id. `$CLAUDE_CODE_SESSION_ID` read `ceabc3c2-770c-4cc3-84ad-25f3ed886c24`
+  before `/clear` and `27cb6c0b-104e-42e6-bd88-049397afc730` after, in the same process. The probe
+  log shows `SessionEnd reason:"clear"` on the old id, then `SessionStart source:"clear"` on the
+  new one.
+- **D-3, carry-over-style clear:** a NEW id. On 2.1.282 with Opus 5.5 the plan-approval menu offered
+  **"Yes, clear context (5% used) and use auto mode"**. Selecting it moved the in-process id from
+  `399b3b17-1fc4-4b15-adde-a1ae2bf82da8` to `c23f8104-4a84-49f0-acfa-0cf07208d049`. The same menu
+  in a Haiku session on 2.1.282 did NOT offer a clear-context option (only "Yes, auto-accept edits"
+  and "Yes, manually approve edits"), so the option is not always present.
+- Consequence for the remake: a driver identity must survive `/clear` and a carry-over through
+  re-arm on the next director call (package 07), never through the id.
 
 ### D-1 -- /compact in-process
 
