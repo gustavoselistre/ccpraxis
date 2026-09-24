@@ -1092,6 +1092,51 @@ sub _observe_cache {
     return;
 }
 
+# 08-fleet-on-holder (Decision 19): the fleet's holder switch. Pure, per-call,
+# never cached -- off (unset/empty/anything but exactly "1") means byte-for-
+# byte today's behavior everywhere it is consulted below.
+sub fleet_holder_on {
+    return (defined $ENV{BUTLER_CONCURRENCY} && $ENV{BUTLER_CONCURRENCY} eq '1') ? 1 : 0;
+}
+
+# 08-fleet-on-holder: does $sid have a live, unexpired holder record right
+# now? Checked FIRST is the switch itself -- off means no require, no I/O, no
+# BpHook.pm in %INC. Never dies, never writes. There is deliberately no pid
+# check and no background_tasks check (the orchestrator has no payload); the
+# deadline alone bounds the exemption to at most 1h past the last hold/extend.
+#
+# $launched_epoch (optional): the current incarnation's own registry
+# `launched_at`, as an epoch. Red-team MEDIUM-2a: a record whose `started_at`
+# predates this incarnation's own launch belongs to an earlier, already-dead
+# process that happened to share this session id (a warm resume that
+# inherited a stale holder record) -- it must NOT grant the exemption. When
+# $launched_epoch or the record's `started_at` is absent, this check is
+# skipped (fixtures that predate `started_at`/`launched_at` keep prior
+# behavior). In list context, also returns the record's deadline so the
+# caller can remember it after the hold ends (spec/red-team MEDIUM-1).
+sub coordinator_holding {
+    my ($sid, $now, $launched_epoch) = @_;
+    return 0 unless fleet_holder_on();
+    return 0 unless defined $sid && $sid =~ /\A[A-Za-z0-9_-]{1,128}\z/;
+    my $ok = eval {
+        require Cwd;
+        require File::Basename;
+        my $d = File::Basename::dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
+        require "$d/BpHook.pm";    # require() itself is idempotent per exact %INC key
+        1;
+    };
+    return 0 unless $ok;
+    my $h = eval { BpHook::holder($sid) };
+    return 0 unless ref $h eq 'HASH';
+    my $deadline = $h->{deadline};
+    return 0 unless defined $deadline && $deadline =~ /\A[0-9]+\z/;
+    return 0 unless $now < $deadline && $deadline <= $now + 3600;
+    if (defined $launched_epoch && defined $h->{started_at} && $h->{started_at} =~ /\A[0-9]+\z/) {
+        return 0 if $h->{started_at} < $launched_epoch;
+    }
+    return wantarray ? (1, $deadline) : 1;
+}
+
 sub resume_mode {
     my ($age_min, $sid, $threshold_min) = @_;
     unless (defined $threshold_min) {
@@ -2971,6 +3016,18 @@ sub run {
     local $SIG{INT}  = sub { $STOP = 1 };
 
     my %seen;            # pkg => {size,mtime} prior jsonl observation
+    # 08-fleet-on-holder / red-team MEDIUM-1: pkg => the last holder deadline
+    # seen while this package was actively held. LOOP-SCOPE, mirroring %seen
+    # above -- bounded by the package count (one entry per package, overwritten
+    # every hold, never appended to), never persisted. Once a hold lapses this
+    # gives the coordinator one full `flat` window of grace (measured from
+    # max(mtime, this deadline)) before the byte-growth watchdog can judge it
+    # wedged, instead of the flat clock silently resuming mid-window.
+    my %held_until;
+    # pkg => 1 while watchdog_flat_held has already been logged for the
+    # CURRENT hold (red-team LOW-3): logs once on the transition into held,
+    # not once per tick. Cleared as soon as the hold is no longer active.
+    my %held_logged;
     # b02 checkpoint bookkeeping: pkg => { at => epoch of the last observation,
     # snap => the launch_snapshot taken then }. LOOP-SCOPE on purpose, mirroring
     # %seen and b01's $exec_fail_streak: no registry schema, no per-tick writes,
@@ -4210,7 +4267,26 @@ sub run {
                 if ($alive) {
                     my ($sz, $mt) = jsonl_stat($runs, $pkg);
                     my $prev = $seen{$pkg};
-                    my $prog = progress_verdict($sz, $mt, ($prev ? $prev->{size} : undef), $now, $t->{flat});
+                    # 08-fleet-on-holder / red-team MEDIUM-1: once a hold has
+                    # lapsed, judge flatness from max(mtime, that hold's last
+                    # deadline) rather than the raw (possibly long-frozen)
+                    # mtime -- see %held_until above. progress_verdict itself
+                    # stays pure/unit-tested; only the mtime fed to it here
+                    # is adjusted.
+                    # Only bump the effective mtime once the remembered hold's
+                    # deadline is itself in the past ($held_until{$pkg} <= $now)
+                    # -- while a hold is STILL active (deadline in the future)
+                    # flatness must be judged from the real mtime, exactly as
+                    # before, so the transition-into-held branch below still
+                    # sees a genuine 'flat' verdict to log and override. The
+                    # bump only ever extends the grace window AFTER a hold has
+                    # lapsed, never while one is in progress.
+                    my $eff_mt = $mt;
+                    if (defined $held_until{$pkg} && $held_until{$pkg} <= $now
+                        && (!defined $mt || $held_until{$pkg} > $mt)) {
+                        $eff_mt = $held_until{$pkg};
+                    }
+                    my $prog = progress_verdict($sz, $eff_mt, ($prev ? $prev->{size} : undef), $now, $t->{flat});
                     $seen{$pkg} = { size => ($sz // 0), mtime => ($mt // $now) };
 
                     # b11-progress-heuristic-turns-backstop: consult the semantic
@@ -4242,6 +4318,38 @@ sub run {
                                 why=>"progress heuristic: $sv ($sr)", now=>$now, reg=>$reg, t=>$t,
                                 spawn_judge=>$spawn_judge, shutdown=>$shutdown });
                             next;   # already actioned this tick — skip the byte-growth verdict below
+                        }
+                    }
+
+                    # 08-fleet-on-holder: a coordinator ending its turn to wait on a
+                    # background subagent writes nothing to its stream log until the
+                    # subagent's completion wakes it -- that can outlast `flat`. With
+                    # the switch on and an unexpired holder record for this package's
+                    # session, treat this tick as growing rather than flat so the
+                    # byte-growth watchdog does not kill it as wedged.
+                    {
+                        my $launched_at = $reg->{$pkg}{launched_at};
+                        my $launched_epoch = defined $launched_at ? BpGovern::iso_to_epoch($launched_at) : undef;
+                        my ($holding, $deadline) = coordinator_holding($sid->{$pkg}, $now, $launched_epoch);
+                        if ($holding) {
+                            $held_until{$pkg} = $deadline;
+                            if ($prog eq 'flat') {
+                                unless ($held_logged{$pkg}) {
+                                    _log($log, 'watchdog_flat_held', { package => $pkg, session_id => $sid->{$pkg} });
+                                    $held_logged{$pkg} = 1;
+                                }
+                                $prog = 'growing';
+                            }
+                        } else {
+                            # red-team LOW: once a previously-held coordinator's
+                            # exemption goes inert (deadline lapsed, record gone,
+                            # BpHook became unavailable, etc.), say so once rather
+                            # than silently falling back to plain byte-growth
+                            # judgment with no trace of why.
+                            if ($held_logged{$pkg}) {
+                                _log($log, 'watchdog_hold_lapsed', { package => $pkg, session_id => $sid->{$pkg} });
+                            }
+                            $held_logged{$pkg} = 0;
                         }
                     }
 

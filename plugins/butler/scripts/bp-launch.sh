@@ -126,6 +126,10 @@ ATTEMPT=$(registry_get "$BP_NAME" "$PKG" attempt); ATTEMPT=$(( ${ATTEMPT:-0} + 1
   export BP_WRITE_SET="$WRITE_SET" BP_TEST_PATHS="$TEST_PATHS"
   export BP_REPORT_DIR="$BPDIR/reports/$PKG"
   export BP_ROLE="coordinator"
+  if [ "${BUTLER_CONCURRENCY:-}" = "1" ]; then
+    [ -x "$PLUGIN_ROOT/bin/butler-hold" ] || echo "bp-launch: BUTLER_CONCURRENCY=1 but $PLUGIN_ROOT/bin/butler-hold is missing or not executable; the coordinator can only stop on its ledger" >&2
+    export BUTLER_CONCURRENCY=1 PATH="$PLUGIN_ROOT/bin:$PATH"
+  fi
   if [ -n "$RESUME_SID" ]; then
     setsid nohup perl "$SCRIPT_DIR/bp-watch-child.pl" "$PIDFILE" "$STATUSFILE" "$ATTEMPT" -- \
       claude -p "$PROMPT" --resume "$RESUME_SID" \
