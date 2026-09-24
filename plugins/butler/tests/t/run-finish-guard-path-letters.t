@@ -16,6 +16,7 @@
 #
 # Deterministic: every case sources the guard's classifier directly and feeds
 # it a fixed command. No drive, transcript or payload is involved.
+BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
 use strict;
 use warnings;
 use FindBin qw($Bin);
