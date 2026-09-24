@@ -86,6 +86,7 @@ use File::Basename qw(dirname);
 use File::Path qw(make_path);
 use Fcntl qw(:flock);
 use Cwd ();
+use JSON::PP ();
 
 my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
 require "$DIR/bp-keepawake.pl";
@@ -210,6 +211,129 @@ sub ttl_hours {
     return $h;
 }
 
+# ---------------------------------------------------------------------------
+# Package 04 additions: bridging to BpHook's new per-session arm store, so
+# the wake-lock follows continuity's new arm state, not just the old
+# registry, until package 16 retires the registry outright. Additive only
+# (Decision 19); every sub above keeps its name and signature, and
+# _legacy_any_active is that original logic, unchanged.
+# ---------------------------------------------------------------------------
+
+# $STATE_ROOT -- a test seam, same shape as $PLATFORM and $FIND_TRANSCRIPT
+# above. Production never sets it; store_root_for() resolves through
+# BpHook::state_dir() instead.
+our $STATE_ROOT;
+
+sub _is_abs_legacy {
+    my ($v) = @_;
+    return 0 unless defined $v && length $v;
+    return 1 if $v =~ m{^/};
+    return 0 unless $v =~ m{^[A-Za-z]:};
+    my $rest = substr($v, 2);
+    return 1 if $rest eq q{} || $rest =~ m{^/} || substr($rest, 0, 1) eq chr(92);
+    return 0;
+}
+
+# legacy_dir() -- exactly bp-continuity.pl's continuity_active_dir rule:
+# CCPRAXIS_CONTINUITY_ACTIVE_DIR if absolute (undef if set but relative);
+# otherwise $HOME (then $USERPROFILE) plus the fixed suffix; otherwise
+# undef. Backslashes are folded to forward slashes on the way out, matching
+# every other path this file hands to a filesystem call.
+sub legacy_dir {
+    my $override = $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR};
+    if (defined $override && length $override) {
+        return undef unless _is_abs_legacy($override);
+        (my $v = $override) =~ tr{\\}{/};
+        return $v;
+    }
+    for my $var (qw(HOME USERPROFILE)) {
+        my $val = $ENV{$var};
+        next unless _is_abs_legacy($val);
+        (my $v = "$val/.claude/ccpraxis/.continuity-active") =~ tr{\\}{/};
+        return $v;
+    }
+    return undef;
+}
+
+# store_root_for($dir) -- the new-store root that a given LEGACY registry
+# dir corresponds to, or undef when $dir is not the production legacy
+# registry (a fixture tempdir is never paired with the real store).
+sub store_root_for {
+    my ($dir) = @_;
+    return $STATE_ROOT if defined $STATE_ROOT;
+    return undef unless defined $dir && length $dir;
+
+    my $ldir = legacy_dir();
+    return undef unless defined $ldir;
+
+    my $norm_d = $dir;    $norm_d =~ tr{\\}{/}; $norm_d =~ s{/+$}{};
+    my $norm_l = $ldir;   $norm_l =~ tr{\\}{/}; $norm_l =~ s{/+$}{};
+    return undef unless $norm_d eq $norm_l;
+
+    my $override = $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR};
+    my $bsd      = $ENV{BUTLER_STATE_DIR};
+    if (defined $override && length $override && !(defined $bsd && length $bsd)) {
+        return undef;
+    }
+
+    my $root = eval {
+        require "$DIR/BpHook.pm" unless grep { m{(?:^|/)BpHook\.pm$} } keys %INC;
+        BpHook::state_dir();
+    };
+    return $@ ? undef : $root;
+}
+
+# new_store_active($root) -> 1 iff $root/armed/ holds a regular file whose
+# name matches a session id and whose mtime is within ttl_hours(). Never
+# deletes anything -- same non-reaping discipline as _legacy_any_active.
+sub new_store_active {
+    my ($root) = @_;
+    return 0 unless defined $root && length $root;
+    my $dir = "$root/armed";
+    return 0 unless -d $dir;
+    my $cutoff = time() - ttl_hours() * 3600;
+    opendir(my $dh, $dir) or return 0;
+    while (defined(my $e = readdir($dh))) {
+        next if $e eq '.' || $e eq '..';
+        next unless $e =~ /^[A-Za-z0-9_-]{1,128}$/;
+        my $f = "$dir/$e";
+        next unless -f $f;
+        next if ((stat($f))[9] // 0) < $cutoff;
+        next unless _arm_file_is_live($f);
+        closedir($dh);
+        return 1;
+    }
+    closedir($dh);
+    return 0;
+}
+
+# _arm_file_is_live($path) -- R4-M2 (redteam MEDIUM-2). Reads the arm
+# file's own transcript_path and applies the SAME rule and threshold as the
+# legacy _marker_is_live check (_transcript_path_is_live), reused rather
+# than duplicated. When the file cannot be read, does not decode, or
+# carries no transcript_path, this keeps TODAY'S legacy behaviour for that
+# case: undeterminable answers "live" (fail-open), exactly like
+# _marker_is_live's own undeterminable cases.
+sub _arm_file_is_live {
+    my ($path) = @_;
+    my $raw = _slurp_small($path);
+    return 1 unless defined $raw && length $raw;
+    my $data = eval { JSON::PP->new->utf8->decode($raw) };
+    return 1 unless ref $data eq 'HASH';
+    my $tp = $data->{transcript_path};
+    return 1 unless defined $tp && !ref($tp) && length $tp;
+    return _transcript_path_is_live($tp);
+}
+
+sub _slurp_small {
+    my ($path) = @_;
+    open(my $fh, '<:raw', $path) or return undef;
+    local $/;
+    my $c = <$fh>;
+    close $fh;
+    return $c;
+}
+
 # $FIND_TRANSCRIPT — a seam, not a setting, same shape as $PLATFORM above.
 # Production never sets it; any_active() falls back to
 # BpSession::find_transcript. Tests set
@@ -249,6 +373,18 @@ sub _marker_is_live {
     my $path = eval { $find->($session_id) };
     return 1 if $@;              # the resolver itself blew up -- undeterminable
     return 1 unless defined $path && length $path;   # no transcript found
+    return _transcript_path_is_live($path);
+}
+
+# _transcript_path_is_live($path) -- the SAME rule and threshold
+# (TRANSCRIPT_LIVENESS_SECONDS) as _marker_is_live above, factored out so
+# new_store_active (R4-M2 / redteam MEDIUM-2) can apply it directly to a new-
+# store arm file's own transcript_path, without resolving a session id
+# through BpSession::find_transcript first. Every undeterminable case
+# answers "live", same fail-safe direction as _marker_is_live.
+sub _transcript_path_is_live {
+    my ($path) = @_;
+    return 1 unless defined $path && length $path;
 
     my @st = stat($path);
     return 1 unless @st;         # stat failed -- undeterminable
@@ -292,6 +428,16 @@ sub _marker_is_live {
 # stat, a future mtime) counts the marker as active, same as before this
 # filter existed.
 sub any_active {
+    my ($dir) = @_;
+    return 1 if _legacy_any_active($dir);
+    my $root = store_root_for($dir);
+    return new_store_active($root) if defined $root;
+    return 0;
+}
+
+# _legacy_any_active($dir) -- the original registry-only logic (package 04
+# adds the new-store OR above it; nothing below this point changed).
+sub _legacy_any_active {
     my ($dir) = @_;
     return 0 unless defined $dir && -d $dir;
     my $cutoff = time() - ttl_hours() * 3600;
