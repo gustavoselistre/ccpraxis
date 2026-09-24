@@ -256,8 +256,8 @@ bp_rf_is_run_ending() {
   # itself prefers and recommends in its own denial text) is recognized as
   # run-ending identically to the .pl and .sh spellings, instead of silently
   # bypassing this authorization check.
-  local runstate_re="(^|${anchor_class})((perl|bash|sh)[[:space:]]+)?([[:alnum:]_./-]*/)?bp-runstate(\.(pl|sh))?\b[^;&|(){}\n]*\bfinish\b"
-  local continuity_re="(^|${anchor_class})((perl|bash|sh)[[:space:]]+)?([[:alnum:]_./-]*/)?bp-continuity(\.(pl|sh))?\b[^;&|(){}\n]*\b(disarm|off)\b"
+  local runstate_re="(^|${anchor_class})((perl|bash|sh)[[:space:]]+)?([[:alnum:]_./-]*/)?bp-runstate(\.(pl|sh))?\b[^;&|(){}]*\bfinish\b"
+  local continuity_re="(^|${anchor_class})((perl|bash|sh)[[:space:]]+)?([[:alnum:]_./-]*/)?bp-continuity(\.(pl|sh))?\b[^;&|(){}]*\b(disarm|off)\b"
   # BLOCKER-2: a command that WRITES to a path matching *.run-finished via
   # touch/cp/mv (verb position, masked/unmasked by adj_re above) or a `>`
   # redirect. Deliberately excludes `.run-finished.consumed` (the archived,
@@ -266,7 +266,7 @@ bp_rf_is_run_ending() {
   # LIVE marker is caught while a stray write to the consumed archive is
   # not. Not anchored to command position for `>`: a redirect target can
   # appear anywhere in a compound command.
-  local finish_marker_re="(^|${anchor_class})(touch|cp|mv)[[:space:]]+[^;&|(){}\n]*\.run-finished([^.]|\$)|>[[:space:]]*[^;&|(){}\n]*\.run-finished([^.]|\$)"
+  local finish_marker_re="(^|${anchor_class})(touch|cp|mv)[[:space:]]+[^;&|(){}]*\.run-finished([^.]|\$)|>[[:space:]]*[^;&|(){}]*\.run-finished([^.]|\$)"
 
   grep -Eq "$runstate_re" <<<"$RF_SCAN" \
     || grep -Eq "$continuity_re" <<<"$RF_SCAN" \
