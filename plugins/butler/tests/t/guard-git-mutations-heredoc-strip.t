@@ -290,7 +290,7 @@ for my $row (
   #    precisely so the same words appearing INSIDE someone's quoted prose do
   #    not trigger this): it re-interprets its own quoted argument as code, so
   #    e.g. `bash -c "git stash"` must still be denied. Raw fallback.
-  if printf '%s' "$out" | grep -Eq '(^|[;&|[:space:]])(bash|sh|zsh|ksh|dash|eval|xargs)([[:space:]]|$)'; then
+  if printf '%s' "${out//\\$'\n'/}" | grep -Eq '(^|[;&|[:space:]])(bash|sh|zsh|ksh|dash|eval|xargs)([[:space:]]|$)|(^|[;&|[:space:]])(perl|ruby|node)[[:space:]]+-e([[:space:]]|$)|(^|[;&|[:space:]])(python|python3)[[:space:]]+-c([[:space:]]|$)'; then
     RAW_KIND=shellword
     SCAN_OUT="$cmd"
     return 0
