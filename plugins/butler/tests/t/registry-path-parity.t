@@ -69,7 +69,9 @@ sub run_with_env {
     my $set   = join ' ', map { "$_='$env->{$_}'" }
                           grep { defined $env->{$_} } sort keys %$env;
     my $pre = $unset ? "unset $unset; " : '';
-    my $out = `$pre $set $cmd 2>&1`;
+    # </dev/null: no leg needs input, and the statusline leg's `do statusline.pl` reads its
+    # payload from STDIN -- an inherited open STDIN hung this test for 35 minutes in a sweep.
+    my $out = `$pre $set $cmd 2>&1 </dev/null`;
     return ($out // '', $? >> 8);
 }
 
