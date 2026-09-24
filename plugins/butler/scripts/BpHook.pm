@@ -1163,6 +1163,38 @@ my $PAYLOAD_LOADED = 0;
 my $PAYLOAD_OK     = 0;
 my $PARSE_COUNT    = 0;
 
+# R6-M2 (red-team MEDIUM-2, Decision 51): JSON::PP's decode dies outright on
+# a lone (unpaired) UTF-16 surrogate escape -- one bad code unit sliced out
+# of free text such as last_assistant_message, or a Node JSON.stringify
+# artefact of an unpaired surrogate -- rather than treating it as ordinary
+# malformed JSON. Left unhandled, that turns a single bad code unit into a
+# fail-open {} for the WHOLE payload (session_id and hook_event_name lost
+# too), which is exactly the "stranding" red-team found. Repair every lone
+# \uD800-\uDFFF escape (one that is not one half of a valid high+low pair)
+# to � (U+FFFD) BEFORE decoding, so the rest of an otherwise well-formed
+# payload still comes through. A genuinely paired surrogate escape is left
+# byte-for-byte untouched.
+sub _repair_lone_surrogates {
+    my ($raw) = @_;
+    return $raw unless defined $raw && length $raw;
+    # Pass 1: a high surrogate (\uD800-\uDBFF, case-insensitive hex digits --
+    # a real Node/JSON.stringify artefact is lowercase, e.g. \ud800)
+    # immediately followed by a low surrogate (\uDC00-\uDFFF) is a valid
+    # pair -- leave it alone, byte for byte. A high surrogate with no such
+    # follower is lone -> the literal JSON escape "�" (U+FFFD), so the
+    # SUBSEQUENT decode turns it into one replacement character.
+    $raw =~ s{
+        \\u([Dd][89abAB][0-9A-Fa-f]{2})
+        (\\u[Dd][c-fC-F][0-9A-Fa-f]{2})?
+    }{
+        defined $2 ? "\\u$1$2" : "\\ufffd"
+    }gex;
+    # Pass 2: any low surrogate escape that survives pass 1 was never
+    # preceded by a matching high surrogate, so it is lone too.
+    $raw =~ s{\\u[Dd][c-fC-F][0-9A-Fa-f]{2}}{\\ufffd}gx;
+    return $raw;
+}
+
 sub load_payload {
     my ($raw) = @_;
     $PARSE_COUNT++;
@@ -1173,7 +1205,20 @@ sub load_payload {
     }
     else {
         $data = eval { JSON::PP->new->utf8->decode($raw) };
-        if (!defined $data || ref($data) ne 'HASH') { $ok = 0 }
+        if (!defined $data || ref($data) ne 'HASH') {
+            my $repaired = _repair_lone_surrogates($raw);
+            if ($repaired ne $raw) {
+                $data = eval { JSON::PP->new->utf8->decode($repaired) };
+            }
+            if (!defined $data || ref($data) ne 'HASH') {
+                $ok = 0;
+                if (defined $@ && length $@) {
+                    my $err = $@;
+                    $err =~ s/\s+\z//;
+                    warn "BpHook: payload decode failed: $err\n";
+                }
+            }
+        }
     }
     if ($ok && defined $ENV{BP_PAYLOAD_TRUNCATED} && $ENV{BP_PAYLOAD_TRUNCATED} eq '1') { $ok = 0 }
     if ($ok) {

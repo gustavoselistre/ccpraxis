@@ -1196,6 +1196,41 @@ $SIG{$_} = sub { exit 1 } for qw(TERM INT HUP);
 }
 
 # ===========================================================================
+# R6-M2 (red-team MEDIUM-2, Decision 51 re-scope): a lone (unpaired) UTF-16
+# surrogate escape in the payload's free text -- one bad code unit sliced
+# out of last_assistant_message, or a Node JSON.stringify artefact of an
+# unpaired surrogate -- makes JSON::PP's decode die outright ("missing low
+# surrogate character"). TODAY load_payload treats that exactly like any
+# other malformed JSON: payload_ok=0, payload {}, so every field including
+# session_id and hook_event_name is lost, and a caller (e.g. the Stop gate)
+# fails open. The core must tolerate this: replace the lone surrogate with
+# U+FFFD (rather than fail the whole decode) so a payload that is otherwise
+# well-formed still decodes with every OTHER field intact, including
+# session_id.
+# ===========================================================================
+{
+    local %ENV = %ENV; scrub_env();
+    my $raw = qq({"session_id":"R6M2","hook_event_name":"Stop","stop_hook_active":false,)
+            . qq("last_assistant_message":"cut \\ud800"});
+    H('load_payload', $raw);
+    is(H('payload_ok'), 1,
+        'R6-M2: a payload with a lone UTF-16 surrogate escape still decodes (payload_ok 1), not a fail-open {}');
+    is(ref(H('payload')) eq 'HASH' ? H('payload')->{session_id} : undef, 'R6M2',
+        'R6-M2: ...and session_id is recovered from the rest of the (otherwise well-formed) payload');
+    is(ref(H('payload')) eq 'HASH' ? H('payload')->{hook_event_name} : undef, 'Stop',
+        'R6-M2: ...and hook_event_name is recovered too');
+
+    # the paired (valid) surrogate case must be completely unaffected --
+    # this is not a blanket "strip all \u" workaround, only lone escapes.
+    my $raw_paired = qq({"session_id":"R6M2B","hook_event_name":"Stop",)
+                   . qq("last_assistant_message":"smile \\ud83d\\ude00"});
+    H('load_payload', $raw_paired);
+    is(H('payload_ok'), 1, 'R6-M2: a payload with a VALID (paired) surrogate decodes fine, unaffected by the fix');
+    is(ref(H('payload')) eq 'HASH' ? H('payload')->{session_id} : undef, 'R6M2B',
+        'R6-M2: ...session_id recovered for the paired-surrogate case too');
+}
+
+# ===========================================================================
 # A19 -- main(): STDIN from a temp file, fixture BpHook::<Module> modules on
 # a temp @INC dir, and every return/die/warn/name-validity path.
 # ===========================================================================
