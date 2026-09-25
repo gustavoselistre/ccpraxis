@@ -582,11 +582,11 @@ sub run_wedge_sim {
         my $out = '';
         while (time() < $out_deadline) {
             $out = slurp($outfile);
-            last if $out =~ /^holding session \Q@{[sid8($sid)]}\E until/m;
+            last if $out =~ /^\d\d:\d\d \(\d\d:\d\dZ\) holding session \Q@{[sid8($sid)]}\E until/m;
             sleep(0.05);
         }
-        like($out, qr/^holding session \Q@{[sid8($sid)]}\E until \S+: A$/m,
-            'AC-9 (8b): stdout prints "holding session <sid8> until ...: A"') or diag("stdout was: $out");
+        like($out, qr/^\d\d:\d\d \(\d\d:\d\dZ\) holding session \Q@{[sid8($sid)]}\E until \d\d:\d\d \(\d\d:\d\dZ\): A$/m,
+            'AC-9 (8b): stdout prints "<T> holding session <sid8> until <D>: A"') or diag("stdout was: $out");
 
         # (c) allow: the same (a) payload now gives 0 (holder alive, A running).
         my ($rc_c) = with_captured_stderr(sub { return BpHook::StopGate::run($p_running) });
@@ -930,7 +930,13 @@ SKIP: {
 
 SKIP: {
     skip $LAUNCH_SKIP_REASON . ' (AC-2/AC-3 NOT exercised)', 8 unless $LAUNCH_OK;
-    my $plugin_root_pwd = do { my $o = `bash -c 'cd "$1" && pwd' bash '$BUTLER'`; chomp $o; $o };
+    # The bash -c script is single-quoted for BASH's benefit, but perl's
+    # backticks interpolate the whole string regardless of that quoting, so
+    # perl's own (empty) $1 was being substituted in before bash ever saw
+    # it, silently collapsing "cd $1" to "cd " and reporting $BUTLER's
+    # parent (/project) instead of $BUTLER itself (/project/plugins/butler).
+    # \$1 escapes it so bash's positional parameter reaches bash unharmed.
+    my $plugin_root_pwd = do { my $o = `bash -c 'cd "\$1" && pwd' bash '$BUTLER'`; chomp $o; $o };
     $plugin_root_pwd ||= $BUTLER;
 
     my ($proj1, $data1, $bp1) = mk_bp_dir08();
@@ -944,14 +950,35 @@ SKIP: {
 
     my $dispatch1 = slurp("$bp1/dispatch/p.md");
 
+    # AC-3 fix (ledger 2026-09-25T20:40:39Z, tests 79/80/82): switch-on and
+    # switch-off are launched against two DIFFERENT fixture project roots
+    # (mk_bp_dir08 mints a fresh tempdir every call), so an absolute path
+    # baked into argv or dispatch/p.md differs by construction even when
+    # everything else is identical. Normalise each side's own project root
+    # to a fixed placeholder before comparing, so the comparison is over
+    # content, not over which tempdir happened to be minted.
+    my $norm_text = sub {
+        my ($text, $root) = @_;
+        return $text unless defined $text;
+        (my $t = $text) =~ s/\Q$root\E/<PROJECT>/g;
+        return $t;
+    };
+    my $norm_argv = sub {
+        my ($argv, $root) = @_;
+        return $argv unless ref $argv eq 'ARRAY';
+        return [ map { $norm_text->($_, $root) } @$argv ];
+    };
+
     # AC-3: byte-identical argv and dispatch prompt vs. switch-off, fresh.
     my ($proj2, $data2, $bp2) = mk_bp_dir08();
     mk_ledger08($bp2, 'p');
     my ($rc2, $o2, $e2, $argv2, $envlog2) = run_launch08($proj2, $data2, 'T', 'p', []);
     ok(defined $argv2, 'AC-3 setup: cold launch, switch off, invoked claude') or diag("rc=$rc2 err=$e2");
-    is_deeply($argv1, $argv2, 'AC-3: the recorded argv is byte-identical between switch-on and switch-off (fresh)')
+    is_deeply($norm_argv->($argv1, $proj1), $norm_argv->($argv2, $proj2),
+        'AC-3: the recorded argv is byte-identical between switch-on and switch-off (fresh)')
         or diag("argv1=@{[ map { qq(\"$_\") } @{$argv1||[]} ]}\nargv2=@{[ map { qq(\"$_\") } @{$argv2||[]} ]}");
-    is(slurp("$bp2/dispatch/p.md"), $dispatch1, 'AC-3: dispatch/p.md bytes are identical between switch-on and switch-off (fresh)');
+    is($norm_text->(slurp("$bp2/dispatch/p.md"), $proj2), $norm_text->($dispatch1, $proj1),
+        'AC-3: dispatch/p.md bytes are identical between switch-on and switch-off (fresh)');
 
     # AC-3: warm (--resume-session) argv equal too.
     my ($proj3, $data3, $bp3) = mk_bp_dir08();
@@ -961,7 +988,8 @@ SKIP: {
     mk_ledger08($bp4, 'p');
     my ($rc4, $o4, $e4, $argv4w) = run_launch08($proj4, $data4, 'T', 'p', ['--resume-session', 'sid-warm-0001']);
     ok(defined $argv3w && defined $argv4w, 'AC-3 setup: both warm launches invoked claude') or diag("rc3=$rc3 e3=$e3 rc4=$rc4 e4=$e4");
-    is_deeply($argv3w, $argv4w, 'AC-3: the recorded argv is byte-identical between switch-on and switch-off (warm, --resume-session)');
+    is_deeply($norm_argv->($argv3w, $proj3), $norm_argv->($argv4w, $proj4),
+        'AC-3: the recorded argv is byte-identical between switch-on and switch-off (warm, --resume-session)');
 }
 
 SKIP: {

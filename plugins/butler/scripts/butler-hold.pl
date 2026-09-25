@@ -74,12 +74,6 @@ sub to_bytes_path {
     return $v;
 }
 
-sub hhmm_of {
-    my ($epoch) = @_;
-    my @t = gmtime($epoch);
-    return sprintf('%02d:%02dZ', $t[2], $t[1]);
-}
-
 sub iso_of {
     my ($epoch) = @_;
     my @t = gmtime($epoch);
@@ -623,12 +617,30 @@ if ($is_alive) {
         $outputs->{$id} = $peek_outputs->{$id} if defined $peek_outputs->{$id};
     }
 
+    # spec 2.2: `held` = old `held` (or old `items` when `held` is absent)
+    # plus ids not already in it, order kept; `ext_seq` = (old ext_seq // 0)
+    # + 1. A record without either field (written by an older holder) is
+    # read as held = items, ext_seq = 0.
+    my @old_held = @{ (ref $existing->{held} eq 'ARRAY') ? $existing->{held}
+                     : (ref $existing->{items} eq 'ARRAY') ? $existing->{items}
+                     : [] };
+    my %held_have = map { $_ => 1 } @old_held;
+    my @held = @old_held;
+    for my $id (@ITEMS) {
+        next if $held_have{$id};
+        push @held, $id;
+        $held_have{$id} = 1;
+    }
+    my $ext_seq = ($existing->{ext_seq} // 0) + 1;
+
     my $rec = {
         session_id      => $SID,
         token           => $existing->{token},
         pid             => $existing->{pid},
         fp              => $existing->{fp},
         items           => \@merged,
+        held            => \@held,
+        ext_seq         => $ext_seq,
         outputs         => $outputs,
         started_at      => $existing->{started_at},
         deadline        => $new_deadline,
@@ -646,7 +658,8 @@ if ($is_alive) {
     unless ($ok) {
         refuse('could not write the holder record (' . ($LAST_WRITE_ERR // 'unknown') . ').');
     }
-    out_line(sprintf('extended holder of session %s until %s: %s', $SID8, hhmm_of($new_deadline), join(', ', @merged)));
+    out_line(sprintf('extended the running holder (pid %s) until %s; this call exits now, the holder keeps waiting',
+        $existing->{pid}, BpHook::local_utc_hhmm($new_deadline)));
     exit 0;
 }
 
@@ -670,6 +683,8 @@ my $rec = {
     pid             => $$,
     fp              => $fp,
     items           => \@ITEMS,
+    held            => [ @ITEMS ],
+    ext_seq         => 0,
     outputs         => $outputs,
     started_at      => $now,
     deadline        => $now + $HOLD,
@@ -684,7 +699,8 @@ unlock_and_close($lockfh);
 unless ($ok) {
     refuse('could not write the holder record (' . ($LAST_WRITE_ERR // 'unknown') . ').');
 }
-out_line(sprintf('holding session %s until %s: %s', $SID8, hhmm_of($rec->{deadline}), join(', ', @ITEMS)));
+out_line(sprintf('%s holding session %s until %s: %s',
+    BpHook::local_utc_hhmm($now), $SID8, BpHook::local_utc_hhmm($rec->{deadline}), join(', ', @ITEMS)));
 
 # ---------------------------------------------------------------------------
 # the wait loop -- this process is the held work's own watcher, start to end.
@@ -693,12 +709,16 @@ out_line(sprintf('holding session %s until %s: %s', $SID8, hhmm_of($rec->{deadli
 # ---------------------------------------------------------------------------
 
 sub end_report {
-    my ($header, $record, $code) = @_;
+    # spec 2.3: the released line, then Decision 9's unchanged item report,
+    # one line per id of `held` (fallback `items`), in `held` order.
+    my ($reason, $record, $code) = @_;
     $code //= 0;
-    my @lines = ($header);
-    my @items = (ref $record->{items} eq 'ARRAY') ? @{ $record->{items} } : ();
+    my @lines = (sprintf('%s released: %s', BpHook::local_utc_hhmm(int(time())), $reason));
+    my @ids = (ref $record->{held} eq 'ARRAY') ? @{ $record->{held} }
+            : (ref $record->{items} eq 'ARRAY') ? @{ $record->{items} }
+            : ();
     my $tail = read_tail($record->{transcript_path});
-    for my $id (@items) {
+    for my $id (@ids) {
         my $st = item_status($record, $id, $tail);
         if ($st->{status} eq 'finished') {
             push @lines, "$id finished";
@@ -729,6 +749,38 @@ sub sleep_watching_signal {
 my $known_deadline = $rec->{deadline};
 my $last_valid = $rec;
 
+# 2.4 loop state: $last_seq is the ext_seq last reported (become writes 0,
+# so this starts at 0); @last_items is items as of the last read or write.
+my $last_seq = $rec->{ext_seq} // 0;
+my @last_items = @{ (ref $rec->{items} eq 'ARRAY') ? $rec->{items} : [] };
+
+# report_extension_if_advanced($record) -- 2.4 step 1. Prints ONE extension
+# line when $record's ext_seq has advanced past $last_seq, then updates
+# $last_seq/@last_items from $record. Several extensions between two reads
+# coalesce into one line, by construction (only the delta since the last
+# report is ever printed).
+#
+# An anonymous sub assigned to a lexical, not a named `sub`: a named sub
+# nested here would close over $last_seq/@last_items declared just above it
+# by reference at compile time only, which perl warns about ("will not stay
+# shared") and which would leak the warning to stderr (R5-M1/RT-M4 asserts
+# an empty stderr on every code path). An anonymous sub closes over them
+# properly.
+my $report_extension_if_advanced = sub {
+    my ($record) = @_;
+    my $seq = $record->{ext_seq} // 0;
+    return 0 unless $seq > $last_seq;
+    my @items_now = @{ (ref $record->{items} eq 'ARRAY') ? $record->{items} : [] };
+    my %had = map { $_ => 1 } @last_items;
+    my @added = grep { !$had{$_} } @items_now;
+    my $body = @added ? ('added: ' . join(', ', @added)) : 'no new ids';
+    out_line(sprintf('%s extended until %s; %s',
+        BpHook::local_utc_hhmm(int(time())), BpHook::local_utc_hhmm($record->{deadline}), $body));
+    $last_seq = $seq;
+    @last_items = @items_now;
+    return 1;
+};
+
 while (1) {
     my $t0 = time();
     my $remaining_to_deadline = $known_deadline - $t0;
@@ -737,66 +789,117 @@ while (1) {
     sleep_watching_signal($sleep_for);
 
     if ($SIGNALLED) {
-        end_report('hold ended: killed.', $last_valid, 143);
+        end_report('killed by a signal', $last_valid, 143);
     }
 
     my $rp = BpHook::holder($SID);
     if (ref($rp) ne 'HASH') {
-        end_report('continuity is off; holder ended.', $last_valid, 0);
+        end_report('continuity is off', $last_valid, 0);
     }
     if (!defined $rp->{token} || $rp->{token} ne $token) {
-        end_report('hold ended: superseded.', $rp, 0);
+        end_report('superseded by another holder', $rp, 0);
     }
+
+    # 2.4 step 1 (unlocked read): an extension is reported as soon as it is
+    # observed, before this tick's finish detection.
+    $report_extension_if_advanced->($rp);
+
     $known_deadline = $rp->{deadline};
     $last_valid = $rp;
 
+    # 2.4 step 2: finish detection, one tail read, no write on a quiet tick
+    # (AC-13: the record file must stay byte-identical when nothing finished
+    # and nothing extended).
     my $t1 = time();
-    my $finished_now = all_finished($rp);
-    if ($t1 >= $rp->{deadline} || $finished_now) {
-        my $lfh2;
-        my $locked2 = 0;
-        if (open($lfh2, '>>', $LOCK_PATH)) {
-            eval {
-                local $SIG{ALRM} = sub { die "bp-hold-lock-timeout\n" };
-                alarm(10);
-                $locked2 = flock($lfh2, LOCK_EX);
-                alarm(0);
-            };
+    my $items_ref = (ref $rp->{items} eq 'ARRAY') ? $rp->{items} : [];
+    my $tail = read_tail($rp->{transcript_path});
+    my @finished_ids = grep { item_status($rp, $_, $tail)->{status} eq 'finished' } @$items_ref;
+    my $deadline_due = ($t1 >= $rp->{deadline});
+
+    next unless @finished_ids || $deadline_due || !@$items_ref;
+
+    # 2.4 step 3/4: prune and/or exit, under the lock.
+    my $lfh2;
+    my $locked2 = 0;
+    if (open($lfh2, '>>', $LOCK_PATH)) {
+        eval {
+            local $SIG{ALRM} = sub { die "bp-hold-lock-timeout\n" };
+            alarm(10);
+            $locked2 = flock($lfh2, LOCK_EX);
             alarm(0);
-        }
-        unless ($locked2) {
-            close $lfh2 if $lfh2;
-            next;
-        }
+        };
+        alarm(0);
+    }
+    unless ($locked2) {
+        close $lfh2 if $lfh2;
+        next;
+    }
 
-        my $rp2 = BpHook::holder($SID);
-        if (ref($rp2) ne 'HASH') {
-            unlock_and_close($lfh2);
-            end_report('continuity is off; holder ended.', $last_valid, 0);
-        }
-        if (!defined $rp2->{token} || $rp2->{token} ne $token) {
-            unlock_and_close($lfh2);
-            end_report('hold ended: superseded.', $rp2, 0);
-        }
+    my $rp2 = BpHook::holder($SID);
+    if (ref($rp2) ne 'HASH') {
+        unlock_and_close($lfh2);
+        end_report('continuity is off', $last_valid, 0);
+    }
+    if (!defined $rp2->{token} || $rp2->{token} ne $token) {
+        unlock_and_close($lfh2);
+        end_report('superseded by another holder', $rp2, 0);
+    }
 
-        my $t2 = time();
-        my $finished2 = all_finished($rp2);
-        if ($t2 < $rp2->{deadline} && !$finished2) {
-            unlock_and_close($lfh2);
-            $known_deadline = $rp2->{deadline};
-            $last_valid = $rp2;
-            next;
-        }
+    # Re-apply step 1 to the re-read record: an extension may have landed
+    # between the unlocked read above and taking the lock.
+    $report_extension_if_advanced->($rp2);
+    $known_deadline = $rp2->{deadline};
+    $last_valid = $rp2;
 
+    my $items2 = (ref $rp2->{items} eq 'ARRAY') ? $rp2->{items} : [];
+    my $tail2 = read_tail($rp2->{transcript_path});
+    my @finished2 = grep { item_status($rp2, $_, $tail2)->{status} eq 'finished' } @$items2;
+
+    my $prune_write_failed = 0;
+    if (@finished2) {
+        my %fin = map { $_ => 1 } @finished2;
+        my @remaining = grep { !$fin{$_} } @$items2;
+        my $rec2 = { %$rp2 };
+        $rec2->{items} = \@remaining;
+        my $ok = write_record_atomic($RECORD_PATH, $rec2);
+        if ($ok) {
+            my $waiting_str = @remaining ? join(', ', @remaining) : 'nothing';
+            for my $fid (@finished2) {
+                out_line(sprintf('%s finished: %s; still waiting on: %s',
+                    BpHook::local_utc_hhmm(int(time())), $fid, $waiting_str));
+            }
+            @last_items = @remaining;
+            $last_valid = $rec2;
+            $items2 = \@remaining;
+        }
+        else {
+            # Edge case (spec 5): a finished line is never printed for a
+            # prune that did not reach disk. M1 (Decision 103): this must
+            # NOT `next` unconditionally -- past the deadline, the release
+            # still has to happen this tick (on the un-pruned record), or a
+            # holder whose disk write keeps failing loops forever instead of
+            # ever releasing.
+            $prune_write_failed = 1;
+        }
+    }
+
+    my $now_empty = (!$prune_write_failed && scalar(@$items2) == 0);
+    my $t2 = time();
+    my $deadline_now = ($t2 >= $rp2->{deadline});
+
+    if ($now_empty) {
         unlink($RECORD_PATH);
         unlock_and_close($lfh2);
-        end_report(
-            ($t2 >= $rp2->{deadline})
-                ? "hold ended at the deadline for session $SID8."
-                : "hold ended: every held item finished (session $SID8).",
-            $rp2,
-            0,
-        );
+        end_report('every held item finished', $last_valid, 0);
+    }
+    elsif ($deadline_now) {
+        unlink($RECORD_PATH);
+        unlock_and_close($lfh2);
+        end_report('deadline reached', $last_valid, 0);
+    }
+    else {
+        unlock_and_close($lfh2);
+        next;
     }
 }
 

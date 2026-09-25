@@ -51,7 +51,7 @@ First step, before Preflight: `butler-continuity on --role driver`. Arms the ses
 Every dispatch prompt carries one line `Ledger: .ccpraxis-local-data/blueprints/<blueprint>/packages/<package>.md` (the `blueprint` and `package` of `run-package`, data-dir-relative).
 With more than one package in flight, a dispatch without exactly one such line naming an in-flight package is denied, and the denial lists the valid lines.
 Never dispatch with `subagent_type: fork`; launch a fresh subagent with a self-contained prompt instead.
-Before a turn ends with background workers or a pause running: `butler-hold <id> [<id> ...]` with `run_in_background: true`, once (re-running it extends the one holder).
+Before a turn ends with background workers or a pause running: `butler-hold <id> [<id> ...]` with `run_in_background: true` only when `butler-continuity status` shows `holder: none`; while one is already running, run `butler-hold <new id>` in the foreground instead, which extends it and returns at once.
 When the holder exits, act on its report and hold again for ids still running.
 At `done`, or when the operator says stop: `butler-continuity off --reason '<what is done>'`.
 A denied stop prints commands carrying a stop token; run them as printed.

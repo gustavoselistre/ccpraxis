@@ -391,10 +391,20 @@ second writer never produces two tickets for one call:
 - File: `<state>/tickets/<k>/<session_id>.<tool_use_id>.json`, for example
   `{"session_id":"abb7e549-0e1f-4c1b-9a53-0d3b5a3c7f10","tool_use_id":"toolu_01HG32t2hGKSSJK7U3qVvWJm","agent_id":null,"operator":false,"background":true,"transcript_path":"C:/Users/André/.claude/projects/C--Development-ccpraxis/abb7e549-....jsonl","cwd":"C:/Development/ccpraxis","at":1790212345}`.
 - `take_ticket` reads the one directory `tickets/<k>/`, deletes entries older than 30 s, and then:
-  exactly one entry left is claimed by an atomic rename, read and deleted; none returns undef; two or
-  more returns `'ambiguous'` and claims nothing. There is no age order and no tie-break. Two sessions
-  that issue the same command inside 30 s get a refusal, never each other's binding. A ticket orphaned
-  by a refused permission prompt or a sibling hook's deny dies within 30 s.
+  none left returns undef; exactly one entry left is claimed by an atomic rename, read and deleted.
+  Two or more left are ambiguous ONLY when they span more than one `session_id`, or one `session_id`
+  with differing `agent_id` (undef counts as its own value; a main-thread call and a subagent call
+  never merge) -- that case returns `'ambiguous'` and claims nothing. Two sessions that issue the
+  same command inside 30 s get a refusal, never each other's binding. Same-session, same-agent
+  duplicates (task 50: a `butler-hold` call denied by another `PreToolUse` guard leaves its ticket,
+  and an identical retry adds another) instead bind: every one of them is claimed (rename, read,
+  delete; an entry another process claimed first is skipped, not fatal), and one hashref is built
+  from all of them -- base record = the claimed entry with the greatest `at` (ties broken by file
+  name, lexically last); `operator` true only if every claimed entry has `operator` true (a stale
+  ticket can never upgrade a call to operator); `background` = the base record's value, except that
+  another claimed entry sharing the SAME greatest `at` with a different `background` forces the
+  conservative `false`. A ticket orphaned by a refused permission prompt or a sibling hook's deny
+  dies within 30 s.
 - Residual, stated rather than hidden: if this call's own hook wrote nothing (a hook failure) while
   another session's identical, never-run call left the only live ticket in the same 30 s, the command
   takes that ticket. That needs two independent faults, and it affects one command.
@@ -614,44 +624,66 @@ exits 1. If the ticket carries an `agent_id`, it prints
 
 - A holder is running when the record's deadline is in the future and its process passes the pid
   check below. Then the command sets `items` to the old items plus the new ones (order kept, no
-  duplicates) and `deadline` to now + 3000 s, rewrites the record, prints
-  `extended holder of session abb7e549 until 02:03Z: a2f2aacc903afc6ac, bsp949ih1`, and exits 0.
-  Extending works from a foreground call too.
+  duplicates), `held` to the old `held` (or old `items`, when a record has neither field yet) plus
+  any ids not already in it (order kept, never pruned -- it is every id this holder instance was
+  ever asked to hold, used only for the exit report), `ext_seq` to (old `ext_seq` // 0) + 1, and
+  `deadline` to now + 3000 s, rewrites the record, and prints, from the EXTENDING process's own
+  stdout, exactly one line:
+  `extended the running holder (pid 832282) until 20:20 (18:20Z); this call exits now, the holder
+  keeps waiting`, then exits 0. Extending works from a foreground call too -- indeed the skills tell
+  an agent to extend in the foreground while a holder is already running, and background only to
+  start the first one (`butler-continuity status` shows `holder: none`).
 - Otherwise this process becomes the holder, unless its ticket says `"background":false`, in which
   case it prints `butler-hold: start it with run_in_background: true.` and exits 1. It writes the
   record with a fresh random `token`, its own `pid` (`$$`) and `fp`, the SHA-1 of the bytes of
-  `/proc/$$/cmdline` read right after start, and prints
-  `holding session abb7e549 until 02:03Z: a2f2aacc903afc6ac`. Then it loops. Every 30 s it re-reads the
-  record, which picks up extensions. It stops when `deadline` passes, when the record is gone, or when
-  the record carries another token (superseded).
+  `/proc/$$/cmdline` read right after start, `items` = `held` = the argv ids, `ext_seq` = 0, and
+  prints `20:20 (18:20Z) holding session abb7e549 until 20:35 (18:35Z): a2f2aacc903afc6ac,
+  bsp949ih1`. Then it loops.
 
 ```
 holder/abb7e549-0e1f-4c1b-9a53-0d3b5a3c7f10.json
 {"session_id":"abb7e549-...","token":"9f2c41d07ab3e855","pid":832282,"fp":"3b1f...e09a",
- "items":["a2f2aacc903afc6ac","bsp949ih1"],"started_at":1790212345,"deadline":1790215345,
+ "items":["a2f2aacc903afc6ac","bsp949ih1"],"held":["a2f2aacc903afc6ac","bsp949ih1"],"ext_seq":0,
+ "started_at":1790212345,"deadline":1790215345,
  "transcript_path":"C:/Users/André/.claude/projects/C--Development-ccpraxis/abb7e549-....jsonl"}
 ```
 
-**Exit.** At the deadline the holder takes `holder/<sid>.lock`, re-reads the record, and goes back to
-looping if an extension moved the deadline. Otherwise it removes the record if the token is still its
-own, releases the lock, prints one line per item, and exits 0. If the record is gone because `off`
-removed it, it prints `continuity is off; holder ended.` and exits 0 at its next tick. On SIGTERM,
-SIGINT or SIGHUP it prints the item lines and exits 143, and it leaves the record in place: the pid
-check makes the record dead for an interactive session, and a headless coordinator keeps the record it
-needs (see Headless coordinators). Item lines:
+**Every time the running holder prints is a pair, `HH:MM (HH:MMZ)`** -- `BpHook::local_utc_hhmm`
+(package 23): local half from `localtime`, UTC half from `gmtime`, both from the same integer
+epoch, both evaluated at print time. No zone is hard-coded, `$ENV{TZ}` is never assigned, and no
+zone NAME/abbreviation (`%Z`) is ever printed (Git for Windows derives an abbreviation from the
+Windows zone name, which is how "W. Europe Standard Time" became "WEST").
+
+**The running holder is not silent between become and exit.** Every 30 s it re-reads the record and,
+in order: (1) if `ext_seq` advanced since its last report, one coalesced line
+`<T> extended until <D>; added: <ids>` (or `; no new ids`); (2) for every id in `items` whose status
+(evidence below) is now `finished`, under the lock, one line each
+`<T> finished: <id>; still waiting on: <remaining ids>` (or `: nothing`), and those ids are removed
+from `items` (never from `held`) so `butler-continuity status` stops listing them; a quiet tick (no
+extension, no finish) writes nothing, so the record file stays byte-identical. It exits when
+`items` is empty after pruning, or at the deadline, or when the record is gone (`off`) or carries
+another token (superseded), or on SIGTERM/SIGINT/SIGHUP.
+
+**Exit.** It prints `<T> released: <reason>` where `<reason>` is exactly one of `deadline reached`,
+`every held item finished`, `continuity is off`, `superseded by another holder`, `killed by a
+signal`, then one line per id of `held` (fallback `items`, for a record written before this field
+existed), in `held` order, and exits. On `deadline reached` or `every held item finished` it removes
+the record first. On `continuity is off` or `superseded by another holder` the record is already
+gone or already someone else's. On SIGTERM/SIGINT/SIGHUP it exits 143 and leaves the record in
+place: the pid check makes the record dead for an interactive session, and a headless coordinator
+keeps the record it needs (see Headless coordinators). Item lines:
 
 ```
 a2f2aacc903afc6ac finished
-bsp949ih1 running, last activity 01:51Z
+bsp949ih1 still running (last activity 2026-09-25T01:51:00Z)
 bq7x2 unknown
 ```
 
 "Finished" means the session transcript (`transcript_path`, tail-read, at most 1 MiB) holds a
-`<task-notification>` naming the id with a terminal status. "Last activity" for a subagent is the
-mtime of `<dirname(transcript_path)>/<session_id>/subagents/agent-<id>.jsonl` (harness-facts (c)).
-For a background task it is the mtime of its output file when that path appears in the transcript. An
-id that resolves to neither is `unknown`, and the command never fails on it. Item status is read only
-at exit.
+`<task-notification>` naming the id with a terminal status. "Still running" for a subagent carries
+the mtime of `<dirname(transcript_path)>/<session_id>/subagents/agent-<id>.jsonl` (harness-facts
+(c)). For a background task it is the mtime of its output file when that path appears in the
+transcript. An id that resolves to neither is `unknown`, and the command never fails on it.
 
 **Liveness at Stop**, `holder_live($sid, $p)`. All of these must hold:
 
