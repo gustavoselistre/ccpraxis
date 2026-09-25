@@ -1,7 +1,7 @@
 # Butler hook architecture
 
-The target design for butler's hooks, written by package 02 of blueprint `hook-continuity-remake`.
-Packages 03-16 implement it. After the cutover, package 16 owns this file and its coverage test
+The design for butler's hooks, written by package 02 of blueprint `hook-continuity-remake` and
+implemented by packages 03-16. Package 16 owns this file and its coverage test
 (`plugins/butler/tests/t/hook-architecture-coverage.t`) and keeps both in step with `hooks/`.
 
 The system in one paragraph: every hook is a short shell file that execs one wrapper, and the wrapper
@@ -34,7 +34,8 @@ Evidence: `plugins/butler/docs/harness-facts.md` (Claude Code 2.1.280). Each fac
 
 Every regular file directly in `plugins/butler/hooks/` and every hook registration in
 `plugins/butler/hooks/hooks.json` and `.claude/settings.json` has one row below (Decision 14). Package 16
-flattened the new hooks from `hooks/next/` and `hooks/next/guards/` straight into `hooks/` (Decision 40)
+flattened the new hooks from its pre-cutover staging tree (a top-level batch and a `guards/`
+sub-batch) straight into `hooks/` (Decision 40)
 and rewrote both registration files to the guarded command form, leaving exactly one Stop entry across
 both files (Decision 5) and dropping every retired script (Decision 6). Every row below carries a
 "keep" verdict now that the flatten and the registration rewrite have both landed (Decision 38: each
@@ -74,43 +75,43 @@ completion still clears its writer marker.
 
 ### file: arm-on-entry.sh
 verdict: keep
-reason: Flattened straight from hooks/next/ by package 16's batch B; it still arms the calling session on a real director call, unchanged from package 03's build.
+reason: Package 16 flattened this file from the pre-cutover staging tree, in batch B; it still arms the calling session on a real director call, unchanged from package 03's build.
 
 ### file: bind-dispatch.sh
 verdict: keep
-reason: Flattened from hooks/next/ by package 16; it still records or denies the tool_use_id binding for Task and Agent dispatch, unchanged from package 12's build.
+reason: Package 16 flattened this file from the pre-cutover staging tree; it still records or denies the tool_use_id binding for Task and Agent dispatch, unchanged from package 12's build.
 
 ### file: context-ceiling.sh
 verdict: keep
-reason: Flattened from hooks/next/guards/ by package 16; it still runs the merged hard-ceiling and soft-ceiling guard for coordinators on both PreToolUse and PostToolUse.
+reason: Package 16 flattened this file from the pre-cutover staging tree's guards sub-batch; it still runs the merged hard-ceiling and soft-ceiling guard for coordinators on both PreToolUse and PostToolUse.
 
 ### file: continuity-off-check.sh
 verdict: keep
-reason: Flattened from hooks/next/ by package 16; it still writes the ticket for a real butler-continuity or butler-hold invocation, unchanged from package 04's build.
+reason: Package 16 flattened this file from the pre-cutover staging tree; it still writes the ticket for a real butler-continuity or butler-hold invocation, unchanged from package 04's build.
 
 ### file: gate-shutdown.sh
 verdict: keep
-reason: Flattened from hooks/next/guards/ by package 16; it still denies new work and worksite edits under a fleet stop file, on the merged edit-tools-plus-dispatch matcher.
+reason: Package 16 flattened this file from the pre-cutover staging tree's guards sub-batch; it still denies new work and worksite edits under a fleet stop file, on the merged edit-tools-plus-dispatch matcher.
 
 ### file: guard-ask-operator.sh
 verdict: keep
-reason: Flattened from hooks/next/guards/ by package 16; it still refuses AskUserQuestion while unattended work runs and queues the question in the legacy store.
+reason: Package 16 flattened this file from the pre-cutover staging tree's guards sub-batch; it still refuses AskUserQuestion while unattended work runs and queues the question in the legacy store.
 
 ### file: guard-bash.sh
 verdict: keep
-reason: Flattened from hooks/next/guards/ by package 16; it still carries the merged coordinator, headless-background, judge-checks and validation-interlock Bash denials in one process.
+reason: Package 16 flattened this file from the pre-cutover staging tree's guards sub-batch; it still carries the merged coordinator, headless-background, judge-checks and validation-interlock Bash denials in one process.
 
 ### file: guard-blueprint-write.sh
 verdict: keep
-reason: Flattened from hooks/next/guards/ by package 16; it still denies direct blueprint.md edits and hand-written package ledgers, plus the case and 8.3-alias rule package 16 added in batch A.
+reason: Package 16 flattened this file from the pre-cutover staging tree's guards sub-batch; it still denies direct blueprint.md edits and hand-written package ledgers, plus the case and 8.3-alias rule package 16 added in batch A.
 
 ### file: guard-git-mutations.sh
 verdict: keep
-reason: Flattened from hooks/next/guards/ by package 16; it still denies destructive git under the same two registrations this repo has always run, hooks.json and settings.json.
+reason: Package 16 flattened this file from the pre-cutover staging tree's guards sub-batch; it still denies destructive git under the same two registrations this repo has always run, hooks.json and settings.json.
 
 ### file: guard-writes.sh
 verdict: keep
-reason: Flattened from hooks/next/ by package 16; it still checks write-set containment and role separation for the driver and each bound subagent, unchanged from package 13's build.
+reason: Package 16 flattened this file from the pre-cutover staging tree; it still checks write-set containment and role separation for the driver and each bound subagent, unchanged from package 13's build.
 
 ### file: hooks.json
 verdict: keep
@@ -118,23 +119,23 @@ reason: It remains the plugin's hook registry, rewritten by package 16 to the ta
 
 ### file: ledger-guard.sh
 verdict: keep
-reason: Flattened from hooks/next/ by package 16; it still validates the resulting content of a package-ledger write, unchanged from package 13's build.
+reason: Package 16 flattened this file from the pre-cutover staging tree; it still validates the resulting content of a package-ledger write, unchanged from package 13's build.
 
 ### file: run-hook.sh
 verdict: keep
-reason: Flattened from hooks/next/ by package 16; it stays the one bash-only entry wrapper every hook execs, unchanged from package 03's build, and its own relative script lookup already resolves from the flattened hooks/ directory.
+reason: Package 16 flattened this file from the pre-cutover staging tree; it stays the one bash-only entry wrapper every hook execs, unchanged from package 03's build, and its own relative script lookup already resolves from the flattened hooks/ directory.
 
 ### file: stop-gate.sh
 verdict: keep
-reason: Flattened from hooks/next/ by package 16; it remains the one Stop gate for the whole plugin, unchanged from package 06's build, now the only Stop registration in either file.
+reason: Package 16 flattened this file from the pre-cutover staging tree; it remains the one Stop gate for the whole plugin, unchanged from package 06's build, now the only Stop registration in either file.
 
 ### file: track-dispatch.sh
 verdict: keep
-reason: Flattened from hooks/next/guards/ by package 16; it still tracks the one write-capable worker for coordinators and armed drivers, now also registered on SubagentStop per package 16's carried note.
+reason: Package 16 flattened this file from the pre-cutover staging tree's guards sub-batch; it still tracks the one write-capable worker for coordinators and armed drivers, now also registered on SubagentStop per package 16's carried note.
 
 ### file: wait-shape-guard.sh
 verdict: keep
-reason: Flattened from hooks/next/guards/ by package 16; it still denies the four polling pathologies for coordinators, with the repeat detector folded in from package 14's build.
+reason: Package 16 flattened this file from the pre-cutover staging tree's guards sub-batch; it still denies the four polling pathologies for coordinators, with the repeat detector folded in from package 14's build.
 
 ### registration: hooks.json PreToolUse [Bash] guard-bash.sh
 verdict: keep
@@ -210,7 +211,7 @@ reason: This repo keeps its unconditional protection against destructive git, ru
 
 ## BpHook core API
 
-Package 03 builds `plugins/butler/scripts/BpHook.pm` and `plugins/butler/hooks/next/run-hook.sh`.
+Package 03 builds `plugins/butler/scripts/BpHook.pm` and `plugins/butler/hooks/run-hook.sh`.
 The core is the only code that decides "is this session running butler work" (Decision 3). Every
 hook reads that answer through it, and none asks whether any drive is active in the project, which
 was the defect behind bug 20260922-210421-0468. Everything below is tested in-process in
@@ -359,13 +360,10 @@ rules. A subagent's director call arms nothing and is denied in a driving sessio
 subagent's dispatch is denied in a driving session (bind-dispatch). A subagent's
 `butler-continuity on|off|silence` and `butler-hold` are refused when its ticket carries an `agent_id`.
 
-Harness-facts (a) measured `agent_id` only for `general-purpose` subagents, not for forks. **Package 03
-obligation:** before any rule relies on it, capture one fork's PreToolUse with
+Harness-facts (a) measured `agent_id` only for `general-purpose` subagents, not for forks. Package 03
+measured this before any rule relied on it, capturing one fork's PreToolUse with
 `plugins/butler/scripts/bp-hook-probe.pl` in a nested `claude -p` in a scratch project (the Decision 28
-method) and record in its ledger whether `agent_id` is present. If it is, the rules above stand. If it
-is not, package 12's bind-dispatch also denies, in a driving session, any main-thread Agent dispatch
-whose `tool_input.subagent_type` is `fork`, with one line:
-`No fork dispatch while this session drives; name a subagent type instead.`
+method): `agent_id` is present, so the rules above stand unconditionally.
 
 ### Command binding: tickets and stop tokens
 
@@ -548,13 +546,15 @@ a reporter at its first step, and any other session "only via /butler:continuity
 self-arm". For a manual session after the operator's own `/clear`, the operator re-arms with
 `/butler:continuity on`. After a carry-over, the carry-over skill prose tells the fresh session to run
 `butler-continuity on` when the work was armed. The old id's arm file is not a live session. It stays
-until its transcript is gone and stops holding the wake-lock 12 h after its last stop. No SessionStart
-or SessionEnd hook is registered.
+until its transcript is gone, and it stops holding the wake-lock once its transcript has gone an hour
+with no activity (Decision 53). No SessionStart or SessionEnd hook is registered.
 
-**Wake-lock (Decision 18).** `BpContinuityLease.pm` (package 04) holds the lock while any `armed/*` file
-was touched by a Stop gate run in the last 12 h, and also, until package 16, while the old
-`.continuity-active` registry says so. The 12 h is only the lease's view of activity: it never deletes
-a file and never changes what `is_armed` answers. Its refresher daemon becomes the internal verb
+**Wake-lock (Decision 18, Decision 53).** `BpContinuityLease.pm` (package 04, rewired by package 16) holds the lock
+while an armed session's transcript was written in the last hour. It no longer reads the old
+`.continuity-active` registry, which package 16 retired. The one-hour window is safe because the
+holder's fixed 50-minute timeout wakes a waiting session (which writes its transcript) before the hour
+runs out; it is only the lease's view of activity: it never deletes a file and never changes what
+`is_armed` answers. Its refresher daemon becomes the internal verb
 `butler-continuity lease --daemon`, which also runs `gc_sessions()`. `keep-awake.ps1` is untouched.
 
 **Statusline contract (package 10).** `scripts/statusline.pl` resolves the root through
@@ -718,7 +718,7 @@ statusline badge (package 10) reads the per-session `off/` and `silence/` files,
 
 ## Stop gate denial text
 
-One Stop hook (Decision 5): `plugins/butler/hooks/next/stop-gate.sh`, logic in
+One Stop hook (Decision 5): `plugins/butler/hooks/stop-gate.sh`, logic in
 `plugins/butler/scripts/BpHook/StopGate.pm` (package 06). The only ways past it are a live holder, or
 the off and silence commands, each with a reason (Decision 1, Decision 6). Exact text when an armed
 non-coordinator session stops with no live holder and no silence (Decision 8: at most 8 lines, the
@@ -787,7 +787,7 @@ the gate fails open.
 Package 04 owns both halves (Decision 37). The check is a hook, not something the agent can supply
 as an argument:
 
-off-check: plugins/butler/hooks/next/continuity-off-check.sh
+off-check: plugins/butler/hooks/continuity-off-check.sh
 
 Its logic lives in the module BpHook::ContinuityOffCheck, at plugins/butler/scripts/BpHook/ContinuityOffCheck.pm,
 which is a re-scope request for package 04 (see Re-scope requests), in line with Decision 35's one
@@ -862,20 +862,21 @@ honours `CCPRAXIS_NO_WAKELOCK` exactly as `bp-continuity.pl` does, so tests neve
 ## Concurrency binding store and switch
 
 Decision 16: the director tracks a set of in-flight packages, every dispatch is bound to one package by
-`tool_use_id`, and write guards apply the package of the subagent making the edit. Decision 31: behind
-the switch, the director hands out further disjoint ready packages.
+`tool_use_id`, and write guards apply the package of the subagent making the edit. Decision 31: the
+director hands out further disjoint ready packages.
 
 binding-store: <project>/.ccpraxis-local-data/.drive-solo/bindings/<tool_use_id>.json
-concurrency-switch: BUTLER_CONCURRENCY
+concurrency-switch: none (removed by package 16; concurrent hand-out is unconditional)
 
-**The switch (Decision 19).** It is on only when the environment variable `BUTLER_CONCURRENCY` equals
-`1`. Unset or any other value is off. Three places read it: `plugins/butler/scripts/bp-drive-next.pl`
-(package 11: concurrent hand-out), and `plugins/butler/scripts/bp-orchestrator.pl` and
-`plugins/butler/scripts/bp-launch.sh` (package 08: the fleet holder path). No hook reads it. The
-one-ledger dispatch rule only bites when more than one package is in flight, and only the switch can
-make that happen. With the switch off, all three behave exactly as today. Package 16 turns it on by
-deleting the off branches and the variable from the three readers. The new path becomes
-unconditional, and the old fleet path and `current.json` go with them.
+**The switch (Decision 19), removed by package 16.** Before the cutover, an environment variable
+`BUTLER_CONCURRENCY` gated concurrent hand-out: on only when it equalled `1`, off otherwise. Four
+places read it, not three: `plugins/butler/scripts/bp-drive-next.pl` (package 11: concurrent
+hand-out), `plugins/butler/scripts/bp-orchestrator.pl` and `plugins/butler/scripts/bp-launch.sh`
+(package 08: the fleet holder path), and `BpHook/BindDispatch.pm` (the switch-off "bind the first
+member instead of denying" branch). No hook reads it now. The one-ledger dispatch rule only bites
+when more than one package is in flight, and only concurrent hand-out can make that happen. Package
+16 deleted the off branches and the variable from all four readers, so the concurrent path is now
+unconditional, and the old fleet path and `current.json` are gone with them.
 
 **In-flight set (package 11):** `<data>/.drive-solo/inflight.json`, written only by the director,
 atomically:
@@ -888,12 +889,11 @@ atomically:
 
 A package is added on `run-package`. It is removed by the first director call that finds its ledger
 terminal (done, blocked, parked or dropped). The file is project-level, so it survives a new session
-id. As with today's `current.json`, one driving session per project is the supported configuration. A
-package whose driver crashed stays in flight until its ledger turns terminal, which is correct, because
-the next driver resumes it. With the switch off the director still records it, never with more than one
-entry, and keeps writing `current.json` until package 16. With the switch on, `ready_packages` receives
-the real in-flight set instead of `[]`, and a further ready package is handed out when
-`write_sets_overlap` is false against every in-flight one.
+id. One driving session per project is the supported configuration. A package whose driver crashed
+stays in flight until its ledger turns terminal, which is correct, because the next driver resumes it.
+The director never creates, reads or removes `current.json`; package 16 deleted that path along with
+the switch. `ready_packages` receives the real in-flight set instead of `[]`, and a further ready
+package is handed out when `write_sets_overlap` is false against every in-flight one.
 
 **Binding store (package 12).** One lookup file per dispatch, `bindings/<tool_use_id>.json`, written
 atomically, so a write guard's lookup is one file open, never a scan. The `tool_use_id` must match
@@ -907,7 +907,7 @@ than 7 days are removed by bind-dispatch when it writes a new one.
 {"tool_use_id":"toolu_01HG32t2hGKSSJK7U3qVvWJm","blueprint":"hook-continuity-remake","package":"03-hook-core","subagent_type":"bp-implementer","session_id":"abb7e549-...","source":"bind-dispatch","at":1790212400}
 ```
 
-**Dispatch rule** (`plugins/butler/hooks/next/bind-dispatch.sh`, PreToolUse Task|Agent):
+**Dispatch rule** (`plugins/butler/hooks/bind-dispatch.sh`, PreToolUse Task|Agent):
 
 - Coordinator: bind to `BP_BLUEPRINT`/`BP_PACKAGE`, never deny.
 - Armed driver, main thread. With 0 in flight, allow and record nothing. With 1, bind to it. With 2 or
@@ -919,12 +919,10 @@ than 7 days are removed by bind-dispatch when it writes a new one.
     .ccpraxis-local-data/blueprints/hook-continuity-remake/packages/11-director-inflight-set.md
   ```
   (one header line, at most 4 ledgers, then `  ...and <n> more`).
-- Armed driver, `agent_id` present (any subagent, fork included): deny
-  `Only the driving session dispatches workers; a subagent may not.`
 - Any other session: allow, record nothing. A denial never happens in an unarmed or non-driving
   session.
-- If `inflight.json` is missing (a director older than package 11), the single package in
-  `current.json` stands in for the set.
+- If `inflight.json` is missing or does not parse, the in-flight set is empty (package 16 deleted the
+  `current.json` fallback along with the switch).
 
 **Write-guard resolution (package 13)**, for `guard-writes.sh` and `ledger-guard.sh` under `next/`:
 
@@ -942,12 +940,12 @@ than 7 days are removed by bind-dispatch when it writes a new one.
    more, the union, and the refusal names every in-flight package. With 0, allow.
 5. Anything else: allow.
 
-**Fleet (package 08).** With the switch on, `bp-launch.sh` starts coordinators with
-`BUTLER_CONCURRENCY=1` exported and `plugins/butler/bin` on `PATH`, so `butler-hold` resolves. The
-coordinator then waits through the holder and stops through the one gate, under the coordinator rule of
-the Holder protocol section. The orchestrator's `runs/.paused`, `runs/.shutdown` and
-`runs/<pkg>.force-stop` behaviour is unchanged. Neither file calls `bp-watch.pl` today. Fleet use of
-watchers lives in coordinator-protocol prose, which package 15 rewrites.
+**Fleet (package 08).** `bp-launch.sh` starts coordinators with `plugins/butler/bin` on `PATH`
+unconditionally (package 16 removed the `BUTLER_CONCURRENCY` export along with the switch), so
+`butler-hold` resolves. The coordinator then waits through the holder and stops through the one gate,
+under the coordinator rule of the Holder protocol section. The orchestrator's `runs/.paused`,
+`runs/.shutdown` and `runs/<pkg>.force-stop` behaviour is unchanged. Neither file calls `bp-watch.pl`
+today. Fleet use of watchers lives in coordinator-protocol prose, which package 15 rewrote.
 
 ## Guard message budgets and early exits
 
@@ -1159,10 +1157,11 @@ What package 16 changes rather than deletes, so the "exact list" above stays exa
   gate-headless-background forbids background Bash in coordinators. The design answers it without
   depending on the unmeasured case: a coordinator's hold counts only alongside a running background
   subagent it names, and a killed holder keeps its record. Package 08 measures the behaviour once.
-- **The wake-lock's 12 hours.** Decision 18 ties the wake-lock to the armed state. With the 12-hour
-  disarm gone, an arm file can outlive its session (a closed terminal, the old id after `/clear`). The
-  lease therefore counts only arm files a Stop gate touched in the last 12 h. That keeps the earlier
-  behaviour for the lock and never disarms anything.
+- **The wake-lock's one-hour window (Decision 53).** Decision 18 ties the wake-lock to the armed
+  state. With disarm-on-timeout gone, an arm file can outlive its session (a closed terminal, the old
+  id after `/clear`). The lease therefore counts only an armed session whose transcript was written in
+  the last hour, safe because the holder's fixed 50-minute timeout wakes a waiting session before the
+  hour runs out. That is only the lease's view of activity; it never disarms anything.
 - **Manual sessions after /clear.** Not a conflict: Decision 2 re-arms drive-solo and reporter sessions
   automatically and leaves every other session to `/butler:continuity on` or self-arm. A new id is a
   new session, so nothing is disarmed.
@@ -1179,7 +1178,7 @@ depend on the variable.
 
 ### D-1
 question: Does /compact change the session id in-process?
-if yes: The compacted session starts with an unarmed id. A drive-solo session re-arms at its next director call, a reporter or manual session must run butler-continuity on again, and the old id's arm file stays until its transcript is gone and stops holding the wake-lock 12 h after its last stop.
+if yes: The compacted session starts with an unarmed id. A drive-solo session re-arms at its next director call, a reporter or manual session must run butler-continuity on again, and the old id's arm file stays until its transcript is gone, no longer holding the wake-lock once its transcript has gone an hour with no activity (Decision 53).
 if no: nothing changes; arm state, holder and silence stay attached to the unchanged id.
 assumed: no
 
@@ -1191,7 +1190,7 @@ assumed: no
 
 ### D-3
 question: Does a carry-over-style clear allocate a new session id?
-if yes: The fresh id starts unarmed. drive-solo re-arms at its first director call (Decision 2), and the carry-over prose tells a reporter or manual session to run butler-continuity on. The old id's arm file stays until its transcript is gone and stops holding the wake-lock 12 h after its last stop.
+if yes: The fresh id starts unarmed. drive-solo re-arms at its first director call (Decision 2), and the carry-over prose tells a reporter or manual session to run butler-continuity on. The old id's arm file stays until its transcript is gone, no longer holding the wake-lock once its transcript has gone an hour with no activity (Decision 53).
 if no: nothing changes; the arm state carries over under the unchanged id and the re-arm call is an idempotent refresh.
 assumed: yes
 

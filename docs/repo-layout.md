@@ -334,6 +334,7 @@ ccpraxis/
 │   │   │       ├── coordinator-death-evidence.t              # platform: any Report 20260917-155539-b6bf, item 2.
 │   │   │       ├── coordinator-death-forensics.t             # platform: linux Oracle for blueprint package 03-deaths-are-diagnosable…
 │   │   │       ├── coordinator-protocol-dispatch-doctrine.t  # platform: any 139 — IMMUTABLE ORACLE for w02's §2.5 edit to…
+│   │   │       ├── cutover-residue-lint.t                    # platform: any
 │   │   │       ├── dag-integrity.t                           # platform: any
 │   │   │       ├── decision-context-split.t                  # platform: any b42 oracle.
 │   │   │       ├── decision-delivery.t                       # platform: any b18-and-park-loop oracle.

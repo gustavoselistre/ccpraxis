@@ -70,11 +70,11 @@ sub rot13 {
 # ---------------------------------------------------------------------------
 # The embedded historical deletion set (ROT13-encoded repo-relative paths).
 # Reconstructed from git history (commit 6638aa8's pristine doc list) plus
-# run-finish-guard-path-letters.t, which the spec's departure 11 says was
-# appended to and removed from the doc within batch B itself, so it never
-# survives to be read back out of the doc at any later commit. "(same path)"
-# successors are excluded on purpose (those files still exist under new
-# content; they are not part of the deletion set).
+# the one path-letters guard test that spec departure 11 says was appended
+# to and removed from the doc within batch B itself, so it never survives to
+# be read back out of the doc at any later commit. "(same path)" successors
+# are excluded on purpose (those files still exist under new content; they
+# are not part of the deletion set).
 # ---------------------------------------------------------------------------
 my @ENCODED_DELETED = (
     q{cyhtvaf/ohgyre/ova/oc-pbagvahvgl.fu},
@@ -277,16 +277,19 @@ subtest 'match routine non-vacuity (E2-1)' => sub {
 
     my $hit_text_1 = 'see hooks/' . $bn_lib;
     my $hit_text_2 = '(' . $bn_stop . ')';
+    my $near_miss_1 = 'bp-' . $bn_lib;                # hyphen before it: not a boundary
+    my $near_miss_2 = 'bp-watch-child.p' . 'l';        # a different, longer basename
+    my $near_miss_3 = 'qr/bp-wat' . 'ch\.pl/';          # an escaped regex, not a bare basename
 
-    ok(line_has_hit($hit_text_1, $bn_lib),  'hits "see hooks/" + lib.sh');
-    ok(line_has_hit($hit_text_2, $bn_stop), 'hits "(" + gate-stop.sh + ")"');
+    ok(line_has_hit($hit_text_1, $bn_lib),  "hits the shared-library fixture ($hit_text_1)");
+    ok(line_has_hit($hit_text_2, $bn_stop), "hits the parenthesised fixture ($hit_text_2)");
 
-    ok(!line_has_hit('bp-lib.sh', $bn_lib),
-        'does not hit "bp-lib.sh" for basename lib.sh (hyphen is not a boundary)');
-    ok(!line_has_hit('bp-watch-child.pl', $bn_watch),
-        'does not hit "bp-watch-child.pl" for basename bp-watch.pl');
-    ok(!line_has_hit('qr/bp-watch\.pl/', $bn_watch),
-        'does not hit the escaped regex qr/bp-watch\.pl/ for basename bp-watch.pl');
+    ok(!line_has_hit($near_miss_1, $bn_lib),
+        "does not hit ($near_miss_1) for the shared-library basename (hyphen is not a boundary)");
+    ok(!line_has_hit($near_miss_2, $bn_watch),
+        "does not hit ($near_miss_2) for the shorter watch-script basename");
+    ok(!line_has_hit($near_miss_3, $bn_watch),
+        "does not hit the escaped regex ($near_miss_3) for the watch-script basename");
 };
 
 subtest 'list parser skips a (same path) line (E2-1)' => sub {
@@ -314,6 +317,74 @@ subtest 'ABSENCE_PINS shape (E2-2)' => sub {
         like($k, qr/\.t\z/, "pin key '$k' is a .t path");
         ok(defined $ABSENCE_PINS{$k} && length($ABSENCE_PINS{$k}), "pin '$k' has a non-empty reason");
     }
+};
+
+# ===========================================================================
+# F-2 (batch F): plugins/butler/docs/hook-architecture.md contains no
+# `hooks/next`, no 12 h / 12-hour lease window, and no "a subagent may not"
+# bind-dispatch rule. Needles are built from concatenated fragments, same
+# convention as the E2-1 fixtures above, so this file's own bytes never
+# spell any of them as a standalone literal.
+# ===========================================================================
+my $F2_HOOKS_NEXT_NEEDLE  = 'hooks' . '/' . 'next';
+my $F2_TWELVE_H_NEEDLE    = '1' . '2' . ' h';
+my $F2_TWELVE_DASH_NEEDLE = '1' . '2' . '-hour';
+# Unique to the bind-dispatch "Armed driver, agent_id present" deny bullet
+# (plugins/butler/docs/hook-architecture.md: "Only the driving session
+# dispatches workers; a subagent may not."); the phrase "a subagent may not"
+# alone also appears in the unrelated butler-hold and butler-continuity
+# refusal lines, which F-2 does not touch.
+my $F2_SUBAGENT_NEEDLE = 'dispatches workers; a subagent may' . ' not';
+
+sub doc_line_hits {
+    my ($text, $needle) = @_;
+    return () unless defined $text;
+    my @hits;
+    my @lines = split /\n/, $text;
+    for my $i (0 .. $#lines) {
+        push @hits, sprintf('%s:%d: %s', $DOC_REL, $i + 1, $lines[$i])
+            if index($lines[$i], $needle) >= 0;
+    }
+    return @hits;
+}
+
+subtest 'F-2 non-vacuity: needle match on inline fixtures' => sub {
+    ok(scalar(doc_line_hits("see $F2_HOOKS_NEXT_NEEDLE for details", $F2_HOOKS_NEXT_NEEDLE)) == 1,
+        'hits a fixture line containing "hooks/next"');
+    ok(scalar(doc_line_hits('see the flattened hooks/ directory for details', $F2_HOOKS_NEXT_NEEDLE)) == 0,
+        'does not hit a fixture line without "hooks/next"');
+
+    ok(scalar(doc_line_hits("lease window: $F2_TWELVE_H_NEEDLE after last stop", $F2_TWELVE_H_NEEDLE)) == 1,
+        'hits a fixture line containing "12 h"');
+    ok(scalar(doc_line_hits('lease window: one hour after last stop', $F2_TWELVE_H_NEEDLE)) == 0,
+        'does not hit a fixture line without "12 h"');
+
+    ok(scalar(doc_line_hits("with the $F2_TWELVE_DASH_NEEDLE lease", $F2_TWELVE_DASH_NEEDLE)) == 1,
+        'hits a fixture line containing "12-hour"');
+    ok(scalar(doc_line_hits('with the one-hour lease', $F2_TWELVE_DASH_NEEDLE)) == 0,
+        'does not hit a fixture line without "12-hour"');
+
+    ok(scalar(doc_line_hits("Only the driving session $F2_SUBAGENT_NEEDLE.", $F2_SUBAGENT_NEEDLE)) == 1,
+        'hits a fixture line containing the bind-dispatch "a subagent may not" rule');
+    ok(scalar(doc_line_hits('only the main session holds; a subagent may not.', $F2_SUBAGENT_NEEDLE)) == 0,
+        'does not hit the unrelated butler-hold refusal line');
+};
+
+subtest 'F-2: hook-architecture.md has none of the three retired phrases' => sub {
+    ok(defined $doc_text, "$DOC_REL is readable") or return;
+
+    my @hooks_next_hits = doc_line_hits($doc_text, $F2_HOOKS_NEXT_NEEDLE);
+    is(scalar(@hooks_next_hits), 0, "$DOC_REL contains no 'hooks/next'")
+        or diag(join("\n", @hooks_next_hits));
+
+    my @twelve_hour_hits = (doc_line_hits($doc_text, $F2_TWELVE_H_NEEDLE),
+                            doc_line_hits($doc_text, $F2_TWELVE_DASH_NEEDLE));
+    is(scalar(@twelve_hour_hits), 0, "$DOC_REL contains no 12 h / 12-hour lease window")
+        or diag(join("\n", @twelve_hour_hits));
+
+    my @subagent_hits = doc_line_hits($doc_text, $F2_SUBAGENT_NEEDLE);
+    is(scalar(@subagent_hits), 0, "$DOC_REL contains no 'a subagent may not' bind-dispatch rule")
+        or diag(join("\n", @subagent_hits));
 };
 
 # ===========================================================================

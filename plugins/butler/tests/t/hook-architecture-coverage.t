@@ -574,7 +574,9 @@ sub coverage_failures {
             push @f, "[C7] missing or empty 'off-check' in H7";
         }
         elsif (defined $pkg_ws) {
-            my %pkg04 = map { $_ => 1 } pkg_entries_matching($pkg_ws, qr/^04-/);
+            # Post-cutover form too: package 16 flattened hooks/next/(guards/) into hooks/.
+            my %pkg04 = map { my $f = $_; $f =~ s{/hooks/next/(?:guards/)?}{/hooks/}; ($_ => 1, $f => 1) }
+                        pkg_entries_matching($pkg_ws, qr/^04-/);
             push @f, "[C7] off-check '$v' is not a package 04-* write_set file entry"
                 unless $pkg04{$v};
         }

@@ -155,7 +155,7 @@ sub run_hook {
     make_path($ti);
     my ($pf, $out_f, $err_f) = ("$ti/payload.json", "$ti/out", "$ti/err");
     write_file($pf, defined $payload ? $payload : '{}');
-    local %ENV = (%CLEAN_ENV, %env,
+    local %ENV = (%CLEAN_ENV, BUTLER_STATE_DIR => fwd("$ROOT/butler-state"), %env,
         HOOKPATH => fwd($hookpath), PFILE => fwd($pf),
         OUTFILE  => fwd($out_f),    ERRFILE => fwd($err_f));
     my $old_cwd;
