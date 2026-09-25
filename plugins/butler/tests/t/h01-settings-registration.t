@@ -64,7 +64,7 @@ pass('A2: hooks.json parses as an object');
 sub settings_template {
     my ($file, $args) = @_;
     $args //= '';
-    return qq{f="\$CLAUDE_PROJECT_DIR/plugins/butler/hooks/$file" ; w="\$CLAUDE_PROJECT_DIR/plugins/butler/hooks/run-hook.sh" ; unset BASH_ENV ; [ -f "\$f" ] && [ -f "\$w" ] || exit 0 ; bash -n "\$f" 2>/dev/null && bash -n "\$w" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash "\$f"$args};
+    return qq{unset BASH_ENV ; f="\$CLAUDE_PROJECT_DIR/plugins/butler/hooks/$file" ; w="\$CLAUDE_PROJECT_DIR/plugins/butler/hooks/run-hook.sh" ; [ -f "\$f" ] && [ -f "\$w" ] || exit 0 ; bash -n "\$f" 2>/dev/null && bash -n "\$w" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash "\$f"$args};
 }
 
 # ===========================================================================
