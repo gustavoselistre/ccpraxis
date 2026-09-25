@@ -57,7 +57,7 @@ and `runs/<pkg>.force-stop`.
 | hooks.json | PreToolUse | Edit\|Write\|MultiEdit\|NotebookEdit | guard-writes.sh, ledger-guard.sh, guard-blueprint-write.sh |
 | hooks.json | PreToolUse | Edit\|Write\|MultiEdit\|NotebookEdit\|Task\|Agent | gate-shutdown.sh |
 | hooks.json | PreToolUse | Task\|Agent | bind-dispatch.sh, track-dispatch.sh |
-| hooks.json | PreToolUse | Task\|Agent\|Bash | context-ceiling.sh |
+| hooks.json | PreToolUse | Task\|Agent\|Bash | context-ceiling.sh, guard-fork.sh |
 | hooks.json | PreToolUse | (none) | wait-shape-guard.sh |
 | hooks.json | PreToolUse | AskUserQuestion | guard-ask-operator.sh |
 | hooks.json | PostToolUse | Task\|Agent | track-dispatch.sh |
@@ -66,7 +66,7 @@ and `runs/<pkg>.force-stop`.
 | hooks.json | Stop | (none) | stop-gate.sh |
 | settings.json | PreToolUse | Bash | guard-git-mutations.sh (sec 2.2 settings form) |
 
-This is 17 hooks.json commands and 1 settings.json command, every one in the guarded registration form
+This is 18 hooks.json commands and 1 settings.json command, every one in the guarded registration form
 of spec 16's section 2.2 (`unset BASH_ENV; f=...; w=.../run-hook.sh; [ -f "$f" ] && [ -f "$w" ] || exit 0;
 bash -n "$f" && bash -n "$w" || exit 0; exec env -u SHELLOPTS bash "$f"`), so a missing or broken script
 or wrapper never blocks (RT-M1), and neither BASH_ENV nor SHELLOPTS reach the hook's own bash (RT-L7).
@@ -104,6 +104,10 @@ reason: Package 16 flattened this file from the pre-cutover staging tree's guard
 ### file: guard-blueprint-write.sh
 verdict: keep
 reason: Package 16 flattened this file from the pre-cutover staging tree's guards sub-batch; it still denies direct blueprint.md edits and hand-written package ledgers, plus the case and 8.3-alias rule package 16 added in batch A.
+
+### file: guard-fork.sh
+verdict: keep
+reason: Package 19 adds this file (Decision 64/90): a PreToolUse guard on Task/Agent/Bash that denies every dispatch whose subagent_type is the literal string fork, overridable once per session by butler-fork-ok.
 
 ### file: guard-git-mutations.sh
 verdict: keep
@@ -180,6 +184,10 @@ reason: Becomes the PreToolUse Task|Agent registration of the merged tracker, in
 ### registration: hooks.json PreToolUse [Task|Agent|Bash] context-ceiling.sh
 verdict: keep
 reason: Becomes the PreToolUse Task|Agent|Bash registration of the merged context-ceiling guard, in the guarded 2.2 form, denying a dispatch or a Bash call past the hard ceiling.
+
+### registration: hooks.json PreToolUse [Task|Agent|Bash] guard-fork.sh
+verdict: keep
+reason: Package 19's own registration (Decision 64/90), in the guarded 2.2 command form, on the same Task|Agent|Bash matcher as context-ceiling.sh so it sees every dispatch and every Bash ticket-writing call.
 
 ### registration: hooks.json PreToolUse [] wait-shape-guard.sh
 verdict: keep
@@ -373,11 +381,13 @@ the second.
 
 **Tickets** (any time, for example arming when no stop is pending). The PreToolUse hook
 `continuity-off-check.sh` writes one ticket per real invocation of `butler-continuity` or `butler-hold`
-whose argv it can predict:
+whose argv it can predict; `guard-fork.sh` is the one and only writer of the third name,
+`butler-fork-ok` (Decision 91) -- `continuity-off-check.sh` is never edited to know about it, so a
+second writer never produces two tickets for one call:
 
 - Key: `k` = lowercase hex SHA-1 (core `Digest::SHA`) of `join("\0", $name, @argv)`, where `$name` is
-  normalised to `butler-continuity` or `butler-hold`. The command computes the same `k` from its own
-  `@ARGV`, so a ticket is found only for the exact same command.
+  normalised to `butler-continuity`, `butler-hold` or `butler-fork-ok`. The command computes the same
+  `k` from its own `@ARGV`, so a ticket is found only for the exact same command.
 - File: `<state>/tickets/<k>/<session_id>.<tool_use_id>.json`, for example
   `{"session_id":"abb7e549-0e1f-4c1b-9a53-0d3b5a3c7f10","tool_use_id":"toolu_01HG32t2hGKSSJK7U3qVvWJm","agent_id":null,"operator":false,"background":true,"transcript_path":"C:/Users/André/.claude/projects/C--Development-ccpraxis/abb7e549-....jsonl","cwd":"C:/Development/ccpraxis","at":1790212345}`.
 - `take_ticket` reads the one directory `tickets/<k>/`, deletes entries older than 30 s, and then:
@@ -416,6 +426,11 @@ denies, and prints it in the denial text:
   any payload that carries an `agent_id` or whose `hook_event_name` is not `Stop`.
 - A token proves the session, never the operator. It is accepted by `butler-continuity off`,
   `butler-continuity silence` and `butler-hold`, and by nothing else.
+
+`butler-fork-ok.pl` uses the same ticket API for its own binding, but has no `--token` path of its
+own (Decision 91 scope: stop tokens are accepted by `butler-continuity off|silence` and `butler-hold`
+only) and refuses outright when no ticket resolves. On success it writes its own one-shot record,
+`fork-ok/<session_id>.json`, consumed by `guard-fork.sh`'s next fork dispatch of that session.
 
 **How a command resolves its binding** (`butler-continuity.pl` and `butler-hold.pl` alike):
 
@@ -707,9 +722,10 @@ One tab-separated line per event, appended with `O_APPEND` by `butler-continuity
 2026-09-25T07:00:00Z	0409cb25-7656-418b-99f3-e9402646f33a	gc	gc	-	transcript gone: C:/Users/André/.claude/projects/x/0409cb25-....jsonl
 ```
 
-Fields: ISO-8601 UTC time, session id, actor (`agent`, `operator` or `gc`), verb (`off`, `silence` or
-`gc`), project root (the ticket `cwd` resolved through `data_dir`, or `-` when the binding was a stop
-token or GC), and reason. Tabs and newlines in the reason become spaces. The reason is capped at 300
+Fields: ISO-8601 UTC time, session id, actor (`agent`, `operator` or `gc`), verb (`off`, `silence`,
+`gc` or `fork-ok`), project root (the ticket `cwd` resolved through `data_dir`, or `-` when the
+binding was a stop token or GC), and reason. `fork-ok` is logged by `butler-fork-ok.pl` (package 19,
+Decision 64) each time it records a fork override. Tabs and newlines in the reason become spaces. The reason is capped at 300
 characters. An agent reason must hold at least two whitespace-separated words, so it is never empty and
 never a single word. Otherwise the command prints
 `butler-continuity: --reason needs at least two words saying why.` and exits 1, and nothing is logged.
@@ -971,6 +987,7 @@ project".
 | guard-blueprint-write.sh | 2 | --pre text:blueprint : exits when the payload text does not contain blueprint |
 | guard-ask-operator.sh | 4 | --pre ledger,armed : exits when BP_LEDGER is unset and armed/<session_id> is absent |
 | track-dispatch.sh | 1 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
+| guard-fork.sh | 3 | --pre text:fork : exits when the payload text does not contain fork |
 
 **Who each rule applies to.** A fork counts as a subagent everywhere.
 
@@ -994,6 +1011,7 @@ project".
 - guard-blueprint-write: every session and caller.
 - guard-ask-operator: coordinator, or any caller in an armed session.
 - track-dispatch: coordinator, and an armed driver's main thread.
+- guard-fork: every session and caller (Decision 64).
 
 Behaviour kept by package 14, and which existing tests each rebuild re-expresses in
 `plugins/butler/tests/t/guards-remake-suite.t` (Decision 26: assertions about a Decision 6 override
