@@ -13,6 +13,7 @@
 # Rule ids below (F, B, N, O, R, P, Q) are the spec's own letters, not
 # invented here -- see specs/15-skills-prose-spec.md section 2.4.
 
+BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
 use strict;
 use warnings;
 use Test::More;
