@@ -276,20 +276,60 @@ my $VALIDATION_RE = qr/
 # validation command from strip_noise's quote/heredoc blanking, so those
 # three shapes must be matched against the RAW command, exactly like
 # GuardBash's own GB-a shellword/carrier escape (spec sec 3.1).
+#
+# 24-interlock-scope B-8/B-9/B-10: the raw-vs-stripped decision now probes
+# the STRIPPED text for a backtick/$(/bare-paren, not the raw command, so a
+# quoted argument (e.g. ledger note text) that merely contains one of those
+# characters does not switch matching to the raw command. Two triggers still
+# force raw matching: is_shell_or_eval_invocation on the raw command
+# (unchanged), and a raw command that carries "<<" together with a backtick
+# or "$(" (an unquoted heredoc body still expands at shell level even though
+# strip_noise blanks it).
 sub _validation_shaped {
     my ($cmd) = @_;
     my $vtext;
+    my $stripped = BpHook::Guards::Shell::strip_noise($cmd);
+    my $probe = (defined $stripped && length $stripped) ? $stripped : $cmd;
     if (BpHook::Guards::Common::is_shell_or_eval_invocation($cmd)
-        || BpHook::Guards::Common::line_match(qr/\x60|\$\(|\(/, $cmd))
+        || BpHook::Guards::Common::line_match(qr/\x60|\$\(|\(/, $probe)
+        || (BpHook::Guards::Common::line_match(qr/<</, $cmd)
+            && BpHook::Guards::Common::line_match(qr/\x60|\$\(/, $cmd)))
     {
         $vtext = $cmd;
     }
     else {
-        my $stripped = BpHook::Guards::Shell::strip_noise($cmd);
-        $vtext = (defined $stripped && length $stripped) ? $stripped : $cmd;
+        $vtext = $probe;
     }
+    $vtext = _neutralize_perl_syntax_checks($vtext);
     $vtext =~ s/\\\n/ /g;
     return BpHook::Guards::Common::line_match($VALIDATION_RE, $vtext);
+}
+
+# 24-interlock-scope B-7: a perl invocation carrying a syntax-check flag
+# (an option token, between "perl" and its script operand, matching
+# ^-[wWXtT]*c[wWXtT]*$) is never validation-shaped. Judged per invocation --
+# "perl -c a.t && perl b.t" is still validation-shaped through its second
+# invocation, because the neutralisation only blanks the ONE matched perl
+# invocation that carries the flag.
+my $PERL_INVOCATION_RE = qr/(^|[;&|])([\x20\t]*)perl\b((?:[\x20\t]+[^\s;&|]+)*)/m;
+
+sub _neutralize_perl_syntax_checks {
+    my ($text) = @_;
+    return $text unless defined $text && length $text;
+    my $out = $text;
+    $out =~ s{$PERL_INVOCATION_RE}{
+        my ($sep, $ws, $rest) = ($1, $2, $3);
+        my $has_c = 0;
+        for my $tok (split /[\x20\t]+/, $rest) {
+            next unless length $tok;
+            last unless $tok =~ /^-/;
+            if ($tok =~ /^-[wWXtT]*c[wWXtT]*$/) { $has_c = 1; last }
+        }
+        $has_c
+            ? ($sep . (' ' x (length($ws) + length('perl') + length($rest))))
+            : ($sep . $ws . 'perl' . $rest);
+    }ge;
+    return $out;
 }
 
 # tree-wide scan (b), shared by the coordinator and driver branches.
@@ -365,6 +405,103 @@ sub _tree_check {
     return undef;
 }
 
+# ---------------------------------------------------------------------------
+# 24-interlock-scope Decision 85/92 -- write-set overlap (mirrors
+# bp-ledger.pl's _widen_ws_prefixes/_widen_prefix_related exactly, AC-15) and
+# binding resolution (spec sec 2.2). Pure/private helpers plus the one
+# public entry point.
+# ---------------------------------------------------------------------------
+sub _widen_ws_prefixes {
+    my ($paths) = @_;
+    my @out;
+    return @out unless ref $paths eq 'ARRAY';
+    for my $p (@$paths) {
+        next unless defined $p && !ref($p) && length $p;
+        (my $q = $p) =~ s/\*.*$//;
+        $q =~ s{/+$}{};
+        push @out, $q;
+    }
+    return @out;
+}
+
+sub _widen_ws_is_ci {
+    return ($^O =~ /^(?:msys|MSWin32|cygwin|darwin)$/) ? 1 : 0;
+}
+
+sub _widen_ws_fold {
+    my ($s) = @_;
+    return $s unless _widen_ws_is_ci();
+    (my $v = $s) =~ tr/A-Z/a-z/;
+    return $v;
+}
+
+sub _widen_prefix_related {
+    my ($a, $b) = @_;
+    $a = _widen_ws_fold($a);
+    $b = _widen_ws_fold($b);
+    return 1 if $a eq $b;
+    return 1 if $a eq '' || $b eq '';
+    return 1 if index("$b/", "$a/") == 0;
+    return 1 if index("$a/", "$b/") == 0;
+    return 0;
+}
+
+# write_sets_overlap(\@ws_a, \@ws_b) -> 1 | 0. Pure: never touches the
+# filesystem, never dies. A non-arrayref argument counts as an empty list.
+sub write_sets_overlap {
+    my ($ws_a, $ws_b) = @_;
+    my @pa = _widen_ws_prefixes($ws_a);
+    my @pb = _widen_ws_prefixes($ws_b);
+    for my $x (@pa) {
+        for my $y (@pb) {
+            return 1 if _widen_prefix_related($x, $y);
+        }
+    }
+    return 0;
+}
+
+sub _valid_member_name {
+    my ($v) = @_;
+    return 0 unless defined $v && !ref($v) && length $v;
+    return 0 unless $v =~ /^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/;
+    return 0 if index($v, '..') >= 0;
+    return 1;
+}
+
+# _resolve_binding($data_n, $tuid) -> { blueprint, package, write_set =>
+# [entries] } | undef. Spec sec 2.2. Never dies; any parse/read failure is
+# an undef (conservative fallback upstream).
+sub _resolve_binding {
+    my ($data_n, $tuid) = @_;
+    return undef unless defined $tuid && $tuid =~ $TUID_NAME_RE;
+    my $braw = _read_bytes("$data_n/.drive-solo/bindings/$tuid.json");
+    return undef unless defined $braw && length $braw;
+    my $rec = eval { JSON::PP->new->utf8->decode($braw) };
+    return undef unless ref $rec eq 'HASH';
+    my ($bp, $pkg) = ($rec->{blueprint}, $rec->{package});
+    return undef unless _valid_member_name($bp) && _valid_member_name($pkg);
+
+    my $lraw = _read_bytes("$data_n/blueprints/$bp/packages/$pkg.md");
+    return undef unless defined $lraw && length $lraw;
+    my @lines = split /\n/, $lraw;
+    return undef unless @lines;
+    (my $first = $lines[0]) =~ s/[ \t\r]+$//;
+    return undef unless $first eq '---';
+
+    my $ws_val;
+    for my $i (1 .. $#lines) {
+        (my $l = $lines[$i]) =~ s/\r$//;
+        last if $l eq '---';
+        if (!defined $ws_val && $l =~ /^write_set:[\x20\t]*(.*?)[\x20\t]*$/) {
+            $ws_val = $1;
+        }
+    }
+    return undef unless defined $ws_val;
+    my @ws = grep { length } split /:/, $ws_val;
+    return undef unless @ws;
+    return { blueprint => $bp, package => $pkg, write_set => \@ws };
+}
+
 sub _gb_d {
     my ($p, $cmd) = @_;
     return undef unless _validation_shaped($cmd);
@@ -426,9 +563,14 @@ sub _gb_d {
                 my $sid = BpHook::session_id($p);
                 my $aid = BpHook::agent_id($p);
                 my $own_binding;
+                my $caller_ws;    # defined only when the caller's own
+                                  # write set resolved -- write-set scoping
+                                  # (Decision 85) applies only then.
                 if (defined $aid) {
                     $own_binding = BpHook::Guards::Common::subagent_tool_use_id($p);
                     return undef unless defined $own_binding; # fail open: cannot tell subagent apart
+                    my $caller_resolved = _resolve_binding($data_n, $own_binding);
+                    $caller_ws = $caller_resolved->{write_set} if defined $caller_resolved;
                 }
                 opendir(my $wdh, $workers_dir);
                 if ($wdh) {
@@ -450,6 +592,31 @@ sub _gb_d {
                         my $role_writer = BpHook::Guards::Common::is_writer($data_rec->{subagent_type});
                         next unless defined $role_writer;
                         next unless _fresh_mtime($full, $stale_min);
+
+                        if (defined $caller_ws) {
+                            # write-set-scoped subagent (B-3/B-4/B-5/B-6).
+                            my $w_resolved = _resolve_binding($data_n, $name);
+                            if (!defined $w_resolved) {
+                                # B-5: the other worker's footprint is
+                                # unknown -- conservative fallback deny.
+                                return [
+                                    "BLOCKED (validation interlock): a write-capable worker ($role_writer) is in flight; running this now can report a false red.",
+                                    $cmd_line,
+                                ];
+                            }
+                            if (write_sets_overlap($caller_ws, $w_resolved->{write_set})) {
+                                my $bpname  = _sanitize($w_resolved->{blueprint}, 64);
+                                my $pkgname = _sanitize($w_resolved->{package}, 64);
+                                return [
+                                    "BLOCKED (validation interlock): package $pkgname of blueprint $bpname has a write-capable worker ($role_writer) in flight whose write set overlaps yours; this run could report a false red.",
+                                    $cmd_line,
+                                ];
+                            }
+                            next; # B-4 disjoint: scan continues past this record.
+                        }
+
+                        # B-1 (driver main thread) / B-3 (own binding
+                        # unresolvable): today's session-wide behaviour.
                         return [
                             "BLOCKED (validation interlock): a write-capable worker ($role_writer) is in flight; running this now can report a false red.",
                             $cmd_line,

@@ -67,7 +67,7 @@ sub hooksjson_template {
 }
 
 # ---------------------------------------------------------------------------
-# sec 2.3's target set for hooks.json -- 17 commands. A group with an empty
+# sec 2.3's target set for hooks.json -- 18 commands. A group with an empty
 # matcher string below means "no matcher key" in the decoded JSON.
 # ---------------------------------------------------------------------------
 my @EXPECT = (
@@ -82,6 +82,7 @@ my @EXPECT = (
     { event => 'PreToolUse',  matcher => 'Task|Agent',                                  file => 'bind-dispatch.sh',            args => '' },
     { event => 'PreToolUse',  matcher => 'Task|Agent',                                  file => 'track-dispatch.sh',           args => '' },
     { event => 'PreToolUse',  matcher => 'Task|Agent|Bash',                             file => 'context-ceiling.sh',          args => '' },
+    { event => 'PreToolUse',  matcher => 'Task|Agent|Bash',                             file => 'guard-fork.sh',               args => '' },
     { event => 'PreToolUse',  matcher => '',                                            file => 'wait-shape-guard.sh',         args => '' },
     { event => 'PreToolUse',  matcher => 'AskUserQuestion',                             file => 'guard-ask-operator.sh',       args => '' },
     { event => 'PostToolUse', matcher => 'Task|Agent',                                  file => 'track-dispatch.sh',           args => '' },
@@ -89,7 +90,7 @@ my @EXPECT = (
     { event => 'SubagentStop',matcher => '',                                            file => 'track-dispatch.sh',           args => '' },
     { event => 'Stop',        matcher => '',                                            file => 'stop-gate.sh',                args => '' },
 );
-is(scalar(@EXPECT), 17, 'sanity: this file\'s own sec 2.3 fixture table has 17 rows');
+is(scalar(@EXPECT), 18, 'sanity: this file\'s own sec 2.3 fixture table has 18 rows');
 
 sub expect_key { my ($r) = @_; return join("\x1e", $r->{event}, $r->{matcher}, $r->{file}, $r->{args}) }
 
@@ -126,7 +127,7 @@ if (ref $doc eq 'HASH' && ref $doc->{hooks} eq 'HASH') {
 my @expect_keys = sort map { expect_key($_) } @EXPECT;
 my @actual_keys = sort map { expect_key($_) } @actual;
 is_deeply(\@actual_keys, \@expect_keys,
-    'B1a: hooks.json\'s (event, matcher, file, args) multiset equals sec 2.3 exactly (17 commands)')
+    'B1a: hooks.json\'s (event, matcher, file, args) multiset equals sec 2.3 exactly (18 commands)')
     or diag("actual:\n" . join("\n", @actual_keys) . "\nexpected:\n" . join("\n", @expect_keys));
 
 is(scalar(@template_mismatches), 0,

@@ -594,6 +594,25 @@ my $PREFLIGHT = "$Bin/../../scripts/bp-preflight.pl";
 my $have_preflight = (-f $PREFLIGHT) ? 1 : 0;
 ok($have_preflight, 'bp-preflight.pl exists') or diag("missing: $PREFLIGHT");
 
+# Preflight's creds.path/creds.shape checks read home()."/.claude/.credentials.json"
+# (home() = $ENV{USERPROFILE} // $ENV{HOME}). Under the real operator's home
+# this file exists and is valid, so the checks pass silently there -- but
+# under a sandboxed run (scripts/run-tests.pl points HOME/USERPROFILE at a
+# fresh temp dir with no such file) both checks FAIL, which populates @fail
+# and defeats AC-24's "quiet + all-pass -> no output" contract even though
+# the DAG itself is fine. None of these tests are actually about creds, so
+# build one throwaway fixture home with a valid credentials file and point
+# every run_preflight() call at it (Decision 87: fixture, don't read the
+# operator's real files).
+my $fixture_home = tempdir(CLEANUP => 1);
+mkdir "$fixture_home/.claude" or die "mkdir fixture .claude: $!";
+open(my $fcfh, '>', "$fixture_home/.claude/.credentials.json")
+    or die "write fixture credentials.json: $!";
+print $fcfh <<'JSON';
+{"claudeAiOauth":{"accessToken":"fixture-access-token","refreshToken":"fixture-refresh-token","expiresAt":9999999999999,"scopes":["user:inference"]}}
+JSON
+close $fcfh;
+
 sub run_preflight {
     my (%opt) = @_;
     my @args;
@@ -606,6 +625,8 @@ sub run_preflight {
     delete local $ENV{BP_BLUEPRINT};
     delete local $ENV{CCPRAXIS_DATA_DIR};
     delete local $ENV{BP_PROJECT_ROOT};
+    local $ENV{HOME}        = $fixture_home;
+    local $ENV{USERPROFILE} = $fixture_home;
     $ENV{BP_BLUEPRINT_DIR}  = $opt{BP_BLUEPRINT_DIR}  if defined $opt{BP_BLUEPRINT_DIR};
     $ENV{BP_BLUEPRINT}      = $opt{BP_BLUEPRINT}      if defined $opt{BP_BLUEPRINT};
     $ENV{CCPRAXIS_DATA_DIR} = $opt{CCPRAXIS_DATA_DIR} if defined $opt{CCPRAXIS_DATA_DIR};

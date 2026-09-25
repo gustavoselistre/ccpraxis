@@ -21,6 +21,8 @@ use strict;
 use warnings;
 use FindBin qw($Bin);
 use lib "$Bin/../lib";
+use File::Temp qw(tempdir);
+use File::Path qw(make_path);
 use StewardTest qw(ok is like unlike done_testing diag);
 
 my $PLUGIN  = "$Bin/../..";
@@ -114,6 +116,21 @@ if (have_bash()) {
 
     # Passthrough: `research status` must reach update-research.pl and come
     # back as its JSON, not as the shim's own output.
+    #
+    # The shim resolves its target via ${HOME}/.claude/ccpraxis/plugins/steward
+    # /scripts -- the LIVE INSTALL tree, not this checkout. Under a sandboxed
+    # run (scripts/run-tests.pl points HOME at a fresh temp dir with no such
+    # tree) the shim would legitimately report "not found" and this assertion
+    # would fail for a reason that has nothing to do with passthrough. Fixture,
+    # per Decision 87: point HOME at a throwaway dir whose ccpraxis/plugins/
+    # steward/scripts is a symlink to THIS checkout's real scripts dir, so the
+    # shim finds a real update-research.pl without touching the operator's
+    # actual home or live install.
+    my $fixture_home = tempdir(CLEANUP => 1);
+    make_path("$fixture_home/.claude/ccpraxis/plugins/steward");
+    symlink($SCRIPTS, "$fixture_home/.claude/ccpraxis/plugins/steward/scripts")
+        or diag("symlink fixture scripts dir failed: $!");
+    local $ENV{HOME} = $fixture_home;
     my $json = `bash "$SH" research status 2>/dev/null`;
     like($json, qr/"store"\s*:/, 'AC5 arguments pass through to the target script')
         or diag("  got: " . substr($json, 0, 200));

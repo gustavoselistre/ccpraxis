@@ -533,7 +533,27 @@ CF
     write_file($cache, '{"rows":[{"package":"pnpm","status":"drifted",'
         . '"detail":"pnpm: pinned 11.17.0, newest eligible 11.20.0"}]}');
 
-    my ($rc, $out, $err) = run_cli($PREFLIGHT_SCRIPT, [], { BP_PIN_CACHE => $cache });
+    # C6b asserts rc==0. bp-preflight.pl's creds.path/creds.shape checks read
+    # home()."/.claude/.credentials.json" (home() = USERPROFILE // HOME) --
+    # under the real operator's home this file exists and is valid, but under
+    # a sandboxed run (scripts/run-tests.pl points HOME/USERPROFILE at a fresh
+    # temp dir) it is absent, both checks FAIL, and preflight's rc becomes 2
+    # for a reason that has nothing to do with this test's pin-audit subject.
+    # Fixture, per Decision 87: build a throwaway home with a valid creds file
+    # instead of depending on the operator's real one.
+    my $fixture_home = "$tmp/fixture-home";
+    mkdir $fixture_home or die "mkdir fixture home: $!";
+    mkdir "$fixture_home/.claude" or die "mkdir fixture .claude: $!";
+    write_file("$fixture_home/.claude/.credentials.json",
+        '{"claudeAiOauth":{"accessToken":"fixture-access-token",'
+        . '"refreshToken":"fixture-refresh-token","expiresAt":9999999999999,'
+        . '"scopes":["user:inference"]}}');
+
+    my ($rc, $out, $err) = run_cli($PREFLIGHT_SCRIPT, [], {
+        BP_PIN_CACHE => $cache,
+        HOME         => $fixture_home,
+        USERPROFILE  => $fixture_home,
+    });
     my $combined = $out . $err;
 
     # Positive first: the row was actually produced, so the negative below cannot pass vacuously.

@@ -78,10 +78,11 @@ use strict;
 use warnings;
 use File::Basename qw(basename dirname);
 use File::Spec;
-use File::Path qw(make_path);
+use File::Path qw(make_path remove_tree);
 use Cwd qw(abs_path);
 use POSIX qw(:sys_wait_h);
 use Time::HiRes ();
+use File::Temp ();
 # bsd_glob(), NOT the builtin glob() -- the builtin word-splits its PATTERN
 # argument on whitespace (csh-style), so an explicit target whose own path
 # contains a space (e.g. a real checkout under "C:\Users\Andre\Personal
@@ -105,6 +106,87 @@ my $ROOT_ABS = do {
     my $here = Cwd::abs_path($self) // $self;
     abs_path(dirname($here) . '/..');
 };
+
+# Package 21-test-sandbox: the REAL global gitconfig path, captured ONCE at
+# load time, BEFORE run_sweep() ever overrides $ENV{HOME} for a per-file
+# sandbox. Each sandboxed child gets GIT_CONFIG_GLOBAL pointed back at this
+# so `git config`/`git commit` inside a test still see the operator's real
+# identity/config, even though HOME itself now resolves to a throwaway dir.
+# Read-only from the sandbox's point of view -- nothing here ever writes to
+# it. undef when the outer HOME is unset/empty; callers must treat that as
+# "leave GIT_CONFIG_GLOBAL unset" rather than guessing a path.
+my $REAL_GIT_CONFIG_GLOBAL = do {
+    my $home = $ENV{HOME};
+    (defined $home && length $home) ? File::Spec->catfile($home, '.gitconfig') : undef;
+};
+
+# Package 21-test-sandbox: the ambient, real %TEMP%/%TMP% path (a genuine
+# Windows drive-letter form, e.g. "C:\Users\<name>\AppData\Local\Temp"),
+# captured ONCE at load time, BEFORE run_sweep() ever overrides $ENV{TEMP}/
+# $ENV{TMP} for a per-file sandbox. WHY THIS MUST STAY A WINDOWS PATH, NOT
+# THE SHORTER MSYS "/tmp" alias _short_tmp_base() below prefers for HOME:
+# at least one oracle in this suite (plugins/steward/tests/t/
+# preflight-git-argv-leak.t) reads $ENV{TEMP}/$ENV{TMP} directly and builds
+# its OWN fixture tempdir under it specifically because it needs a real
+# drive-rooted path to reproduce an MSYS argv-translation bug -- File::Temp's
+# own "/tmp" default (a bind mount whose physical target is NOT the drive
+# path native git.exe/_native_path() expect) would make that reproduction
+# fail for a reason unrelated to the bug the file targets. Every per-file
+# sandbox still gets its OWN throwaway TEMP/TMP subdirectory (see run_one())
+# -- this is only the BASE that subdirectory is created under, so the
+# isolation guarantee (never the operator's bare system temp itself) holds
+# regardless. undef when the ambient TEMP/TMP is unset/empty; callers must
+# treat that as "fall back to the short /tmp base instead" rather than
+# guessing a path.
+my $REAL_WINDOWS_TMP = $ENV{TEMP} // $ENV{TMP};
+$REAL_WINDOWS_TMP = undef unless defined $REAL_WINDOWS_TMP && length $REAL_WINDOWS_TMP && -d $REAL_WINDOWS_TMP;
+
+# The sweep-wide sandbox root (one File::Temp dir; every per-file sandbox is a
+# fresh subdirectory under it) and the --keep-sandbox flag. Both are file-
+# scope so run_one() -- called both in-process (serial phase) and inside a
+# forked child (parallel phase, which inherits this process's memory at fork
+# time) -- sees the SAME root and the SAME flag value without any IPC.
+my $SANDBOX_SWEEP_ROOT;
+my $KEEP_SANDBOX = 0;
+
+# _short_tmp_base() -> $dir | undef -- on this project's actual host (a
+# cygwin/msys-flavored Git-for-Windows perl), "/tmp" is a real, writable
+# mount aliasing the same physical directory $ENV{TEMP} names, but through a
+# MUCH shorter path (4 bytes vs. the operator's real
+# "C:\Users\<name>\AppData\Local\Temp", 30+ bytes on this machine). Package
+# 21's own File::Temp::tempdir() calls default to whatever
+# File::Spec->tmpdir() resolves given the AMBIENT %ENV at the moment this
+# process started -- and that resolution was observed to be unstable across
+# otherwise-identical invocations (sometimes the short "/tmp" alias,
+# sometimes the long %ENV{TMPDIR}-derived path), which is exactly the
+# nondeterminism that let this package's own sandbox occasionally build
+# fixture paths long enough to cross BpHook::Guards::Common::path_echo's
+# 90-character display-truncation threshold -- a threshold no PLAIN `perl
+# some.t` run ever approaches, because a bare run's own File::Temp calls are
+# not nested inside this runner's extra sandbox-root/per-file layers to begin
+# with. Preferring the short alias whenever it truly exists and is writable
+# removes both problems at once: deterministic AND short. Falls back to
+# File::Spec->tmpdir() (via a DIR-less tempdir() call) when "/tmp" is not a
+# real, writable directory on this host (e.g. a non-Windows CI runner where
+# "/tmp" already IS the real system tmpdir and this helper is a no-op).
+sub _short_tmp_base {
+    return '/tmp' if -d '/tmp' && -w '/tmp';
+    return undef;
+}
+
+# _sandbox_sweep_root() -> $dir -- lazily creates the sweep-wide root exactly
+# once per process. CLEANUP => 0: File::Temp's own END-based auto-cleanup
+# would delete --keep-sandbox'd per-file dirs out from under the operator at
+# process exit, so removal is handled explicitly (per file in run_one(), and
+# a best-effort rmdir of the empty root itself at the end of run_sweep()).
+sub _sandbox_sweep_root {
+    return $SANDBOX_SWEEP_ROOT if defined $SANDBOX_SWEEP_ROOT;
+    my $base = _short_tmp_base();
+    $SANDBOX_SWEEP_ROOT = defined $base
+        ? File::Temp::tempdir(DIR => $base, CLEANUP => 0)
+        : File::Temp::tempdir(CLEANUP => 0);
+    return $SANDBOX_SWEEP_ROOT;
+}
 
 # TestPlatform is package 01's sole decision point for a file's platform
 # marker; loaded by literal path (not `use lib` + `use TestPlatform`) because
@@ -172,7 +254,7 @@ if (defined $__msys2_before_container_require) {
 }
 
 sub _usage { return <<'USAGE' }
-usage: perl scripts/run-tests.pl [--fast] [--jobs N] [--nice] [--state=failed] [PATH-OR-GLOB ...]
+usage: perl scripts/run-tests.pl [--fast] [--jobs N] [--nice] [--state=failed] [--keep-sandbox] [PATH-OR-GLOB ...]
   --fast          skip the host-serial lane. Membership is a TEXT MATCH on a
                   file's own source, NOT an answer to "does this start a real
                   container" -- a file that merely mentions the container
@@ -188,6 +270,8 @@ usage: perl scripts/run-tests.pl [--fast] [--jobs N] [--nice] [--state=failed] [
                   covered by that). Env var CCPRAXIS_TEST_JOBS=N sets the same
                   kind of ambient low-impact default without a per-run flag.
   --state=failed  re-run only the files recorded failing by the previous run
+  --keep-sandbox  do not remove each file's per-file sandbox HOME after it
+                  runs (package 21-test-sandbox). Default: removed.
 
 Precedence for parallelism (most to least specific):
   --jobs N  >  --nice  >  CCPRAXIS_TEST_JOBS env var  >  default (cores - 2)
@@ -423,6 +507,36 @@ sub _resolve_jobs {
 # hand: non-zero exit is red, and the `not ok` count says whether it was a
 # failed assertion or the process dying (EXIT != 0 with NOTOK == 0 is the
 # signature of a timeout or a kill, not a broken expectation).
+# _skip_all_reason($out) -> $reason | undef -- true iff $out carries a bare
+# "1..0" plan line (Test::More's plan skip_all => $reason shape: "1..0 #
+# SKIP $reason", case-insensitive on SKIP). Returns the reason text (may be
+# empty) when found, undef otherwise -- undef is the "not a skip_all file"
+# signal, distinct from a skip with an empty reason.
+sub _skip_all_reason {
+    my ($out) = @_;
+    return undef unless defined $out;
+    return undef unless $out =~ /^1\.\.0\s*(?:#\s*(?:SKIP\S*\s*)?(.*))?$/mi;
+    my $reason = defined $1 ? $1 : '';
+    $reason =~ s/\s+\z//;
+    return $reason;
+}
+
+# run_one($file) -> \%result. The judgement rule the project already uses by
+# hand: non-zero exit is red, and the `not ok` count says whether it was a
+# failed assertion or the process dying (EXIT != 0 with NOTOK == 0 is the
+# signature of a timeout or a kill, not a broken expectation).
+#
+# PACKAGE 21-TEST-SANDBOX: every invocation below runs inside a fresh,
+# throwaway HOME/USERPROFILE/APPDATA/LOCALAPPDATA/TEMP/TMP/TMPDIR/
+# BUTLER_STATE_DIR/CCPRAXIS_CONTINUITY_ACTIVE_DIR -- a per-file subdirectory
+# of the sweep-wide sandbox root -- so a test that writes real user state
+# (a hook's own $HOME/.claude/butler-state, a lease file, etc.) never
+# touches the operator's actual home directory. `local %ENV = %ENV` scopes
+# every override to this call: the parent (serial phase) and any later
+# sibling call in the SAME process see the unmodified %ENV again once this
+# sub returns. GIT_CONFIG_GLOBAL is pointed at the REAL global gitconfig
+# (captured at load time, above) so `git commit`/`git config` inside a test
+# still resolve an identity even though HOME no longer does.
 sub run_one {
     my ($f) = @_;
     # Sub-second: durations.tsv orders the next sweep, and whole seconds
@@ -437,11 +551,66 @@ sub run_one {
     # on how many. `local` + `delete` scopes the removal to this call only.
     local $ENV{CCPRAXIS_CONTAINER_LANE_ENABLED};
     delete $ENV{CCPRAXIS_CONTAINER_LANE_ENABLED};
+
+    local %ENV = %ENV;
+    my $root    = _sandbox_sweep_root();
+    my $sandbox = File::Temp::tempdir(DIR => $root, CLEANUP => 0);
+    # TMPDIR points at $sandbox itself now, NOT a "Temp" subdirectory of it.
+    # A fixture's own File::Temp/File::Spec->tmpdir()-based tempfiles landing
+    # in the same directory as its sandboxed HOME is harmless (nothing here
+    # or in any test depends on them differing) -- but the extra path
+    # SEGMENT that subdirectory used to add was not harmless: it was one of
+    # the layers of nesting (sweep root / per-file sandbox / "Temp" / a
+    # fixture's own tempdir()) that pushed an otherwise-ordinary fixture path
+    # past BpHook::Guards::Common::path_echo's 90-character
+    # display-truncation threshold, a threshold a bare `perl some.t` run
+    # never approaches because it never nests inside any of this runner's
+    # own sandbox layers to begin with. Combined with _short_tmp_base()
+    # above (deterministically short SWEEP root and per-file sandbox
+    # names), this keeps a sandboxed fixture's own tempdir()-based paths
+    # close to what the SAME fixture would get run plain.
+    #
+    # TEMP/TMP are DELIBERATELY NOT the same value as TMPDIR/HOME here. They
+    # get their OWN throwaway subdirectory, created under $REAL_WINDOWS_TMP
+    # (the ambient real %TEMP%, captured at load time) rather than under
+    # $sandbox -- see that variable's own comment for why a file in this
+    # suite needs $ENV{TEMP} itself to stay a genuine Windows drive-letter
+    # path rather than the shorter MSYS "/tmp" alias _short_tmp_base()
+    # prefers for HOME. Falls back to $sandbox when the ambient TEMP/TMP was
+    # missing/unusable (a non-Windows host, where "/tmp" already IS the real
+    # system tmpdir and this whole distinction is moot).
+    my $win_tmp = defined $REAL_WINDOWS_TMP
+        ? File::Temp::tempdir(DIR => $REAL_WINDOWS_TMP, CLEANUP => 0)
+        : $sandbox;
+    $ENV{HOME}                              = $sandbox;
+    $ENV{USERPROFILE}                       = $sandbox;
+    $ENV{APPDATA}                           = File::Spec->catdir($sandbox, 'AppData', 'Roaming');
+    $ENV{LOCALAPPDATA}                      = File::Spec->catdir($sandbox, 'AppData', 'Local');
+    $ENV{TEMP}                              = $win_tmp;
+    $ENV{TMP}                               = $win_tmp;
+    $ENV{TMPDIR}                            = $sandbox;
+    $ENV{BUTLER_STATE_DIR}                  = File::Spec->catdir($sandbox, '.claude', 'butler-state');
+    $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR}    = File::Spec->catdir($sandbox, 'active');
+    $ENV{CCPRAXIS_NO_WAKELOCK}              = 1;
+    if (defined $REAL_GIT_CONFIG_GLOBAL) {
+        $ENV{GIT_CONFIG_GLOBAL} = $REAL_GIT_CONFIG_GLOBAL;
+    } else {
+        delete $ENV{GIT_CONFIG_GLOBAL};
+    }
+
     my $out = `perl "$f" 2>&1`;
     my $rc  = $? >> 8;
     $out = '' unless defined $out;
     my $notok = () = $out =~ /^not ok/mg;
+    my $skip_reason = _skip_all_reason($out);
+
+    unless ($KEEP_SANDBOX) {
+        eval { remove_tree($sandbox, { safe => 1 }) };
+        eval { remove_tree($win_tmp, { safe => 1 }) } if $win_tmp ne $sandbox;
+    }
+
     return { file => $f, rc => $rc, notok => $notok,
+             skipped => (defined $skip_reason ? 1 : 0), skip_reason => $skip_reason,
              secs => 0 + sprintf('%.1f', Time::HiRes::time() - $t0), out => $out };
 }
 
@@ -661,6 +830,58 @@ sub _run_container_batch {
     return @results;
 }
 
+# --- sweep-level audit (package 21-test-sandbox) ---------------------------
+#
+# _git_status_paths($repo_root_abs) -> @relpaths -- every path `git status
+# --porcelain --untracked-files=all` reports under $repo_root_abs, MINUS
+# anything under .ccpraxis-local-data/test-state/ (this runner's own
+# bookkeeping, exempted by the contract -- it writes there on every sweep
+# regardless). Returns () if git itself is unavailable/fails rather than
+# dying -- an audit that cannot run is not the same claim as "nothing new".
+sub _git_status_paths {
+    my ($repo) = @_;
+    my $out = `git -C "$repo" status --porcelain --untracked-files=all 2>&1`;
+    return () unless defined $out && $? == 0;
+    my @paths;
+    for my $line (split /\n/, $out) {
+        next unless length $line;
+        my $p = $line;
+        $p =~ s/^..\s+//;
+        $p =~ s/^"(.*)"$/$1/;
+        $p =~ s{\\}{/}g;
+        next if $p =~ m{^\.ccpraxis-local-data/test-state/};
+        push @paths, $p;
+    }
+    return sort @paths;
+}
+
+# _wakelock_pids() -> @{ {pid, cmd} } -- every live process (WINPID
+# namespace, per Get-CimInstance) whose command line names one of the fake/
+# real wake-lock stand-ins the contract lists: keep-awake.ps1,
+# BpContinuityLease, bp-keepawake. Windows-only (the whole concept of a
+# WINPID vs. a perl pid is a Windows landmine -- see CLAUDE.md); returns ()
+# unqualified elsewhere or if the CIM query itself is unavailable/unparsable.
+sub _wakelock_pids {
+    return () unless $^O =~ /^(MSWin32|cygwin|msys)$/;
+    my $ps = 'powershell.exe -NoProfile -NonInteractive -Command '
+           . '"Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | '
+           . 'Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress -Depth 3"';
+    my $raw = `$ps 2>/dev/null`;
+    return () unless defined $raw && $raw =~ /\S/;
+    my $data = eval { require JSON::PP; JSON::PP->new->utf8(0)->decode($raw) };
+    return () unless ref $data;
+    $data = [$data] if ref $data eq 'HASH';
+    my @out;
+    for my $p (@$data) {
+        next unless ref $p eq 'HASH';
+        my $cmd = $p->{CommandLine};
+        next unless defined $cmd && length $cmd;
+        next unless $cmd =~ /keep-awake\.ps1|BpContinuityLease|bp-keepawake/;
+        push @out, { pid => $p->{ProcessId}, cmd => $cmd };
+    }
+    return @out;
+}
+
 # run_sweep(@argv) -> $exit_code -- everything that used to be this script's
 # top-level executable flow, wrapped in one sub so merely `require`ing this
 # file (as plugins/butler/tests/t/lane-routing.t must, to reach classify_file
@@ -687,12 +908,27 @@ sub run_sweep {
             exit 2;
         }
         elsif ($a eq '--help' || $a eq '-h') { print _usage(); exit 0 }
+        elsif ($a eq '--keep-sandbox')    { $KEEP_SANDBOX = 1 }
         else                              { push @targets, $a }
     }
     if ($state_mode && @targets) {
         print STDERR "error: --state=failed cannot be combined with a path/glob target\n";
         exit 2;
     }
+
+    # Force the sweep-wide sandbox root into existence NOW, before any
+    # host-parallel/host-serial worker is spawned -- forked children inherit
+    # this process's memory at fork time, so every one of them sees the SAME
+    # root without any IPC (package 21-test-sandbox).
+    _sandbox_sweep_root();
+
+    # Pre-sweep audit snapshot (package 21-test-sandbox). Taken here, before
+    # any test file runs, so a file that appears afterward is genuinely new
+    # -- never a pre-existing artifact of this same run's own state-file
+    # bookkeeping (that write happens later, and is filtered by path below
+    # regardless).
+    my @audit_pre_paths = _git_status_paths($ROOT_ABS);
+    my @audit_pre_procs = _wakelock_pids();
 
     # --- collect ---------------------------------------------------------------
     my @files;
@@ -963,6 +1199,23 @@ sub run_sweep {
         print "all green\n";
     }
 
+    # SKIPPED (package 21-test-sandbox, task 42): a skip_all file is listed
+    # by name with its own reason, not folded silently into "all green" --
+    # rc==0/notok==0 for these already, so without this section they were
+    # indistinguishable from a file that genuinely ran and passed.
+    # Derived from each result's captured TAP output, not from run_one()'s
+    # skipped/skip_reason fields: parallel children report back only
+    # rc/notok/secs/file/out, so those fields never survive the fork.
+    my @skipped = grep { defined _skip_all_reason($_->{out}) } @results;
+    if (@skipped) {
+        print "\nSKIPPED:\n";
+        for my $r (sort { $a->{file} cmp $b->{file} } @skipped) {
+            my $reason = _skip_all_reason($r->{out});
+            printf "  %-52s %s\n", basename($r->{file}),
+                (defined $reason && length $reason) ? $reason : '(no reason given)';
+        }
+    }
+
     my @slow = (sort { $b->{secs} <=> $a->{secs} } @results)[0 .. ($#results < 9 ? $#results : 9)];
     print "\nslowest:\n";
     printf "  %5ds  %s\n", $_->{secs}, basename($_->{file}) for grep { defined } @slow;
@@ -1002,7 +1255,46 @@ sub run_sweep {
         print "\nstate: all green, .ccpraxis-local-data/test-state/last-failures.txt cleared\n";
     }
 
-    exit scalar(@red);
+    # --- post-sweep audit (package 21-test-sandbox) -----------------------------
+    # A new repo path (git status, minus .ccpraxis-local-data/test-state/) or a
+    # surviving fake/real wake-lock process (WINPID namespace) that was NOT
+    # present before this sweep started FAILS the sweep and is NAMED, even when
+    # every test file itself was green. The real ~/.claude/butler-state is never
+    # part of this -- it is not under $ROOT_ABS, so git status never sees it.
+    my $audit_failed = 0;
+    {
+        my @post_paths = _git_status_paths($ROOT_ABS);
+        my %pre_path = map { ($_ => 1) } @audit_pre_paths;
+        my @new_paths = grep { !$pre_path{$_} } @post_paths;
+
+        my @post_procs = _wakelock_pids();
+        my %pre_pid = map { ($_->{pid} => 1) } @audit_pre_procs;
+        my @new_procs = grep { !$pre_pid{$_->{pid}} } @post_procs;
+
+        if (@new_paths || @new_procs) {
+            $audit_failed = 1;
+            print "\nAUDIT FAILED:\n";
+            if (@new_paths) {
+                print "  new repo path(s) appeared during this sweep (git status):\n";
+                print "    $_\n" for @new_paths;
+            }
+            if (@new_procs) {
+                print "  wake-lock-style process(es) survived this sweep:\n";
+                printf "    pid=%s  %s\n", $_->{pid}, $_->{cmd} for @new_procs;
+            }
+        }
+    }
+
+    # Best-effort: remove the sweep-wide sandbox root if it is now empty (every
+    # per-file dir already removed itself in run_one() unless --keep-sandbox).
+    # Never fatal, never reported -- this is hygiene, not a done criterion.
+    unless ($KEEP_SANDBOX) {
+        eval { rmdir $SANDBOX_SWEEP_ROOT if defined $SANDBOX_SWEEP_ROOT };
+    }
+
+    my $exit_code = scalar(@red);
+    $exit_code = 1 if $audit_failed && $exit_code == 0;
+    exit $exit_code;
 }
 
 exit run_sweep(@ARGV) unless caller();
