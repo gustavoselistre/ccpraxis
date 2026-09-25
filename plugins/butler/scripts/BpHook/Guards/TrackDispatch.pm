@@ -548,7 +548,18 @@ sub _driver_pre {
     elsif (defined $ti->{prompt} && !ref($ti->{prompt})) {
         $w = BpHook::Guards::Common::is_writer($ti->{prompt});
     }
-    return 0 unless defined $w;
+
+    # Decision 101 B1: an exempt subagent_type (Decision 98's allowlist,
+    # read from BindDispatch so the list stays single-sourced) also gets a
+    # worker record written, even though is_writer() never recognises it --
+    # WriteGuards' reports-only allowance (Decision 100/101 M2) reads this
+    # record. GuardBash's OWN validation interlock is unaffected: it filters
+    # worker records through this same is_writer() before treating one as a
+    # live writer, so an exempt record written here is never counted there.
+    my $is_exempt = (defined $type && length $type
+        && defined &BpHook::BindDispatch::is_exempt_type
+        && eval { BpHook::BindDispatch::is_exempt_type($type) }) ? 1 : 0;
+    return 0 unless defined $w || $is_exempt;
 
     my $sid = BpHook::session_id($p);
     return 0 unless defined $sid;
