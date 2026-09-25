@@ -179,13 +179,17 @@ SKIP: {
                "AC8 MIGRATED: $name does not define its own sub pid_fingerprint");
     }
 
-    open my $gh, '<', "$Bin/../../hooks/gate-continuity.sh" or die $!;
-    my $gate = do { local $/; <$gh> };
-    close $gh;
-    like($gate, qr/bp-resumption\.pl/,
-         'AC8 the continuity gate verifies through the same module, via the CLI');
-    unlike($gate, qr/WBOUND|WALIVE/,
-           'AC8 and no longer re-implements the rules in shell');
+    # The gate-continuity.sh block that used to close this AC8 -- REMOVED
+    # (reason DEL, package 16 batch B): gate-continuity.sh is on the
+    # deletion list (Decision 5 collapses the Stop gate to the single
+    # stop-gate.sh) and has no successor that re-verifies resumption
+    # through bp-resumption.pl's CLI; that role is not carried forward as a
+    # shell-side check any more. Spec's own forward note (batch E1) already
+    # anticipated trimming this file "to what bp-worker.pl uses"; this is
+    # that trim landing early because gate-continuity.sh disappeared in B,
+    # ahead of E1. The behavior this protected -- bp-watch.pl and
+    # bp-worker.pl sharing ONE resumption implementation, never growing
+    # their own pid_alive/pid_fingerprint -- is unweakened above.
 }
 
 done_testing();

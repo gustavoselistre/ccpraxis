@@ -209,16 +209,18 @@ sub count_window {
     return ws_call('bp_ws_count_window', $sf, $tok, $now, $win);
 }
 
-# lib.sh's sanitiser, reused read-only (spec §2.6 mandates the same token function).
+# The session-token sanitiser (spec §2.6): batch B's fix round re-points this from
+# shelling out to the now-deleted hooks/lib.sh (its bp_repeat_session_token) to a
+# pure-perl mirror of BpHook::Guards::WaitShapeGuard::_token
+# (plugins/butler/scripts/BpHook/Guards/WaitShapeGuard.pm) -- the successor's own
+# token sanitiser, same rule: non-alnum/underscore/hyphen -> "_", truncate to 16,
+# empty falls back to a placeholder. Reason DEL (lib.sh gone); behavior preserved.
 sub session_token {
     my ($raw) = @_;
-    local %ENV = (%CLEAN_ENV, LIBSH => $LIB);
-    open(my $f, '-|', 'bash', '-c', 'source "$LIBSH"; bp_repeat_session_token "$1"', 'h', $raw)
-        or die "bash: $!";
-    my $o = do { local $/; <$f> }; close $f;
-    $o = '' unless defined $o;
-    $o =~ s/\s+\z//;
-    return $o;
+    $raw = '' unless defined $raw && !ref($raw);
+    (my $t = $raw) =~ s/[^A-Za-z0-9_-]/_/g;
+    $t = substr($t, 0, 16);
+    return length($t) ? $t : 'nosid';
 }
 
 # PATH containing every executable on the ambient PATH EXCEPT $name (t/62:472, t/64:279).
@@ -517,9 +519,8 @@ sub lacks_str{ my ($hay, $needle, $label) = @_; ok(index($hay, $needle) <  0, $l
     has_str($MSG_R2, q{out=$(cmd 2>&1); rc=$?}, 'FIXTURE-SANITY: the R2 expectation string carries the mandated command-substitution advice');
     like(msg_r3a(6, 'tok', 600), qr/SUPERSEDES/, 'FIXTURE-SANITY: the R3a expectation string carries the SUPERSEDES clause');
 
-    ok(-e $LIB && -s $LIB, 'FIXTURE-SANITY: hooks/lib.sh is present (its bp_repeat_session_token is reused read-only)');
     my $tok = session_token($SESSION);
-    like($tok, qr/\A[A-Za-z0-9_-]{1,16}\z/, 'FIXTURE-SANITY: lib.sh sanitises the fixture session id to a usable token');
+    like($tok, qr/\A[A-Za-z0-9_-]{1,16}\z/, 'FIXTURE-SANITY: session_token() sanitises the fixture session id to a usable token');
     ok(-e $HOOKSJSON && -s $HOOKSJSON, 'FIXTURE-SANITY: hooks/hooks.json is present and non-empty');
     # See t/64: jq ships in the container, not on the Windows host. Every
     # hook-behaviour group below already skips without it, so a failure here
@@ -541,328 +542,23 @@ sub lacks_str{ my ($hay, $needle, $label) = @_; ok(index($hay, $needle) <  0, $l
 }
 
 # =====================================================================================
-# [pure] Matcher-level coverage. Runs UNCONDITIONALLY -- spec §2.1/§4.1: the D1 main-guard exists
-# precisely so this group keeps its value on the jq-less Windows host, where the highest-risk part
-# of the package (false positives that block real work fleet-wide) would otherwise have zero
-# coverage. Each helper is invoked with arg0 'h' per the MANDATED §2.1 source form.
+# [pure]/[file]/[registration] blocks REMOVED (package 16 batch-B fix round, reason
+# codes DEL/SRC/REG): three whole groups pinned the retired bash implementation --
+# bp_ws_is_wait_loop/bp_ws_is_false_green_pipe/bp_ws_is_task_artifact_poll/
+# bp_ws_action_of/bp_ws_state_path/bp_ws_count_window called directly after sourcing
+# hooks/lib.sh (DEL: lib.sh is on the deletion list, gone), the BP_WS_*_RE/main-guard
+# source-text pins and the AC-26/AC-27/AC-21/AC-5 source greps (SRC: the matcher now
+# lives in BpHook::Guards::WaitShapeGuard, plugins/butler/scripts/BpHook/Guards/
+# WaitShapeGuard.pm, as perl, not bash source text to pin), and the AC-32..AC-35
+# hooks.json shape/registration checks (REG: package 16's own concern, proven by
+# hooks-json-route-registration.t and hook-registration-resilience.t instead). Every
+# behavior these exercised (wait-loop/false-green-pipe/task-artifact-poll detection,
+# the action_of/off-hatch vocabulary, the state-path/count-window rolling-log rules,
+# and the registration shape) is re-expressed in guards-remake-wait-shape.t's WS-1..
+# WS-12 corpus, per that file's own header note (spec sec 4.10). No behavior
+# assertion is weakened; only the OLD monolith's now-nonexistent source and its
+# lib.sh-sourced pure calls are dropped.
 # =====================================================================================
-
-# --- AC-10: bp_ws_is_wait_loop ------------------------------------------------------
-for my $c (@WAITS) {
-    is(is_wait_loop($c->[1]), 'yes', "AC-10 [pure]: bp_ws_is_wait_loop echoes yes for $c->[0]");
-}
-for my $c (@AC2) {
-    is(is_wait_loop($c->[1]), 'yes', "AC-10 [pure]: bp_ws_is_wait_loop echoes yes for $c->[0]");
-}
-for my $c (@AC6) {
-    is(is_wait_loop($c->[1]), 'no', "AC-10 [pure]: bp_ws_is_wait_loop echoes NO for the legitimate loop-free sleep [$c->[0]]");
-}
-for my $c (@AC7) {
-    is(is_wait_loop($c->[1]), 'no', "AC-10 [pure]: bp_ws_is_wait_loop echoes NO for sleep-as-a-non-command-token [$c->[0]]");
-}
-is(is_wait_loop($QUOTED_PERL), 'no', 'AC-10 [pure]: bp_ws_is_wait_loop echoes NO for a quoted perl program text embedding "sleep 30" (§5.2)');
-is(is_wait_loop($AC8), 'no', 'AC-10 [pure]: bp_ws_is_wait_loop echoes NO for the mandated test-runner idiom (loop WITHOUT sleep)');
-is(is_wait_loop($AC9), 'no', 'AC-10 [pure]: bp_ws_is_wait_loop echoes NO for `find | while read ... done | head -60`');
-for my $c (@AC13, @AC14, @AC15, @AC16, @AC11) {
-    is(is_wait_loop($c->[1]), 'no', "AC-10 [pure]: bp_ws_is_wait_loop echoes NO for the pipe-group string [$c->[0]]");
-}
-is(is_wait_loop($AC17_ALLOW), 'no', 'AC-10 [pure]: bp_ws_is_wait_loop echoes NO for the sleepless task-output listing');
-is(is_wait_loop($PREC_R1_R3B), 'yes', 'AC-10 [pure]: bp_ws_is_wait_loop echoes yes for the R1+R3b overlap string');
-is(is_wait_loop($PREC_R1_R2),  'yes', 'AC-10 [pure]: bp_ws_is_wait_loop echoes yes for the R1+R2 overlap string');
-is(is_wait_loop(''),           'no',  'AC-10 [pure]: bp_ws_is_wait_loop echoes no for the empty command');
-
-# --- [pure] §2.2/§2.4: bp_ws_is_false_green_pipe -------------------------------------
-for my $c (@AC11) {
-    is(is_false_green_pipe($c->[1]), 'yes', "§2.4 [pure]: bp_ws_is_false_green_pipe echoes yes for $c->[0]");
-}
-for my $c (@AC13) {
-    is(is_false_green_pipe($c->[1]), 'no', "§2.4 [pure]: bp_ws_is_false_green_pipe echoes NO for a pipe into tail/head with no \$? read [$c->[0]]");
-}
-for my $c (@AC14) {
-    is(is_false_green_pipe($c->[1]), 'no', "§2.4 [pure]: bp_ws_is_false_green_pipe echoes NO for the CORRECT form [$c->[0]]");
-}
-for my $c (@AC15) {
-    is(is_false_green_pipe($c->[1]), 'no', "§2.4 [pure]: bp_ws_is_false_green_pipe echoes NO for META-04's discriminating case [$c->[0]]");
-}
-for my $c (@AC16) {
-    is(is_false_green_pipe($c->[1]), 'no', "§2.4 [pure]: bp_ws_is_false_green_pipe echoes NO for the known-miss string [$c->[0]]");
-}
-is(is_false_green_pipe(q{cmd | tail -20 || echo "failed $?"}), 'no',
-   '§5.4 [pure]: `|| ` after a pipeline is a recorded, accepted evasion -- under-matching is the safe direction');
-is(is_false_green_pipe(''), 'no', '§2.4 [pure]: bp_ws_is_false_green_pipe echoes no for the empty command');
-
-# --- [pure] §2.5: bp_ws_is_task_artifact_poll ----------------------------------------
-for my $c (@AC17) {
-    is(is_task_artifact_poll($c->[1]), 'yes', "§2.5 [pure]: bp_ws_is_task_artifact_poll echoes yes for $c->[0]");
-}
-is(is_task_artifact_poll($AC17_ALLOW), 'no', '§2.5 [pure]: bp_ws_is_task_artifact_poll echoes NO for the sleepless task-output listing');
-is(is_task_artifact_poll($PREC_R1_R3B), 'yes', '§2.5 [pure]: bp_ws_is_task_artifact_poll echoes yes for the R1+R3b overlap string');
-for my $c (@AC6, @AC7) {
-    is(is_task_artifact_poll($c->[1]), 'no', "§2.5 [pure]: bp_ws_is_task_artifact_poll echoes NO for [$c->[0]] (no tasks/<id>.output token)");
-}
-is(is_task_artifact_poll(q{sleep 30; cat /tmp/x/tasks/bad id.output}), 'no',
-   '§2.5 [pure]: a tasks/ path with a space in the id does not satisfy tasks/[A-Za-z0-9_-]+\.output');
-is(is_task_artifact_poll(''), 'no', '§2.5 [pure]: bp_ws_is_task_artifact_poll echoes no for the empty command');
-
-# --- AC-29 [pure] bp_ws_action_of: the deliberate C-5 INVERSION of b10's mapping -----
-is(action_of(''),      'deny', 'AC-29 [pure]: bp_ws_action_of "" -> deny (the default is enforcement)');
-is(action_of('deny'),  'deny', 'AC-29 [pure]: bp_ws_action_of "deny" -> deny');
-is(action_of('off'),   'off',  'AC-29 [pure]: bp_ws_action_of "off" -> off (the operational escape hatch)');
-is(action_of('bogus'), 'deny', 'AC-29 [pure]: bp_ws_action_of "bogus" -> DENY (a typo must never silently disarm the guard)');
-is(action_of('nudge'), 'deny', 'AC-29 [pure]: bp_ws_action_of "nudge" -> DENY (b10\'s vocabulary is not b15\'s)');
-is(action_of('Off'),   'deny', 'AC-29 [pure]: bp_ws_action_of "Off" -> DENY (case-sensitive; not "off")');
-is(action_of('0'),     'deny', 'AC-29 [pure]: bp_ws_action_of "0" -> DENY');
-
-# --- [pure] §2.2/§2.6: bp_ws_state_path, and the b10 filename divergence -------------
-{
-    my $tok = 'TOK1';
-    is(state_path_call($tok, '/tmp/bpx', 'p'), '/tmp/bpx/runs/p.taskpoll-TOK1.log',
-       '§2.6 [pure]: bp_ws_state_path is $BP_DIR/runs/$BP_PACKAGE.taskpoll-<TOKEN>.log');
-    is(state_path_call($tok, '/tmp/bpx', undef), '/tmp/bpx/runs/pkg.taskpoll-TOK1.log',
-       '§2.6 [pure]: bp_ws_state_path falls back to "pkg" when BP_PACKAGE is unset');
-    unlike(state_path_call($tok, '/tmp/bpx', 'p'), qr/\.repeat-/,
-           '§2.6 [pure]: the state filename is NOT b10\'s repeat-<TOKEN>.log (writing there would corrupt b10\'s window)');
-}
-
-# --- [pure] §2.2/§2.6: bp_ws_count_window -- CUMULATIVE in a window, not a trailing run ----
-{
-    is(count_window('t1', 1000, 600), '1',
-       '§2.6 [pure]: no prior state -> count is 1 (the current, not-yet-written call)');
-    is(count_window('t1', 1000, 600, "900\tt1", "920\tt1", "940\tt1"), '4',
-       '§2.6 [pure]: three in-window lines at the same task -> 4 (three plus the current call)');
-    is(count_window('t1', 1000, 600, "900\tt1", "910\tt2", "920\tt1"), '3',
-       '§2.6 [pure]: an INTERVENING different task does not break the scan -- cumulative, not a trailing run');
-    is(count_window('t1', 1000, 600, "100\tt1", "950\tt1"), '2',
-       '§2.6 [pure]: a line older than the window is excluded');
-    is(count_window('t1', 1000, 0, "100\tt1", "950\tt1"), '3',
-       '§2.6 [pure]: WINDOW_SECONDS 0 disables the time filter');
-    is(count_window('t1', 1000, 600, "garbage", "abc\tt1", "900\tt1\textra", "900\tt1"), '2',
-       '§2.6 [pure]: malformed state lines are skipped, never fatal');
-    is(count_window('t2', 1000, 600, "900\tt1", "920\tt1"), '1',
-       '§2.6 [pure]: a different task id counts separately');
-    is(count_window('t1', 'notanum', 600, "900\tt1"), '1',
-       '§2.6 [pure]: a non-integer NOW fails OPEN to 1');
-    is(count_window('t1', 1000, 'notanum', "900\tt1"), '1',
-       '§2.6 [pure]: a non-integer WINDOW_SECONDS fails OPEN to 1');
-}
-
-# --- AC-30 [pure] sourcing the guard is SILENT and INERT, with and without the butler env ----
-{
-    my @cases = (
-        ['with the full butler env set', { BP_DIR => '/tmp/x', BP_PROJECT_ROOT => '/tmp/y', BP_LEDGER => '/tmp/z.md' }],
-        ['with the butler env unset',    {}],
-    );
-    for my $c (@cases) {
-        my ($label, $env) = @$c;
-        my $n  = ++$pn;
-        my $of = "$ROOT/src-out.$n.txt";
-        my $ef = "$ROOT/src-err.$n.txt";
-        my $rc;
-        {
-            local %ENV = (%CLEAN_ENV, %$env, GUARDSH => fwd($HOOK), OFILE => fwd($of), EFILE => fwd($ef));
-            system('bash', '-c',
-                   'timeout 20 bash -c \'source "$GUARDSH"; echo REACHED\' h > "$OFILE" 2> "$EFILE"');
-            $rc = $? >> 8;
-        }
-        is($rc, 0, "AC-30 ($label): sourcing the guard and continuing exits 0 -- the enforcement body did NOT run");
-        is(read_file($of), "REACHED\n", "AC-30 ($label): stdout is exactly REACHED (sourcing writes nothing of its own)");
-        is(read_file($ef), '',          "AC-30 ($label): sourcing produces no stderr");
-    }
-}
-
-# =====================================================================================
-# [file] Source-text criteria. No jq, no hook process -- pure greps over the guard source.
-# =====================================================================================
-{
-    my $src = -e $HOOK ? read_file($HOOK) : undef;
-    ok(defined $src && length $src, 'AC-33: plugins/butler/hooks/wait-shape-guard.sh exists and is non-empty');
-    $src = '' unless defined $src;
-
-    my @lines     = split /\n/, $src, -1;
-    my @code      = grep { !/^\s*#/ } @lines;
-    my $code      = join("\n", @code);
-
-    # AC-26 (DC-H2): the judge opt-out must be ABSENT. Its presence would silently fail
-    # "applies to judges too" while every other test stayed green (§2.11).
-    is(scalar(() = $src =~ /BP_ROLE/g), 0,
-       'AC-26: the guard source contains ZERO occurrences of BP_ROLE (the gate-stop.sh judge opt-out must not be copied in)');
-
-    # AC-27: fail-OPEN on infrastructure, and nothing that could clobber the deliberate exit 2.
-    is(scalar(() = $src =~ /bp_hook_require_jq/g), 0,
-       'AC-27: the guard source contains ZERO occurrences of bp_hook_require_jq (that helper is fail-CLOSED)');
-    is(scalar(grep { /^set -e/ || /trap .* EXIT/ } @lines), 0,
-       'AC-27: the guard source has no `set -e` and no `trap ... EXIT` (either would clobber the deliberate exit 2)');
-    like($code, qr/command -v jq/, 'AC-27: the guard reaches for the fail-open `command -v jq` idiom instead');
-
-    # AC-21: b10's state-path helper must never be called.
-    is(scalar(() = $src =~ /bp_repeat_state_path/g), 0,
-       'AC-21: the guard source contains ZERO occurrences of bp_repeat_state_path (it would corrupt b10\'s rolling window)');
-
-    # AC-5: `timeout`-wrapping is NOT an exemption -- no matcher regex may carry a timeout clause.
-    my @re_lines = grep { /BP_WS_(LOOP|SLEEP|PIPE|TASKOUT)_RE=/ } @lines;
-    is(scalar(grep { /timeout/ } @re_lines), 0,
-       'AC-5: no BP_WS_*_RE assignment mentions "timeout" (18 of 21 observed constructs are timeout-wrapped and still pathological)');
-    is(scalar(grep { /timeout/ } @code), 0,
-       'AC-5: no non-comment line of the guard mentions "timeout" at all (§2.3-5: none may be added)');
-
-    # §2.1 D1: the mandated bottom-of-file main-guard idiom, verbatim.
-    # index()-based per the rule at the top of this file: `${BASH_SOURCE[0]}` and `$0`
-    # interpolate inside qr// and \Q...\E does not stop it (that spelling was a compile error).
-    has_str($code, q{if [ "${BASH_SOURCE[0]}" = "$0" ]; then},
-            '§2.1/AC-30: the guard carries the MANDATED main-guard condition verbatim');
-    like($code, qr/\Qbp_ws_main\E/, '§2.1: the guard defines/invokes bp_ws_main');
-
-    # §2.3/§2.4/§2.5: the mandated EREs, verbatim.
-    like($code, qr/\QBP_WS_LOOP_RE='(^|[^A-Za-z0-9_-])(while|until|for)[[:space:]]'\E/,
-         '§2.3: BP_WS_LOOP_RE is the mandated ERE verbatim (it includes `for`, not just while|until)');
-    like($code, qr/\QBP_WS_SLEEP_RE='(^|[^A-Za-z0-9_-])sleep[[:space:]]+[0-9]'\E/,
-         '§2.3: BP_WS_SLEEP_RE is the mandated ERE verbatim (a numeric argument is required after sleep)');
-    like($code, qr/\QBP_WS_PIPE_RE='\|[[:space:]]*(tail|head)([[:space:]][^;&|]*)?[;&]+[^;&|]*\$\?'\E/,
-         '§2.4: BP_WS_PIPE_RE is the mandated strict-adjacency ERE verbatim');
-    like($code, qr/\QBP_WS_TASKOUT_RE='tasks\/[A-Za-z0-9_-]+\.output'\E/,
-         '§2.5: BP_WS_TASKOUT_RE is the mandated ERE verbatim');
-
-    # §2.4: META-04's REJECTED alternation must not appear.
-    unlike($code, qr/analyze\|test\|lint\|build/,
-           '§2.4: META-04\'s command alternation is NOT implemented (1 confirmed FP, 0 TP in corpus)');
-}
-
-# =====================================================================================
-# AC-32..AC-35 [file] hooks.json registration. THIS is where the registration evidence lives --
-# t/hooks-selftest.t never opens hooks.json (ledger 09:14Z), so it proves nothing here.
-# Needs no jq and no hook process.
-# =====================================================================================
-{
-    my $raw = read_file($HOOKSJSON);
-    ok(length $raw, 'AC-32: hooks.json is readable and non-empty');
-    my $H = eval { $J->decode($raw) };
-    ok(defined $H, 'AC-32: hooks.json still parses as valid JSON') or diag("parse error: $@");
-
-    my $cmd_of = sub { my $f = shift; return qq(bash "\${CLAUDE_PLUGIN_ROOT}/hooks/$f") };
-    my $pre = ($H && $H->{hooks}{PreToolUse}) // [];
-
-    # AC-33: b15's block is matcher-less with exactly one entry.
-    #
-    # LOCATED BY COMMAND, not by position (relaxed 2026-08-03, b43). This originally
-    # asserted b15's block was the LAST in the array. That is a positional
-    # over-specification: hooks in a PreToolUse array ALL run, so order carries no
-    # meaning, and "last" simply forbids any later package from appending — which b43
-    # then legitimately did, breaking this oracle for no behavioural reason.
-    # Exactly the shape b26 documented and b15 itself hit on the block COUNT
-    # (`== 4` -> `>= 4`, operator-approved); this is the same lesson one axis over.
-    # Nothing is weakened: every property b15 actually guards — its block exists, is
-    # matcher-less, has exactly one entry, and that entry is byte-exact — is still
-    # asserted, and now cannot be satisfied by some OTHER package's block happening to
-    # sit last.
-    ok(scalar(@$pre) >= 5, 'AC-33: PreToolUse carries at least five blocks (b15 appends a fifth)');
-    my ($b15_block) = grep {
-        scalar(@{ $_->{hooks} // [] }) == 1
-        && ($_->{hooks}[0]{command} // '') eq $cmd_of->('wait-shape-guard.sh')
-    } @$pre;
-    ok(defined $b15_block, "AC-33: b15's wait-shape-guard.sh block is registered in PreToolUse")
-        or diag('no PreToolUse block invokes wait-shape-guard.sh');
-    my $last = $b15_block // {};
-    ok(defined $b15_block && !exists $last->{matcher},
-       'AC-33: b15\'s PreToolUse block has NO matcher key (match-all-by-omission, the in-tree idiom for a universal hook)');
-    is(scalar(@{ $last->{hooks} // [] }), 1, 'AC-33: b15\'s PreToolUse block has exactly one hook entry');
-    is_deeply($last->{hooks}[0],
-              { type => 'command', command => $cmd_of->('wait-shape-guard.sh'), timeout => 15 },
-              'AC-33: the entry is exactly { type: command, command: bash "${CLAUDE_PLUGIN_ROOT}/hooks/wait-shape-guard.sh", timeout: 15 }');
-
-    # AC-34: blocks 0-3 are byte-for-byte what they read today; PostToolUse and Stop untouched.
-    my $b0 = $pre->[0] // {};
-    is($b0->{matcher}, 'Edit|Write|MultiEdit|NotebookEdit', 'AC-34: block 0 matcher unchanged');
-    is_deeply([ map { $_->{command} } @{ $b0->{hooks} // [] } ],
-              [ $cmd_of->('gate-shutdown.sh'), $cmd_of->('guard-writes.sh'), $cmd_of->('ledger-guard.sh') ],
-              'AC-34: block 0 command list unchanged, in order');
-    my $b1 = $pre->[1] // {};
-    is($b1->{matcher}, 'Bash', 'AC-34: block 1 matcher is still Bash');
-    # b46 (drive-loop dead-man's switch, 559379c) deliberately appended
-    # mark-wakeup.sh to the Bash and Task blocks. The claim these two assertions
-    # make is "b15 must NOT append here", and it survives verbatim: the expected
-    # list grows only by the entry another package registered on purpose, and
-    # wait-shape-guard.sh appearing in either block still fails.
-    # UPDATED 2026-08-14 (w03-validation-interlock, driver-adjudicated). Red since
-    # h01 and g02 appended gate-headless-background.sh and guard-judge-checks.sh
-    # here without updating this list -- a regression this blueprint's own run
-    # introduced and did not notice. Brought up to reality, NOT loosened: the list
-    # stays EXACT and ORDERED, so the claim this assertion exists to make -- "b15
-    # must NOT append here" -- survives verbatim, and wait-shape-guard.sh appearing
-    # in this block still fails.
-    is_deeply([ map { $_->{command} } @{ $b1->{hooks} // [] } ],
-    # UPDATED 2026-09-16 (almanac 20260911-211454-863c). guard-git-mutations.sh
-    # is registered here FIRST, and in the RUN-SCOPED form. It was previously
-    # registered only in ccpraxis's own .claude/settings.json, so the hook
-    # written to stop a destructive git command protected sessions working on
-    # ccpraxis and nobody else -- and the incident it exists to prevent then
-    # happened again in another project, taking a completed package
-    # implementation off disk. The --only-during-butler-run flag is what makes
-    # this registration acceptable to ship machine-wide; see
-    # hooks-json-route-registration.t's AC7 for the objection it answers.
-    # Brought up to reality rather than loosened: the list stays EXACT and
-    # ORDERED, so what this assertion actually pins still fails on sight.
-              [ $cmd_of->('guard-git-mutations.sh') . ' --only-during-butler-run',
-                $cmd_of->('guard-bash.sh'), $cmd_of->('mark-wakeup.sh'),
-                $cmd_of->('gate-headless-background.sh'), $cmd_of->('guard-judge-checks.sh'),
-                $cmd_of->('guard-validation-interlock.sh'),
-                # UPDATED 2026-09-17: guard-run-finish.sh, registered LAST. An agent
-                # read five background tasks dying as the operator pressing Stop and
-                # wound a session down with an in-flight package's required check
-                # never run. Brought up to reality rather than loosened -- the list
-                # stays EXACT and ORDERED. THIS ASSERTION EXISTS IN THREE FILES
-                # (here, ledger-guard.t AC-36, wait-shape-guard.t AC-34 / repeat-guard.t
-                # AC-20); updating one and not the others is how it sat red for weeks
-                # before, and is exactly what the full plugin sweep caught this time.
-                $cmd_of->('guard-run-finish.sh') ],
-              'AC-34: block 1 command list is exactly the six registered Bash hooks IN ORDER (b15 must NOT append here)');
-    my $b2 = $pre->[2] // {};
-    is($b2->{matcher}, 'Task', 'AC-34: block 2 matcher unchanged');
-    is_deeply([ map { $_->{command} } @{ $b2->{hooks} // [] } ],
-              [ $cmd_of->('gate-shutdown.sh'), $cmd_of->('track-dispatch.sh'), $cmd_of->('mark-wakeup.sh') ],
-              'AC-34: block 2 command list unchanged, in order');
-    my $b3 = $pre->[3] // {};
-    ok(!exists $b3->{matcher}, 'AC-34: block 3 (b10 repeat-guard) still has NO matcher key');
-    is_deeply([ map { $_->{command} } @{ $b3->{hooks} // [] } ], [ $cmd_of->('repeat-guard.sh') ],
-              'AC-34: block 3 command list unchanged (b15 must NOT append here either)');
-
-    my $post = ($H && $H->{hooks}{PostToolUse}) // [];
-    # RELAXED 2026-08-14 (w03-validation-interlock, driver-adjudicated), mirroring
-    # the same relaxation in plugins/butler/tests/t/ledger-guard.t and the
-    # operator-approved PreToolUse precedent of 2026-08-03: only the prohibition on
-    # APPENDING A NEW BLOCK is lifted. w03 registers untrack-worker-solo.sh under a
-    # Task|Agent PostToolUse block. b15's claim stays pinned by the two assertions
-    # below -- block 0's matcher is exactly 'Task', its command list exactly
-    # [log-dispatch.sh] -- so wait-shape-guard.sh appearing here still fails.
-    #   OLD: is(scalar(@$post), 1, 'AC-34: PostToolUse still has exactly one block');
-    cmp_ok(scalar(@$post), '>=', 1, 'AC-34: PostToolUse still has at least the 1 pre-w03 block (later packages may append)');
-    is($post->[0]{matcher}, 'Task', 'AC-34: PostToolUse matcher unchanged');
-    is_deeply([ map { $_->{command} } @{ $post->[0]{hooks} // [] } ], [ $cmd_of->('log-dispatch.sh') ],
-              'AC-34: PostToolUse hook list unchanged');
-    my $stop = ($H && $H->{hooks}{Stop}) // [];
-    is(scalar(@$stop), 1, 'AC-34: Stop still has exactly one block');
-    ok(!exists $stop->[0]{matcher}, 'AC-34: Stop block still has no matcher key');
-    # UPDATED 2026-08-14 (g01-explicit-continuity-arming), same discipline as the
-    # PostToolUse relaxation immediately above: brought up to reality, not
-    # loosened. gate-continuity.sh is a legitimate THIRD entry appended to this
-    # same unmatchered block; the list stays EXACT and ORDERED.
-    is_deeply([ map { $_->{command} } @{ $stop->[0]{hooks} // [] } ],
-              [ $cmd_of->('gate-stop.sh'), $cmd_of->('gate-drive-loop.sh'), $cmd_of->('gate-continuity.sh') ],
-              'AC-34: Stop hook list is exactly [gate-stop.sh, gate-drive-loop.sh, gate-continuity.sh] IN ORDER');
-
-    # AC-35(a): the absence of a matcher key IS the "reached for every tool" evidence. (b) is the
-    # behavioural conjunction asserted in the jq-gated group below.
-    ok(defined $b15_block && !exists $last->{matcher},
-       'AC-35(a): b15\'s block is matcher-less, which is how it is reached for BOTH Bash and TaskOutput');
-    # `>= 2`, not `== 2`, for the same reason AC-33 no longer says "last": a later
-    # package may legitimately register another matcher-less universal hook, and that
-    # says nothing about whether b10's and b15's are still correct. Both are asserted
-    # individually — b15's immediately above, b10's in t/62 — so this is a floor, not
-    # a licence. An exact count here would forbid extension, which is the standoff
-    # b26 was written to end.
-    cmp_ok(scalar(grep { !exists $_->{matcher} } @$pre), '>=', 2,
-       'AC-35(a): at least two PreToolUse blocks are matcher-less -- b10\'s and b15\'s');
-}
-
 # =====================================================================================
 # Every remaining group drives the hook PROCESS, which needs jq present to get past
 # `command -v jq || exit 0` (§2.13). One SKIP keeps this file useful on the jq-less

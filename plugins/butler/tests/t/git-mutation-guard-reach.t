@@ -82,13 +82,19 @@ is(scalar @gate_calls, 0,
    . 'only reason registering it above buys anything');
 
 # Non-vacuity for B1: the same detector must fire on a hook that DOES gate.
-my $gated = "$Bin/../../hooks/guard-bash.sh";
-SKIP: {
-    skip 'guard-bash.sh absent', 1 unless -f $gated;
-    my $gsrc = do { local (@ARGV, $/) = ($gated); <> };
-    my @g = grep { /^\s*bp_hook_gate\s*$/ } split /\n/, $gsrc;
+# bp_hook_gate itself is retired (package 16's cutover): the successor core
+# gates through run-hook.sh's --pre clauses in the REGISTRATION string, not
+# an in-script function call, so no hooks/*.sh file calls bp_hook_gate any
+# more and this non-vacuity fixture has no live subject (DEL, Decision 34).
+# The detector is proven non-vacuous instead against its own historical
+# positive: a literal fixture string containing the retired call shape.
+{
+    my $fixture_src = "some_other_line\nbp_hook_gate\ntrailing\n";
+    my @g = grep { /^\s*bp_hook_gate\s*$/ } split /\n/, $fixture_src;
     cmp_ok(scalar @g, '>', 0,
-           'B2: the B1 detector does fire on a gated hook -- it is a real check');
+           'B2: the B1 detector does fire on text that calls bp_hook_gate -- it is a real '
+         . 'check (bp_hook_gate itself is retired; no successor hook calls it any more, so '
+         . 'this is a fixture positive rather than a live hooks/ file, DEL)');
 }
 
 # ===========================================================================
@@ -218,11 +224,17 @@ SKIP: {
     # And the predicate that covers the case this whole report was about: a
     # drive-solo Task subagent inherits no BP_* at all, so liveness has to be
     # readable from disk rather than from the environment.
+    # bp_drive_any_active (lib.sh) is retired; the successor's scope predicate
+    # is the run-hook.sh --pre clause "ledger,armed" on the run-scoped
+    # registration branch, which run-hook.sh resolves by reading the on-disk
+    # armed/<sid> file (never just the environment) -- retargeted per
+    # Decision 34 (DEL: bp_drive_any_active has no successor symbol).
     my $src2 = do { local (@ARGV, $/) = ($GUARD); <> };
-    like($src2, qr/bp_drive_any_active/,
-         'E4: the scope predicate consults the on-disk drive-solo marker, not just the '
-       . 'environment -- a Task subagent dispatched by a driver inherits no BP_* but can '
-       . 'still see the marker, and that subagent is exactly what destroyed the package');
+    like($src2, qr/--pre\s+ledger,armed/,
+         'E4: the scope predicate consults the on-disk armed/<session_id> file via '
+       . 'run-hook.sh\'s ledger,armed clause, not just the environment -- a Task subagent '
+       . 'dispatched by a driver inherits no BP_* but can still be armed on disk, and that '
+       . 'subagent is exactly what destroyed the package');
 }
 
 done_testing();

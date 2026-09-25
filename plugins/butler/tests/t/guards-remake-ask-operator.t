@@ -6,7 +6,7 @@
 # successor (GuardAskOperator, against the legacy queue, Decision 22),
 # running on the package-03 hook core.
 #
-# hooks/next/guards/guard-ask-operator.sh and BpHook/Guards/GuardAskOperator.pm
+# hooks/guard-ask-operator.sh and BpHook/Guards/GuardAskOperator.pm
 # DO NOT EXIST YET. Every in-process call goes through
 # GuardHarness::run_module() (batch 1's harness,
 # plugins/butler/tests/lib/GuardHarness.pm), which mirrors BpHook::main()'s
@@ -137,7 +137,7 @@ my $ISO_RE = qr/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ/;
 # SH-1/SH-2 -- static shape.
 # ===========================================================================
 {
-    my $wrapper = "$BUTLER_DIR/hooks/next/guards/guard-ask-operator.sh";
+    my $wrapper = "$BUTLER_DIR/hooks/guard-ask-operator.sh";
     my $module  = "$BUTLER_DIR/scripts/BpHook/Guards/GuardAskOperator.pm";
     ok(-f $wrapper, 'SH-1 precondition: guard-ask-operator.sh exists on disk')
         or diag("missing: $wrapper (package 14 has not written it yet)");
@@ -475,7 +475,7 @@ for my $role (qw(manual driver reporter)) {
 # on its own when the runner parallelises files.
 # ===========================================================================
 {
-    my $stopgate = "$BUTLER_DIR/hooks/next/stop-gate.sh";
+    my $stopgate = "$BUTLER_DIR/hooks/stop-gate.sh";
     ok(-f $stopgate, 'self-check precondition: stop-gate.sh (package 06) exists on disk');
 
     my $res_wrapper = GuardHarness::run_wrapper($stopgate,

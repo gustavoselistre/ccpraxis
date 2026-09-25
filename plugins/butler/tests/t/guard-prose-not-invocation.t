@@ -310,11 +310,15 @@ my $delim = 'PLAINDELIM';
            'AC-25b: the hook source no longer contains the old residual clause '
          . '(heredoc-only ... narrower, safer path)');
 
-    like($norm, qr/WHAT IS NARROWED/, 'AC-26a: header names WHAT IS NARROWED');
-    like($norm, qr/RESIDUAL LEFT UNFIXED, KNOWINGLY, after that narrowing/,
-         'AC-26b: header names the post-narrowing residual paragraph');
-    like($norm, qr/git \\<newline>stash/,
-         'AC-26c: header names the git \<newline>stash residual (E-3)');
+    # AC-26a/b/c pinned narrative header prose ("WHAT IS NARROWED", "RESIDUAL
+    # LEFT UNFIXED, KNOWINGLY...", the git \<newline>stash residual) that
+    # lived in the pre-package-14 monolithic guard-git-mutations.sh. Package
+    # 14's guards-remake rewrote that file as a thin run-hook.sh dispatcher
+    # (logic moved to BpHook/Guards/GuardGitMutations.pm, outside this
+    # package's write set), so no hooks/*.sh header carries implementation
+    # narrative any more -- there is no successor location for this prose to
+    # retarget to. Removed per Decision 34 (DEL: subject file's content was
+    # replaced by package 14, before this package's batch B flatten).
 }
 
 {

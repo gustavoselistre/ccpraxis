@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 # platform: any
 # Oracle for package 12-dispatch-binding (blueprint hook-continuity-remake),
-# specs/12-dispatch-binding-spec.md AC-1..AC-20. plugins/butler/hooks/next/
+# specs/12-dispatch-binding-spec.md AC-1..AC-20. plugins/butler/hooks/
 # bind-dispatch.sh and BpHook/BindDispatch.pm DO NOT EXIST YET at the time
 # this file is written -- every in-process case goes through GuardHarness::
 # run_module() (plugins/butler/tests/lib/GuardHarness.pm), which mirrors
@@ -50,7 +50,7 @@ GuardHarness::isolate_env();
 # @INC, which no longer contains "." on modern perl -- a relative path here
 # would fail to locate bp-drive-next.pl regardless of whether it exists).
 (my $BUTLER_DIR = Cwd::abs_path(dirname(__FILE__) . '/../..')) =~ s{\\}{/}g;
-my $WRAPPER    = 'plugins/butler/hooks/next/bind-dispatch.sh';
+my $WRAPPER    = 'plugins/butler/hooks/bind-dispatch.sh';
 my $J = JSON::PP->new->utf8->canonical;
 
 # ---------------------------------------------------------------------------
@@ -690,14 +690,20 @@ sub bd {
 }
 
 # ===========================================================================
-# AC-18: not registered anywhere.
+# AC-18: registration. Package 12 built bind-dispatch.sh additive-only, not
+# registered anywhere (Decision 19) -- but package 16's cutover is exactly
+# what wires it in, so the pre-cutover "not registered anywhere" premise is
+# retired here (Decision 34, SW: the switch from unregistered to registered
+# is what this package does). hooks.json now registers it on PreToolUse
+# Task|Agent (spec 16 sec 2.3); settings.json never has and still does not.
 # ===========================================================================
 {
     my $hooks_json = "$BUTLER_DIR/hooks/hooks.json";
     my $settings_json = "$BUTLER_DIR/../../.claude/settings.json";
     ok(-f $hooks_json, 'AC-18 precondition: hooks.json exists');
     ok(-f $settings_json, 'AC-18 precondition: .claude/settings.json exists');
-    unlike(read_bytes($hooks_json) // '', qr/bind-dispatch/, 'AC-18: hooks.json does not mention bind-dispatch');
+    like(read_bytes($hooks_json) // '', qr/bind-dispatch/,
+        'AC-18: hooks.json registers bind-dispatch.sh now that package 16 has cut over');
     unlike(read_bytes($settings_json) // '', qr/bind-dispatch/, 'AC-18: .claude/settings.json does not mention bind-dispatch');
 }
 

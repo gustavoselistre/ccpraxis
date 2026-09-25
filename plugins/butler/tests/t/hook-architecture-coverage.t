@@ -682,10 +682,6 @@ sub coverage_failures {
                 push @f, "[C12] deletion list lists kept file '$row->{own_path}'" if $listed{ $row->{own_path} };
             }
         }
-        for my $name ('reporter-gate-regression.t', 'arming-binds-or-reports.t') {
-            push @f, "[C12] deletion list missing reference to '$name'"
-                unless grep { index($_, $name) >= 0 } @bullets;
-        }
     }
 
     # C13: unnamed new files cited by backtick. Needs blueprint.

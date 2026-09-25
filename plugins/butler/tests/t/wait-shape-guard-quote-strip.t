@@ -97,53 +97,21 @@ sub ws_call {
 sub is_wait_loop { return ws_call('bp_ws_is_wait_loop', $_[0]) }
 
 # =====================================================================================
-# AC1 (DC1) -- rationale comment at the site of the new code.
+# AC1/AC3/AC11 -- REMOVED (package 16 batch-B fix round). AC1 and AC3 pinned literal
+# bash source (the ACCIDENT/ADVERSARY/D7 rationale comment and the BP_WS_*_RE matcher
+# strings) that no longer exists: wait-shape-guard.sh is now an exec shim into
+# BpHook::Guards::WaitShapeGuard (reason SRC, same as guards-remake-wait-shape.t's own
+# header note for the sibling old file wait-shape-guard.t). AC11 tested a pure
+# bp_ws_is_wait_loop bash FUNCTION called directly, bypassing bp_ws_main entirely, to
+# prove the split between the unstripped pure helper and the stripped-aware main body
+# -- that split does not exist in the new architecture (there is no separately
+# callable pure helper any more, only one run() entry point), so the whole mechanism
+# AC11 exercised is gone (reason DEL). The behavior AC11 protected either side of
+# (quote-stripping happens only in the enforcement path, not underneath it) is
+# re-expressed by WS-1 (a real wait-loop denies) and WS-2 (a quoted mention of the
+# same shape allows) in guards-remake-wait-shape.t. AC10 below (subprocess, jq-gated)
+# is untouched -- it already exercises the real behavior through the actual hook.
 # =====================================================================================
-{
-    my $src = do { local (@ARGV, $/) = ($HOOK); <> };
-    like($src, qr/ACCIDENT/, 'AC1: wait-shape-guard.sh source states the ACCIDENT-not-ADVERSARY threat model ruling');
-    like($src, qr/ADVERSARY/i, 'AC1: ...and explicitly names ADVERSARY as the rejected alternative');
-    # SS5 requires this hook's comment to distinguish D7 (infra-uncertainty fail-open)
-    # from the NEW stripping-unavailable degrade, which must NOT reuse D7's fail-open.
-    like($src, qr/D7/, 'AC1: ...and distinguishes this from D7 (infra-uncertainty fail-open does not extend to stripping)');
-}
-
-# =====================================================================================
-# AC3 (DC2) -- the three mandated matcher EREs (verbatim, per 67's own AC3.x pins) are
-# unchanged; the enforcement body gains stripped-text computation but no new grep -E
-# pattern text.
-# =====================================================================================
-{
-    my $src = do { local (@ARGV, $/) = ($HOOK); <> };
-    ok(index($src, q{BP_WS_LOOP_RE='(^|[^A-Za-z0-9_-])(while|until|for)[[:space:]]'}) >= 0,
-       'AC3: BP_WS_LOOP_RE is byte-identical to today');
-    ok(index($src, q{BP_WS_SLEEP_RE='(^|[^A-Za-z0-9_-])sleep[[:space:]]+[0-9]'}) >= 0,
-       'AC3: BP_WS_SLEEP_RE is byte-identical to today');
-    ok(index($src, q{BP_WS_PIPE_RE='\|[[:space:]]*(tail|head)([[:space:]][^;&|]*)?[;&]+[^;&|]*\$\?'}) >= 0,
-       'AC3: BP_WS_PIPE_RE is byte-identical to today');
-}
-
-# =====================================================================================
-# AC11 (DC1) -- the pure helpers stay PURE and UNCHANGED: bp_ws_is_wait_loop, called
-# DIRECTLY (as t/67 calls it, bypassing bp_ws_main entirely), must still see a real
-# while/sleep shape as "yes" REGARDLESS of surrounding quoting -- because these pure
-# functions never receive MATCH_TEXT; bp_ws_main alone gains that layer. If a future
-# change accidentally pushed stripping INTO the pure helpers themselves (forbidden by
-# spec SS2.3: "the three functions' own signatures/bodies are untouched"), a quoted
-# wait-loop mention would start reading 'no' here, which is the regression this guards.
-# =====================================================================================
-{
-    is(is_wait_loop(q{while ! test -f x; do sleep 5; done}), 'yes',
-       'AC11: bp_ws_is_wait_loop called directly still detects a real wait-loop shape (unaffected by t09)');
-    is(is_wait_loop(''), 'no', 'AC11: bp_ws_is_wait_loop called directly still returns no for empty input');
-    # A quoted MENTION of the wait-loop shape (e.g. inside an echoed doc string) is
-    # matched 'yes' by the PURE helper when called directly -- it has no quote-
-    # awareness at all (spec SS2.3: "the three functions' own signatures/bodies are
-    # untouched"). Only bp_ws_main (fed MATCH_TEXT) may allow this at the hook level;
-    # the raw helper's own behavior on this string must stay exactly what it is today.
-    is(is_wait_loop(q{echo 'anti-pattern example: while ! test -f x; do sleep 5; done'}), 'yes',
-       'AC11: the pure helper itself still matches a quoted mention (no quote-awareness in the pure layer -- that lives only in bp_ws_main)');
-}
 
 SKIP: {
     skip 'jq is not installed on this host; wait-shape-guard.sh fails OPEN (D7) without it, so no denial is observable', 2

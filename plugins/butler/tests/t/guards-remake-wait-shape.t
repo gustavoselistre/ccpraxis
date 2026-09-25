@@ -6,7 +6,7 @@
 # successor (WaitShapeGuard), which absorbs repeat-guard, running on the
 # package-03 hook core.
 #
-# hooks/next/guards/wait-shape-guard.sh and BpHook/Guards/WaitShapeGuard.pm
+# hooks/wait-shape-guard.sh and BpHook/Guards/WaitShapeGuard.pm
 # DO NOT EXIST YET. Every in-process case goes through
 # GuardHarness::run_module() (batch 1's harness), which mirrors
 # BpHook::main()'s own require-and-call contract, so a missing module fails
@@ -344,7 +344,7 @@ my $REAL_WAIT_LOOP   = q{while ! test -f x; do sleep 5; done};
 # SH-1/SH-2 -- static shape.
 # =====================================================================================
 {
-    my $wrapper = "$BUTLER_DIR/hooks/next/guards/wait-shape-guard.sh";
+    my $wrapper = "$BUTLER_DIR/hooks/wait-shape-guard.sh";
     my $module  = "$BUTLER_DIR/scripts/BpHook/Guards/WaitShapeGuard.pm";
     ok(-f $wrapper, 'SH-1 precondition: wait-shape-guard.sh exists on disk')
         or diag("missing: $wrapper (package 14 has not written it yet)");
@@ -858,7 +858,7 @@ for my $v (qw(bogus Off 0 nudge)) {
 # =====================================================================================
 {
     GuardHarness::fresh_state();
-    my $stopgate = "$BUTLER_DIR/hooks/next/stop-gate.sh";
+    my $stopgate = "$BUTLER_DIR/hooks/stop-gate.sh";
     ok(-f $stopgate, 'self-check precondition: stop-gate.sh (package 06) exists on disk');
 
     my $res_shim = GuardHarness::run_shim($stopgate,

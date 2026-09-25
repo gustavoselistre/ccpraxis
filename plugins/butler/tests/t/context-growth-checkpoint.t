@@ -507,8 +507,11 @@ subtest 'AC10: --ctx-usage tail-reads a >=2MB transcript, only the last usable l
 # =====================================================================================
 subtest 'AC31: ctx_ceiling / BP_CONTEXT_CEILING_TOKENS (whole word) appear nowhere in the migrated files (B30)' => sub {
     my $SKILL = "$Bin/../../skills/coordinator-protocol/SKILL.md";
-    my $GUIDANCE_HOOK = "$Bin/../../hooks/context-ceiling-guidance.sh";
-    my $FLUSH_HOOK    = "$Bin/../../hooks/context-ceiling-flush.sh";
+    # Retargeted per package 16's batch B (Decision 34, spec 16 sec 4 batch B
+    # note "context-growth-checkpoint AC31 (retarget to hooks/context-ceiling.sh)"):
+    # context-ceiling-guidance.sh and context-ceiling-flush.sh were merged
+    # into one guard, hooks/context-ceiling.sh, by package 14's guards-remake.
+    my $CEILING_HOOK = "$Bin/../../hooks/context-ceiling.sh";
     my $sub_re = sub {
         my ($path) = @_;
         return unless -f $path;
@@ -516,7 +519,7 @@ subtest 'AC31: ctx_ceiling / BP_CONTEXT_CEILING_TOKENS (whole word) appear nowhe
         local $/; my $c = <$r>; close $r;
         return $c;
     };
-    for my $f ($ORCH, $SKILL, $GUIDANCE_HOOK, $FLUSH_HOOK) {
+    for my $f ($ORCH, $SKILL, $CEILING_HOOK) {
         my $src = $sub_re->($f);
         ok(defined $src, "$f exists and is readable") or next;
         unlike($src, qr/\bctx_ceiling\b/, "$f: no whole-word 'ctx_ceiling' (ctx_ceiling_soft/hard are fine, this is not a substring check)");

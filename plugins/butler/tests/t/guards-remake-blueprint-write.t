@@ -6,7 +6,7 @@
 # successor (GuardBlueprintWrite, which absorbs guard-ledger-create),
 # running on the package-03 hook core.
 #
-# hooks/next/guards/guard-blueprint-write.sh and
+# hooks/guard-blueprint-write.sh and
 # BpHook/Guards/GuardBlueprintWrite.pm DO NOT EXIST YET. Every in-process
 # call goes through GuardHarness::run_module() (batch 1's harness,
 # plugins/butler/tests/lib/GuardHarness.pm), which mirrors BpHook::main()'s
@@ -132,7 +132,7 @@ my $LEDGER_L2_CONSUME = "A valid ledger-write-override was found but could not b
 # SH-1/SH-2 -- static shape.
 # ===========================================================================
 {
-    my $wrapper = "$BUTLER_DIR/hooks/next/guards/guard-blueprint-write.sh";
+    my $wrapper = "$BUTLER_DIR/hooks/guard-blueprint-write.sh";
     my $module  = "$BUTLER_DIR/scripts/BpHook/Guards/GuardBlueprintWrite.pm";
     ok(-f $wrapper, 'SH-1 precondition: guard-blueprint-write.sh exists on disk')
         or diag("missing: $wrapper (package 14 has not written it yet)");
@@ -507,7 +507,7 @@ my $LEDGER_L2_CONSUME = "A valid ledger-write-override was found but could not b
 # this file must stand on its own when the runner parallelises files.
 # ===========================================================================
 {
-    my $stopgate = "$BUTLER_DIR/hooks/next/stop-gate.sh";
+    my $stopgate = "$BUTLER_DIR/hooks/stop-gate.sh";
     ok(-f $stopgate, 'self-check precondition: stop-gate.sh (package 06) exists on disk');
 
     my $res_wrapper = GuardHarness::run_wrapper($stopgate,

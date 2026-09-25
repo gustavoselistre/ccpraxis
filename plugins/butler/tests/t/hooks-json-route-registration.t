@@ -1,36 +1,27 @@
 #!/usr/bin/env perl
 # platform: any
-# 141 -- oracle for the REGISTRATION-ROUTE
-# half of g02's fix (spec §2.1/§2.2/§2.3/§2.4, AC3/AC4/AC7, done criteria
-# 3/4/6). Complements 140 (which pins the SCRIPTS' cwd/env independence,
-# already true today). This file pins the thing that is NOT yet true: that
-# gate-headless-background.sh and guard-judge-checks.sh are registered via
-# ${CLAUDE_PLUGIN_ROOT} (hooks.json, machine-wide, reaches any project once
-# promoted -- scout-step1.md item 1) and are registered NOWHERE in
-# .claude/settings.json ($CLAUDE_PROJECT_DIR-relative, ccpraxis-only, dead
-# everywhere else). BEFORE this package's edit, block B below fails (the
-# entries are absent from hooks.json) and block C below fails (the entries
-# are still present in settings.json) -- that is the correct, expected shape
-# of red for a test written from the spec before the fix exists.
+# REWRITTEN oracle for batch B of blueprint hook-continuity-remake, package
+# 16-cutover (specs/16-cutover-spec.md sec 2.2/2.3/2.4, acceptance B-1).
 #
-# NON-VACUITY NOTE, since this is a JSON-structure file and structural
-# checks are exactly the kind of oracle this package exists to distrust.
-# What makes THESE structural checks different from t/61's and t/112's
-# registration-only checks (which this package's whole point is that they
-# proved nothing about reach): this file does not stand alone as evidence of
-# reach -- 140 supplies the "the script itself doesn't care where it's
-# invoked from" half, and scout-step1.md's item 1 (${CLAUDE_PLUGIN_ROOT}
-# resolves machine-wide, independent of driven project, confirmed against
-# DAME's own settings.local.json) supplies the "the route itself reaches
-# other projects" half at the mechanism level. This file's job is narrower
-# and more honest: prove the SOURCE FILES were actually edited as the spec
-# demands, not that the edit causes a session to fire (spec §6: that would
-# require launching a real session, out of reach for this suite).
+# The file's ORIGINAL subject (gate-headless-background.sh and
+# guard-judge-checks.sh's settings.json-vs-hooks.json route, packages g02/h01)
+# is retired here rather than carried: both scripts are on the batch-B
+# deletion list (spec sec 4 batch-B file list), so a route decision about a
+# deleted script cannot be an oracle for the tree this package leaves behind.
+# What replaces it is the full sec 2.3 target registration set: the exact
+# (event, matcher, file, args) multiset hooks.json must decode to, that every
+# command string is byte-identical to the sec 2.2 template for its own file
+# and args, and that every named file actually exists directly under
+# plugins/butler/hooks/ (never hooks/next/).
 #
-# NEVER MUTATES the real files -- read-only assertions, same discipline as
-# h01-settings-registration.t and plugins/sandbox/tests/t/settings-scope-split.t.
+# READ-ONLY against the tracked hooks.json and the hooks/ directory listing --
+# never writes to either. Runs standalone: perl this file.
 #
-# Runs standalone: perl this file
+# RIGHT NOW (before batch B lands) this file is red: hooks.json still carries
+# the pre-cutover 30-ish-command layout and the sec 2.3 files still live under
+# hooks/next/ and hooks/next/guards/, not directly under hooks/. That is the
+# correct shape of red for an oracle written from the spec, not from the
+# unfinished tree.
 
 use strict;
 use warnings;
@@ -42,243 +33,113 @@ use JSON::PP;
 my $REPO_ROOT = abs_path("$Bin/../../../..");
 BAIL_OUT("cannot resolve repo root from $Bin/../../../..") unless defined $REPO_ROOT;
 
-my $SETTINGS   = "$REPO_ROOT/.claude/settings.json";
-my $HOOKS_JSON = "$REPO_ROOT/plugins/butler/hooks/hooks.json";
+my $HOOKS_DIR  = "$REPO_ROOT/plugins/butler/hooks";
+my $HOOKS_JSON = "$HOOKS_DIR/hooks.json";
 
-ok(-f $SETTINGS,   '.claude/settings.json exists') or BAIL_OUT('no settings.json');
-ok(-f $HOOKS_JSON, 'hooks.json exists')             or BAIL_OUT('no hooks.json');
-
-sub slurp {
-    my ($path) = @_;
-    open my $fh, '<:raw', $path or BAIL_OUT("cannot open $path: $!");
-    local $/;
-    my $raw = <$fh>;
-    close $fh;
-    return $raw;
-}
+ok(-f $HOOKS_JSON, 'hooks.json exists') or BAIL_OUT('no hooks.json');
 
 sub read_json {
     my ($path) = @_;
-    my $raw = slurp($path);
+    open my $fh, '<:raw', $path or BAIL_OUT("cannot open $path: $!");
+    my $raw = do { local $/; <$fh> };
+    close $fh;
     my $doc = eval { JSON::PP->new->utf8->decode($raw) };
     return ($doc, $raw, $@);
 }
 
-my ($settings, $settings_raw, $serr) = read_json($SETTINGS);
-ok(ref $settings eq 'HASH', 'A1: .claude/settings.json parses as an object') or diag("decode failed: $serr");
-
-my ($hooksjson, $hooksjson_raw, $herr) = read_json($HOOKS_JSON);
-ok(ref $hooksjson eq 'HASH', 'A2: hooks.json parses as an object') or diag("decode failed: $herr");
+my ($doc, $raw, $err) = read_json($HOOKS_JSON);
+unless (ref $doc eq 'HASH') {
+    fail('A1: hooks.json parses as an object');
+    diag("decode failed: $err");
+    BAIL_OUT('unparseable hooks.json');
+}
+pass('A1: hooks.json parses as an object');
 
 # ---------------------------------------------------------------------------
-# Helper: find all PreToolUse/Bash-matcher command hooks in a hooks.json-style
-# decoded document ({hooks:{PreToolUse:[...]}} for hooks.json,
-# {hooks:{PreToolUse:[...]}} for settings.json -- same shape).
+# sec 2.2 template builder. <args> is '' or ' --only-during-butler-run' (one
+# leading space, per spec). ${CLAUDE_PLUGIN_ROOT} form for hooks.json.
 # ---------------------------------------------------------------------------
-sub bash_matcher_blocks {
-    my ($doc) = @_;
-    return () unless ref $doc eq 'HASH' && ref $doc->{hooks} eq 'HASH';
-    my @blocks;
-    for my $entry (@{ $doc->{hooks}{PreToolUse} // [] }) {
-        next unless ref $entry eq 'HASH';
-        my $matcher = $entry->{matcher} // '';
-        my @alts = split /\|/, $matcher;
-        push @blocks, $entry if grep { $_ eq 'Bash' } @alts;
-    }
-    return @blocks;
+sub hooksjson_template {
+    my ($file, $args) = @_;
+    $args //= '';
+    return qq{f="\${CLAUDE_PLUGIN_ROOT}/hooks/$file" ; w="\${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh" ; unset BASH_ENV ; [ -f "\$f" ] && [ -f "\$w" ] || exit 0 ; bash -n "\$f" 2>/dev/null && bash -n "\$w" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash "\$f"$args};
 }
 
-sub commands_matching {
-    my ($doc, $command_re) = @_;
-    my @found;
-    for my $block (bash_matcher_blocks($doc)) {
-        for my $h (@{ $block->{hooks} // [] }) {
-            next unless ref $h eq 'HASH';
-            push @found, $h->{command} // '' if ($h->{command} // '') =~ $command_re;
+# ---------------------------------------------------------------------------
+# sec 2.3's target set for hooks.json -- 17 commands. A group with an empty
+# matcher string below means "no matcher key" in the decoded JSON.
+# ---------------------------------------------------------------------------
+my @EXPECT = (
+    { event => 'PreToolUse',  matcher => 'Bash',                                        file => 'guard-bash.sh',              args => '' },
+    { event => 'PreToolUse',  matcher => 'Bash',                                        file => 'guard-git-mutations.sh',     args => ' --only-during-butler-run' },
+    { event => 'PreToolUse',  matcher => 'Bash',                                        file => 'arm-on-entry.sh',            args => '' },
+    { event => 'PreToolUse',  matcher => 'Bash',                                        file => 'continuity-off-check.sh',    args => '' },
+    { event => 'PreToolUse',  matcher => 'Edit|Write|MultiEdit|NotebookEdit',           file => 'guard-writes.sh',            args => '' },
+    { event => 'PreToolUse',  matcher => 'Edit|Write|MultiEdit|NotebookEdit',           file => 'ledger-guard.sh',             args => '' },
+    { event => 'PreToolUse',  matcher => 'Edit|Write|MultiEdit|NotebookEdit',           file => 'guard-blueprint-write.sh',    args => '' },
+    { event => 'PreToolUse',  matcher => 'Edit|Write|MultiEdit|NotebookEdit|Task|Agent', file => 'gate-shutdown.sh',           args => '' },
+    { event => 'PreToolUse',  matcher => 'Task|Agent',                                  file => 'bind-dispatch.sh',            args => '' },
+    { event => 'PreToolUse',  matcher => 'Task|Agent',                                  file => 'track-dispatch.sh',           args => '' },
+    { event => 'PreToolUse',  matcher => 'Task|Agent|Bash',                             file => 'context-ceiling.sh',          args => '' },
+    { event => 'PreToolUse',  matcher => '',                                            file => 'wait-shape-guard.sh',         args => '' },
+    { event => 'PreToolUse',  matcher => 'AskUserQuestion',                             file => 'guard-ask-operator.sh',       args => '' },
+    { event => 'PostToolUse', matcher => 'Task|Agent',                                  file => 'track-dispatch.sh',           args => '' },
+    { event => 'PostToolUse', matcher => 'Task|Agent|Bash',                             file => 'context-ceiling.sh',          args => '' },
+    { event => 'SubagentStop',matcher => '',                                            file => 'track-dispatch.sh',           args => '' },
+    { event => 'Stop',        matcher => '',                                            file => 'stop-gate.sh',                args => '' },
+);
+is(scalar(@EXPECT), 17, 'sanity: this file\'s own sec 2.3 fixture table has 17 rows');
+
+sub expect_key { my ($r) = @_; return join("\x1e", $r->{event}, $r->{matcher}, $r->{file}, $r->{args}) }
+
+# ---------------------------------------------------------------------------
+# B1: decode every actual (event, matcher, command) entry, extract its file
+# name (first .sh-ending token per sec 2.2) and infer which of '' /
+# ' --only-during-butler-run' the command's args tail equals -- WITHOUT
+# assuming the command already matches the sec 2.2 template (it may be the
+# stale pre-cutover form entirely).
+# ---------------------------------------------------------------------------
+my @actual;
+my @template_mismatches;
+if (ref $doc eq 'HASH' && ref $doc->{hooks} eq 'HASH') {
+    for my $event (sort keys %{ $doc->{hooks} }) {
+        for my $group (@{ $doc->{hooks}{$event} // [] }) {
+            next unless ref $group eq 'HASH';
+            my $matcher = defined $group->{matcher} ? $group->{matcher} : '';
+            for my $h (@{ $group->{hooks} // [] }) {
+                next unless ref $h eq 'HASH';
+                my $cmd = $h->{command} // '';
+                my ($file) = $cmd =~ m{([A-Za-z0-9_.-]+\.sh)};
+                $file //= '';
+                my $args = '';
+                $args = ' --only-during-butler-run' if $cmd =~ /--only-during-butler-run\z/;
+                my $expected_cmd = length($file) ? hooksjson_template($file, $args) : '';
+                push @template_mismatches, "$event/$matcher: $cmd"
+                    unless length($file) && $cmd eq $expected_cmd;
+                push @actual, { event => $event, matcher => $matcher, file => $file, args => $args, command => $cmd };
+            }
         }
     }
-    return @found;
 }
 
-# ===========================================================================
-# B. hooks.json GAINS gate-headless-background.sh and guard-judge-checks.sh,
-#    under the EXISTING Bash-matcher PreToolUse block, ${CLAUDE_PLUGIN_ROOT}-
-#    relative (spec §2.1, behavior 3, AC3). THIS IS THE BLOCK THAT FAILS
-#    BEFORE THE FIX -- hooks.json today has no mention of either script.
-# ===========================================================================
-{
-    # Only the plain "Bash" matcher counts here: context-ceiling-flush.sh's own "Task|Bash"
-    # block (dd39431, pinned by context-ceiling-flush.t) is a different feature's deliberate
-    # registration, not a second opening of this block.
-    my @bash_blocks = grep { ($_->{matcher} // '') eq 'Bash' } bash_matcher_blocks($hooksjson);
-    is(scalar(@bash_blocks), 1,
-       'B1: hooks.json has exactly ONE PreToolUse block whose matcher is plain Bash -- '
-     . 'the spec requires appending into the existing block, never opening a third one '
-     . '(a count of 2 here means a new block was opened instead of appending)')
-        or diag('found ' . scalar(@bash_blocks) . ' Bash-matcher blocks');
+my @expect_keys = sort map { expect_key($_) } @EXPECT;
+my @actual_keys = sort map { expect_key($_) } @actual;
+is_deeply(\@actual_keys, \@expect_keys,
+    'B1a: hooks.json\'s (event, matcher, file, args) multiset equals sec 2.3 exactly (17 commands)')
+    or diag("actual:\n" . join("\n", @actual_keys) . "\nexpected:\n" . join("\n", @expect_keys));
 
-    my @gate = commands_matching($hooksjson, qr/gate-headless-background\.sh/);
-    is(scalar(@gate), 1,
-       'B2: hooks.json registers gate-headless-background.sh exactly once under the Bash matcher')
-        or diag('an unregistered or duplicated hook cannot be the single, correct route');
-    if (@gate) {
-        like($gate[0], qr/\$\{CLAUDE_PLUGIN_ROOT\}/,
-             'B3: ...using ${CLAUDE_PLUGIN_ROOT} (machine-wide live-install-relative, per scout item 1) '
-           . '-- NOT $CLAUDE_PROJECT_DIR (the dead route being replaced) and not a hardcoded path');
-        unlike($gate[0], qr/\$CLAUDE_PROJECT_DIR/,
-             'B4: ...and specifically does NOT use $CLAUDE_PROJECT_DIR');
-    }
+is(scalar(@template_mismatches), 0,
+    'B1b: every command string in hooks.json equals the sec 2.2 template for its own file and args')
+    or diag("mismatched commands:\n" . join("\n", @template_mismatches));
 
-    my @judge = commands_matching($hooksjson, qr/guard-judge-checks\.sh/);
-    is(scalar(@judge), 1,
-       'B5: hooks.json registers guard-judge-checks.sh exactly once under the Bash matcher');
-    if (@judge) {
-        like($judge[0], qr/\$\{CLAUDE_PLUGIN_ROOT\}/,
-             'B6: ...using ${CLAUDE_PLUGIN_ROOT}');
-        unlike($judge[0], qr/\$CLAUDE_PROJECT_DIR/,
-             'B7: ...and specifically does NOT use $CLAUDE_PROJECT_DIR');
-    }
-
-    # Sibling entries (guard-bash.sh, mark-wakeup.sh) must still be present,
-    # unmoved -- the spec requires APPENDING, not replacing the block's
-    # existing contents.
-    my @siblings = commands_matching($hooksjson, qr/guard-bash\.sh|mark-wakeup\.sh/);
-    is(scalar(@siblings), 2,
-       'B8: the pre-existing guard-bash.sh and mark-wakeup.sh entries in the same block '
-     . 'are still present, unremoved by this edit');
-}
-
-# ===========================================================================
-# C. .claude/settings.json LOSES all mention of gate-headless-background.sh
-#    and guard-judge-checks.sh anywhere in the file (spec §2.2, behavior 4,
-#    AC4). THIS IS THE OTHER BLOCK THAT FAILS BEFORE THE FIX -- today the
-#    h01 block is still present.
-# ===========================================================================
-{
-    unlike($settings_raw, qr/gate-headless-background\.sh/,
-       'C1: .claude/settings.json contains NO mention of gate-headless-background.sh anywhere '
-     . 'in the raw file -- single route, no dual registration (h01 spec §2.5, adopted by citation)');
-    unlike($settings_raw, qr/guard-judge-checks\.sh/,
-       'C2: .claude/settings.json contains NO mention of guard-judge-checks.sh anywhere in the raw file');
-}
-
-# ===========================================================================
-# D. Regression: the PRE-EXISTING guard-git-mutations.sh and
-#    guard-subagent-stall.sh registrations in .claude/settings.json survive
-#    BYTE-IDENTICAL (structurally, via deep equality on the decoded JSON
-#    entries -- spec §2.2's "byte-for-byte untouched", behavior 5, AC4/AC6).
-#    Expected structures captured from the file BEFORE this package's edit
-#    (read while writing this test, from the still-unedited tracked file).
-# ===========================================================================
-{
-    my $expect_git_mutations = {
-        'matcher' => 'Bash',
-        'hooks' => [
-            {
-                'command' => '"$CLAUDE_PROJECT_DIR"/plugins/butler/hooks/guard-git-mutations.sh',
-                'type' => 'command',
-            },
-        ],
-    };
-    my $expect_stall_post = {
-        'matcher' => 'Task|Bash',
-        'hooks' => [
-            {
-                'command' => '"$CLAUDE_PROJECT_DIR"/plugins/butler/hooks/guard-subagent-stall.sh',
-                'type' => 'command',
-            },
-        ],
-    };
-    my $expect_stall_stop = {
-        'hooks' => [
-            {
-                'command' => '"$CLAUDE_PROJECT_DIR"/plugins/butler/hooks/guard-subagent-stall.sh',
-                'type' => 'command',
-            },
-        ],
-    };
-
-    my @pretooluse = @{ $settings->{hooks}{PreToolUse} // [] };
-    my ($git_block) = grep {
-        ref $_ eq 'HASH'
-        && grep { ($_->{command} // '') =~ /guard-git-mutations\.sh/ } @{ $_->{hooks} // [] }
-    } @pretooluse;
-    ok(defined $git_block, 'D1: a PreToolUse/Bash block for guard-git-mutations.sh still exists')
-        or diag('guard-git-mutations.sh is explicitly OUT of this package'."'".'s write-set-legal scope '
-               . '(spec §2.4) -- its disappearance would be a different, worse defect than the one fixed');
-    is_deeply($git_block, $expect_git_mutations,
-       'D2: ...and it is structurally IDENTICAL to its pre-edit form -- not merely present, '
-     . 'but untouched (matcher, command string, and type all pinned)')
-        if defined $git_block;
-
-    is(scalar(@pretooluse), 1,
-       'D3: .claude/settings.json'."'".' PreToolUse array now has exactly ONE block (guard-git-mutations.sh) -- '
-     . 'the h01 block was DELETED, not merely emptied or left as an empty array entry')
-        or diag('found ' . scalar(@pretooluse) . ' PreToolUse blocks; expected exactly 1 after the h01 block is removed');
-
-    my @posttooluse = @{ $settings->{hooks}{PostToolUse} // [] };
-    my ($stall_post) = grep { ref $_ eq 'HASH' } @posttooluse;
-    ok(defined $stall_post, 'D4: the PostToolUse/Task|Bash guard-subagent-stall.sh block still exists');
-    is_deeply($stall_post, $expect_stall_post,
-       'D5: ...structurally identical to its pre-edit form') if defined $stall_post;
-
-    my @stop = @{ $settings->{hooks}{Stop} // [] };
-    my ($stall_stop) = grep { ref $_ eq 'HASH' } @stop;
-    ok(defined $stall_stop, 'D6: the Stop guard-subagent-stall.sh block still exists');
-    is_deeply($stall_stop, $expect_stall_stop,
-       'D7: ...structurally identical to its pre-edit form') if defined $stall_stop;
-}
-
-# ===========================================================================
-# E. AC7 -- neither guard-git-mutations.sh nor guard-subagent-stall.sh may reach
-#    every session on this machine as an UNSCOPED side effect. Neither carries
-#    bp_hook_gate/BP_LEDGER, so a bare registration in hooks.json -- which
-#    travels to every project -- would apply it to sessions that have nothing to
-#    do with butler, and confiscate the operator's own tools in their own work.
-#
-#    E1 WAS "does not mention guard-git-mutations.sh anywhere", deferring the
-#    registration entirely as "a materially larger, separately-decided policy
-#    change". That decision has now been made, on evidence: registered nowhere
-#    but ccpraxis's own settings.json, the guard protected sessions working on
-#    ccpraxis and nobody else, and the incident it exists to prevent happened
-#    again in another project on 2026-09-11, taking a completed package
-#    implementation off disk (almanac 20260911-211454-863c).
-#
-#    THE OBJECTION THIS BLOCK RECORDED IS STILL RIGHT, so it is enforced rather
-#    than dropped: the travelling registration carries
-#    --only-during-butler-run, which gates on bp_drive_any_active or BP_LEDGER.
-#    A filesystem predicate, deliberately -- a Task subagent dispatched by a
-#    drive-solo driver inherits no BP_* but can still see the marker. So the
-#    guard reaches the sessions that need it without reaching the ones that do
-#    not. A BARE registration here must still fail.
-# ===========================================================================
-{
-    # Matched against the DECODED document, not the raw text: in raw JSON the
-    # closing quote is backslash-escaped, and a regex written to step over that
-    # escape is a regex about JSON encoding rather than about registration.
-    my @ggm = commands_matching($hooksjson, qr/guard-git-mutations\.sh/);
-    cmp_ok(scalar @ggm, '>', 0,
-       'E1a: hooks.json registers guard-git-mutations.sh, so the guard travels with the plugin');
-    my @unscoped = grep { $_ !~ /--only-during-butler-run/ } @ggm;
-    is(scalar @unscoped, 0,
-       'E1b: ...and EVERY such registration is run-scoped -- an unscoped one would apply to '
-     . 'every session on this machine, which is the objection AC7 was originally written to hold');
-
-    unlike($hooksjson_raw, qr/guard-subagent-stall\.sh/,
-       'E2: hooks.json does not mention guard-subagent-stall.sh anywhere either');
-}
-
-# ===========================================================================
-# F. Both files remain valid, parseable JSON post-edit -- a syntactically
-#    broken hooks.json would silently disable all NINE pre-existing hooks,
-#    not just the two this package adds (spec §5 edge case). Re-asserts A1/A2
-#    explicitly as a named, independent check rather than relying solely on
-#    the BAIL_OUT guards above (which would abort the whole file rather than
-#    report a clean failure).
-# ===========================================================================
-{
-    ok(defined $settings, 'F1: .claude/settings.json is valid JSON after the edit');
-    ok(defined $hooksjson, 'F2: hooks.json is valid JSON after the edit');
-}
+# ---------------------------------------------------------------------------
+# B1c: every <file> named in sec 2.3 exists directly under
+# plugins/butler/hooks/ (never only under hooks/next/ or hooks/next/guards/).
+# ---------------------------------------------------------------------------
+my %want_file = map { $_->{file} => 1 } @EXPECT;
+my @missing = grep { !-f "$HOOKS_DIR/$_" } sort keys %want_file;
+is(scalar(@missing), 0,
+    'B1c: every sec 2.3 <file> exists directly under plugins/butler/hooks/')
+    or diag('missing under hooks/ (top level): ' . join(', ', @missing));
 
 done_testing();

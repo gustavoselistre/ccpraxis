@@ -53,16 +53,21 @@ use FindBin qw($Bin);
 use File::Temp qw(tempdir);
 use Cwd qw(abs_path);
 
+# Package 16 batch B merged gate-headless-background.sh and guard-judge-checks.sh
+# (both on the deletion list) into guard-bash.sh (BpHook::Guards::GuardBash's
+# GB-b/GB-c rules). Both variables below now name that one successor file: same
+# cwd/CLAUDE_PROJECT_DIR-independence claim, same behaviors, one script. The old
+# jq-hard-requirement (guard-judge-checks.sh's own gate) is gone too --
+# guard-bash.sh runs through run-hook.sh's perl module, which needs no jq at all
+# (Decision 33) -- so section D's SKIP-on-no-jq gate below is removed with it.
 my $HOOKS = "$Bin/../../hooks";
-my $GATE  = "$HOOKS/gate-headless-background.sh";
-my $GUARD = "$HOOKS/guard-judge-checks.sh";
+my $GATE  = "$HOOKS/guard-bash.sh";
+my $GUARD = "$HOOKS/guard-bash.sh";
 
-ok(-f $GATE,  'gate-headless-background.sh exists at its documented path')
+ok(-f $GATE,  'guard-bash.sh (gate-headless-background.sh successor) exists at its documented path')
     or diag('everything below fails-for-the-right-reason (missing file) until it does');
-ok(-f $GUARD, 'guard-judge-checks.sh exists at its documented path')
+ok(-f $GUARD, 'guard-bash.sh (guard-judge-checks.sh successor) exists at its documented path')
     or diag('everything below fails-for-the-right-reason (missing file) until it does');
-
-my $HAVE_JQ = `command -v jq 2>/dev/null` ne '';
 
 # A directory that is demonstrably NOT an ancestor of this repo, and whose
 # tree (like every real non-ccpraxis project verified by the scout: DAME,
@@ -147,15 +152,12 @@ sub judge_payload {
 }
 
 # ===========================================================================
-# D. guard-judge-checks.sh, same independence claim (behavior 2, AC2).
-#    SKIP the jq-dependent assertion on a jq-less host (this host confirmed
-#    jq-less), per the established guard-judge-checks.t pattern -- a
-#    false negative for an infrastructure reason is exactly what must be
-#    avoided.
+# D. guard-judge-checks (now GB-c inside guard-bash.sh), same independence
+#    claim (behavior 2, AC2). No jq gate needed any more: guard-bash.sh runs
+#    through run-hook.sh's perl module (JSON::PP), not guard-judge-checks.sh's
+#    old hard jq requirement.
 # ===========================================================================
-SKIP: {
-    skip 'jq is not installed on this host; guard-judge-checks.sh hard-requires it by design', 2
-        unless $HAVE_JQ;
+{
     my ($rc, $out) = run_from_foreign($GUARD, judge_payload('pnpm run lint'),
         BP_LEDGER => '/fake/ledger.md', BP_ROLE => 'harvest-judge', CLAUDE_PROJECT_DIR => $FOREIGN);
     is($rc, 2, 'D1: from a foreign cwd/CLAUDE_PROJECT_DIR, a harvest-judge re-running a declared '

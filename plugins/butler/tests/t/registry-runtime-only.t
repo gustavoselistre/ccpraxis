@@ -30,7 +30,11 @@ my $SCRIPTS_DIR = "$Bin/../../scripts";
 my $ORCH_PATH   = "$SCRIPTS_DIR/bp-orchestrator.pl";
 my $LIB_PATH    = "$SCRIPTS_DIR/bp-lib.sh";
 my $LAUNCH_PATH = "$SCRIPTS_DIR/bp-launch.sh";
-my $GATESTOP_PATH   = "$Bin/../../hooks/gate-stop.sh";
+# Retargeted per package 16's batch B (Decision 34): gate-stop.sh was
+# renamed stop-gate.sh in the flatten, and its registry-sync logic moved
+# into BpHook/StopGate.pm's _registry_sync_locked (the {status} => $status
+# assignment there is this file's byte-for-byte successor).
+my $GATESTOP_PATH   = "$Bin/../../scripts/BpHook/StopGate.pm";
 my $LIFECYCLE_PATH  = "$SCRIPTS_DIR/bp-lifecycle.pl";
 my $ANSWER_PATH     = "$SCRIPTS_DIR/bp-answer-decision.pl";
 my $SWEEP_PATH      = "$SCRIPTS_DIR/bp-resume-sweep.sh";
@@ -163,8 +167,9 @@ PERL
 my @ALLOWLIST = (
     { label => 'bp-launch.sh:150 (launch-time status:"running")', path => $LAUNCH_PATH,
       pattern => qr/status:"running"/ },
-    { label => 'gate-stop.sh:~150 (best-effort status sync, jq {status:$st})', path => $GATESTOP_PATH,
-      pattern => qr/\{status:\$st\}/ },
+    { label => 'BpHook/StopGate.pm _registry_sync_locked (best-effort status sync, replacing the '
+             . 'pre-cutover gate-stop.sh jq {status:$st} line)', path => $GATESTOP_PATH,
+      pattern => qr/\{status\}\s*=\s*\$status/ },
     # REMOVED for s05-retire-reconciler-drift-paths (AC-16), not retargeted.
     # This entry pinned bp-lifecycle.pl's $entry->{status} = $ledger_status
     # line (reconcile_one's step-3 status-reconciliation half) as a

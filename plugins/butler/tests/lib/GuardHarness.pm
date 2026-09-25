@@ -48,7 +48,7 @@ use Cwd ();
 (my $MY_DIR = Cwd::abs_path(dirname(__FILE__))) =~ s{\\}{/}g;
 my $BUTLER_DIR = "$MY_DIR/../..";  # plugins/butler, from plugins/butler/tests/lib
 my $SCRIPTS_DIR = "$BUTLER_DIR/scripts";
-my $GUARDS_DIR  = "$BUTLER_DIR/hooks/next/guards";
+my $GUARDS_DIR  = "$BUTLER_DIR/hooks";
 my $BPHOOK_PM   = "$SCRIPTS_DIR/BpHook.pm";
 
 # Production runs "perl -I$s" (run-hook.sh:250, $s = plugins/butler/scripts)

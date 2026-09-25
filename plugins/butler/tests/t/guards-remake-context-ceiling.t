@@ -6,7 +6,7 @@
 # successor (ContextCeiling), which absorbs context-ceiling-flush and
 # context-ceiling-guidance, running on the package-03 hook core.
 #
-# hooks/next/guards/context-ceiling.sh and BpHook/Guards/ContextCeiling.pm
+# hooks/context-ceiling.sh and BpHook/Guards/ContextCeiling.pm
 # DO NOT EXIST YET. Every in-process case goes through
 # GuardHarness::run_module() (batch 1's harness), which mirrors
 # BpHook::main()'s own require-and-call contract, so a missing module fails
@@ -238,7 +238,7 @@ my $HARD = 350_000;
 # SH-1/SH-2 -- static shape.
 # =====================================================================================
 {
-    my $wrapper = "$BUTLER_DIR/hooks/next/guards/context-ceiling.sh";
+    my $wrapper = "$BUTLER_DIR/hooks/context-ceiling.sh";
     my $module  = "$BUTLER_DIR/scripts/BpHook/Guards/ContextCeiling.pm";
     ok(-f $wrapper, 'SH-1 precondition: context-ceiling.sh exists on disk')
         or diag("missing: $wrapper (package 14 has not written it yet)");
@@ -644,7 +644,7 @@ for my $tokens (10_000, 300_000) {
 # =====================================================================================
 {
     GuardHarness::fresh_state();
-    my $stopgate = "$BUTLER_DIR/hooks/next/stop-gate.sh";
+    my $stopgate = "$BUTLER_DIR/hooks/stop-gate.sh";
     ok(-f $stopgate, 'self-check precondition: stop-gate.sh (package 06) exists on disk');
 
     my $res_shim = GuardHarness::run_shim($stopgate,

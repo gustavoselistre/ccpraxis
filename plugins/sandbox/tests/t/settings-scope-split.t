@@ -264,6 +264,34 @@ sub by_key {
                   . 'prohibited `git stash` destroyed a completed fix-batch (commit ef272c3); '
                   . 'leaving its registration untracked repeats the very mistake it was '
                   . 'written to prevent -- an instruction is not an enforcement mechanism.');
+
+        # =================================================================
+        # C5c -- added for blueprint hook-continuity-remake, package
+        # 16-cutover (specs/16-cutover-spec.md sec 2.3, acceptance B-4):
+        # after batch B, settings.json's guard-subagent-stall.sh entries
+        # (PostToolUse Task|Bash and Stop) are gone -- that script is on the
+        # batch-B deletion list, and Decision 5 leaves exactly one Stop
+        # entry across the whole tree, owned by stop-gate.sh in hooks.json,
+        # not by anything in settings.json. RIGHT NOW (before batch B lands)
+        # this is red: the tracked settings.json still carries both
+        # guard-subagent-stall.sh entries.
+        # =================================================================
+        unlike($raw, qr/guard-subagent-stall/,
+           'C5c: settings.json names no guard-subagent-stall anywhere in the raw file')
+            or diag('guard-subagent-stall.sh is on the batch-B deletion list (16-cutover spec '
+                  . 'sec 4 batch B file list); its settings.json entries must be removed with it');
+
+        my $stop_count = 0;
+        if (ref $s eq 'HASH' && ref $s->{hooks} eq 'HASH') {
+            for my $group (@{ $s->{hooks}{Stop} // [] }) {
+                next unless ref $group eq 'HASH';
+                $stop_count += scalar @{ $group->{hooks} // [] };
+            }
+        }
+        is($stop_count, 0,
+           'C5c: settings.json has no Stop entry at all (Decision 5\'s one Stop lives in '
+         . 'hooks.json\'s stop-gate.sh only)')
+            or diag("found $stop_count Stop command(s) in settings.json");
     }
 }
 

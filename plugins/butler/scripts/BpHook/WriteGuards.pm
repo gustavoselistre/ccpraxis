@@ -732,18 +732,41 @@ sub _deny_writer_scope {
     return BpHook::deny(map { _cfit($_) } @lines);
 }
 
-sub _show_write_set_line {
+# _write_set_pattern_lines($ws) -> (COUNT, @LINES). Report 20260916-175013-34af:
+# a corrupt write_set: field (prose or a colon-bearing annotation splices into
+# extra patterns) must be surfaced pattern-by-pattern, not as one raw
+# colon-joined string, or the refusal reads as a scope dispute when the real
+# defect is serialization. Each returned line is ALREADY the full display
+# line (indented), one per split pattern -- never re-joined -- so a corrupt
+# element lands on its own line and a coordinator can see the split without
+# counting colons by eye.
+sub _write_set_pattern_lines {
     my ($ws) = @_;
     $ws = '' unless defined $ws;
     my @elems = length($ws) ? split(/:/, $ws, -1) : ('');
     my $n = scalar @elems;
-    my @disp;
+    my @lines;
     for my $e (@elems) {
-        if ($e eq '')          { push @disp, '(empty)' }
-        elsif ($e =~ /\s/)      { push @disp, qq("$e" <-- contains whitespace) }
-        else                    { push @disp, $e }
+        if ($e eq '') {
+            push @lines, '    (empty)';
+        }
+        elsif ($e =~ /\s/) {
+            push @lines, qq(    "$e" <-- contains whitespace: not a path (report 20260916-175013-34af));
+        }
+        else {
+            push @lines, "    $e";
+        }
     }
-    return sprintf('  write_set, as %d pattern(s) after splitting on ":": %s', $n, join(', ', @disp));
+    return ($n, @lines);
+}
+
+# _test_paths_display($tp) -> single display string, '(empty)' when unset or
+# empty, else the raw value (test_paths is not the corruption this report is
+# about; it only needs to render without dying on the empty case, AC8).
+sub _test_paths_display {
+    my ($tp) = @_;
+    return '(empty)' unless defined $tp && length $tp;
+    return $tp;
 }
 
 sub _deny_write_set {
@@ -751,9 +774,34 @@ sub _deny_write_set {
     my @packages = @{ $R->{packages} };
     if (@packages == 1) {
         my $P = $packages[0];
+        # Report 20260916-175013-34af's rich, self-diagnosing form (pattern-
+        # per-line, the parsed count, a corrupt element citing the report, and
+        # the serialization-vs-scope-dispute guidance) applies ONLY in
+        # coordinator "env" mode (guard-writes.sh's BP_LEDGER/BP_WRITE_SET/
+        # BP_TEST_PATHS env-var path, write-set-refusal-diagnoses-itself.t) --
+        # the one path where write_set is a raw, env-serialized string that
+        # can actually BE corrupted this way. The driver/subagent path
+        # (guards-per-subagent.t AC-1, package 13, kind ne 'env') resolves
+        # write_set from inflight.json + the ledger's own parsed field, which
+        # cannot suffer this corruption, and that oracle pins the message at
+        # <=3 lines -- so it keeps the original short form unconditionally.
+        if (defined $R->{kind} && $R->{kind} eq 'env') {
+            my ($n, @pat_lines) = _write_set_pattern_lines($P->{write_set});
+            my @lines = (
+                sprintf("BLOCKED: %s is outside this package's write set (package %s).", $REL, $P->{package}),
+                sprintf('  write_set, as %d pattern(s) after splitting on ":":', $n),
+                @pat_lines,
+                sprintf('  test_paths: %s', _test_paths_display($P->{test_paths})),
+                'This may be serialized wrong and the scope is already correct, rather than a real '
+              . 'scope dispute: nothing re-derives BP_WRITE_SET mid-session, so an in-session ledger '
+              . 'repair will not help -- relaunch is the only recovery.',
+                'Record the scope problem under Next action and escalate; the orchestrator re-scopes packages.',
+            );
+            return BpHook::deny(map { _cfit($_) } @lines);
+        }
         my @lines = (
             sprintf("BLOCKED: %s is outside this package's write set (package %s).", $REL, $P->{package}),
-            _show_write_set_line($P->{write_set}),
+            sprintf('  write_set: %s', (defined $P->{write_set} && length $P->{write_set}) ? $P->{write_set} : '(empty)'),
             'Record the scope problem under Next action and escalate; the orchestrator re-scopes packages.',
         );
         return BpHook::deny(map { _cfit($_) } @lines);

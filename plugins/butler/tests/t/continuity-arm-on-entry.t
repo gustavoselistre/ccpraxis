@@ -13,7 +13,7 @@
 # fails with a non-zero rc / "No such file or directory" until the hook file
 # is written.
 #
-# BpHook.pm and hooks/next/run-hook.sh belong to package 03 and are already
+# BpHook.pm and hooks/run-hook.sh belong to package 03 and are already
 # implemented; this file requires the real copies and never edits or
 # recreates them.
 use strict;
@@ -30,7 +30,7 @@ use Cwd qw(getcwd);
 my $BUTLER_DIR = "$Bin/../..";
 my $S = "$BUTLER_DIR/scripts";
 $S =~ s{\\}{/}g;
-my $HOOKSH = "$BUTLER_DIR/hooks/next/arm-on-entry.sh";
+my $HOOKSH = "$BUTLER_DIR/hooks/arm-on-entry.sh";
 $HOOKSH =~ s{\\}{/}g;
 my $ARMPM  = "$S/BpHook/ArmOnEntry.pm";
 my $BPHOOK = "$S/BpHook.pm";

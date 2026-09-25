@@ -33,7 +33,7 @@ my $S       = "$Bin/../../scripts";
 $S =~ s{\\}{/}g;
 my $CMD     = "$S/butler-continuity.pl";
 my $BINSHIM = "$Bin/../../bin/butler-continuity";
-my $HOOKSH  = "$Bin/../../hooks/next/continuity-off-check.sh";
+my $HOOKSH  = "$Bin/../../hooks/continuity-off-check.sh";
 my $COPM    = "$S/BpHook/ContinuityOffCheck.pm";
 
 require "$S/BpHook.pm";   # package 03 -- real and already implemented

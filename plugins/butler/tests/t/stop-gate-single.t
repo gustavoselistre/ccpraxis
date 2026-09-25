@@ -28,7 +28,7 @@ use POSIX qw(WNOHANG _exit);
 use Time::HiRes qw(sleep time);
 
 (my $BUTLER = "$Bin/../..") =~ s{\\}{/}g;
-my $HOOK = "$BUTLER/hooks/next/stop-gate.sh";
+my $HOOK = "$BUTLER/hooks/stop-gate.sh";
 my $S    = "$BUTLER/scripts";
 
 require "$S/BpHook.pm";    # package 03 -- real and already implemented

@@ -6,7 +6,7 @@
 # successor (TrackDispatch), which absorbs log-dispatch, track-worker-solo
 # and untrack-worker-solo, running on the package-03 hook core.
 #
-# hooks/next/guards/track-dispatch.sh and BpHook/Guards/TrackDispatch.pm DO
+# hooks/track-dispatch.sh and BpHook/Guards/TrackDispatch.pm DO
 # NOT EXIST YET. Every in-process case goes through GuardHarness::run_module()
 # (batch 1's harness, plugins/butler/tests/lib/GuardHarness.pm), which
 # mirrors BpHook::main()'s own require-and-call contract, so a missing
@@ -263,7 +263,7 @@ sub td {
 # SH-1/SH-2 -- static shape.
 # ===========================================================================
 {
-    my $wrapper = "$BUTLER_DIR/hooks/next/guards/track-dispatch.sh";
+    my $wrapper = "$BUTLER_DIR/hooks/track-dispatch.sh";
     my $module  = "$BUTLER_DIR/scripts/BpHook/Guards/TrackDispatch.pm";
     ok(-f $wrapper, 'SH-1 precondition: track-dispatch.sh exists on disk')
         or diag("missing: $wrapper (package 14 has not written it yet)");
@@ -824,7 +824,7 @@ sub td {
 # ===========================================================================
 {
     GuardHarness::fresh_state();
-    my $stopgate = "$BUTLER_DIR/hooks/next/stop-gate.sh";
+    my $stopgate = "$BUTLER_DIR/hooks/stop-gate.sh";
     ok(-f $stopgate, 'self-check precondition: stop-gate.sh (package 06) exists on disk');
 
     my $res_shim = GuardHarness::run_shim($stopgate,

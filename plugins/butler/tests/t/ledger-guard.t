@@ -338,129 +338,18 @@ sub nonblank_lines { return grep { /\S/ } split /\n/, $_[0] }
 }
 
 # =====================================================================================
-# AC-36 [file] hooks.json registration. Needs no jq and no hook process: it is a pure
-# structural oracle over the file. Blocks 1-3 / PostToolUse / Stop must be unchanged.
+# AC-36 [file] hooks.json registration -- REMOVED (package 16 batch-B fix round,
+# reason REG). This whole block pinned the pre-cutover hooks.json shape (4+ PreToolUse
+# blocks, ledger-guard.sh in block 0, the 7-hook Bash block, the old 3-entry Stop
+# block). Package 16 rewrote hooks.json to the flattened 2.3 registration set (one
+# PreToolUse/Edit-family block with gate-shutdown.sh/guard-writes.sh/ledger-guard.sh/
+# guard-blueprint-write.sh, a single Stop entry naming stop-gate.sh, no
+# gate-drive-loop.sh or gate-continuity.sh anywhere). That shape is now the
+# concern of, and proven by, hooks-json-route-registration.t and
+# hook-registration-resilience.t (both immutable oracles for this package). No
+# behavior assertion is weakened; only the OLD registration-shape pin is dropped.
 # =====================================================================================
 {
-    my $raw = eval { read_file($HOOKSJSON) };
-    ok(defined $raw && length $raw, 'AC-36: hooks.json is readable and non-empty') or diag($@ // '');
-    my $H = eval { $J->decode($raw // '') };
-    ok(defined $H, 'AC-36: hooks.json parses as valid JSON') or diag("parse error: $@");
-
-    my $cmd_of = sub { my $f = shift; return qq(bash "\${CLAUDE_PLUGIN_ROOT}/hooks/$f") };
-    my $pre = ($H && $H->{hooks}{PreToolUse}) // [];
-    # RELAXED 2026-08-03 (b15-wait-shape-and-pipe-guards, operator-approved).
-    #   OLD: is(scalar(@$pre), 4, 'AC-36: PreToolUse still has exactly 4 blocks');
-    #   NEW: the >= form below.
-    # Same reasoning as the sibling relax in t/repeat-guard.t. b12's own
-    # registration remains pinned exactly by the assertions immediately below —
-    # block 0's command list is_deeply [gate-shutdown, guard-writes, ledger-guard]
-    # IN THAT ORDER, and block 0 has exactly 3 entries — so a missing, renamed or
-    # reordered ledger-guard.sh still fails. Only the prohibition on appending a
-    # NEW block is lifted.
-    cmp_ok(scalar(@$pre), '>=', 4, 'AC-36: PreToolUse still has at least the 4 pre-b15 blocks (later packages may append)');
-
-    my $b0 = $pre->[0] // {};
-    is($b0->{matcher}, 'Edit|Write|MultiEdit|NotebookEdit', 'AC-36: block 0 matcher is Edit|Write|MultiEdit|NotebookEdit');
-    is_deeply([ map { $_->{command} } @{ $b0->{hooks} // [] } ],
-              [ $cmd_of->('gate-shutdown.sh'), $cmd_of->('guard-writes.sh'), $cmd_of->('ledger-guard.sh') ],
-              'AC-36: block 0 command list is exactly [gate-shutdown.sh, guard-writes.sh, ledger-guard.sh] IN THAT ORDER');
-    my $n = 0;
-    for my $h (@{ $b0->{hooks} // [] }) {
-        $n++;
-        ok(defined($h->{type}) && $h->{type} eq 'command'
-           && defined($h->{timeout}) && $h->{timeout} == 15
-           && defined($h->{command}) && $h->{command} =~ m{^bash "\$\{CLAUDE_PLUGIN_ROOT\}/hooks/[a-z-]+\.sh"$},
-           "AC-36: block 0 entry #$n has type=command, timeout=15 and the house command shape");
-    }
-    is(scalar(@{ $b0->{hooks} // [] }), 3, 'AC-36: block 0 has exactly 3 hook entries');
-
-    my $b1 = $pre->[1] // {};
-    is($b1->{matcher}, 'Bash', 'AC-36: block 1 matcher unchanged');
-    # b46 (drive-loop dead-man's switch, 559379c) deliberately appended
-    # mark-wakeup.sh to the Bash and Task blocks: it must see every tool call
-    # that could schedule a wake-up. The claim -- b12 appended only to its own
-    # block 0 -- is untouched, and ledger-guard.sh appearing here still fails.
-    # UPDATED 2026-08-14 (w03-validation-interlock, driver-adjudicated). This
-    # assertion had been RED since h01 and g02 appended gate-headless-background.sh
-    # and guard-judge-checks.sh to this block without updating it here -- a
-    # regression this blueprint's own run introduced and did not notice, found
-    # only when w03 added a fifth entry and its implementer flagged the conflict
-    # instead of editing the oracle. The expected list is brought up to reality
-    # rather than loosened: it stays EXACT and ORDERED, so b12's claim -- that it
-    # appended only to its own block 0 -- still fails the moment ledger-guard.sh
-    # appears here, which is the whole point of pinning it.
-    # UPDATED 2026-09-16 (almanac 20260911-211454-863c). guard-git-mutations.sh
-    # is now registered here, FIRST. It was previously registered only in
-    # ccpraxis's own .claude/settings.json, so the hook written to stop a
-    # destructive `git st`+`ash` protected sessions working on ccpraxis and
-    # nobody else -- and the incident it exists to prevent then happened again,
-    # in another project, taking a completed package implementation off disk.
-    # Brought up to reality rather than loosened, on the same principle the note
-    # above records: the list stays EXACT and ORDERED, so the claim this
-    # assertion actually pins -- that ledger-guard.sh is not in the Bash block --
-    # still fails the moment it appears.
-    # UPDATED 2026-09-17. guard-run-finish.sh is now registered here, LAST. An
-    # agent read five background tasks dying as the operator pressing Stop, ran
-    # `bp-runstate finish` and `bp-continuity disarm`, and wound a session down
-    # with the in-flight package's own required check never run -- not for the
-    # first time. The operator's verdict on the guidance note written first was
-    # "that's just prose, and I don't think it's enough", so the rule became a
-    # hook. Brought up to reality rather than loosened, on the same principle
-    # every note above records: the list stays EXACT and ORDERED, so the claim
-    # this assertion actually pins -- that ledger-guard.sh is not in the Bash
-    # block -- still fails the moment it appears.
-    #
-    # Worth recording about the mechanism rather than the entry: this assertion
-    # was RED for weeks once before, because two packages appended here without
-    # updating it and nobody noticed. It was caught THIS time by the full --fast
-    # sweep, on a package that had just added `full-sweep` to its own checks
-    # after shipping a defect a sweep would have caught. The rule lives in a
-    # test that a hooks/-scoped change never runs, which is precisely what the
-    # blueprint's checks-table exists to force.
-    is_deeply([ map { $_->{command} } @{ $b1->{hooks} // [] } ],
-              [ $cmd_of->('guard-git-mutations.sh') . ' --only-during-butler-run',
-                $cmd_of->('guard-bash.sh'), $cmd_of->('mark-wakeup.sh'),
-                $cmd_of->('gate-headless-background.sh'), $cmd_of->('guard-judge-checks.sh'),
-                $cmd_of->('guard-validation-interlock.sh'),
-                $cmd_of->('guard-run-finish.sh') ],
-              'AC-36: block 1 command list is exactly the seven registered Bash hooks IN ORDER (ledger-guard.sh appearing here still fails)');
-    my $b2 = $pre->[2] // {};
-    is($b2->{matcher}, 'Task', 'AC-36: block 2 matcher unchanged');
-    is_deeply([ map { $_->{command} } @{ $b2->{hooks} // [] } ],
-              [ $cmd_of->('gate-shutdown.sh'), $cmd_of->('track-dispatch.sh'), $cmd_of->('mark-wakeup.sh') ],
-              'AC-36: block 2 command list unchanged, in order');
-    my $b3 = $pre->[3] // {};
-    ok(!exists $b3->{matcher}, 'AC-36: block 3 (b10 repeat-guard) still has NO matcher key');
-    is_deeply([ map { $_->{command} } @{ $b3->{hooks} // [] } ], [ $cmd_of->('repeat-guard.sh') ],
-              'AC-36: block 3 command list unchanged');
-
-    my $post = ($H && $H->{hooks}{PostToolUse}) // [];
-    # RELAXED 2026-08-14 (w03-validation-interlock, driver-adjudicated), exactly
-    # mirroring the PreToolUse relaxation above and its stated reasoning: only the
-    # prohibition on APPENDING A NEW BLOCK is lifted. w03 registers
-    # untrack-worker-solo.sh under a Task|Agent PostToolUse block. b12's own claim
-    # stays pinned by the two assertions immediately below -- block 0's matcher is
-    # exactly 'Task' and its command list is exactly [log-dispatch.sh] -- so a
-    # missing, renamed or reordered log-dispatch.sh still fails.
-    #   OLD: is(scalar(@$post), 1, 'AC-36: PostToolUse still has exactly one block');
-    cmp_ok(scalar(@$post), '>=', 1, 'AC-36: PostToolUse still has at least the 1 pre-w03 block (later packages may append)');
-    is($post->[0]{matcher}, 'Task', 'AC-36: PostToolUse matcher unchanged');
-    is_deeply([ map { $_->{command} } @{ $post->[0]{hooks} // [] } ], [ $cmd_of->('log-dispatch.sh') ],
-              'AC-36: PostToolUse hook list unchanged');
-    my $stop = ($H && $H->{hooks}{Stop}) // [];
-    is(scalar(@$stop), 1, 'AC-36: Stop still has exactly one block');
-    ok(!exists $stop->[0]{matcher}, 'AC-36: Stop block still has no matcher key');
-    # UPDATED 2026-08-14 (g01-explicit-continuity-arming). Same discipline as the
-    # PreToolUse block-1 update immediately above: brought up to reality rather
-    # than loosened. gate-continuity.sh is a legitimate THIRD entry appended to
-    # this same unmatchered block (spec SS2.5's own registration instruction);
-    # the list stays EXACT and ORDERED, so a missing/renamed/reordered
-    # gate-stop.sh or gate-drive-loop.sh still fails this assertion.
-    is_deeply([ map { $_->{command} } @{ $stop->[0]{hooks} // [] } ],
-              [ $cmd_of->('gate-stop.sh'), $cmd_of->('gate-drive-loop.sh'), $cmd_of->('gate-continuity.sh') ],
-              'AC-36: Stop hook list is exactly [gate-stop.sh, gate-drive-loop.sh, gate-continuity.sh] IN ORDER');
-
     ok(-e $HOOK,  'AC-36: plugins/butler/hooks/ledger-guard.sh exists');
     ok(-s $HOOK,  'AC-36: plugins/butler/hooks/ledger-guard.sh is non-empty');
 }

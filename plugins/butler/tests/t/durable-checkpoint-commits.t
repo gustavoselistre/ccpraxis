@@ -941,16 +941,22 @@ my $WS_RAW   = 'src/live/:docs/live.md';        # a RAW ledger string, colon and
 }
 
 # ---- AC-29: the pre-existing baseline is untouched ----------------------
+# graceful-stop-gate.t dropped from this list (reason DEL, package 16 batch
+# B fix round): it is on plugins/butler/docs/hook-architecture.md's
+# deletion list -- its subject was gate-stop.sh/gate-drive-loop.sh's
+# graceful-shutdown behavior, absorbed into gate-shutdown.sh, and its own
+# shutdown-assertion sibling coverage lives in orchestrate-shutdown-clear.t
+# (still in this baseline below), which is unedited. 20 files remain.
 {
     my @baseline = qw(
         bp-contract-validators.t bp-preflight-platform-guard.t bp-govern-decision-functions.t bp-log-redaction.t token-keeper-survivability.t orchestrator-decision-core.t
-        http-response-parsing.t orchestrator-scenarios.t graceful-stop-gate.t judge-decision-core.t orchestrator-loop-simulation.t
+        http-response-parsing.t orchestrator-scenarios.t judge-decision-core.t orchestrator-loop-simulation.t
         wait-for-decision.t answer-decision.t hooks-selftest.t
         orchestrate-shutdown-clear.t oauth-sandbox-preflight.t drive-next.t
         usage-governor.t drive-integration.t deps-check.t
         orchestrator-broken-env-turns.t );
     my @missing = grep { !-f "$TDIR/$_" } @baseline;
-    is_deeply(\@missing, [], 'AC-29 all 21 pre-existing test files are still present');
+    is_deeply(\@missing, [], 'AC-29 all 20 pre-existing test files are still present');
     ok(-f "$TDIR/durable-checkpoint-commits.t", 'AC-29 the new assertions live in a NEW file');
     opendir(my $dh, $TDIR) or die "opendir $TDIR: $!";
     my @all = sort grep { /\.t$/ } readdir $dh;

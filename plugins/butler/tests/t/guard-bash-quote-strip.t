@@ -152,66 +152,22 @@ sub path_without {
 }
 
 # =====================================================================================
-# AC1 (DC1) -- rationale comment at the site of the new code: ACCIDENT-not-ADVERSARY,
-# citing precedent, naming the residual false-positive left unfixed (bare/unquoted
-# mentions -- spec SS6 out-of-scope reader-veto).
+# AC1/AC3/AC3b (DC1/DC2) -- REMOVED (reason code SRC, package 16 batch-B fix round):
+# these pinned literal bash source text (the ACCIDENT/ADVERSARY rationale comment,
+# five `grep -Eq` regex strings, and a bash-only `ANCHOR_CLASS='...'` default branch)
+# inside guard-bash.sh itself. Package 14 moved that whole matcher into
+# BpHook::Guards::GuardBash::_gb_a/_anchor_for (plugins/butler/scripts/BpHook/Guards/
+# GuardBash.pm) as perl qr// regexes; guard-bash.sh is now an 8-line exec shim with no
+# inline matcher text left to pin. The underlying behaviors this block was guarding --
+# quoted mentions of git checkout/rm -rf/firebase deploy/git stash ALLOW, the real
+# unquoted invocations DENY, and BP_BASH_EXTRA_DENY matching -- are re-expressed
+# behaviorally (not as source pins) in plugins/butler/tests/t/guards-remake-bash.t:
+# GB-1/GB-2 (quoted-mention allow + real-invocation deny, including the exact GB-a
+# line-1 text), GB-3 (rm -rf exemptions), and GB-4 (BP_BASH_EXTRA_DENY match/no-match).
+# The command-position-anchor property AC3b asserted (openers bind, quotes don't) is
+# exercised by the same GB-1/GB-2 quoted-mention cases. No behavior assertion is
+# weakened; only the OLD monolith's now-nonexistent source text is dropped.
 # =====================================================================================
-{
-    my $src = do { local (@ARGV, $/) = ($GUARD); <> };
-    like($src, qr/ACCIDENT/, 'AC1: guard-bash.sh source states the ACCIDENT-not-ADVERSARY threat model ruling');
-    like($src, qr/ADVERSARY/i, 'AC1: ...and explicitly names ADVERSARY as the rejected alternative');
-    ok(($src =~ /mark-wakeup\.sh/ || $src =~ /guard-validation-interlock\.sh/),
-       'AC1: ...citing an existing documented ruling rather than re-deriving it');
-}
-
-# =====================================================================================
-# AC3 (DC2) -- exactly one new stripped-match-text computation; the SAME matcher regex
-# text as today, unchanged. Pinned via literal substrings of today's five `grep -Eq`
-# patterns -- captured from the pre-t09 tree, must still be present verbatim.
-# =====================================================================================
-{
-    my $src = do { local (@ARGV, $/) = ($GUARD); <> };
-    ok(index($src, 'git[[:space:]]+(-[^[:space:]]+[[:space:]]+)*(checkout|switch|restore|reset|clean|rebase|merge|commit|push)\b') >= 0,
-       'AC3: the git working-tree/history mutation regex is byte-identical to today');
-    # The VERB half stays byte-identical -- that is what AC3 is for: proving the
-    # set of covered commands has not silently changed.
-    #
-    # The ANCHOR half is deliberately no longer pinned here. It used to be, as
-    # part of this same string, which meant AC3 pinned `(^|[;&|[:space:]])` --
-    # precisely the boundary class almanac 20260819-164901-52d3 identifies as
-    # WRONG (an invocation immediately after a quote or paren was not matched, so
-    # `zsh -c 'git reset --hard'` was allowed while `sh -c ' git reset --hard'`
-    # was denied, differing by one space). An oracle that pins a defect makes
-    # fixing it look like a regression.
-    ok(index($src, 'git[[:space:]]+stash\b') >= 0,
-       'AC3: the git stash VERB regex is byte-identical to today');
-
-    # The anchor is asserted as a PROPERTY instead: command-position openers must
-    # be boundaries. `(` and `{` open a subshell or brace group, so a verb
-    # immediately after one runs exactly as it would after a `;`.
-    my ($base_anchor) = $src =~ /^\s*\*\)\s*ANCHOR_CLASS='([^']*)'/m;
-    ok(defined $base_anchor, 'AC3b: the base anchor class is parseable from the source')
-        or diag('no ANCHOR_CLASS default branch found');
-    for my $ch ('(', '{', ';', '&', '|') {
-        ok(index($base_anchor // '', $ch) >= 0,
-           "AC3b: '$ch' is a command-position boundary in the base anchor class");
-    }
-    # ...and quotes are NOT, on the default path. A quote is never itself the
-    # reason a shell executes what it encloses, so treating it as a boundary
-    # unconditionally turns a quoted MENTION into a match -- the false-positive
-    # class that makes a guard something people route around.
-    for my $ch ("'", '"') {
-        ok(index($base_anchor // '', $ch) < 0,
-           "AC3b: [$ch] is NOT a boundary on the default path -- only when a shell "
-         . "interpreter is present and the quoted span really is code");
-    }
-    ok(index($src, 'rm[[:space:]]+-[a-zA-Z]*r[a-zA-Z]*f') >= 0,
-       'AC3: the rm -rf regex is byte-identical to today');
-    ok(index($src, 'firebase[[:space:]]+deploy\b') >= 0,
-       'AC3: the firebase deploy regex is byte-identical to today');
-    ok(index($src, 'BP_BASH_EXTRA_DENY') >= 0,
-       'AC3: the BP_BASH_EXTRA_DENY extension point is byte-identical to today');
-}
 
 SKIP: {
     skip 'jq is not installed on this host; guard-bash.sh hard-requires it (bp_hook_require_jq, fail-closed)', 12

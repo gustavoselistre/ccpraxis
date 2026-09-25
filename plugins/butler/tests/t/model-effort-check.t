@@ -354,20 +354,24 @@ ITEM
                      && ref $decoded->{hooks}{PreToolUse} eq 'ARRAY'
                    ? @{ $decoded->{hooks}{PreToolUse} } : ();
 
+    # Retargeted per package 16's batch B (Decision 34): guard-ledger-create.sh
+    # is on the deletion list, merged into guard-blueprint-write.sh (package
+    # 02's design doc, "Inventory"). B-51's live successor is
+    # guard-blueprint-write.sh's own registration in the same block.
     my ($ledger_create_block) = grep {
         ref $_ eq 'HASH' && ($_->{matcher} // '') eq 'Edit|Write|MultiEdit|NotebookEdit'
         && ref $_->{hooks} eq 'ARRAY'
-        && grep { ref $_ eq 'HASH' && defined $_->{command} && $_->{command} =~ /guard-ledger-create\.sh/ }
+        && grep { ref $_ eq 'HASH' && defined $_->{command} && $_->{command} =~ /guard-blueprint-write\.sh/ }
            @{ $_->{hooks} }
     } @pretooluse;
     ok(defined $ledger_create_block,
        "AC-21/B-51: hooks.json has a PreToolUse block, matcher Edit|Write|MultiEdit|NotebookEdit, "
-     . "whose hooks array names guard-ledger-create.sh");
+     . "whose hooks array names guard-blueprint-write.sh (guard-ledger-create.sh's successor)");
 
-    # B-52: that block is not the one carrying guard-writes.sh / ledger-guard.sh, and no
-    # PRE-EXISTING block's hooks array changed. Snapshot every OTHER Edit|Write|... block's
-    # hooks-array commands as they exist on disk right now and assert none of them contains
-    # guard-ledger-create.sh (i.e. it landed in its OWN new block, not spliced into one).
+    # B-52: no PRE-EXISTING guard-writes.sh/ledger-guard.sh block gained the
+    # ledger-creation guard's command (it landed in guard-blueprint-write.sh
+    # instead, package 13's own merge, not spliced into the writes/ledger
+    # block).
     for my $block (@pretooluse) {
         next unless ref $block eq 'HASH' && ref $block->{hooks} eq 'ARRAY';
         my @cmds = map { $_->{command} // '' } grep { ref $_ eq 'HASH' } @{ $block->{hooks} };
