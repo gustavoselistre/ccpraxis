@@ -26,17 +26,36 @@ Pass the raw scope straight through as `next --scope <arg>`; the director resolv
 ## What drive-solo is NOT
 
 - **No deterministic orchestrator** and **no `bp-launch.sh` / `bp-orchestrate.sh`** — those are the fleet's. You are the driver.
-- **No parallel coordinators.** Packages run **sequentially** with one write-capable worker in flight
-  at a time — **your discipline, not a hook.** `track-dispatch.sh` maintains that lock but opens with
-  `bp_hook_gate`, which needs `BP_LEDGER`/`BP_DIR`/`BP_PROJECT_ROOT` — exported only into a
-  `bp-launch.sh` coordinator, never into this session. Check `git status` after every write-capable
-  worker; see coordinator-protocol, "…but only inside a butler-LAUNCHED coordinator".
+- **No parallel coordinators**, but the director may hand out a further ready package whose write
+  set is disjoint from every in-flight one, so several packages can be in flight, with one
+  write-capable worker per package at a time as your discipline.
 - **You do NOT poll usage or manage keep-awake.** The director does both — you simply dispatch the actions it returns.
-- **Validation can be denied while a write-capable worker is live.** `guard-validation-interlock.sh`
+- **Validation can be denied while a write-capable worker is live.** `guard-bash.sh`
   (PreToolUse, mechanically enforced — not this doc) blocks a test/build/lint-shaped `Bash` command
   whenever a write-capable worker's marker is fresh, so you don't read its live/leftover temp state
-  as a false red. The denial (exit 2) says so itself and names the wait/retry remedy — nothing further
-  to memorize here; just wait for the worker to return (or the marker to age out) and re-run.
+  as a false red (the worker running its own tests is exempt). The denial (exit 2) says so itself and
+  names the wait/retry remedy — nothing further to memorize here; just wait for the worker to return
+  (or the marker to age out) and re-run.
+
+**Write scope.** In an armed drive-solo session the write guards apply to you and your
+subagents. A subagent may write only its bound package's write set (test paths only as the
+test-writer), its own ledger, and its own blueprint dir except a sibling package's ledger, and
+temp. With two or more packages in flight, an unbound subagent's edits are refused. Your own
+edits are checked against the in-flight write set, or their union. Check `git status` after
+every write-capable worker.
+
+## Continuity and dispatch
+
+<!-- continuity:begin -->
+First step, before Preflight: `butler-continuity on --role driver`. Arms the session and clears an earlier off; after a new session id, the first director call re-arms it.
+Every dispatch prompt carries one line `Ledger: .ccpraxis-local-data/blueprints/<blueprint>/packages/<package>.md` (the `blueprint` and `package` of `run-package`, data-dir-relative).
+With more than one package in flight, a dispatch without exactly one such line naming an in-flight package is denied, and the denial lists the valid lines.
+Never dispatch with `subagent_type: fork`; launch a fresh subagent with a self-contained prompt instead.
+Before a turn ends with background workers or a pause running: `butler-hold <id> [<id> ...]` with `run_in_background: true`, once (re-running it extends the one holder).
+When the holder exits, act on its report and hold again for ids still running.
+At `done`, or when the operator says stop: `butler-continuity off --reason '<what is done>'`.
+A denied stop prints commands carrying a stop token; run them as printed.
+<!-- continuity:end -->
 
 ## Preflight
 
@@ -51,17 +70,18 @@ Call `bp-drive-next.pl next --scope <scope>` → dispatch the returned action **
 | `action` | Session behavior | Next director call |
 |---|---|---|
 | `need-order` | JUDGE the blueprint order over `candidates` (dependencies / risk / value — a Claude judgment, Decision #3), then persist it. | `bp-drive-next.pl record-order <bp> [<bp> …]`, then `next` again |
-| `run-package` | Drive `action.package` of `action.blueprint` through its pipeline per **`coordinator-protocol` VERBATIM** — flat plugin-namespaced `bp-*` worker tree, ledger kept current, disk-is-truth verify each worker. | `next` again |
-| `pause` (reason=`usage`) | Wait **token-cheaply** until `action.until_epoch` — **Monitor** with an until-condition, or **ScheduleWakeup** to the epoch under `/loop`; never busy-poll, never spin tokens. | `next` again (after the epoch) |
+| `run-package` | Set the ledger to `running`, dispatch the package's next pipeline step per **`coordinator-protocol` VERBATIM** with its `Ledger:` line, and verify each worker's result on disk. When that worker runs in the background, call `next` again in the same turn; the director may hand out another disjoint package. A `run-package` for a package already in flight means no dispatch was bound to it for 30 minutes: dispatch its next step. | `next` again |
+| `pause` (reason=`usage`) | Wait **token-cheaply** until `action.until_epoch` with one background Bash call that sleeps until that epoch, held as described in Continuity and dispatch. Never busy-poll. | `next` again (after it finishes) |
 | `stop` (reason=`token-refresh-failed`) | **Genuinely terminal:** the director already tried and failed to refresh the token (via `bp-token-keeper.pl`). Tell the user to `/login` and re-invoke `drive-solo`; add to the end-batch (Decision #15). NOT an auto-resume. | *(none — stop; user re-invokes)* |
 | `blueprint-done` | RE-EVALUATE the still-`pending` blueprints' validity (semantic Claude judgment, Decision #3/#4/#17); PARK the stale/moot ones. | `bp-drive-next.pl park <blueprint> <reason…>` for each stale bp, then `next` again |
-| `done` | Present ALL batched decisions/parks in ONE pass (Decision #5): per-blueprint done/total, every accumulated park with its one-line decision + verify command, any governance-degraded note, any relogin. Then, as the LAST act before stopping, retire this session's driver marker by running the sentinel command verbatim: `echo butler-drive-solo-retire` (see "Retire the driver marker" below). | *(none — run settled; stop)* |
+| `in-flight` | Nothing new can start yet; the packages named in the action's `inflight` key are still being driven (use `running` when the key is absent). Any listed package with no worker of yours running (after `/clear`, a crash or a new session) is resumed from its ledger per coordinator-protocol "Resumption". Otherwise end the turn waiting on your workers (see Continuity and dispatch). It is never completion. | `next` again after a worker returns |
+| `done` | Present ALL batched decisions/parks in ONE pass (Decision #5): per-blueprint done/total, every accumulated park with its one-line decision + verify command, any governance-degraded note, any relogin. Then, as the LAST act, turn continuity off (see Continuity and dispatch). | *(none — run settled; stop)* |
 
 > The **governor** verdict (`bp-usage-gate.pl verdict`) that produces a `pause` is fetched INTERNALLY by the director — the session never runs it (Decision #13).
 > **Keep-awake** is a director-managed side-effect, never a session action (Decision #7).
 > A merely-**stale** token (still refreshable) is recovered **transparently** before any action ever surfaces to the session — the director attempts the refresh on-demand inside `next` the moment the governor reports the token floor, and proceeds silently on success. No session-visible row exists for that path by design; `stop`/`token-refresh-failed` above fires only once that refresh attempt has actually failed.
 
-## Never end a turn with nothing scheduled — **mechanically enforced**
+## Never end a turn with nothing scheduled
 
 **A driver turn may end for exactly two reasons: something will wake the session, or
 the run is settled.** Nothing else.
@@ -73,22 +93,15 @@ was a ledger write, ending with text that promises the next step, is a **dead st
 the run halts mid-package while *appearing* finished, and the operator only discovers
 it by asking. That is the worst failure an unattended run can have.
 
-Observed three times in a single 12-hour run (2026-08-07), each time right after a
-ledger write. So it is no longer prose:
-`plugins/butler/hooks/gate-drive-loop.sh` (Stop) blocks the turn from ending when
-nothing is scheduled and `bp-drive-next.pl next` still returns actionable work;
-`mark-wakeup.sh` (PreToolUse) records the dispatch that earns a legitimate turn end.
-Proven by `plugins/butler/tests/t/drive-loop-gate.t`.
+The one Stop gate refuses an armed driver's stop unless a holder is waiting on running
+work (see Continuity and dispatch), and a foreground call schedules nothing.
 
 - **Do the next thing in the same turn, rather than announcing it.** "Moving on to X"
   followed by a turn end is precisely the shape the gate exists to catch.
 - Record the ledger **and then** dispatch, in one turn. The ledger write is not a
   stopping point.
-- The gate yields after 3 consecutive blocks, honours `.drive-solo/.stop-ok`
-  (one-shot) and `CCPRAXIS_DRIVE_STOP_OK=1`, and fails **open** on any internal
-  error — a gate that will not yield is worse than a stalled run.
 
-## Arm the watcher — the other half, for **wedged** rather than **stopped**
+## Wedged workers
 
 The gate above catches a turn that ends with nothing scheduled. It cannot catch the
 harder failure: you dispatch a worker, the turn legitimately ends because a wake-up
@@ -107,78 +120,15 @@ sand.
 ```bash
 perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-dispatch-log.pl start \
      --id <bp>-<pkg>-<epoch-or-short-tag> --worker-type <bp-implementer|bp-test-writer|...> \
-     --budget-seconds <this dispatch's own expected budget — the SAME number used below>
+     --budget-seconds <this dispatch's own expected budget>
 ```
 
-**Step 2 — arm `bp-watch.pl` for the dispatch you just made, sized to that dispatch's
-own expected budget** (the SAME number as step 1's `--budget-seconds`) —
-`bp-watchdog.pl` is **superseded** by this (see its own header) and is no longer
-armed here: it used to print one of `SETTLED`/`PROGRESS`/`STALLED` on a fixed
-30-minute tick, but its progress scan
-walked the whole blueprint tree with no subject-scoping at all, so a driver's own
-ledger edit read as the worker's progress and manufactured false `PROGRESS` verdicts
-during a real four-hour stall. One arm here covers the **whole** dispatch — there is
-no routine 30-minute tick to forget, unlike the old universal-timer habit that
-produced dozens of forgettable re-arms across a single long run (2026-08-06 #11):
+A wedge is noticed when the holder exits and prints an id as `still running (last activity
+<time>)` well past this dispatch's own expected budget, or `unknown`; either, or
+`bp-dispatch-log.pl elapsed --id <id>` showing `over_budget: true`, is what triggers the next
+step.
 
-```bash
-perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-watch.pl --arm --package <bp>/<pkg-just-dispatched> \
-     --max-seconds <this dispatch's own expected budget — SAME number as step 1> \
-     --keepawake        # run_in_background
-```
-
-A backgrounded Bash call notifies the session when it exits — `mark-wakeup.sh`
-matches any backgrounded Bash call by shape, not by binary name, so this satisfies
-"registers as a legitimate wake-up" for free, no new wiring needed. `--keepawake`
-refreshes the *existing* `bp-keepawake.pl` lease (the same `.drive-solo/keepawake.pid`
-`bp-drive-next.pl` already manages) once per poll tick — closing the gap where that
-900s lease is refreshed only when the director runs, and the director is skipped
-whenever a wakeup is already pending. It never creates a second, independent
-lease: if no lease is currently held, `--keepawake` is a no-op for that tick — the
-director remains the only thing that ever spawns the first one.
-
-**Step 3 — Step 2's armed watcher IS what satisfies the gate; there is no
-declaration to make.** `guard-subagent-stall.sh` asks the **probe**
-(`bp-watch.pl probe`), not a record — a live `bp-watch.pl` for this project,
-armed the way Step 2 just did, is the whole proof. Nothing further to call.
-
-- **There is no verb that ends a run.** Only the operator's own marker does
-  (Decision 7/16):
-  `touch <project>/.ccpraxis-local-data/.drive-solo/.run-finished`
-- **`--keepawake` on the Step 2 arm is what keeps the machine awake across the
-  wait**, by REFRESHING the director's existing lease — it never creates one.
-
-### Retire the driver marker
-
-When the operator says stop **before** the director ever returns `done` (the
-early-stop case), run the same sentinel command as the last act of the turn:
-
-```
-echo butler-drive-solo-retire
-```
-
-`mark-wakeup.sh` observes this exact command on a `Bash` call and deregisters
-this session from the machine-level driver registry (`bp_drive_retire`,
-`lib.sh`). **Retirement is NOT a verb that ends a run** — it only deregisters
-*this session* from the driver registry, after the run has already ended some
-other way (the operator's word, here, or a presented `done`, above). The
-operator's `.run-finished` marker remains the only thing that ends a run
-(Decision 7/16). An operator holding a session id directly can run the
-equivalent from a shell:
-`bash -c 'source <hooks>/lib.sh; bp_drive_retire <session-id>'`.
-
-On exit `bp-watch.pl` prints one of five verdicts — act on it, don't just re-arm
-blindly:
-
-| verdict (exit code) | meaning | what to do |
-|---|---|---|
-| `TERMINAL` (0) | the watched package's ledger reached `done`/`dropped`/`blocked`/`parked` | stop; assess the result — does not imply "never re-arm anything else" |
-| `BOUND` (1) | `--max-seconds` elapsed, nothing resolved; liveness is **unknown** | investigate, or widen the budget and re-arm — never assume dead or done |
-| `WORKERS-GONE` (2) | any ONE configured pid died with no terminal status observed | likely crash — **re-dispatch the wedged worker instead**, don't wait longer |
-| `ARTIFACT` (3) | a watched path's mtime advanced, or it appeared | re-arm and carry on |
-| `STATUS-CHANGE` (4) | the ledger status changed to a **non-terminal** value | re-arm and carry on |
-
-**Step 4 — before killing, and before waiting again: interrupt and ask for a
+**Step 2 — before killing, and before waiting again: interrupt and ask for a
 report.** Once `bp-dispatch-log.pl elapsed --id <id>` shows `over_budget: true`,
 **do not defer again.** State it as the instruction, not merely as an observation:
 the 2026-08-12 report is explicit that a driver deferring "this has been too long"
@@ -204,24 +154,15 @@ perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-dispatch-log.pl finish --id <id> --statu
 
 The dispatch is **not** killed by this move — it is asked to stop iterating and hand
 back what it has. Deciding whether to then re-dispatch, accept partial work, or
-escalate is a judgment call that stays with you, same as `bp-watch.pl`'s own
-"observes and reports; never kills" posture.
+escalate is a judgment call that stays with you.
 
-A `WORKERS-GONE` (or a `BOUND` where you have independent reason to believe the worker
-died) is not a prompt to wait longer. A wait that has already failed once does not
-improve by being repeated: **re-dispatch the wedged worker instead**. And treat an
+A holder report of `<id> unknown`, or `still running` with a last activity long past where
+you have independent reason to believe the worker died, is not a prompt to wait longer. A
+wait that has already failed once does not improve by being repeated: **re-dispatch the
+wedged worker instead**. And treat an
 empty or narration-shaped worker result as a **dead dispatch**, not a finding of
 "nothing" — a worker that runs out of turns returns its last narration, which reads
 exactly like success.
-
-`bp-watch.pl` observes and reports; it never kills anything and never writes into a
-blueprint. Remediation is a judgment call and stays with you.
-
-**A `BOUND` exit means exactly what `bp-watch.pl` itself prints: the bound elapsed,
-subject liveness is UNKNOWN.** Re-arm with a fresh bound, or investigate — never
-treat it as dead or as done. The residual is closed by the fold: `gate-drive-loop.sh`'s
-fold reads the probe (a live `bp-watch.pl` for this project) directly, the same
-signal Step 3 above already relies on — there is no separate record left to consult.
 
 ## Lean-context
 

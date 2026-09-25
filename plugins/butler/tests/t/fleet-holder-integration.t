@@ -79,7 +79,6 @@ my $ORCH     = "$SCRIPTS/bp-orchestrator.pl";
 my $LAUNCH   = "$SCRIPTS/bp-launch.sh";
 my $BPHOOKPM = "$SCRIPTS/BpHook.pm";
 my $STOPGATE = "$SCRIPTS/BpHook/StopGate.pm";
-my $WATCH    = "$SCRIPTS/bp-watch.pl";
 my $HOLDPL   = "$SCRIPTS/butler-hold.pl";
 my $HOLDSHIM = "$BUTLER/bin/butler-hold";
 my $SKILL    = "$BUTLER/skills/coordinator-protocol/SKILL.md";
@@ -480,11 +479,13 @@ sub run_wedge_sim {
         'AC-7: ...and a cold relaunch actually happened (launched at least twice)');
 }
 
-{
-    # AC-8 (batch C, spec 16-cutover 2.8, reason SW): the switch-off wedge
-    # fixture is retired -- there is no more "switch off" state in which a
-    # holder is ignored and the coordinator is killed immediately.
-}
+# AC-8 (batch C, spec 16-cutover 2.8, reason SW): the switch-off wedge
+# fixture is retired -- there is no more "switch off" state in which a
+# holder is ignored and the coordinator is killed immediately.
+# [fixed here, package 16 batch D]: batch C left this as an EMPTY bare block
+# ({ # comment-only \n }), which does not compile -- Perl's heuristic for a
+# statement-position "{" with nothing but a comment inside parses ambiguously
+# and the file fails perl -c. Replaced with a plain comment (no block).
 
 # ===========================================================================
 # R9-M2 (red-team MEDIUM-2a): a holder record whose started_at PREDATES this
@@ -804,18 +805,10 @@ sub run_once_marker {
     }
 }
 
-# ===========================================================================
-# AC-15 -- the bp-watch.pl path is still the one in place with the switch off.
-# ===========================================================================
-{
-    ok(-e $WATCH, 'AC-15: plugins/butler/scripts/bp-watch.pl exists');
-    my $skill_txt = slurp($SKILL);
-    like($skill_txt, qr{scripts/bp-watch\.pl\s+--arm}, 'AC-15: coordinator-protocol/SKILL.md still tells a coordinator to run bp-watch.pl --arm');
-    my $launch_txt = slurp($LAUNCH);
-    my $orch_txt   = slurp($ORCH);
-    unlike($launch_txt, qr/bp-watch\.pl/, 'AC-15: bp-launch.sh contains no "bp-watch.pl" (only bp-watch-child.pl, a different file)');
-    unlike($orch_txt, qr/bp-watch\.pl/, 'AC-15: bp-orchestrator.pl contains no "bp-watch.pl" (only bp-watch-child.pl, a different file)');
-}
+# AC-15 deleted [PIN, package 16 batch D]: it pinned the bp-watch.pl coordinator-arming
+# recipe (the switch-off path) that package 16 retires -- bp-watch.pl itself is gone
+# (batch B/E1) and the "scripts/bp-watch.pl --arm" recipe no longer exists anywhere,
+# per spec 16 section 4 batch D and reports/15-skills-prose/pin-audit.md.
 
 # ===========================================================================
 # AC-1 / AC-2 / AC-3 / AC-4 / AC-14 -- bp-launch.sh driven with a fake `claude`

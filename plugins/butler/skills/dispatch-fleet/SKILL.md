@@ -32,4 +32,10 @@ Sandbox-only: the fleet is detached `claude -p` coordinators (`setsid`/`nohup`/`
    ```
    Closing this session does **not** stop the run — the orchestrator is detached and survives on the container's dashboard heartbeat. Recovery after a container restart is automatic on the next `bp-orchestrate.sh` (it continues, never duplicates).
 
+<!-- continuity:begin -->
+Fleet coordinators wait on background subagents through `butler-hold` and stop only on a
+terminal ledger. This session is not armed by dispatch-fleet, so watching happens in
+`/butler:reporter`, which arms itself.
+<!-- continuity:end -->
+
 > **Not this verb?** For a single interactive session with a flat worker layer (host-safe, no detached coordinators), use `/butler:drive-solo $0` — the **linear single-session, host-or-sandbox counterpart** that drives one/some/all blueprints as a thin loop over the perl director (shares building blocks like usage-governance and the per-package pipeline; different functionality — Decision #10). To just check state without touching anything, `/butler:status`.

@@ -549,8 +549,11 @@ subtest 'AC32: SKILL.md documents the two-tier model per SS2.11' => sub {
     like($section, qr/CTX_CEILING_DEFAULT/, 'names %CTX_CEILING_DEFAULT as the canonical source');
     like($section, qr/BP_CONTEXT_CEILING_SOFT_TOKENS/, 'contains BP_CONTEXT_CEILING_SOFT_TOKENS');
     like($section, qr/BP_CONTEXT_CEILING_HARD_TOKENS/, 'contains BP_CONTEXT_CEILING_HARD_TOKENS');
-    like($section, qr/context-ceiling-guidance\.sh/, 'names context-ceiling-guidance.sh');
-    like($section, qr/context-ceiling-flush\.sh/, 'names context-ceiling-flush.sh');
+    # [PIN, package 16 batch D]: context-ceiling-guidance.sh and context-ceiling-flush.sh
+    # were merged into one guard, hooks/context-ceiling.sh, by package 14's guards-remake
+    # (same retarget rationale as AC31 above).
+    like($section, qr/context-ceiling\.sh/, 'names context-ceiling.sh (guidance tier)');
+    like($section, qr/context-ceiling\.sh/, 'names context-ceiling.sh (flush tier)');
     like($section, qr/bp-dispatch-log\.pl outstanding/, 'names bp-dispatch-log.pl outstanding');
     like($section, qr/\bguidance\b/, 'uses the word "guidance" for the soft tier');
     like($section, qr/\bflush\b/, 'uses the word "flush" for the hard tier');

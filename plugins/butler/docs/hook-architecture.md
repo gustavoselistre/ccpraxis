@@ -1106,10 +1106,8 @@ stop-gate-single.t, stop-gate-coordinator-ledger.t, continuity-command-verbs.t, 
 continuity-arm-on-entry.t, continuity-lease-follows-arm.t, dispatch-binding.t, guards-per-subagent.t
 and guards-remake-suite.t.
 
-- `plugins/butler/tests/t/bp-watch-cli.t`
 - `plugins/butler/tests/t/bp-watch-decision-core.t`
 - `plugins/butler/tests/t/watcher-probe-liveness.t`
-- `plugins/butler/tests/t/waits-check-liveness.t`
 - `plugins/butler/tests/t/continuity-toggle.t`
 - `plugins/butler/tests/t/continuity-bounded-hold.t`
 - `plugins/butler/tests/t/continuity-output-stays-parseable.t`

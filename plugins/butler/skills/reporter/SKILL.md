@@ -6,6 +6,13 @@ argument-hint: [blueprint]
 
 # /butler:reporter
 
+<!-- continuity:begin -->
+First: `butler-continuity on --role reporter`. After arming the watcher in the background,
+`butler-hold <its task id>` with `run_in_background: true` (once per re-arm, as the turn ends;
+extends the one holder). To wait for the operator: `butler-continuity silence --reason '<why this
+stop>'`; when no live run is left to watch: `butler-continuity off --reason '<what is done>'`.
+<!-- continuity:end -->
+
 You are the **reporter**: the interactive **Claude** front door to an unattended run (Decisions #5/#26/#27). It is a *role*, not a window — a plain session becomes the reporter when this skill runs. You **observe and relay**; you do **not** drive the run. The deterministic **orchestrator script** (`bp-orchestrator.pl`) does all the watching/launching/governing with zero Claude. Closing this window never affects the run; re-running `/butler:reporter` re-attaches.
 
 **Read first:** `${CLAUDE_PLUGIN_ROOT}/skills/orchestrator-protocol/SKILL.md` — the **Cast** section (reporter vs orchestrator-script vs coordinator) is binding doctrine for this role.
@@ -183,32 +190,9 @@ Maintain a **seen-set** = the decision ids you have already surfaced this sessio
 
 This is the **only** way you watch for a *queued decision* — no repeated `bp-status.sh` poll loop. Between watcher returns and user turns you spend no tokens.
 
-**`bp-wait-for-decision.pl` only wakes on a queued decision.** Four things never queue
-one, so none of them was ever noticed: the orchestrator process dying, the container
-being reaped, a clean idle-exit with everything `done`, or a single package flipping
-to `done`. Arm `bp-watch.pl` **alongside** it, in Mode B (blueprint-wide, no
-`--package`), as a second `run_in_background` Bash call:
-
-```
-perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-watch.pl --arm --blueprint $0 \
-     --pid-file "<bpdir>/runs/.orchestrator" --max-seconds 1800   # run_in_background
-```
-
-Arming `bp-watch.pl` in Mode B **is** the declaration -- there is nothing further to
-call after this arm. `gate-drive-loop.sh`'s reporter branch reads the probe (a live
-`bp-watch.pl` for this project) and the finish marker, nothing else.
-
-To stop watching permanently, simply **do not re-arm** -- once the watch you just
-armed exits, whenever a `WORKERS-GONE` (2) or `TERMINAL`/`SETTLED` (0) exit is
-auto-announced, or step 2's "No live run" branch is reached, the probe reports no
-live watcher and `gate-drive-loop.sh`'s reporter branch allows the stop.
-
-A `WORKERS-GONE` (exit 2, the orchestrator's pid died) or a `TERMINAL`/`SETTLED` exit
-(exit 0, every package reached `done`/`dropped`/`blocked`/`parked`) is the trigger to
-**auto-announce to the user**, the same auto-announce doctrine this section already
-uses for decisions — not a silent re-arm. A `BOUND` exit (nothing changed within the
-window) just means re-arm and keep watching. No wake-lock flag here: the reporter
-surface holds no wake-lock today and this does not add one to it.
+The watcher never wakes on the orchestrator dying, a reap, or an idle-exit, so on every watcher
+return, timeouts included, re-check step 2's liveness before re-arming, and if the run is no
+longer live, auto-announce it and stop watching.
 
 ## Remediation (what the fleet fixed by itself)
 

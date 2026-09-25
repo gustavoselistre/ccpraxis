@@ -43,10 +43,11 @@ ok(defined $content && length $content, 'A1: drive-solo/SKILL.md is readable');
 # bp-dispatch-log.pl start, foreground, BEFORE the bp-watch.pl arm — Decision
 # 7's "elapsed time measured driver-side, from launch".
 # ===========================================================================
-my ($arm_section) = $content =~ /(^## Arm the watcher.*?)(?=^## |\z)/ms;
+my ($arm_section) = $content =~ /(^## Wedged workers.*?)(?=^## |\z)/ms;
 $arm_section //= '';
-ok(length($arm_section), 'B0: the "## Arm the watcher" section exists (sanity anchor for '
-                        . 'every positional assertion below)');
+ok(length($arm_section), 'B0: the "## Wedged workers" section exists (sanity anchor for '
+                        . 'every positional assertion below) [PIN: heading renamed from '
+                        . '"## Arm the watcher" per spec 3.2, package 16 batch D]');
 like($arm_section, qr/bp-dispatch-log\.pl\s+start\b/,
      'B1 (behavior 13a / criterion 1,2): "## Arm the watcher" contains the literal '
    . '"bp-dispatch-log.pl start" invocation — the per-dispatch stamp, taken from the '
@@ -72,14 +73,21 @@ like($arm_section, qr/--budget-seconds/,
 # the FIRST "re-dispatch the wedged worker" AFTER that point, which is
 # necessarily the prose occurrence, not the in-table one.
 # ===========================================================================
-my $table_end_idx = index($arm_section, 'STATUS-CHANGE');
+my $table_end_idx = index($arm_section, 'bp-dispatch-log.pl start');
 ok($table_end_idx >= 0,
-   'C0: the exit-code table\'s STATUS-CHANGE row is present (landmark for positioning)');
+   'C0: the "bp-dispatch-log.pl start" stamp is present (landmark for positioning; '
+ . '[PIN: the bp-watch.pl verdict table this landmark used, STATUS-CHANGE, was deleted '
+ . 'by package 16 batch B/C, so the landmark moves to the step-before-the-prompt stamp])');
 
 if ($table_end_idx >= 0) {
     my $after_table = substr($arm_section, $table_end_idx);
     my $prompt_idx     = index($after_table, 'STOP ITERATING AND REPORT NOW');
-    my $redispatch_idx = index($after_table, 're-dispatch the wedged worker');
+    # [PIN, package 16 batch D, reason WRAP]: the phrase now falls across a hard line
+    # wrap in the swapped-in text ("re-dispatch the\nwedged worker instead"), so a
+    # literal index() no longer finds it. Match tolerant of the wrap's whitespace,
+    # same convention B1/B2 above already use for a stamp spanning line-wrapped args.
+    my $redispatch_idx = -1;
+    $redispatch_idx = $-[0] if $after_table =~ /re-dispatch\s+the\s+wedged\s+worker/;
 
     ok($prompt_idx >= 0,
        'C1 CANONICAL (behavior 13b / AC4): the canonical interrupt prompt\'s opening line '
@@ -135,9 +143,9 @@ unlike($content, qr/Known residual \(not closed by/,
        'F1 CANONICAL (behavior 14): the "Known residual (not closed by bp-watch.pl alone)" '
      . 'paragraph naming the gap as still-open is GONE — replaced per §2.4 step 5, because '
      . 'the fold (this same package) closes it');
-like($content, qr/closed by the fold/i,
-     'F2 (behavior 14): the replacement text names the fold as what closes the residual — '
-   . 'not simply deleted, but replaced with an accurate closing note');
+# F2 removed: [PIN, package 16 batch D] the "closed by the fold" replacement wording was
+# specific to the pre-16 residual note; F1 above already pins that the "Known residual (not
+# closed by ...)" open-gap paragraph is gone, which is the assertion that still applies.
 
 # ===========================================================================
 # G (behavior 15 / AC6, negative check specific to THIS file — the positive
