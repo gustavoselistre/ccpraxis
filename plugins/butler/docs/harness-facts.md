@@ -976,3 +976,16 @@ Not needed: `--plugin-dir` **is** present in Claude Code 2.1.280 (see Method's f
 2. Start an interactive session with `--plugin-dir "$S/plug-h2"`.
 3. Ask the model to run `sleep 6` then, from a separate Git Bash window, copy `hooks.B.json` over `hooks.json` mid-sleep; ask it to run a second marker command.
 4. Record which log (`h2-A.jsonl` or `h2-B.jsonl`) the second marker lands in.
+
+## (i) Windows: a hook command whose first token ends in `.sh` is run as a script (measured 2026-09-25)
+
+Claude Code on Windows expands `${CLAUDE_PLUGIN_ROOT}` / `$CLAUDE_PROJECT_DIR` in a hook command and, when
+the command's FIRST whitespace-delimited token ends in `.sh`, runs that token as a script through bash.
+Package 16's first guarded registration began `f="${CLAUDE_PLUGIN_ROOT}/hooks/x.sh" ; ...`, so the
+harness ran `bash f=C:/.../x.sh`. Every hook_success record in the session transcript carried
+`stderr: "bash: f=C:/Users/.../hooks/x.sh: No such file or directory"` with exitCode 0: the rest of
+the line ran with `$f` unset, and the guard's `[ -f "$f" ] || exit 0` passed silently, so every
+registration was inert (fail-open). Starting the command with `unset BASH_ENV ; ` fixed it; verified
+live when the settings.json git-mutation guard blocked a checkout of a nonexistent path again. Pinned
+by hook-registration-resilience.t B-12. Also note: a hook_success record is only useful when you read
+its `stderr`. A green exit code proved nothing here.

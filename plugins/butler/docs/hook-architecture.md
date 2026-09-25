@@ -67,7 +67,7 @@ and `runs/<pkg>.force-stop`.
 | settings.json | PreToolUse | Bash | guard-git-mutations.sh (sec 2.2 settings form) |
 
 This is 17 hooks.json commands and 1 settings.json command, every one in the guarded registration form
-of spec 16's section 2.2 (`f=...; w=.../run-hook.sh; unset BASH_ENV; [ -f "$f" ] && [ -f "$w" ] || exit 0;
+of spec 16's section 2.2 (`unset BASH_ENV; f=...; w=.../run-hook.sh; [ -f "$f" ] && [ -f "$w" ] || exit 0;
 bash -n "$f" && bash -n "$w" || exit 0; exec env -u SHELLOPTS bash "$f"`), so a missing or broken script
 or wrapper never blocks (RT-M1), and neither BASH_ENV nor SHELLOPTS reach the hook's own bash (RT-L7).
 SubagentStop carries track-dispatch.sh alone, added per package 16's carried note so a subagent's own

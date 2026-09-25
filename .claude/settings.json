@@ -15,7 +15,7 @@
          {
             "hooks" : [
                {
-                  "command" : "f=\"$CLAUDE_PROJECT_DIR/plugins/butler/hooks/guard-git-mutations.sh\" ; w=\"$CLAUDE_PROJECT_DIR/plugins/butler/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "command" : "unset BASH_ENV ; f=\"$CLAUDE_PROJECT_DIR/plugins/butler/hooks/guard-git-mutations.sh\" ; w=\"$CLAUDE_PROJECT_DIR/plugins/butler/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                }

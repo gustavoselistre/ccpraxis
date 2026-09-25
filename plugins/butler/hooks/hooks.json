@@ -4,7 +4,7 @@
          {
             "hooks" : [
                {
-                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/track-dispatch.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/track-dispatch.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                }
@@ -14,7 +14,7 @@
          {
             "hooks" : [
                {
-                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/context-ceiling.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/context-ceiling.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                }
@@ -26,22 +26,22 @@
          {
             "hooks" : [
                {
-                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/guard-bash.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/guard-bash.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                },
                {
-                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/guard-git-mutations.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\" --only-during-butler-run",
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/guard-git-mutations.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\" --only-during-butler-run",
                   "timeout" : 15,
                   "type" : "command"
                },
                {
-                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/arm-on-entry.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/arm-on-entry.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                },
                {
-                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/continuity-off-check.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/continuity-off-check.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                }
@@ -51,17 +51,17 @@
          {
             "hooks" : [
                {
-                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/guard-writes.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/guard-writes.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                },
                {
-                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/ledger-guard.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/ledger-guard.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                },
                {
-                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/guard-blueprint-write.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/guard-blueprint-write.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                }
@@ -71,7 +71,7 @@
          {
             "hooks" : [
                {
-                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/gate-shutdown.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/gate-shutdown.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                }
@@ -81,12 +81,12 @@
          {
             "hooks" : [
                {
-                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/bind-dispatch.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/bind-dispatch.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                },
                {
-                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/track-dispatch.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/track-dispatch.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                }
@@ -96,7 +96,7 @@
          {
             "hooks" : [
                {
-                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/context-ceiling.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/context-ceiling.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                }
@@ -106,7 +106,7 @@
          {
             "hooks" : [
                {
-                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/wait-shape-guard.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/wait-shape-guard.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                }
@@ -115,7 +115,7 @@
          {
             "hooks" : [
                {
-                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/guard-ask-operator.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/guard-ask-operator.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                }
@@ -127,7 +127,7 @@
          {
             "hooks" : [
                {
-                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/track-dispatch.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/track-dispatch.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                }
@@ -138,7 +138,7 @@
          {
             "hooks" : [
                {
-                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/stop-gate.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/stop-gate.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                }

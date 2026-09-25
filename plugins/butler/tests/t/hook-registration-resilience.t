@@ -284,13 +284,13 @@ sub build_temp_mirror {
 sub hooksjson_template {
     my ($file, $args) = @_;
     $args //= '';
-    return qq{f="\${CLAUDE_PLUGIN_ROOT}/hooks/$file" ; w="\${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh" ; unset BASH_ENV ; [ -f "\$f" ] && [ -f "\$w" ] || exit 0 ; bash -n "\$f" 2>/dev/null && bash -n "\$w" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash "\$f"$args};
+    return qq{unset BASH_ENV ; f="\${CLAUDE_PLUGIN_ROOT}/hooks/$file" ; w="\${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh" ; [ -f "\$f" ] && [ -f "\$w" ] || exit 0 ; bash -n "\$f" 2>/dev/null && bash -n "\$w" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash "\$f"$args};
 }
 
 sub settings_template {
     my ($file, $args) = @_;
     $args //= '';
-    return qq{f="\$CLAUDE_PROJECT_DIR/plugins/butler/hooks/$file" ; w="\$CLAUDE_PROJECT_DIR/plugins/butler/hooks/run-hook.sh" ; unset BASH_ENV ; [ -f "\$f" ] && [ -f "\$w" ] || exit 0 ; bash -n "\$f" 2>/dev/null && bash -n "\$w" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash "\$f"$args};
+    return qq{unset BASH_ENV ; f="\$CLAUDE_PROJECT_DIR/plugins/butler/hooks/$file" ; w="\$CLAUDE_PROJECT_DIR/plugins/butler/hooks/run-hook.sh" ; [ -f "\$f" ] && [ -f "\$w" ] || exit 0 ; bash -n "\$f" 2>/dev/null && bash -n "\$w" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash "\$f"$args};
 }
 
 # ===========================================================================
@@ -530,6 +530,33 @@ sub settings_template {
     is($res->{rc}, 0, 'B10a: a non-applying Stop through the full stop-gate.sh registration string exits 0');
     my @perl_lines = -f $log ? do { open(my $lfh, '<', $log); my @l = grep { /^perl$/ } <$lfh>; close $lfh; @l } : ();
     is(scalar(@perl_lines), 0, 'B10b: ...and launches 0 perl');
+}
+
+# ===========================================================================
+# B-12 (Decision 81): Claude Code on Windows runs a hook command whose FIRST
+# whitespace-delimited token ends in `.sh` as a script via bash. The first
+# cut of the guarded form began with f="<root>/hooks/x.sh", so the harness ran
+# `bash f=C:/.../x.sh` ("No such file or directory"), the rest of the line saw
+# $f unset and exited 0, and every registration was silently inert. Measured
+# from this repo's own session transcripts (hook_success stderr), 2026-09-25.
+# No registered command may start with a token ending in .sh.
+# ===========================================================================
+{
+    my @cmds;
+    for my $file ($HOOKS_JSON, $SETTINGS) {
+        open my $fh, '<:raw', $file or die "$file: $!";
+        my $d = JSON::PP->new->decode(do { local $/; <$fh> });
+        for my $ev (keys %{ $d->{hooks} || {} }) {
+            for my $g (@{ $d->{hooks}{$ev} }) {
+                push @cmds, map { $_->{command} } @{ $g->{hooks} || [] };
+            }
+        }
+    }
+    ok(scalar(@cmds) >= 18, 'B-12: found the registered commands (' . scalar(@cmds) . ')');
+    my @bad = grep { my ($t) = /^\s*(\S+)/; defined $t && $t =~ /\.sh"?\z/ } @cmds;
+    is(scalar(@bad), 0, 'B-12: no registered command starts with a token ending in .sh')
+        or diag("starts with a .sh token: $_") for @bad;
+    ok(!(grep { !/^unset BASH_ENV ; / } @cmds), 'B-12: every registered command starts with "unset BASH_ENV ; "');
 }
 
 done_testing();
