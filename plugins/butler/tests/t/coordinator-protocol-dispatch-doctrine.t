@@ -69,18 +69,27 @@ if (length $dispatch_section) {
 }
 
 # ===========================================================================
-# C (behavior 15 / AC6, docs-consistency). stop-gate.sh is
-# drive-solo-scoped by construction (exits immediately whenever BP_LEDGER
-# is set — i.e. inside every coordinator, per stop-gate.sh:48). A
-# coordinator's own stop discipline is stop-gate.sh, untouched by w02.
-# Documenting the fold HERE would be actively misleading: it would tell a
-# coordinator to expect a gate that never runs in its own session.
+# C (behavior 15, regression guard -- fix-batch F11/review m5). E2's
+# mechanical rename left this block's own comment and description false
+# and self-contradicting: it claimed stop-gate.sh "exits immediately
+# whenever BP_LEDGER is set" (false -- post-cutover, stop-gate.sh's own
+# coordinator branch is what a BP_LEDGER-bearing session's Stop actually
+# runs; see BpHook::StopGate::_coordinator) while also saying "a
+# coordinator's own stop discipline is stop-gate.sh", and the description
+# claimed the regex checks "does NOT mention stop-gate.sh" when the regex
+# it names (gate-drive-loop, the RETIRED predecessor hook, batch E1) can no
+# longer fail either way -- vacuous under its own stated description.
+#
+# What this assertion actually is, and remains: a residue guard (code DEL)
+# that the retired gate-drive-loop hook is never named here again. It is
+# NOT a claim that coordinator-protocol/SKILL.md must avoid "the stop
+# gate" generically -- it legitimately does describe the one shared gate
+# now (see lines mentioning "the stop gate" / "the Stop gate" elsewhere in
+# this file).
 # ===========================================================================
 unlike($content, qr/gate-drive-loop/,
-       'C1 CANONICAL (behavior 15 / docs-consistency): coordinator-protocol/SKILL.md does '
-     . 'NOT mention stop-gate.sh anywhere — that gate is drive-solo-scoped, and '
-     . 'documenting it here would mislead a coordinator into expecting a gate that never '
-     . 'runs inside a BP_LEDGER-bearing session');
+       'C1 (regression guard, code DEL): coordinator-protocol/SKILL.md does NOT name '
+     . 'the retired gate-drive-loop hook');
 
 # ===========================================================================
 # D (§2.5). The interrupt-and-report doctrine is dispatch-shape-agnostic

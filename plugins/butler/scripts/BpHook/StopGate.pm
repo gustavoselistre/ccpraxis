@@ -28,6 +28,14 @@ my $SELF_DIR;
 }
 require "$SELF_DIR/../BpHook.pm"
     unless grep { m{(?:^|/)BpHook\.pm$} } keys %INC;
+# F4 (red-team M2, package 16 fix-batch): needed so G7 can ensure the
+# continuity lease refresher is running for an armed session. A require
+# failure here degrades to "no ensure" (G7 wraps the call in eval), never
+# to a denial.
+eval {
+    require "$SELF_DIR/../BpContinuityLease.pm"
+        unless grep { m{(?:^|/)BpContinuityLease\.pm$} } keys %INC;
+};
 
 # ---------------------------------------------------------------------------
 # run($p, @args) -> 0 | 2. @args is ignored. Decision table (spec sec 2.3).
@@ -61,9 +69,13 @@ sub run {
     # G6: not armed -> allow.
     return 0 unless BpHook::is_armed($sid);
 
-    # G7: armed -- refresh the wake-lock lease's activity marker. Failure
-    # ignored (the touch is best-effort; it never changes the verdict).
+    # G7: armed -- refresh the wake-lock lease's activity marker, and make
+    # sure the lease refresher is actually running (F4, red-team M2: the
+    # old drive-loop gate's restart-on-Stop step has no successor since the
+    # cutover, so nothing else restarts a dead refresher for an armed
+    # session). Both are best-effort; neither changes the verdict.
     eval { _touch_armed($sid) };
+    eval { _ensure_lease_daemon() };
 
     # G8: a live own holder allows. Decision 50 (R6-H1, supersedes the
     # original spec S11): silence is ONE-TURN -- the very next Stop of this
@@ -110,6 +122,21 @@ sub _touch_armed {
     my $path = "$root/armed/$sid";
     return unless -e $path;
     utime(undef, undef, $path);
+    return;
+}
+
+# ---------------------------------------------------------------------------
+# _ensure_lease_daemon() -- F4 (red-team M2): converge() re-asserts the
+# lease (cheap stat+utime) and, only if nothing is already refreshing it,
+# spawns exactly one daemon (BpContinuityLease::ensure_daemon's own cheap
+# pid-file-mtime check, gated on CCPRAXIS_NO_WAKELOCK). Never starts a
+# process itself; delegates entirely to BpContinuityLease.
+# ---------------------------------------------------------------------------
+sub _ensure_lease_daemon {
+    return unless defined &BpContinuityLease::legacy_dir;
+    my $dir = BpContinuityLease::legacy_dir();
+    return unless defined $dir;
+    BpContinuityLease::converge($dir);
     return;
 }
 

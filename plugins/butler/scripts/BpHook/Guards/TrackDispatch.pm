@@ -34,6 +34,16 @@ require "$SELF_DIR/../../BpHook.pm"
     unless grep { m{(?:^|/)BpHook\.pm$} } keys %INC;
 require "$SELF_DIR/Common.pm"
     unless grep { m{(?:^|/)Guards/Common\.pm$} } keys %INC;
+# F1 (review B1, blocker, package 16 fix-batch): needed so _driver_pre can
+# ask BindDispatch's pure decision function whether THIS dispatch would be
+# denied, and skip writing the per-dispatch marker when it would. A require
+# failure here is not fatal -- _driver_pre below checks "can I even call
+# this" before relying on it, and degrades to "write the marker" (today's
+# behaviour) rather than to a deny.
+eval {
+    require "$SELF_DIR/../BindDispatch.pm"
+        unless grep { m{(?:^|/)BpHook/BindDispatch\.pm$} } keys %INC;
+};
 
 my $DISPATCH_LOG_OK;
 my $WRITE_GUARD_OK;
@@ -515,6 +525,18 @@ sub _coord_post {
 # ---------------------------------------------------------------------------
 sub _driver_pre {
     my ($p, $ti, $type, $data_fs, $tuid) = @_;
+
+    # F1 (review B1, blocker): a dispatch bind-dispatch DENIES must leave no
+    # worker marker -- the parallel PreToolUse Task|Agent group runs
+    # bind-dispatch.sh and track-dispatch.sh side by side, so without this
+    # check a denied dispatch that Claude Code never actually runs still
+    # leaves a marker nothing clears, wedging GuardBash's driver interlock
+    # for up to 180 minutes. would_deny() is pure (no writes, no prints) and
+    # fails toward 0 (write the marker, today's behaviour) on any error.
+    if (defined &BpHook::BindDispatch::would_deny) {
+        my $deny = eval { BpHook::BindDispatch::would_deny($p) };
+        return 0 if !$@ && $deny;
+    }
 
     my $w;
     if (defined $type && length $type) {

@@ -560,6 +560,16 @@ for my $prior_role (qw(manual reporter)) {
 
 # ===========================================================================
 # AC12 -- Decision 36: an off session is not re-armed, for either actor.
+#
+# REASON CODE F2 (package 16 fix-batch, red-team H1): Decision 36's "not
+# re-armed" is now enforced by an explicit DENY (exit 2, with a one-line
+# "run `butler-continuity on` first" instruction), not a silent allow.
+# Before this fix an off session's `next` returned 0 with nothing armed,
+# so the director handed out concurrent packages to a caller bind-dispatch
+# and guard-writes never covered (H1's reproduction). This assertion is
+# widened, not weakened: it still requires "armed/S was not created" and
+# "off/S byte-identical" exactly as before, and additionally requires the
+# call be REFUSED rather than merely inert.
 # ===========================================================================
 for my $actor (qw(agent operator)) {
     fresh_base();
@@ -567,8 +577,9 @@ for my $actor (qw(agent operator)) {
     ok(BpHook::disarm($sid, actor => $actor, reason => 'done for today'), "AC12 ($actor) setup: off written");
     my $before = read_bytes(off_path($sid));
 
-    my ($ret) = run_captured(payload_for(session_id => $sid, command => $AC1_CMDS[0]));
-    is($ret, 0, "AC12 ($actor): run() returns 0");
+    my ($ret, undef, $err) = run_captured(payload_for(session_id => $sid, command => $AC1_CMDS[0]));
+    is($ret, 2, "AC12 ($actor): run() returns 2 (F2: denied, not silently allowed)");
+    like($err, qr/butler-continuity on/, "AC12 ($actor): the denial tells the agent to run `butler-continuity on` first");
     ok(!-e armed_path($sid), "AC12 ($actor): armed/S was not created");
     is(read_bytes(off_path($sid)), $before, "AC12 ($actor): off/S byte-identical");
 }

@@ -276,7 +276,10 @@ sub _has_ledger_signal {
 sub _decl_lines {
     my ($prompt) = @_;
     my @out;
-    while ($prompt =~ /^[ \t]*Ledger:[ \t]*(.*?)[ \t]*$/mgi) {
+    # F7 (red-team L3): a CRLF prompt leaves a trailing "\r" inside the
+    # captured remainder unless it is stripped alongside the plain
+    # trailing whitespace here.
+    while ($prompt =~ /^[ \t]*Ledger:[ \t]*(.*?)[ \t\r]*$/mgi) {
         push @out, $1;
     }
     return @out;
@@ -487,24 +490,36 @@ sub _handle_ledger {
 }
 
 # ---------------------------------------------------------------------------
-# _handle_driver($p) -- spec sec 3, B3-B8, plus Decision 67 and the
-# fix-batch LOWs.
+# _decide_driver($p) -- F1 (review B1, blocker): the decision half of
+# _handle_driver, factored out as a PURE function -- no writes (never calls
+# _bind), no prints (never calls _deny/_deny_labelled). Same inputs, same
+# verdict, spec sec 3 B3-B8 plus Decision 67 and the fix-batch LOWs.
+#
+# Returns a hashref:
+#   { verdict => 'allow' }                                  -- nothing to bind
+#   { verdict => 'allow', data => $d, bp => $b, pkg => $p }  -- bind this one
+#   { verdict => 'deny', kind => 'none'|'many'|'named', data => $d,
+#     members => \@members }
+#
+# TrackDispatch's _driver_pre calls this (via would_deny(), below) with the
+# SAME payload bind-dispatch itself sees, to learn whether bind-dispatch
+# would deny this dispatch -- without performing any of bind-dispatch's own
+# side effects itself.
 # ---------------------------------------------------------------------------
-sub _handle_driver {
+sub _decide_driver {
     my ($p) = @_;
     my $data = _resolve_data_dir($p); # LOW: same resolution as the director
 
-    return 0 unless defined $data && length $data;
+    return { verdict => 'allow' } unless defined $data && length $data;
 
     my @members = _inflight_members($data);
     my $n = scalar @members;
-    return 0 if $n == 0;
+    return { verdict => 'allow' } if $n == 0;
 
     if ($n == 1) {
         my $tuid = _tuid_of($p);
-        return 0 unless defined $tuid;
-        _bind($data, $members[0]{bp}, $members[0]{pkg}, $p, $tuid);
-        return 0;
+        return { verdict => 'allow' } unless defined $tuid;
+        return { verdict => 'allow', data => $data, bp => $members[0]{bp}, pkg => $members[0]{pkg} };
     }
 
     # Batch C (spec 16-cutover, sec 2.5): the switch is gone. With two or
@@ -519,33 +534,80 @@ sub _handle_driver {
     if (_has_ledger_signal($prompt)) {
         my @decls = _decl_lines($prompt);
         my @valid;
+        my %seen_valid;
         for my $decl (@decls) {
             for my $m (@members) {
                 if ($decl eq _ledger_line($data, $m->{bp}, $m->{pkg})
                     || canon($decl) eq canon(_ledger_abs($data, $m->{bp}, $m->{pkg}))) {
-                    push @valid, $m;
+                    # F7 (red-team L2): the SAME member named twice (its
+                    # relative and absolute forms) counts as ONE, not two.
+                    push @valid, $m unless $seen_valid{"$m->{bp}\0$m->{pkg}"}++;
                     last;
                 }
             }
         }
         if (@valid == 1) {
             my $tuid = _tuid_of($p);
-            return 0 unless defined $tuid;
-            _bind($data, $valid[0]{bp}, $valid[0]{pkg}, $p, $tuid);
-            return 0;
+            return { verdict => 'allow' } unless defined $tuid;
+            return { verdict => 'allow', data => $data, bp => $valid[0]{bp}, pkg => $valid[0]{pkg} };
         }
-        return _deny_labelled($data, \@members, (@valid == 0) ? 'none' : 'many');
+        return { verdict => 'deny', kind => (@valid == 0 ? 'none' : 'many'), data => $data, members => \@members };
     }
 
     my @named = grep { _names_member($prompt, $_->{bp}, $_->{pkg}) } @members;
     if (@named == 1) {
         my $tuid = _tuid_of($p);
-        return 0 unless defined $tuid;
-        _bind($data, $named[0]{bp}, $named[0]{pkg}, $p, $tuid);
-        return 0;
+        return { verdict => 'allow' } unless defined $tuid;
+        return { verdict => 'allow', data => $data, bp => $named[0]{bp}, pkg => $named[0]{pkg} };
     }
 
-    return _deny($data, \@members);
+    return { verdict => 'deny', kind => 'named', data => $data, members => \@members };
+}
+
+# ---------------------------------------------------------------------------
+# _handle_driver($p) -- runs _decide_driver's verdict: binds on allow,
+# denies (prints) on deny.
+# ---------------------------------------------------------------------------
+sub _handle_driver {
+    my ($p) = @_;
+    my $d = _decide_driver($p);
+
+    if ($d->{verdict} eq 'deny') {
+        return $d->{kind} eq 'named'
+            ? _deny($d->{data}, $d->{members})
+            : _deny_labelled($d->{data}, $d->{members}, $d->{kind});
+    }
+
+    if (defined $d->{data} && defined $d->{bp} && defined $d->{pkg}) {
+        my $tuid = _tuid_of($p);
+        _bind($d->{data}, $d->{bp}, $d->{pkg}, $p, $tuid) if defined $tuid;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# would_deny($p) -- F1 public accessor: 1 iff a driver-role Task/Agent
+# dispatch with this exact payload would be denied by bind-dispatch's own
+# run(), 0 otherwise (including every "not applicable" case -- not a
+# driver session, BP_LEDGER set, not Task/Agent, etc). Pure: no writes, no
+# prints. Wrapped in eval so any unforeseen exception fails toward 0
+# (never deny something bind-dispatch itself would have allowed).
+# ---------------------------------------------------------------------------
+sub would_deny {
+    my ($p) = @_;
+    my $ok = eval {
+        return 0 unless BpHook::payload_ok();
+        return 0 unless ref $p eq 'HASH';
+        my $tool = $p->{tool_name};
+        return 0 unless defined $tool && !ref($tool) && ($tool eq 'Task' || $tool eq 'Agent');
+        my $ledger = $ENV{BP_LEDGER};
+        return 0 if defined $ledger && length $ledger; # ledger path never denies
+        my $role = eval { BpHook::role($p) };
+        return 0 unless defined $role && $role eq 'driver';
+        my $d = _decide_driver($p);
+        return ($d->{verdict} eq 'deny') ? 1 : 0;
+    };
+    return (defined $ok && $ok) ? 1 : 0;
 }
 
 # ---------------------------------------------------------------------------
@@ -592,5 +654,7 @@ sub _run {
 sub member_ok        { return _member_ok(@_) }
 sub resolve_data_dir { return _resolve_data_dir(@_) }
 sub inflight_members { return _inflight_members(@_) }
+# would_deny is defined above, next to _decide_driver, so it shares the
+# same "pure, no writes, no prints" contract documentation.
 
 1;

@@ -308,7 +308,7 @@ sub new_store_active {
         next unless -f $f;
         my $tp = _arm_file_transcript_path($f);
         if (defined $tp) {
-            next unless _transcript_path_is_live($tp);
+            next unless _transcript_path_is_live($tp, $f);
         }
         else {
             next if ((stat($f))[9] // 0) < $cutoff;
@@ -359,16 +359,37 @@ sub _slurp_small {
 # on purpose — different clocks, different owners.
 our $TRANSCRIPT_LIVENESS_SECONDS = 3600;
 
-# _transcript_path_is_live($path) -- applies TRANSCRIPT_LIVENESS_SECONDS to a
-# new-store arm file's own transcript_path (R4-M2 / redteam MEDIUM-2). Every
-# undeterminable case answers "live" (fail-safe: an unresolvable stat is not
-# evidence of death).
+# F3 (red-team H2): the refresher itself must periodically reap ghost arm
+# files (BpHook::gc_sessions), not just exclude them from any_active --
+# otherwise the registry only ever grows, and hook-architecture.md's own
+# claim ("the lease daemon runs it at most once an hour") stays fiction.
+# Rate-limited to at most once per $GC_SESSIONS_INTERVAL, same shape as
+# BindDispatch's own $GC_INTERVAL.
+our $GC_SESSIONS_INTERVAL = 3600;
+
+# _transcript_path_is_live($path, $armfile) -- applies
+# TRANSCRIPT_LIVENESS_SECONDS to a new-store arm file's own transcript_path
+# (R4-M2 / redteam MEDIUM-2). A stat FAILURE (missing transcript) is
+# "undeterminable" and answers "live" -- but only for as long as the arm
+# file ITSELF is fresh (F3 / red-team H2): treating a permanently-missing
+# transcript as live forever is exactly how the wake-lock got held with no
+# armed session anywhere -- once the arm file's own mtime passes the same
+# one-hour window, a ghost arm (transcript gone) must stop counting. $armfile
+# is optional; omitting it (or an unstat-able arm file) keeps the old
+# fail-safe "live" answer, since there is then nothing to bound it by.
 sub _transcript_path_is_live {
-    my ($path) = @_;
+    my ($path, $armfile) = @_;
     return 1 unless defined $path && length $path;
 
     my @st = stat($path);
-    return 1 unless @st;         # stat failed -- undeterminable
+    unless (@st) {
+        return 1 unless defined $armfile;
+        my @ast = stat($armfile);
+        return 1 unless @ast && defined $ast[9];
+        my $age = time() - $ast[9];
+        return 1 if $age < 0;
+        return $age <= $TRANSCRIPT_LIVENESS_SECONDS ? 1 : 0;
+    }
 
     my $age = time() - $st[9];
     return 1 if $age < 0;        # future mtime: clock skew, not evidence of death
@@ -772,11 +793,19 @@ sub daemon_loop {
     # process happens to have started. A second cap derived from the same clock
     # and the same files could only either duplicate it or contradict it.
     my $iter = 0;
+    my $last_gc = 0;
 
     while (1) {
         last unless any_active($dir);
         sync($dir, %opts, active => 1);
         my $now = time;
+        if (($now - $last_gc) >= $GC_SESSIONS_INTERVAL) {
+            $last_gc = $now;
+            eval {
+                require "$DIR/BpHook.pm" unless grep { m{(?:^|/)BpHook\.pm$} } keys %INC;
+                BpHook::gc_sessions();
+            };
+        }
         utime($now, $now, $pf);          # the heartbeat cheap readers rely on
         $iter++;
         last if defined $opts{max_iterations} && $iter >= $opts{max_iterations};

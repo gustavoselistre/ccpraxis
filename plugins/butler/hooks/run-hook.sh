@@ -2,7 +2,9 @@
 # run-hook.sh -- the bash-only entry wrapper (package 03 of blueprint
 # hook-continuity-remake). Contract: specs/03-hook-core-spec.md sec 2.6;
 # architecture: plugins/butler/docs/hook-architecture.md "Entry path and
-# process budget". Additive only (Decision 19): nothing calls this yet.
+# process budget". Registered by package 16's cutover -- every hooks.json
+# and settings.json command that runs a BpHook module goes through this
+# file.
 #
 # Usage: run-hook.sh <Module> [--pre <clause>]... [--] [hook args...]
 #

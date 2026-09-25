@@ -448,8 +448,13 @@ sub _bp_is_absolute_path {
     # backslash is matched via chr(92) rather than written into a character
     # class: this repo edits perl through shell heredocs, which collapse a
     # doubled backslash and silently produce an unterminated class.
+    # F8 (red-team L6, package 16 fix-batch): a BARE drive letter ("C:", no
+    # slash) is NOT absolute -- must agree with BpHook::_is_abs, which
+    # requires [\\/] right after the colon. Before this fix a bare "C:"
+    # BUTLER_STATE_DIR could make the badge claim armed from a resolved
+    # "C:/continuity/armed/<sid>" the gate itself never reads.
     my $rest = substr($v, 2);
-    return 1 if $rest eq q{} || $rest =~ m{^/} || substr($rest, 0, 1) eq chr(92);
+    return 1 if $rest =~ m{^/} || substr($rest, 0, 1) eq chr(92);
     return 0;
 }
 

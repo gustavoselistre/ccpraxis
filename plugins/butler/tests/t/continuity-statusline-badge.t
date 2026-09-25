@@ -348,6 +348,26 @@ sub mkdir_p_test {
 }
 
 # ===========================================================================
+# L. F8 (fix-batch 16-cutover, red-team L6). Addition, not a weakening: a
+#    BARE drive letter with no slash ("C:") is NOT absolute -- BpHook::_is_abs
+#    requires [\\/] right after the colon, and statusline.pl must agree, so a
+#    bare "C:" BUTLER_STATE_DIR leaves the badge hollow rather than resolving
+#    to a real "C:/continuity" this test must never touch.
+# ===========================================================================
+{
+    my $home = tempdir(CLEANUP => 1);
+    my ($out, $rc) = run_statusline(
+        payload_for(session_id => 'sess-l-bare-drive'),
+        home => $home, state => 'C:',
+    );
+    is($rc, 0, 'L1: exits 0 with a bare drive-letter BUTLER_STATE_DIR');
+    ok(!armed_out($out),
+       'L2 CANONICAL (-> F8/L6): a bare "C:" BUTLER_STATE_DIR (no slash) is treated as NOT '
+     . 'absolute, matching BpHook::_is_abs -- the badge stays hollow rather than resolving '
+     . 'to a real C:/continuity path');
+}
+
+# ===========================================================================
 # J. NARROW-WIDTH TRUNCATION MUST NOT SPLIT AN ANSI ESCAPE.
 #
 # NON-VACUITY: this asserts on the RAW BYTES of stdout, and the widths below
