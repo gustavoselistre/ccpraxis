@@ -99,29 +99,18 @@ if ($cmd =~ />>?\s*['"]?NUL\b/i) {
         print STDERR
             "Blocked by block-nul-redirect.pl: CCPRAXIS_ALLOW_NUL needs a real reason.\n",
             "  Got: '$reason'\n",
-            "  The override exists so you can state WHY this is a false positive,\n",
-            "  not to wave the check through. Give at least 6 characters including\n",
-            "  a letter, e.g.:\n",
+            "  The override exists so you can state WHY this is a false positive, not to wave the check through. Give at least 6 characters including a letter, e.g.:\n",
             "    CCPRAXIS_ALLOW_NUL=\"search pattern, not a redirect\" grep ...\n";
         exit 2;
     }
 
     print STDERR
         "Blocked by block-nul-redirect.pl: this Bash command redirects to 'NUL'.\n",
-        "  On Git Bash for Windows, '> NUL' creates a literal file named NUL\n",
-        "  in the working directory (the NUL device only resolves from cmd.exe\n",
-        "  / PowerShell). The resulting stray file is painful to delete.\n",
-        "  Use '/dev/null' instead — e.g. '> /dev/null', '2> /dev/null',\n",
-        "  '2>&1 > /dev/null'. From PowerShell, use '\$null' (e.g. '*> \$null').\n",
+        "  On Git Bash for Windows, '> NUL' creates a literal file named NUL in the working directory (the NUL device only resolves from cmd.exe / PowerShell). The resulting stray file is painful to delete. Use '/dev/null' instead — e.g. '> /dev/null', '2> /dev/null', '2>&1 > /dev/null'. From PowerShell, use '\$null' (e.g. '*> \$null').\n",
         "\n",
-        "  FALSE POSITIVE? This check reads the command as text and cannot tell a\n",
-        "  redirect from the same characters inside a search pattern or a string\n",
-        "  literal. If nothing here actually redirects — you are grepping for the\n",
-        "  pattern, or quoting it as test data — retry with an explicit reason:\n",
+        "  FALSE POSITIVE? This check reads the command as text and cannot tell a redirect from the same characters inside a search pattern or a string literal. If nothing here actually redirects — you are grepping for the pattern, or quoting it as test data — retry with an explicit reason:\n",
         "    CCPRAXIS_ALLOW_NUL=\"search pattern, not a redirect\" <your command>\n",
-        "  It runs as an ordinary shell assignment, and the override is logged to\n",
-        "  ~/.claude/.nul-overrides.log. Do NOT use it to force through a command\n",
-        "  that really does redirect — it will create the file.\n",
+        "  It runs as an ordinary shell assignment, and the override is logged to ~/.claude/.nul-overrides.log. Do NOT use it to force through a command that really does redirect — it will create the file.\n",
         "  Command attempted: $cmd\n";
     exit 2;
 }

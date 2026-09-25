@@ -190,8 +190,7 @@ sub _holder_line {
     my $host   = defined $holder->{host}        ? $holder->{host}        : '?';
     my $script = defined $holder->{script}      ? $holder->{script}      : '?';
     my $at     = defined $holder->{acquired_at} ? $holder->{acquired_at} : '?';
-    return "  holder: the holder record names pid $pid on host $host, script $script,\n"
-         . "          recorded at $at (read from $holder_path)\n";
+    return "  holder: the holder record names pid $pid on host $host, script $script, recorded at $at (read from $holder_path)\n";
 }
 
 sub _err {

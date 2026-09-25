@@ -410,39 +410,17 @@ if (defined $__msys2_before_container_require) {
 
 sub _usage { return <<'USAGE' }
 usage: perl scripts/run-tests.pl [--fast] [--jobs N] [--nice] [--state=failed] [--keep-sandbox] [PATH-OR-GLOB ...]
-  --fast          skip the host-serial lane. Membership is a TEXT MATCH on a
-                  file's own source, NOT an answer to "does this start a real
-                  container" -- a file that merely mentions the container
-                  helpers is skipped too (report 20260918-042312-02db). The
-                  summary names every file skipped, so check it rather than
-                  reading "0 serial" as "there were none". This does NOT touch
-                  the container LANE below -- if that is enabled, its files
-                  still run there regardless of --fast.
+  --fast          skip the host-serial lane. Membership is a TEXT MATCH on a file's own source, NOT an answer to "does this start a real container" -- a file that merely mentions the container helpers is skipped too (report 20260918-042312-02db). The summary names every file skipped, so check it rather than reading "0 serial" as "there were none". This does NOT touch the container LANE below -- if that is enabled, its files still run there regardless of --fast.
   --jobs N        parallelism for non-container tests (default: cores - 2)
-  --nice          low-impact mode: cap parallelism at max(2, cores/4), leaving
-                  the machine usable for whoever else is on it. Does not touch
-                  OS scheduling priority (spawned git/podman children aren't
-                  covered by that). Env var CCPRAXIS_TEST_JOBS=N sets the same
-                  kind of ambient low-impact default without a per-run flag.
+  --nice          low-impact mode: cap parallelism at max(2, cores/4), leaving the machine usable for whoever else is on it. Does not touch OS scheduling priority (spawned git/podman children aren't covered by that). Env var CCPRAXIS_TEST_JOBS=N sets the same kind of ambient low-impact default without a per-run flag.
   --state=failed  re-run only the files recorded failing by the previous run
-  --keep-sandbox  do not remove each file's per-file sandbox HOME after it
-                  runs (package 21-test-sandbox). Default: removed.
+  --keep-sandbox  do not remove each file's per-file sandbox HOME after it runs (package 21-test-sandbox). Default: removed.
 
 Precedence for parallelism (most to least specific):
   --jobs N  >  --nice  >  CCPRAXIS_TEST_JOBS env var  >  default (cores - 2)
 
-Container lane (opt-in, off by default -- a lane-AVAILABILITY switch, never a
-routing switch; see classify_file()'s own header comment):
-  CCPRAXIS_CONTAINER_LANE_ENABLED=1|true|yes|on   run any/linux-marked,
-                  non-serial-classified files inside the existing
-                  claude-sandbox:latest container instead of on this host.
-                  Any other value (unset, "", "0", "false", "no", "off", ...)
-                  means OFF -- those files simply run on the host instead,
-                  exactly as before this env var existed. Only the whole
-                  working tree that was last committed is reflected in the
-                  container (package 05's own limitation), so an ordinary
-                  sweep tests HEAD, not uncommitted edits, for every file
-                  this sends there.
+Container lane (opt-in, off by default -- a lane-AVAILABILITY switch, never a routing switch; see classify_file()'s own header comment):
+  CCPRAXIS_CONTAINER_LANE_ENABLED=1|true|yes|on   run any/linux-marked, non-serial-classified files inside the existing claude-sandbox:latest container instead of on this host. Any other value (unset, "", "0", "false", "no", "off", ...) means OFF -- those files simply run on the host instead, exactly as before this env var existed. Only the whole working tree that was last committed is reflected in the container (package 05's own limitation), so an ordinary sweep tests HEAD, not uncommitted edits, for every file this sends there.
 USAGE
 
 # --- state file (--state=failed) --------------------------------------------

@@ -1542,48 +1542,17 @@ bp-dispatch-log.pl — the per-dispatch budget record for an Agent/Task worker.
   outstanding [--worker-type <TYPE>] [--blueprint <NAME>] [--package <NAME>] [--root DIR] [--now EPOCH]
   ratio   --transcript <PATH> [--blueprint <NAME>] [--package <NAME>] [--root DIR]
 
---blueprint / --package are optional, valid with `start`, `resolve`,
-`outstanding` and `ratio`. --role is optional and valid ONLY with `start`; it
-is a closed vocabulary of exactly coordinator, worker or judge. --dispatch-key
-is optional and valid ONLY with `start` (stamps the record) and `resolve`
-(query criteria); shape /^[a-z0-9-]{1,48}$/. --transcript is required and
-valid ONLY with `ratio` -- the path to the coordinator's own runs transcript;
-its value is never printed on stdout.
+--blueprint / --package are optional, valid with `start`, `resolve`, `outstanding` and `ratio`. --role is optional and valid ONLY with `start`; it is a closed vocabulary of exactly coordinator, worker or judge. --dispatch-key is optional and valid ONLY with `start` (stamps the record) and `resolve` (query criteria); shape /^[a-z0-9-]{1,48}$/. --transcript is required and valid ONLY with `ratio` -- the path to the coordinator's own runs transcript; its value is never printed on stdout.
 
-`ratio` prints self_tool_calls/self_bash_calls/self_read_calls/
-self_edit_calls/self_grep_calls/dispatches_transcript/dispatches_recorded/
-dispatches/ratio/min_calls/min_ratio/scan_truncated/verdict/summary/
-dispatch_note, one bounded scan of --transcript plus one scoped read of the
-dispatch store, never writes anything. min_calls/min_ratio default to
-200/40 (BpDispatchLog::%RATIO_DEFAULT) and are overridable via
-BP_DISPATCH_RATIO_MIN_CALLS / BP_DISPATCH_RATIO_MIN.
+`ratio` prints self_tool_calls/self_bash_calls/self_read_calls/self_edit_calls/self_grep_calls/dispatches_transcript/dispatches_recorded/dispatches/ratio/min_calls/min_ratio/scan_truncated/verdict/summary/dispatch_note, one bounded scan of --transcript plus one scoped read of the dispatch store, never writes anything. min_calls/min_ratio default to 200/40 (BpDispatchLog::%RATIO_DEFAULT) and are overridable via BP_DISPATCH_RATIO_MIN_CALLS / BP_DISPATCH_RATIO_MIN.
 
-Exit codes: 0 ok · 2 usage error · 3 start refused (a running record already
-exists for --id) · 4 elapsed/finish/resolve: no record, or the store could
-not be read/written · 5 resolve: no running record matched the criteria
-(not an error).
+Exit codes: 0 ok · 2 usage error · 3 start refused (a running record already exists for --id) · 4 elapsed/finish/resolve: no record, or the store could not be read/written · 5 resolve: no running record matched the criteria (not an error).
 
-A `running` record is STALE once its elapsed time exceeds 4x its own
-budget_seconds; `list` marks it `stale: true` but still shows it.
+A `running` record is STALE once its elapsed time exceeds 4x its own budget_seconds; `list` marks it `stale: true` but still shows it.
 
-`outstanding`'s stdout prints outstanding_count/live_count/stale_count/
-unevaluable_count/unreadable_count, in that order, then one `outstanding:`
-line per counted record. unreadable_count counts a *.json file that exists
-but failed to parse as a JSON object -- it cannot be proven NOT outstanding,
-so it is folded into outstanding_count too (with every other field on its
-`outstanding:` line reported as `-`/unknown); the invariant
-`live_count + stale_count + unevaluable_count == outstanding_count` holds
-exactly when unreadable_count is 0, and is short by unreadable_count
-otherwise.
+`outstanding`'s stdout prints outstanding_count/live_count/stale_count/unevaluable_count/unreadable_count, in that order, then one `outstanding:` line per counted record. unreadable_count counts a *.json file that exists but failed to parse as a JSON object -- it cannot be proven NOT outstanding, so it is folded into outstanding_count too (with every other field on its `outstanding:` line reported as `-`/unknown); the invariant `live_count + stale_count + unevaluable_count == outstanding_count` holds exactly when unreadable_count is 0, and is short by unreadable_count otherwise.
 
-RETENTION. `start` prunes automatically once the store passes its high-water
-mark, keeping the 256 most recent non-live records (bug 20260908-225444-b9db --
-before this the store only ever grew, and two consumers went silently dark at
-512 and at 2000 records). LIVE records are never pruned, whatever the count.
-`prune` does the same pass on demand, ignoring the high-water gate. If a prune
-leaves the store still over the 512 reader cap, one line is written to
-.dispatch-log/retention-alarm.log: a cap reached silently is a permanent stop
-nobody can discover.
+RETENTION. `start` prunes automatically once the store passes its high-water mark, keeping the 256 most recent non-live records (bug 20260908-225444-b9db -- before this the store only ever grew, and two consumers went silently dark at 512 and at 2000 records). LIVE records are never pruned, whatever the count. `prune` does the same pass on demand, ignoring the high-water gate. If a prune leaves the store still over the 512 reader cap, one line is written to .dispatch-log/retention-alarm.log: a cap reached silently is a permanent stop nobody can discover.
 USAGE
         exit 2;
     }

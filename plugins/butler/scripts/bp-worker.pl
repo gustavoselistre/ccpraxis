@@ -107,13 +107,10 @@ sub usage_text {
 usage: bp-worker.pl --worker <name> --prompt-file <path> [--model <M>]
                      [--turn-budget <N>] [--help]
 
-  --worker <name>       required; one of: implementer, test-writer, ui-prober,
-                        scout, architect, reviewer, redteam (any of the
-                        bp-<name> / butler:bp-<name> spellings also accepted)
+  --worker <name>       required; one of: implementer, test-writer, ui-prober, scout, architect, reviewer, redteam (any of the bp-<name> / butler:bp-<name> spellings also accepted)
   --prompt-file <path>  required; readable file whose contents are the prompt
   --model <M>           optional; passed through to a non-claude backend
-  --turn-budget <N>     optional; materialises a per-dispatch copy of the
-                        OpenCode agent file with `steps:` overridden to N
+  --turn-budget <N>     optional; materialises a per-dispatch copy of the OpenCode agent file with `steps:` overridden to N
   --help                print this message and exit 0
 USAGE
 }

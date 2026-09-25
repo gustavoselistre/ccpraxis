@@ -721,8 +721,7 @@ my $missing = grep {
 print "gen-readme-tree.pl: wrote $README.\n";
 if ($missing) {
     print STDERR "  ($missing entr", ($missing == 1 ? 'y has' : 'ies have'),
-        " no description — add a `.about` sidecar, plugin.json/SKILL.md description,\n";
-    print STDERR "  or comment header to surface one.)\n";
+        " no description — add a `.about` sidecar, plugin.json/SKILL.md description, or comment header to surface one.)\n";
 }
 
 exit 0;

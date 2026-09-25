@@ -313,8 +313,7 @@ USAGE
 
 LEGACY TEXT PATH (no arg) — one line + exit code:
   OK          five=<pct> seven=<pct> token_life_h=<h>                              exit 0
-  PAUSE       window=<five_hour|seven_day> resets_at_epoch=<e> resets_at_iso=<iso>
-              estimated=<0|1> five=<pct> seven=<pct> token_life_h=<h>              exit 10
+  PAUSE       window=<five_hour|seven_day> resets_at_epoch=<e> resets_at_iso=<iso> estimated=<0|1> five=<pct> seven=<pct> token_life_h=<h>              exit 10
   RELOGIN     token_life_h=<h> detail=...                                          exit 40
   UNAVAILABLE status=<n> detail=...                                                exit 20
   CREDS       detail=...                                                           exit 30
@@ -323,11 +322,7 @@ VERDICT SUBCOMMAND (bp-usage-gate.pl verdict) — always exit 0, ONE single-line
   {"action":"ok"|"pause-usage"|"pause-token"|"unavailable","until_epoch":E|null,"reason":"..."}
     ok           until_epoch=null            reason="ok"
     pause-usage  until_epoch=<epoch secs>    reason="usage"   (timed auto-resume)
-    pause-token  until_epoch=<epoch secs>    reason="token"   (timed condition, not a hard-stop --
-                                                                 the only consumer refreshes immediately
-                                                                 rather than waiting on the epoch;
-                                                                 success=recovery, failure=a separate
-                                                                 stop/token-refresh-failed)
+    pause-token  until_epoch=<epoch secs>    reason="token"   (timed condition, not a hard-stop -- the only consumer refreshes immediately rather than waiting on the epoch; success=recovery, failure=a separate stop/token-refresh-failed)
     unavailable  until_epoch=null            reason="telemetry"|"creds"  (degrade-and-proceed)
 END_HELP
         return 0;

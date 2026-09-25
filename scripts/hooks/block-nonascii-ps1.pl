@@ -93,14 +93,9 @@ my $shown = join ' ', map { sprintf('U+%04X', ord) } @bad;
 print STDERR <<"MSG";
 BLOCKED: this write puts non-ASCII characters into a .ps1 file ($shown).
 
-PowerShell 5.1 reads a BOM-less file as CP1252. An em dash (U+2014) becomes the
-bytes E2 80 94, and 0x94 is a SMART QUOTE in CP1252 -- PowerShell treats it as a
-string delimiter, opens a phantom string, swallows the following braces, and
-reports "Missing closing '}'" at a line far from the real problem.
+PowerShell 5.1 reads a BOM-less file as CP1252. An em dash (U+2014) becomes the bytes E2 80 94, and 0x94 is a SMART QUOTE in CP1252 -- PowerShell treats it as a string delimiter, opens a phantom string, swallows the following braces, and reports "Missing closing '}'" at a line far from the real problem.
 
-Use ASCII: -- for an em dash, - for an en dash, -> for an arrow, plain quotes.
-If the file genuinely needs non-ASCII, give it a UTF-8 BOM first and this guard
-will stand aside.
+Use ASCII: -- for an em dash, - for an en dash, -> for an arrow, plain quotes. If the file genuinely needs non-ASCII, give it a UTF-8 BOM first and this guard will stand aside.
 
 File: $path
 MSG

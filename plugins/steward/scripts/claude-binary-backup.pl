@@ -914,12 +914,10 @@ Subcommands:
 
   restore    [--snapshot <id> | --latest] [--binary <path>]
              [--no-pre-snapshot] [--dry-run]
-             Overwrite the live binary with the chosen snapshot. Takes
-             a pre-restore snapshot first unless --no-pre-snapshot.
+             Overwrite the live binary with the chosen snapshot. Takes a pre-restore snapshot first unless --no-pre-snapshot.
 
   prune      [--keep N] [--dry-run]
-             Keep the N newest non-corrupt snapshots; remove the rest
-             (always removes corrupt entries). Default N=4.
+             Keep the N newest non-corrupt snapshots; remove the rest (always removes corrupt entries). Default N=4.
 
   help       Show this message.
 

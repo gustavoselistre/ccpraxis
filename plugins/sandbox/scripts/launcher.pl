@@ -193,8 +193,7 @@ sub _detect_container_cli {
 my $PODMAN = _detect_container_cli();
 unless (defined $PODMAN) {
     print STDERR "ERROR: no container CLI on PATH (looked for docker, podman).\n";
-    print STDERR "       Install Docker Desktop (https://docker.com) or Podman Desktop\n";
-    print STDERR "       (https://podman-desktop.io/) and re-run.\n";
+    print STDERR "       Install Docker Desktop (https://docker.com) or Podman Desktop (https://podman-desktop.io/) and re-run.\n";
     exit 1;
 }
 
@@ -592,32 +591,15 @@ sub _pp_env_seam {
 sub _pp_explanation {
     my ($reason) = @_;
     my %text = (
-        'ccpraxis-install' => q{That is the ccpraxis installation Claude Code is running from. Its plugins,
-skills and launcher are in use right now, so sandboxing it would edit the
-tooling while it is running, and git inside the container would not work.},
-        'claude-home' => q{That is Claude Code's own configuration home. It holds your credentials, your
-session transcripts, your memory files and every installed plugin.
-Bind-mounting it into a container would expose all of it read-write.},
-        'marketplace-install' => q{That is where Claude Code installed a plugin marketplace registered in
-known_marketplaces.json. Editing it from inside a container would corrupt the
-installed plugin tree Claude Code is loading from.},
-        'marketplace-source' => q{That is the directory-source of a plugin marketplace registered in
-known_marketplaces.json. Claude Code loads plugins straight out of it, so it
-is live installed code, not a checkout.},
-        'user-configured' => q{That path is in your own protected-paths list at
-~/.claude/ccpraxis-protected-paths.json.
+        'ccpraxis-install' => q{That is the ccpraxis installation Claude Code is running from. Its plugins, skills and launcher are in use right now, so sandboxing it would edit the tooling while it is running, and git inside the container would not work.},
+        'claude-home' => q{That is Claude Code's own configuration home. It holds your credentials, your session transcripts, your memory files and every installed plugin. Bind-mounting it into a container would expose all of it read-write.},
+        'marketplace-install' => q{That is where Claude Code installed a plugin marketplace registered in known_marketplaces.json. Editing it from inside a container would corrupt the installed plugin tree Claude Code is loading from.},
+        'marketplace-source' => q{That is the directory-source of a plugin marketplace registered in known_marketplaces.json. Claude Code loads plugins straight out of it, so it is live installed code, not a checkout.},
+        'user-configured' => q{That path is in your own protected-paths list at ~/.claude/ccpraxis-protected-paths.json.
 
-The guard reads that list from your real home directory only. CLAUDE_CONFIG_DIR
-does not relocate it: a list read from a directory named by one environment
-variable could be pointed elsewhere, and the guard would then silently stop
-reading your real list - fewer protections, not more.},
-        'drive-root' => q{A filesystem root contains every file on the volume - your home directory,
-Claude Code's configuration, and every other project on the machine. Putting
-all of that inside a container read-write is never what a sandbox is for, and
-every file operation in the container would crawl.},
-        'user-home' => q{Your home directory contains every project you have, plus Claude Code's
-configuration and your credentials. Putting all of that inside a container
-read-write is never what a sandbox is for.},
+The guard reads that list from your real home directory only. CLAUDE_CONFIG_DIR does not relocate it: a list read from a directory named by one environment variable could be pointed elsewhere, and the guard would then silently stop reading your real list - fewer protections, not more.},
+        'drive-root' => q{A filesystem root contains every file on the volume - your home directory, Claude Code's configuration, and every other project on the machine. Putting all of that inside a container read-write is never what a sandbox is for, and every file operation in the container would crawl.},
+        'user-home' => q{Your home directory contains every project you have, plus Claude Code's configuration and your credentials. Putting all of that inside a container read-write is never what a sandbox is for.},
     );
     return $text{$reason}
         // 'This path collides with something Claude Code has installed on this machine.';
@@ -627,45 +609,34 @@ sub _pp_advice {
     my ($reason, $root) = @_;
 
     if ($reason eq 'ccpraxis-install') {
-        return q{Work on a separate clone instead. Pick any ordinary directory outside this
-install (for example C:/Development/ccpraxis on Windows, or ~/src/ccpraxis on
-macOS or Linux), then run:
+        return q{Work on a separate clone instead. Pick any ordinary directory outside this install (for example C:/Development/ccpraxis on Windows, or ~/src/ccpraxis on macOS or Linux), then run:
 
   git clone --no-hardlinks } . $root . q{ <your-clone-dir>
   cd <your-clone-dir>
   claude-sandbox
 
-The --no-hardlinks flag is required: a local clone hardlinks the object store
-by default, which would silently re-couple the clone to this installation.
-See plugins/sandbox/docs/working-on-ccpraxis.md.};
+The --no-hardlinks flag is required: a local clone hardlinks the object store by default, which would silently re-couple the clone to this installation. See plugins/sandbox/docs/working-on-ccpraxis.md.};
     }
 
     if ($reason eq 'marketplace-install' || $reason eq 'marketplace-source') {
-        return q{Open the specific project directory you meant to work in - cd into it and run
-claude-sandbox there, or pass it explicitly:
+        return q{Open the specific project directory you meant to work in - cd into it and run claude-sandbox there, or pass it explicitly:
 
   claude-sandbox <your-project-dir>
 
-If you meant to work on the plugin source that lives there, work from a
-clone outside it. That directory is not necessarily a repository root, so
-clone the repository that contains it - not the directory itself:
+If you meant to work on the plugin source that lives there, work from a clone outside it. That directory is not necessarily a repository root, so clone the repository that contains it - not the directory itself:
 
   git clone --no-hardlinks <repository-root> <your-clone-dir>};
     }
 
     if ($reason eq 'user-configured') {
-        return q{Open the specific project directory you meant to work in - cd into it and run
-claude-sandbox there, or pass it explicitly:
+        return q{Open the specific project directory you meant to work in - cd into it and run claude-sandbox there, or pass it explicitly:
 
   claude-sandbox <your-project-dir>
 
-If that entry was added by mistake, remove it from
-~/.claude/ccpraxis-protected-paths.json - your real home directory, which is the
-only place this list is read from (CLAUDE_CONFIG_DIR does not relocate it).};
+If that entry was added by mistake, remove it from ~/.claude/ccpraxis-protected-paths.json - your real home directory, which is the only place this list is read from (CLAUDE_CONFIG_DIR does not relocate it).};
     }
 
-    return q{Open the specific project directory you meant to work in - cd into it and run
-claude-sandbox there, or pass it explicitly:
+    return q{Open the specific project directory you meant to work in - cd into it and run claude-sandbox there, or pass it explicitly:
 
   claude-sandbox <your-project-dir>};
 }
@@ -675,9 +646,7 @@ sub _pp_message {
 
     my $explanation = _pp_explanation($reason);
     my $advice      = _pp_advice($reason, $root);
-    my $no_override = q{There is no override: no flag and no environment variable will make
-claude-sandbox act on this path. If this refusal is wrong, the guard itself
-has to be fixed - see plugins/sandbox/docs/protected-paths.md.};
+    my $no_override = q{There is no override: no flag and no environment variable will make claude-sandbox act on this path. If this refusal is wrong, the guard itself has to be fixed - see plugins/sandbox/docs/protected-paths.md.};
 
     my $header;
     my $body;
@@ -1900,10 +1869,7 @@ sub ensure_ccpraxis_data_dir {
                 chomp $st if defined $st;
                 $st = '' unless defined $st;
                 if ($st eq 'running') {
-                    print STDERR "ERROR: a sandbox container ($name) is running and still bind-mounts\n";
-                    print STDERR "       the old .claude-data, which blocks the one-time migration to\n";
-                    print STDERR "       .ccpraxis-local-data/claude-home. Close its dashboard / session\n";
-                    print STDERR "       first, then re-run.\n";
+                    print STDERR "ERROR: a sandbox container ($name) is running and still bind-mounts the old .claude-data, which blocks the one-time migration to .ccpraxis-local-data/claude-home. Close its dashboard / session first, then re-run.\n";
                     reset_terminal();
                     exit 1;
                 }
@@ -1922,11 +1888,7 @@ sub ensure_ccpraxis_data_dir {
             log_ev('migrate_claude_data', { from => $old, to => $CLAUDE_DATA });
         } else {
             print STDERR "ERROR: could not migrate $old -> $CLAUDE_DATA: $!\n";
-            print STDERR "       Something holds a handle on the old .claude-data so it can't be\n";
-            print STDERR "       moved. The usual culprit is another editor or Claude Code session\n";
-            print STDERR "       open on THIS project folder — its recursive file-watcher keeps a\n";
-            print STDERR "       handle on the directory (a running sandbox, a shell whose cwd is\n";
-            print STDERR "       inside it, or a file indexer do the same). Close it, then re-run.\n";
+            print STDERR "       Something holds a handle on the old .claude-data so it can't be moved. The usual culprit is another editor or Claude Code session open on THIS project folder — its recursive file-watcher keeps a handle on the directory (a running sandbox, a shell whose cwd is inside it, or a file indexer do the same). Close it, then re-run.\n";
             print STDERR "       (Or move it by hand once nothing holds it:\n";
             print STDERR "         mv '$old' '$CLAUDE_DATA')\n";
             reset_terminal();
@@ -2606,8 +2568,7 @@ my $CONTAINER_NAME;
         # Connector requires a manager/dashboard to already be up.
         if ($state ne 'running') {
             _emit_err(_c_err("ERROR:"), " no running sandbox to connect to for this project.\n");
-            _emit_err("       Run `claude-sandbox` (no flags) to start the sandbox + dashboard first,\n");
-            _emit_err("       then launch a claude session from the dashboard.\n");
+            _emit_err("       Run `claude-sandbox` (no flags) to start the sandbox + dashboard first, then launch a claude session from the dashboard.\n");
             SandboxLock::release($LOCK_DIR);
             reset_terminal();
             exit 1;
@@ -2630,11 +2591,7 @@ my $CONTAINER_NAME;
                 : undef;
             if (my $skew = decide_forced_rebuild(1, $rv, $HOST_VERSION)) {
                 _emit_err(_c_warn("WARNING:"), " $skew\n");
-                _emit_err("       Connecting anyway -- this container is running and rebuilding it\n",
-                          "       would end the session inside it. Session files under claude-home\n",
-                          "       are shared through the bind mount and assume one version wrote\n",
-                          "       them, so close this sandbox and run `claude-sandbox` with no flags\n",
-                          "       to rebuild it when convenient.\n");
+                _emit_err("       Connecting anyway -- this container is running and rebuilding it would end the session inside it. Session files under claude-home are shared through the bind mount and assume one version wrote them, so close this sandbox and run `claude-sandbox` with no flags to rebuild it when convenient.\n");
                 log_ev('connector_version_skew', { recorded => $rv, host => $HOST_VERSION });
             }
         }
@@ -3025,15 +2982,7 @@ sub enforce_container_config_shape {
         # Leave the frame first: this refusal is the ONLY thing the operator
         # gets, and an alt screen discards whatever was painted into it.
         tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST;
-        _emit_err(_c_err("ERROR:"), " sandbox container ($name) still has the old\n");
-        _emit_err("       claude.json mount shape (@{[join(', ', @codes)]}) and its\n");
-        _emit_err("       running state could not be positively confirmed as safe to\n");
-        _emit_err("       remove (status: '@{[$st_ok ? ($st eq '' ? '(empty)' : $st) : 'inspect failed']}'). Continuing risks silent config\n");
-        _emit_err("       loss (an atomic rename() over the shared host config would\n");
-        _emit_err("       leave a still-attached container following a stale, unlinked\n");
-        _emit_err("       inode) or killing a live session. Close its dashboard /\n");
-        _emit_err("       session first (or re-run once the container engine responds\n");
-        _emit_err("       normally), then re-run.\n");
+        _emit_err(_c_err("ERROR:"), " sandbox container ($name) still has the old claude.json mount shape (@{[join(', ', @codes)]}) and its running state could not be positively confirmed as safe to remove (status: '@{[$st_ok ? ($st eq '' ? '(empty)' : $st) : 'inspect failed']}'). Continuing risks silent config loss (an atomic rename() over the shared host config would leave a still-attached container following a stale, unlinked inode) or killing a live session. Close its dashboard / session first (or re-run once the container engine responds normally), then re-run.\n");
         log_ev('config_shape_blocked', { container => $name, violations => \@codes, state => $st, state_ok => $st_ok });
         # H1: this sub is now also called from the early-dispatch block,
         # above enter_dashboard()'s fast path, where $LOCK_DIR (the setup
@@ -3187,11 +3136,10 @@ my %plan_state = (
 my $answer;
 if (defined $FORCE_REBUILD_REASON) {
     # Non-declinable. Stated, not asked.
+    # >>> forced-rebuild-notice:BEGIN
     _emit_err(_c_warn("REBUILD REQUIRED:"), " $FORCE_REBUILD_REASON\n");
-    _emit_err("       A container and host on different Claude Code versions is not a\n",
-              "       supported configuration -- session files under claude-home are\n",
-              "       shared through the bind mount and assume one version wrote them.\n",
-              "       Rebuilding the image and recreating the container.\n");
+    _emit_err("       A container and host on different Claude Code versions is not a supported configuration -- session files under claude-home are shared through the bind mount and assume one version wrote them. Rebuilding the image and recreating the container.\n");
+    # <<< forced-rebuild-notice:END
     log_ev('forced_rebuild', { reason => $FORCE_REBUILD_REASON });
 }
 elsif (plan_wants_prompt(%plan_state)) {
@@ -4608,9 +4556,7 @@ sub kill_orphan_claudes_if_user_confirms {
         "Found " . scalar(@orphans) . " orphan claude process(es) in the container:",
         (map { "  PID $_" } @orphans),
         '',
-        'Left over from a previous session — usually a Ctrl+C from PowerShell, which',
-        'kills the local client but does not always propagate into the container. They',
-        'hold lockfiles in /root/.claude/ that will block any new claude session.',
+        'Left over from a previous session — usually a Ctrl+C from PowerShell, which kills the local client but does not always propagate into the container. They hold lockfiles in /root/.claude/ that will block any new claude session.',
     );
 
     my $kill;
@@ -5013,15 +4959,9 @@ if (! _container_exists($CONTAINER_NAME)) {
             _emit_err("       Found $n stray `;C`-suffixed bind-mount target(s):\n");
             _emit_err("         - $_\n") for @stray;
             _emit_err("\n");
-            _emit_err("       Cause: the MSYS2_ARG_CONV_EXCL=* guard didn't apply when\n");
-            _emit_err("       podman.exe was invoked. Likely someone edited launcher.pl\n");
-            _emit_err("       or the .sh/.ps1 shim and removed the env-var setup, OR you\n");
-            _emit_err("       invoked launcher.pl directly without the shim.\n");
-            _emit_err("       See global-config/CLAUDE.md \"MSYS2 path-conversion\" for the\n");
-            _emit_err("       full failure mode.\n");
+            _emit_err("       Cause: the MSYS2_ARG_CONV_EXCL=* guard didn't apply when podman.exe was invoked. Likely someone edited launcher.pl or the .sh/.ps1 shim and removed the env-var setup, OR you invoked launcher.pl directly without the shim. See global-config/CLAUDE.md \"MSYS2 path-conversion\" for the full failure mode.\n");
             _emit_err("\n");
-            _emit_err("       Auto-recovering: removing the stray dirs and the broken\n");
-            _emit_err("       container so the next run can rebuild cleanly.\n");
+            _emit_err("       Auto-recovering: removing the stray dirs and the broken container so the next run can rebuild cleanly.\n");
             _launch_fail('create', 'MSYS2 path corruption detected after podman create', undef);
             for my $path (@stray) {
                 _rmtree($path);
@@ -5372,7 +5312,7 @@ sub reap_notice_lines {
     # The sentence heartbeat.sh composed. It is authored next to the decision
     # it describes, so it cannot drift from it -- prefer it to anything
     # reconstructed here.
-    push @out, _reap_wrap($f->{why}) if defined $f->{why} && length $f->{why};
+    push @out, $f->{why} if defined $f->{why} && length $f->{why};
 
     # The facts, compactly, for a reader who wants to check the sentence.
     my @facts;
@@ -5393,28 +5333,12 @@ sub reap_notice_lines {
     # A suspend-shaped reap has a specific, actionable cause, and the operator
     # cannot infer it from the numbers alone. Say what to do about it.
     if (($f->{host_suspends_detected} || 0) > 0) {
-        push @out, _reap_wrap(
+        push @out,
             'The machine slept while the container was up. keep-awake.ps1 holds it '
           . 'out of connected standby, but it only runs while a butler run is active '
-          . '-- so an idle sandbox is still exposed to a long suspend.');
+          . '-- so an idle sandbox is still exposed to a long suspend.';
     }
     return @out;
-}
-
-# _reap_wrap TEXT -> one wrapped string. PURE. Greedy word wrap at 76 columns;
-# a word longer than the limit is emitted whole rather than broken, since
-# breaking a path or an identifier makes it uncopyable.
-sub _reap_wrap {
-    my ($text) = @_;
-    my @lines; my $cur = '';
-    for my $w (split /\s+/, ($text // '')) {
-        next unless length $w;
-        if (!length $cur)              { $cur = $w }
-        elsif (length($cur) + 1 + length($w) <= 76) { $cur .= " $w" }
-        else                           { push @lines, $cur; $cur = $w }
-    }
-    push @lines, $cur if length $cur;
-    return join("\n", @lines);
 }
 # >>> s-reap-notice:END
 
@@ -5621,9 +5545,8 @@ if ($start_rc != 0 && $port_in_use->($start_rc)) {
         _emit_err(_c_err("ERROR:"),
             " another sandbox took this container's host ports"
             . (defined $PORT_BASE ? " (block $PORT_BASE-@{[$PORT_BASE + 19]})" : '') . ".\n");
-        _emit_err("       This container's port mapping is fixed for its lifetime.\n");
-        _emit_err("       Rebuild ([r] at the next prompt) to recreate it with a fresh,\n");
-        _emit_err("       free port block.\n\n");
+        _emit_err("       This container's port mapping is fixed for its lifetime. Rebuild ([r] at the next prompt) to recreate it with a fresh, free port block.\n");
+        _emit_err("\n");
         reset_terminal();
         exit ($start_rc >> 8 || 1);   # never exit 0 on a failed/ signal-killed start
     }
@@ -9064,9 +8987,7 @@ sub plain_heartbeat_loop {
     print "=" x 60 . "\n";
     print "Sandbox ready: $CONTAINER_NAME\n";
     print "=" x 60 . "\n";
-    print "This terminal is the manager — keep it open. Closing it stops\n";
-    print "the sandbox (~5 minutes after the last heartbeat).\n";
-    print "Press Ctrl+C to stop now.\n";
+    print "This terminal is the manager — keep it open. Closing it stops the sandbox (~5 minutes after the last heartbeat). Press Ctrl+C to stop now.\n";
     print "\n";
 
     my $BEAT_INTERVAL = 120;  # Container's HB is 300 (5 min); 120s gives 2.5x margin.

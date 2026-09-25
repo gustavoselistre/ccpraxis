@@ -2234,7 +2234,7 @@ my %PRINT_DETECTORS = (
         cmp_ok(index($LSRC_RAW, $b), '<', index($LSRC_RAW, $e), "AC-W4 '$b' precedes its END");
     }
     my $reap = region_between($LSRC_RAW, '# >>> s-reap-notice:BEGIN', '# >>> s-reap-notice:END');
-    for my $s (qw(parse_reap_record reap_notice_lines _reap_wrap)) {
+    for my $s (qw(parse_reap_record reap_notice_lines)) {
         cmp_ok(index(bstr($reap), "sub $s"), '>=', 0, "AC-W4 $s is still defined INSIDE the reap-notice region");
     }
     my $s03 = region_between($LSRC_RAW, '# >>> s03:health-detect:BEGIN', '# <<< s03:health-detect:END');

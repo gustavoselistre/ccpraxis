@@ -1040,8 +1040,11 @@ like($scan_code, qr/read_file\s*=>/, 'AC-50: t/53 always supplies an injected re
 #                    unnormalizable-target warning (AC-63).
 #   R4 (already ruled) -- marketplace-install/marketplace-source advice:
 #                    at most one 'git clone' occurrence (AC-64, expected to
-#                    already pass -- confirms the earlier ruling landed)
-#                    and no message line over 80 columns (AC-65, new).
+#                    already pass -- confirms the earlier ruling landed).
+#                    AC-65 (no message line over 80 columns) was removed by
+#                    blueprint hook-continuity-remake package 25 (Decision
+#                    95): it pinned fixed-column wrapping, which contradicts
+#                    the one-logical-line-per-paragraph rule.
 #   reviewer MAJOR -- docs/protected-paths.md's false claim that the
 #                    ccpraxis-install root is derived only from the
 #                    launcher's own path (AC-66..67).
@@ -1289,7 +1292,6 @@ like($PP_CALL_BLOCK_TEXT, qr/extra_list_path\s*=>\s*"[^"]+"/,
         my ($ok, $got, $err) = _try_decide($target, \%O64);
         if (!$ok || !defined $got->{message} || ($got->{reason} // '') ne $want_reason) {
             ok(0, "AC-64: $want_reason advice section contains at most one occurrence of 'git clone'");
-            ok(0, "AC-65: $want_reason message contains no line exceeding 80 characters");
             diag("decision call failed or reason mismatch for '$target': " . ($err || ($got->{reason} // 'undef')));
             next;
         }
@@ -1297,11 +1299,6 @@ like($PP_CALL_BLOCK_TEXT, qr/extra_list_path\s*=>\s*"[^"]+"/,
         my $gc_count = () = ($msg =~ /git clone/g);
         ok($gc_count <= 1,
            "AC-64: $want_reason advice section contains at most one occurrence of 'git clone' (no repeated instruction)");
-
-        my @long_lines = grep { length($_) > 80 } split /\n/, $msg;
-        is(scalar(@long_lines), 0,
-           "AC-65: $want_reason message contains no line exceeding 80 characters (root='$target', " . length($target) . ' chars)')
-            or diag('long lines: ' . join(' | ', map { length($_) . ':' . $_ } @long_lines));
     }
 }
 

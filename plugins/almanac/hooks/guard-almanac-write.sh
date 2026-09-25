@@ -50,10 +50,7 @@ BLOCKED: $TOOL on a bug report. These are written only through almanac-bug.pl.
 
   $FPATH
 
-A report's body is FROZEN once it leaves 'open' — that is what lets a reviewer
-read it without the filer rewriting it underneath them, and what makes 'taken'
-mean something. A direct edit would bypass both the state machine and the
-sha256 recorded at freeze time.
+A report's body is FROZEN once it leaves 'open' — that is what lets a reviewer read it without the filer rewriting it underneath them, and what makes 'taken' mean something. A direct edit would bypass both the state machine and the sha256 recorded at freeze time.
 
   While still open, revise it:
     perl <ccpraxis>/plugins/almanac/scripts/almanac-bug.pl update $ID --body -

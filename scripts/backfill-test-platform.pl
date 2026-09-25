@@ -70,26 +70,17 @@ sub usage_text {
     return <<'USAGE';
 usage: perl scripts/backfill-test-platform.pl --dry-run|--apply [GLOB ...]
 
-Scans .t files for nine textual signals of host-specific test behavior and
-proposes a platform marker for every file that does not already carry a
-legal one (package 01's TestPlatform.pm parser decides "legal").
+Scans .t files for nine textual signals of host-specific test behavior and proposes a platform marker for every file that does not already carry a legal one (package 01's TestPlatform.pm parser decides "legal").
 
   --dry-run    scan and print the report; write nothing
-  --apply      scan, print the report, and insert exactly one
-               "# platform: windows" or "# platform: any" line into every
-               file classified windows or any. Files already carrying a
-               legal marker, or a marker-shaped-but-invalid line, are left
-               untouched either way.
+  --apply      scan, print the report, and insert exactly one "# platform: windows" or "# platform: any" line into every file classified windows or any. Files already carrying a legal marker, or a marker-shaped-but-invalid line, are left untouched either way.
   --help, -h   print this message and exit 0
 
-Exactly one of --dry-run/--apply is required; giving neither or both is a
-usage error (exit 2).
+Exactly one of --dry-run/--apply is required; giving neither or both is a usage error (exit 2).
 
-With no positional GLOB, the default is plugins/*/tests/t/*.t resolved
-under the repo root, independent of the caller's current directory.
+With no positional GLOB, the default is plugins/*/tests/t/*.t resolved under the repo root, independent of the caller's current directory.
 
-This is a one-time migration aid (blueprint test-platform-split, Decision
-3): nothing in scripts/run-tests.pl or any runtime path ever calls it.
+This is a one-time migration aid (blueprint test-platform-split, Decision 3): nothing in scripts/run-tests.pl or any runtime path ever calls it.
 USAGE
 }
 

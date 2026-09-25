@@ -2702,8 +2702,7 @@ sub op_migrate_depends_on {
     my $edge_txt = join(', ', map { length($_) ? $_ : '(empty)' } @edges);
     my $note = "\n## Dependency edges\n\n"
              . "- Migrated from frontmatter `depends_on:` by `bp-ledger.pl migrate-depends-on`: $edge_txt\n"
-             . "  The scheduler builds its DAG from blueprint.md's package-status table; this is the\n"
-             . "  record of what the ledger used to claim, kept so the edge and its reason are not lost.\n";
+             . "  The scheduler builds its DAG from blueprint.md's package-status table; this is the record of what the ledger used to claim, kept so the edge and its reason are not lost.\n";
     if ($new =~ /^##\s+Dependency edges\b/m) {
         $new =~ s/(^##\s+Dependency edges\b[^\n]*\n)/$1\n- Migrated from frontmatter `depends_on:` by `bp-ledger.pl migrate-depends-on`: $edge_txt\n/m;
     }
