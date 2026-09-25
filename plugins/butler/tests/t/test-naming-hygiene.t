@@ -41,8 +41,8 @@ my $ROOT = "$Bin/../../../..";
 # that only showed up once the tree was actually renamed:
 #
 #   1. It forbade a test from naming the very script it tests whenever the two
-#      share a name. gate-headless-background.t could not write
-#      "gate-headless-background.sh" in its header. Roughly twelve headers had
+#      share a name. guard-bash-registration.t could not write
+#      "guard-bash.sh" in its header. Roughly twelve headers had
 #      to be reworded into unnatural word order to avoid reproducing a literal
 #      filename that referred to a DIFFERENT FILE.
 #   2. It fired on ordinary English. A file named hard-exclude.t whose header
@@ -190,17 +190,17 @@ unless (ok(@r3_violations == 0,
 # scanning the real tree above.
 ok(!header_self_references(
         "# See judge-decision-core.t for the seam test.\n",
-        "graceful-stop-gate.t",
+        "stop-gate-single.t",
     ),
     'header_self_references(): citing a SIBLING basename is not a self-reference (AC-4 / AC-7)');
 
 ok(header_self_references(
-        "# graceful-stop-gate.t -- the gate matrix.\n",
-        "graceful-stop-gate.t",
+        "# stop-gate-single.t -- the gate matrix.\n",
+        "stop-gate-single.t",
     ),
     'header_self_references(): citing its OWN basename IS a self-reference (sanity check for the negative case above)');
 
-ok(!header_self_references('', 'graceful-stop-gate.t'),
+ok(!header_self_references('', 'stop-gate-single.t'),
     'header_self_references(): an empty header cannot self-reference');
 
 # --- Decision 11: the token-aware boundaries -------------------------------
@@ -209,8 +209,8 @@ ok(!header_self_references('', 'graceful-stop-gate.t'),
 # word order, the second inflated the tree's violation count from ~140 to 193.
 
 ok(!header_self_references(
-        "# Proves gate-headless-background.sh denies a backgrounded Bash call.\n",
-        "gate-headless-background.t",
+        "# Proves guard-bash.sh denies a backgrounded Bash call.\n",
+        "guard-bash-registration.t",
     ),
     'naming the .sh script under test is NOT a self-reference (Decision 11, right boundary)');
 

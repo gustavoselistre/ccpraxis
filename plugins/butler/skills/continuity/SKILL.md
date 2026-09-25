@@ -1,12 +1,10 @@
 ---
 name: continuity
-description: Toggle or check explicit continuity arming for THIS session — a Stop gate that blocks
-  ending a turn with nothing scheduled to resume it, for sessions doing unattended work with no
-  blueprint, drive-solo run, or reporter involved. `on` arms, `off` disarms, no argument or
-  `status` reports current state. Arming also holds the machine awake until it is turned off — the
-  wake-lock on the host, the container's busy-lease in a sandbox — automatically, with nothing for
-  the agent to manage. Use when the operator asks to be "watched" or to arm/disarm
-  continuity, or when the agent is about to start open-ended unattended work with no blueprint.
+description: Toggle or check whether THIS session is armed to keep going. While armed, the one
+  Stop gate refuses to end a turn unless something confirmed still running is waited on. This
+  works for any session, not only a drive-solo run or the reporter. Arming keeps the machine
+  awake automatically, with nothing for the agent to manage. Use when the operator asks, or
+  before starting open-ended unattended work.
 argument-hint: "[on|off|status]  (default: status)"
 user-invocable: true
 allowed-tools: Bash
@@ -14,29 +12,9 @@ allowed-tools: Bash
 
 # /butler:continuity
 
-Explicit continuity arming for the current session. Once armed, `gate-continuity.sh` (a Stop hook)
-blocks a turn from ending with nothing scheduled to resume this session — unless the arm is
-explicitly lifted with `off`. This is independent of `/butler:drive-solo` and the reporter; it exists
-for unattended work that involves neither.
-
-## What counts as "scheduled to resume"
-
-A **bounded** wait, and only that. Dispatching a subagent or backgrounding a Bash call is not
-enough on its own: a dispatch records that something *started*, never that anything will come
-back. A subagent that runs forever, or a background command with no timeout, satisfies a naive
-gate and then never returns — leaving the session idle with nothing left to re-invoke it, which is
-the exact outcome this gate exists to prevent.
-
-So take a bounded wait alongside whatever you dispatched, as a **background** Bash call:
-
-```bash
-perl "<plugin-root>/scripts/bp-continuity.pl" hold --seconds 600
-```
-
-One command both records the promise and keeps it: it writes the deadline, sleeps, and exits — and
-a backgrounded command that exits is what actually re-invokes the session. When it elapses, poll
-whatever you were really waiting on and either finish or hold again. Pick the horizon to match what
-you are waiting for; it may not exceed the wake-up TTL (900s by default).
+Explicit continuity arming for the current session. While armed, the one Stop gate refuses to end
+a turn unless a holder is waiting on running work — this applies to any session, including one
+that is not a drive-solo run or the reporter.
 
 ## Arming also keeps the machine awake — automatically
 
@@ -48,28 +26,62 @@ as the arm stands:
 | host (Windows) | the wake-lock (`keep-awake.ps1`) | the machine entering connected standby mid-run |
 | inside a sandbox | the busy-lease (`/tmp/.butler-busy`) | `heartbeat.sh` reaping the container — and, through the launcher dashboard's probe of that same file, the host sleeping behind it |
 
-`on` starts a detached refresher that re-asserts this every 60s; `off` releases it. The Stop gate
-restarts the refresher if it ever dies. **Nothing here needs you to run anything** — do not take out
-a lock by hand, and do not treat holding it as one of your responsibilities.
+`on` starts a detached refresher that re-asserts this every 60s; `off` releases it. **Nothing here
+needs you to run anything** — do not take out a lock by hand, and do not treat holding it as one of
+your responsibilities.
 
 Two details worth knowing rather than re-deriving:
 
 - It is machine-level, not per-session. Two armed sessions share one lock and the **last** `off`
   releases it.
-- `status` reports `LEASE:` — `held`, `starting` (just asked; the helper records itself a moment
-  later), `releasing` (a sandbox `off`: the busy-lease is shared with fleet runs, so it is left to
-  go stale rather than deleted, and the container stays protected for the rest of the 600s window),
-  `released`, or `disabled` (`CCPRAXIS_NO_WAKELOCK` is set). It reports what is actually asserted,
-  so `armed` with `LEASE: released` means the session is watched but the machine is free to sleep —
-  say so rather than glossing it.
+- `status` prints a `wake-lock:` line that reports what is actually asserted. An armed session
+  whose transcript has been idle for more than one hour stops holding the machine awake (Decision
+  53) — say so rather than glossing it when the two disagree.
+
+## Using continuity
+
+<!-- continuity:begin -->
+Run these as plain Bash tool calls, arguments in single quotes.
+
+- **Arguments:** `on` -> `butler-continuity on`. `off` -> `butler-continuity off`. `status` or
+  empty -> `butler-continuity status`. A refusal prints one `butler-continuity: ...` line; report
+  it word for word.
+- **Operator branch:** a reasonless `off` works only when the operator's own message was
+  `/butler:continuity off`. If it refuses, the agent started the off itself and needs a `--reason`.
+- **Output:** `on` prints `continuity on for session <sid> (role <role>)`. `off` prints
+  `continuity off for session <sid> (actor ...); reason logged`. `status` prints an armed/off/not
+  armed line, a `holder:` line, an optional `silence:` line, and a `wake-lock:` line. `silence`
+  prints `continuity silenced for one stop of session <sid>; reason logged`.
+- **Self-arm triggers:** run `butler-continuity on` before starting background work you expect to
+  outlive the turn, or before unattended multi-step work — for example when the operator is away
+  or said "keep going". Do not self-arm for one interactive answer.
+- **Off** (`butler-continuity off --reason '<what is done>'`) is right only when all work is done
+  or the operator ended it. It stays off until an explicit `on`; a later director call does not
+  re-arm it.
+- **Silence** (`butler-continuity silence --reason '<why this stop>'`) lets one stop through, to
+  report or to wait for the operator. The gate applies again next stop. Silence never replaces a
+  holder while work is running.
+- **A reason** is at least two words and says what is done (off) or why this stop (silence). Quote
+  it in single quotes; it is logged for the operator.
+- **Holder:** `butler-hold <id> [<id> ...]` as a Bash call with `run_in_background: true`. Ids are
+  the agent id a background dispatch returns, or a background Bash task id. The hold is fixed at
+  50 minutes, or sooner once every id has finished. A dispatch alone does not let an armed session
+  stop; a running holder does. There is one holder per session: running it again while it runs adds
+  ids and restarts its 50 minutes, and never starts a second holder. Call it once, when a turn ends
+  with work running — not after every dispatch and not for ids already held, and its stop token
+  runs its three commands with `--token <token>` as printed. It counts only while one of its ids is
+  still running. On exit it wakes the session and prints each id as `<id> finished`, `<id> still
+  running (last activity <time>)` or `<id> unknown`. Act on that, then hold again only for ids
+  still running.
+- **New session id:** after `/clear` or a carry-over, the session is unarmed — run
+  `butler-continuity on` again. `--resume` keeps the arm.
+- **Questions:** queue one with `butler-continuity ask --text '<question>'` and keep working.
+- **Subagents:** cannot turn continuity on, off or silence it, or hold; those refuse.
+<!-- continuity:end -->
 
 ## If you have a question for the operator
 
-Queue it. Do NOT end the turn for it:
-
-```bash
-bp-continuity.sh ask --text "<your question>"
-```
+Queue it. Do NOT end the turn for it — see the `ask` line in "Using continuity".
 
 An armed session IS unattended work — that is what arming means — so a turn that
 ends to ask something stops the work for an answer nobody is there to give. The
@@ -79,86 +91,17 @@ answered when the work stops for a reason that is actually about the work.
 Meanwhile: decide it yourself if it is not a product call
 (`.ccpraxis-local-data/guidance/escalate-product-decisions-only.md`), and carry
 on with everything that does not depend on the answer. If nothing can proceed,
-the honest report is that the work is finished pending an answer — `disarm` and
-say so.
+the honest report is that the work is finished pending an answer — turn
+continuity off with a reason (see "Using continuity") and say so.
 
-## `on` does not arm immediately, and that is deliberate
-
-Nothing running as a Bash tool call is told which session Claude Code considers live — including
-this skill. `${CLAUDE_SESSION_ID}` is a *template substitution* pasted into this file's text before
-it runs, never re-checked, while the Stop gate keys its marker off the `session_id` in its own hook
-payload. When those disagreed, `on` reported success and the gate enforced nothing.
-
-So `on` reports **`STATUS: arming`** and prints a nonce. The arm binds at the next turn boundary,
-when the Stop hook — which *is* handed the live session id — confirms which session actually
-printed that nonce. Tell the operator it is armed *from the next turn boundary*; `status` after
-that shows `STATUS: armed` with the real id.
-
-`status` also reports `GATE_SEEN`. The gate touches the marker on every run, so `GATE_SEEN: no`
-well after binding means no Stop has been gated for this id — disarm and re-arm to rebind.
-
-## After a `--resume`, re-arm
-
-Resuming a conversation starts a NEW session with a NEW id (measured, not
-assumed). The previous session's marker stays in the registry until its TTL
-expires, so the statusline badge may still show "watched" for an id that no
-longer exists — while the resumed session is not gated at all. `status` reports
-this honestly (`unarmed`), and `on` fixes it.
-
-## Arguments
-
-- `$ARGUMENTS` — one of `on`, `off`, `status`. Empty defaults to `status`.
-
-## Steps
-
-### 1. Run the script
-
-`${CLAUDE_SKILL_DIR}` is the documented Claude Code substitution for this skill's own directory; the
-canonical script lives two levels up at `<plugin-root>/scripts/`.
-
-**No `--session` is passed, deliberately.** This file used to interpolate `${CLAUDE_SESSION_ID}`
-into every command, and that value is a template substitution rendered into this text — not a live
-lookup, and not checked against anything. When it was wrong, the gate silently enforced nothing.
-The script identifies the session through the Stop hook instead (see above), so passing an id here
-would only reintroduce the guess.
-
-- `on` →
-  ```bash
-  perl "${CLAUDE_SKILL_DIR}/../../scripts/bp-continuity.pl" arm --by operator
-  ```
-- `off` →
-  ```bash
-  perl "${CLAUDE_SKILL_DIR}/../../scripts/bp-continuity.pl" disarm
-  ```
-- `status` (or no argument) →
-  ```bash
-  perl "${CLAUDE_SKILL_DIR}/../../scripts/bp-continuity.pl" status
-  ```
-
-### 2. Parse the result
-
-The script emits `KEY: value` lines on stdout:
-
-- `STATUS: arming` → `on` succeeded. The arm binds at the next turn boundary; say so rather than
-  claiming it is already in force. `NONCE:` is how the session will be identified.
-- `STATUS: armed` → the arm is bound and in force. `ARMED_BY:` and `SINCE:` are present, and
-  `GATE_SEEN:` says whether a Stop has actually been gated for it yet.
-- `STATUS: disarmed` → disarm succeeded (a `NOTE:` says so if it cancelled a still-pending arm).
-- `STATUS: not_armed` → disarm on a session that was not armed (not a failure — report it plainly).
-- `STATUS: unarmed` → status on a session that is not armed.
-- `CONFIDENCE: unverified` on a status line → the id was taken from a process-scoped env value with
-  nothing to check it against. Treat the reading as advisory and re-arm if it matters.
-- `STATUS: error` followed by `ERROR: …` → report the error verbatim and stop.
-
-### 3. Confirm to the user
+## Confirm to the user
 
 One short sentence confirming the new state to the user.
 
 Examples:
 
-> Continuity arms from the next turn boundary — from then on I'll be blocked from ending a turn
-> with nothing scheduled to resume it, until you run `/butler:continuity off`.
+> Continuity is on for this session — I'll keep going until the work is done or you end it.
 
-> Continuity disarmed for this session.
+> Continuity is off for this session.
 
 > This session is not currently armed.

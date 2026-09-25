@@ -6,7 +6,7 @@
 # successor (WaitShapeGuard), which absorbs repeat-guard, running on the
 # package-03 hook core.
 #
-# hooks/next/guards/wait-shape-guard.sh and BpHook/Guards/WaitShapeGuard.pm
+# hooks/wait-shape-guard.sh and BpHook/Guards/WaitShapeGuard.pm
 # DO NOT EXIST YET. Every in-process case goes through
 # GuardHarness::run_module() (batch 1's harness), which mirrors
 # BpHook::main()'s own require-and-call contract, so a missing module fails
@@ -19,7 +19,7 @@
 # (sec 2.3/2.6 for Common's fit/echo_cmd, sec 3.7 for WaitShapeGuard's own
 # contract) and the CASES (never the source bash) of the four source files
 # this batch's oracle absorbs -- never from reading wait-shape-guard.sh,
-# repeat-guard.sh, lib.sh's bp_ws_*/bp_repeat_* functions, or
+# wait-shape-guard.sh, the old shared bash guard library's bp_ws_*/bp_repeat_* functions, or
 # waiting-discipline.t's skill prose.
 #
 # A READING CALL WORTH FLAGGING: spec 3.7's R3b message text reads
@@ -57,23 +57,23 @@
 #   wait-shape-guard.t's verbatim long advisory texts, the SKILL.md     | MSG (the 2.6 message budget dropped
 #     citation sentence in every message                               |   these; the new text carries only
 #                                                                       |   the substring this file asserts)
-#   repeat-guard.t's pure bp_repeat_* helper calls, AS SUCH (calling    | LIB (those subs live in retired
-#     the shell function directly via `source lib.sh`)                 |   lib.sh; their semantics are
+#   wait-shape-guard.t's pure bp_repeat_* helper calls, AS SUCH (calling    | LIB (those subs live in retired
+#     the shell function directly via `source the old shared bash guard library`)                 |   the old shared bash guard library; their semantics are
 #                                                                       |   re-expressed as WaitShapeGuard::run
 #                                                                       |   verdicts in WS-8/WS-9/WS-10 below)
-#   repeat-guard.t AC-12's BP_DIR/BP_PROJECT_ROOT individually-unset    | OTHER (the three-variable gate is
+#   wait-shape-guard.t AC-12's BP_DIR/BP_PROJECT_ROOT individually-unset    | OTHER (the three-variable gate is
 #     cases                                                            |   retired -- BP_LEDGER alone selects
 #                                                                       |   this guard now, per the spec 2.1
 #                                                                       |   clause table; WS-11 re-expresses
 #                                                                       |   the BP_DIR-specific case that still
 #                                                                       |   has a successor: state rules skip
 #                                                                       |   without BP_DIR, R1/R2/R3b do not)
-#   repeat-guard.t AC-13 (missing-jq fail-open)                        | JQ
-#   repeat-guard.t AC-20/AC-20d (hooks.json shape, cmds_contain_in_order)| REG
-#   repeat-guard.t AC-21 (bp_gate_verdict/bp_active_stop_signal/        | LIB (regression spot-checks of
-#     bp_hook_gate regression spot-checks)                             |   ANOTHER component's own lib.sh subs,
+#   wait-shape-guard.t AC-13 (missing-jq fail-open)                        | JQ
+#   wait-shape-guard.t AC-20/AC-20d (hooks.json shape, cmds_contain_in_order)| REG
+#   wait-shape-guard.t AC-21 (bp_gate_verdict/bp_active_stop_signal/        | LIB (regression spot-checks of
+#     bp_hook_gate regression spot-checks)                             |   ANOTHER component's own the old shared bash guard library subs,
 #                                                                       |   not this guard's)
-#   repeat-guard.t F1 (HIGH-1 super-linear-scrub wall-clock bound)      | D33 (a wall-clock assertion)
+#   wait-shape-guard.t F1 (HIGH-1 super-linear-scrub wall-clock bound)      | D33 (a wall-clock assertion)
 #   waiting-discipline.t / oneshot-judge-waiting-discipline.t (whole    | OTHER (skill/prose documentation
 #     files)                                                           |   checks, not the guard itself)
 #
@@ -100,7 +100,7 @@ use GuardHarness;
 # BpHook::arm() -- WaitShapeGuard's own prefilter atom is "ledger" alone
 # (spec sec 2.1's clause table), never a per-session armed-file lookup.
 # ---------------------------------------------------------------------------
-delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
 $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
 GuardHarness::isolate_env();
 
@@ -304,9 +304,9 @@ my $QUOTED_PERL = q{printf '%s' 'shim("$R/hang", "sleep 30;")' > /tmp/fixture-fr
 my $AC8 = q{for f in plugins/butler/tests/t/*.t; do out=$(timeout 120 perl "$f" 2>&1); rc=$?; nok=$(printf '%s' "$out" | grep -c '^not ok'); echo "$f rc=$rc nok=$nok"; done};
 my $AC9 = q{find /root/.claude -name 'hooks.json' 2>/dev/null | while read f; do echo "--- $f"; jq -r '.' "$f" 2>/dev/null; done | head -60};
 
-my $P7 = join("\n", q{perl plugins/butler/tests/t/repeat-guard.t 2>&1 | tail -20}, q{echo "EXIT=$?"});
+my $P7 = join("\n", q{perl plugins/butler/tests/t/wait-shape-guard.t 2>&1 | tail -20}, q{echo "EXIT=$?"});
 my @AC11 = (
-    q{perl plugins/butler/tests/t/repeat-guard.t 2>&1 | tail -20; echo "EXIT=$?"},
+    q{perl plugins/butler/tests/t/wait-shape-guard.t 2>&1 | tail -20; echo "EXIT=$?"},
     q{perl plugins/butler/tests/t/status-recognition.t 2>&1 | tail -5; echo "exit=$?"},
     q{timeout 120 perl plugins/sandbox/tests/t/detector-hardening.t 2>&1 | tail -60; echo "EXIT=$?"},
     q{perl plugins/sandbox/tests/run-tests.pl 2>&1 | tail -25; echo "EXIT=$?"},
@@ -315,13 +315,13 @@ my @AC11 = (
     $P7,
 );
 my @AC13 = (
-    q{ls -la /project/plugins/butler/hooks/repeat-guard.sh 2>&1 | tail -1},
+    q{ls -la /project/plugins/butler/hooks/wait-shape-guard.sh 2>&1 | tail -1},
     q{ls -la .ccpraxis-local-data/blueprints/x/specs/ 2>&1 | tail -20},
     $AC9,
 );
 my @AC14 = (
     q{prove plugins/sandbox/tests/t/detector-hardening.t > /tmp/prove2.txt 2>&1; echo "exit=$?"; tail -3 /tmp/prove2.txt},
-    q{out=$(perl plugins/butler/tests/t/repeat-guard.t 2>&1); rc=$?},
+    q{out=$(perl plugins/butler/tests/t/wait-shape-guard.t 2>&1); rc=$?},
 );
 my @AC16 = (
     q{sleep 120; cat .ccpraxis-local-data/blueprints/x/reports/y/implementer-step7-batch1.md | tail -20},
@@ -335,7 +335,7 @@ my $AC17_ALLOW = q{for id in a49213afc416089fd a712a884417c60e49; do printf '%s 
 
 my $PREC_R1_R3B = q{until [ -s /tmp/claude-0/-project/x/tasks/a8f15ee1ec26598b5.output ]; do sleep 10; done};
 my $PREC_R3B_R2 = q{sleep 30; cat /tmp/claude-0/-project/x/tasks/a8f15ee1ec26598b5.output | tail -20; echo "EXIT=$?"};
-my $PREC_R1_R2  = q{for i in $(seq 1 3); do sleep 6; done; perl plugins/butler/tests/t/repeat-guard.t 2>&1 | tail -20; echo "EXIT=$?"};
+my $PREC_R1_R2  = q{for i in $(seq 1 3); do sleep 6; done; perl plugins/butler/tests/t/wait-shape-guard.t 2>&1 | tail -20; echo "EXIT=$?"};
 
 my $QUOTED_WAIT_LOOP = q{echo 'anti-pattern example: while ! test -f x; do sleep 5; done'};
 my $REAL_WAIT_LOOP   = q{while ! test -f x; do sleep 5; done};
@@ -344,7 +344,7 @@ my $REAL_WAIT_LOOP   = q{while ! test -f x; do sleep 5; done};
 # SH-1/SH-2 -- static shape.
 # =====================================================================================
 {
-    my $wrapper = "$BUTLER_DIR/hooks/next/guards/wait-shape-guard.sh";
+    my $wrapper = "$BUTLER_DIR/hooks/wait-shape-guard.sh";
     my $module  = "$BUTLER_DIR/scripts/BpHook/Guards/WaitShapeGuard.pm";
     ok(-f $wrapper, 'SH-1 precondition: wait-shape-guard.sh exists on disk')
         or diag("missing: $wrapper (package 14 has not written it yet)");
@@ -858,7 +858,7 @@ for my $v (qw(bogus Off 0 nudge)) {
 # =====================================================================================
 {
     GuardHarness::fresh_state();
-    my $stopgate = "$BUTLER_DIR/hooks/next/stop-gate.sh";
+    my $stopgate = "$BUTLER_DIR/hooks/stop-gate.sh";
     ok(-f $stopgate, 'self-check precondition: stop-gate.sh (package 06) exists on disk');
 
     my $res_shim = GuardHarness::run_shim($stopgate,

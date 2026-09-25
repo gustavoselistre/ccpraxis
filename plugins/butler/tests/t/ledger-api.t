@@ -55,6 +55,7 @@
 
 use strict;
 use warnings;
+BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 } # package 16 post-fix-batch (Decision 80): this file names a wake-lock actuator, in prose or a path check, never a real invocation -- the guard is the cheap side of test-wakelock-hygiene.t's deliberate over-matching.
 use Test::More;
 use FindBin qw($Bin);
 use File::Temp qw(tempdir);
@@ -729,7 +730,7 @@ my $ISO_RE = qr/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
     unlike(read_file($p), qr/^last_updated:/m, "AC-6: last_updated: was NOT appended");
 }
 
-{   # ---- AC-9 (B6): output stays parseable by gate-stop.sh's awk, which is STRICTER than perl's.
+{   # ---- AC-9 (B6): output stays parseable by stop-gate.sh's awk, which is STRICTER than perl's.
     my $p    = stage_bytes(clean_ledger());
     my $orig = read_file($p);
     my ($rc) = run_pl(['set-status', '--ledger', $p, '--status', 'blocked']);
@@ -1073,8 +1074,8 @@ sub next_action_sections {
         is($rc, 3, "AC-24: $lbl -> exit 3 (argument check, not a validation rule)");
         is($out, '', "AC-24: $lbl stdout empty");
         is(one_stderr_line($err), 1, "AC-24: $lbl exactly one stderr line");
-        ok(index($err, 'bp-status.sh') >= 0 && index($err, 'gate-stop.sh') >= 0,
-           "AC-24: $lbl message cites the bp-status.sh / gate-stop.sh reader disagreement");
+        ok(index($err, 'bp-status.sh') >= 0 && index($err, 'stop-gate.sh') >= 0,
+           "AC-24: $lbl message cites the bp-status.sh / stop-gate.sh reader disagreement");
         is(read_file($p), $orig, "AC-24: $lbl file byte-identical");
     }
 }

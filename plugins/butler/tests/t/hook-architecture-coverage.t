@@ -574,7 +574,9 @@ sub coverage_failures {
             push @f, "[C7] missing or empty 'off-check' in H7";
         }
         elsif (defined $pkg_ws) {
-            my %pkg04 = map { $_ => 1 } pkg_entries_matching($pkg_ws, qr/^04-/);
+            # Post-cutover form too: package 16 flattened hooks/next/(guards/) into hooks/.
+            my %pkg04 = map { my $f = $_; $f =~ s{/hooks/next/(?:guards/)?}{/hooks/}; ($_ => 1, $f => 1) }
+                        pkg_entries_matching($pkg_ws, qr/^04-/);
             push @f, "[C7] off-check '$v' is not a package 04-* write_set file entry"
                 unless $pkg04{$v};
         }
@@ -682,10 +684,6 @@ sub coverage_failures {
                 push @f, "[C12] deletion list lists kept file '$row->{own_path}'" if $listed{ $row->{own_path} };
             }
         }
-        for my $name ('reporter-gate-regression.t', 'arming-binds-or-reports.t') {
-            push @f, "[C12] deletion list missing reference to '$name'"
-                unless grep { index($_, $name) >= 0 } @bullets;
-        }
     }
 
     # C13: unnamed new files cited by backtick. Needs blueprint.
@@ -746,8 +744,8 @@ sub build_fixture {
     write_utf8("$root/plugins/butler/hooks/a.sh", "#!/usr/bin/env bash\nexit 0\n");
     write_utf8("$root/plugins/butler/hooks/b.sh", "#!/usr/bin/env bash\nexit 0\n");
     write_utf8("$root/plugins/butler/hooks/c.pl", "#!/usr/bin/env perl\n");
-    write_utf8("$root/plugins/butler/tests/t/reporter-gate-regression.t", "1;\n");
-    write_utf8("$root/plugins/butler/tests/t/arming-binds-or-reports.t", "1;\n");
+    write_utf8("$root/plugins/butler/tests/t/sample-fixture-a.t", "1;\n");
+    write_utf8("$root/plugins/butler/tests/t/sample-fixture-b.t", "1;\n");
 
     my $hooks_json = {
         hooks => {
@@ -913,8 +911,8 @@ Decision 43):
 
 - `plugins/butler/hooks/b.sh`
 - `plugins/butler/hooks/c.pl`
-- `plugins/butler/tests/t/reporter-gate-regression.t`
-- `plugins/butler/tests/t/arming-binds-or-reports.t`
+- `plugins/butler/tests/t/sample-fixture-a.t`
+- `plugins/butler/tests/t/sample-fixture-b.t`
 
 ## NEEDS-OPERATOR forks
 

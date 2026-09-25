@@ -11,7 +11,7 @@
 # for a blueprint sitting at `status: drafting`.
 #
 # The second-order cost is what made it expensive rather than merely wrong.
-# `next` is invoked from the Stop hook on every turn end; guard-subagent-stall.sh
+# `next` is invoked from the Stop hook on every turn end; wait-shape-guard.sh
 # activates the runstate whenever it sees a run-package verdict come back; and
 # keepawake_apply('active') re-spawns the Windows wake-lock on every tick. So a
 # drafting blueprint held the machine awake for hours, re-arming itself after the

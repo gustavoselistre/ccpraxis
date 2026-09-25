@@ -15,6 +15,11 @@ use B qw(svref_2object SVp_POK);
 
 our $DENY_LINE = 'butler: a subagent may not call bp-drive-next next; only the driving session\'s main thread runs the director.';
 
+# F2 (red-team H1, package 16 fix-batch): a session with an off/<sid>
+# record must stay off until an explicit "on" (Decision 1) -- it must not
+# be silently re-armed just because it calls `next` again.
+our $OFF_DENY_LINE = 'butler: continuity is off for this session; run `butler-continuity on` before calling `next` again.';
+
 # A plain (unblessed) string scalar, the same test BpHook.pm itself uses
 # internally to tell "42" (a real string) apart from 42 (a bare IV that
 # happens to stringify the same way) -- see spec sec 2.3 step 3.
@@ -67,7 +72,11 @@ sub run {
         return 0;
     }
 
-    return 0 if BpHook::latest_is_off($sid);
+    # F2 (red-team H1): before this fix, an off session's `next` was silently
+    # allowed with nothing armed, so the director handed out (concurrent)
+    # packages to a caller with no bind-dispatch and no write-set guard.
+    # Deny instead, and never arm.
+    return BpHook::deny($OFF_DENY_LINE) if BpHook::latest_is_off($sid);
 
     if (BpHook::role($p) eq 'driver') {
         my $root = BpHook::state_dir();

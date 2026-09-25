@@ -5,7 +5,7 @@
 # specs/14-guards-remake-spec.md sec 3.1/4.3/4.4: the guard-bash successor
 # (GuardBash), running on the package-03 hook core.
 #
-# hooks/next/guards/guard-bash.sh and BpHook/Guards/GuardBash.pm (and its
+# hooks/guard-bash.sh and BpHook/Guards/GuardBash.pm (and its
 # siblings Common.pm, Shell.pm) DO NOT EXIST YET. Every in-process call goes
 # through GuardHarness::run_module(), which mirrors BpHook::main()'s own
 # require-and-call contract, so a missing module fails open (rc 0) exactly
@@ -14,7 +14,7 @@
 # plain "No such file or directory" until the implementer writes it.
 #
 # WRITTEN BLIND TO THE IMPLEMENTATION: derived only from the spec text
-# above, never from reading guard-bash.sh, guard-validation-interlock.sh or
+# above, never from reading guard-bash.sh, its old separate validation-interlock counterpart or
 # any other source hook.
 #
 # NOT RE-EXPRESSED (Decision 26/Decision 6 exemptions, and every case the
@@ -84,7 +84,7 @@ use GuardHarness;
 # own env changes in local %ENV = %ENV" was false (no such wrap exists
 # anywhere in this file) and is removed rather than repeated.
 # ---------------------------------------------------------------------------
-delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
 $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
 
 my $BUTLER_DIR = dirname(__FILE__) . '/../..';
@@ -168,7 +168,7 @@ my $STALE_SECS = 180 * 60; # default CCPRAXIS_VALIDATION_STALE_MIN
 # test step, so a missing file is reported, not papered over).
 # ===========================================================================
 {
-    my $wrapper = "$BUTLER_DIR/hooks/next/guards/guard-bash.sh";
+    my $wrapper = "$BUTLER_DIR/hooks/guard-bash.sh";
     my $module  = "$BUTLER_DIR/scripts/BpHook/Guards/GuardBash.pm";
     ok(-f $wrapper, 'SH-1 precondition: guard-bash.sh exists on disk')
         or diag("missing: $wrapper (package 14 has not written it yet)");
@@ -710,7 +710,7 @@ my $STALE_SECS = 180 * 60; # default CCPRAXIS_VALIDATION_STALE_MIN
 # Proves a red result above is guard-bash's absence, not a harness defect.
 # ===========================================================================
 {
-    my $stopgate = "$BUTLER_DIR/hooks/next/stop-gate.sh";
+    my $stopgate = "$BUTLER_DIR/hooks/stop-gate.sh";
     ok(-f $stopgate, 'self-check precondition: stop-gate.sh (package 06) exists on disk');
     my $base = GuardHarness::fresh_state();
     my $res_wrapper = GuardHarness::run_wrapper($stopgate,

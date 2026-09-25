@@ -28,7 +28,7 @@ use POSIX qw(WNOHANG _exit);
 use Time::HiRes qw(sleep time);
 
 (my $BUTLER = "$Bin/../..") =~ s{\\}{/}g;
-my $HOOK = "$BUTLER/hooks/next/stop-gate.sh";
+my $HOOK = "$BUTLER/hooks/stop-gate.sh";
 my $S    = "$BUTLER/scripts";
 
 require "$S/BpHook.pm";    # package 03 -- real and already implemented
@@ -50,7 +50,7 @@ END {
 }
 $SIG{$_} = sub { exit 1 } for qw(TERM INT HUP);
 
-delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
 
 # ---------------------------------------------------------------------------
 # guard: never touch the real ~/.claude or ~/.ccpraxis-local-data
@@ -107,7 +107,7 @@ sub run_gate {
     my (undef, $epath) = tempfile();
 
     local %ENV = %ENV;
-    delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+    delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
     for my $k (keys %env) {
         if (defined $env{$k}) { $ENV{$k} = $env{$k} } else { delete $ENV{$k} }
     }
@@ -155,7 +155,7 @@ sub load_stopgate {
 sub run_gate_inprocess {
     my ($payload_json, %env) = @_;
     local %ENV = %ENV;
-    delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+    delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
     for my $k (keys %env) {
         if (defined $env{$k}) { $ENV{$k} = $env{$k} } else { delete $ENV{$k} }
     }
@@ -195,7 +195,7 @@ sub state_dir_of { my ($root) = @_; return "$root/continuity" }
 sub arm_session {
     my ($root, $sid, %opts) = @_;
     local %ENV = %ENV;
-    delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+    delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
     $ENV{HOME} = $FAKE_HOME; $ENV{USERPROFILE} = $FAKE_HOME;
     $ENV{BUTLER_STATE_DIR} = $root;
     my $ok = BpHook::arm($sid, role => ($opts{role} // 'manual'), by => 'arm-on-entry');
@@ -205,7 +205,7 @@ sub arm_session {
 sub set_silence {
     my ($root, $sid, %opts) = @_;
     local %ENV = %ENV;
-    delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+    delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
     $ENV{HOME} = $FAKE_HOME; $ENV{USERPROFILE} = $FAKE_HOME;
     $ENV{BUTLER_STATE_DIR} = $root;
     return BpHook::set_silence($sid, reason => ($opts{reason} // 'reporting progress now'));
@@ -341,7 +341,7 @@ my ($S2_ROOT, $S2_SID, $S2_TOKEN);
     my $sid  = next_sid();
     arm_session($root, $sid);
     my $res = run_gate(payload_json($sid), BUTLER_STATE_DIR => $root);
-    is($res->{rc}, 2, 'S2 (re-expresses graceful-stop-gate.t "gate-stop: no signal + non-terminal -> blocked"): subprocess exit 2');
+    is($res->{rc}, 2, 'S2 (re-expresses the retired graceful-stop-gate coverage "gate-stop: no signal + non-terminal -> blocked"): subprocess exit 2');
     is($res->{out}, '', 'S2: stdout empty');
     my @lines = lines_of($res->{err});
     is(scalar(@lines), 7, 'S2: stderr is exactly 7 lines') or diag("stderr:\n$res->{err}");
@@ -896,7 +896,7 @@ SKIP: {
         my (undef, $err_path) = tempfile();
 
         local %ENV = %ENV;
-        delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+        delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
         for my $k (keys %{ $opt{env} }) {
             if (defined $opt{env}{$k}) { $ENV{$k} = $opt{env}{$k} } else { delete $ENV{$k} }
         }

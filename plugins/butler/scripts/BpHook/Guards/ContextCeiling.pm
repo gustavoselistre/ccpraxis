@@ -1,7 +1,7 @@
 # BpHook::Guards::ContextCeiling -- coordinator context-flush enforcement
 # (PreToolUse) and guidance (PostToolUse) (package 14 of blueprint
-# hook-continuity-remake), successor to context-ceiling-flush.sh and
-# context-ceiling-guidance.sh.
+# hook-continuity-remake), successor to the old separate context-ceiling
+# flush and guidance hooks, now merged into hooks/context-ceiling.sh.
 #
 # Contract: .ccpraxis-local-data/blueprints/hook-continuity-remake/specs/
 # 14-guards-remake-spec.md sec 3.8 (this successor's own contract).

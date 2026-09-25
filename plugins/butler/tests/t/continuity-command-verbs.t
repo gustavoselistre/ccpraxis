@@ -33,7 +33,7 @@ my $S       = "$Bin/../../scripts";
 $S =~ s{\\}{/}g;
 my $CMD     = "$S/butler-continuity.pl";
 my $BINSHIM = "$Bin/../../bin/butler-continuity";
-my $HOOKSH  = "$Bin/../../hooks/next/continuity-off-check.sh";
+my $HOOKSH  = "$Bin/../../hooks/continuity-off-check.sh";
 my $COPM    = "$S/BpHook/ContinuityOffCheck.pm";
 
 require "$S/BpHook.pm";   # package 03 -- real and already implemented
@@ -75,7 +75,7 @@ $SIG{$_} = sub { exit 1 } for qw(TERM INT HUP);
 # ---------------------------------------------------------------------------
 # fixtures / environment
 # ---------------------------------------------------------------------------
-delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
 
 my $TMPROOT = tempdir(CLEANUP => 1);
 (my $LEGACY    = "$TMPROOT/legacy") =~ s{\\}{/}g;
@@ -214,7 +214,7 @@ sub spawn_cmd {
     my $pid = fork();
     die "fork: $!" unless defined $pid;
     if ($pid == 0) {
-        delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+        delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
         $ENV{BUTLER_STATE_DIR}               = $CURRENT_STATE_BASE;
         $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR} = $LEGACY;
         $ENV{CLAUDE_PROJECT_DIR}             = $PROJECT;
@@ -743,61 +743,38 @@ sub reasons_log_lines {
 }
 
 # ===========================================================================
-# V12 -- ask matches bp-continuity.pl ask, byte for byte modulo the [ISO] stamp
+# V12 -- ask writes the legacy-queue line shape, pinned literally.
+#
+# Formerly this compared butler-continuity's output against a live
+# subprocess ask on the old continuity CLI (masked for the [ISO] stamp). That
+# CLI is on the deletion list and gone (package 16 batch E1); its comparator
+# role is retired, code DEL, and the line shape it used to prove is pinned directly
+# instead -- "- [ISO] <flattened text>", one line per queued question, with an
+# embedded newline flattened to a single space (unweakened: same two cases,
+# same masking, same assertions-per-case; only the second-process comparator
+# is gone).
 # ===========================================================================
 {
     my $proj_a = "$TMPROOT/askproj-a";
-    my $proj_b = "$TMPROOT/askproj-b";
     make_path("$proj_a/.ccpraxis-local-data");
-    make_path("$proj_b/.ccpraxis-local-data");
 
     my ($outA, $errA, $rcA) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_a }, 'ask', '--text', 'q one');
     is($rcA, 0, 'V12: butler-continuity ask exits 0') or diag("stderr: $errA");
 
-    my $cli_b = "$S/bp-continuity.pl";
-    my $pid2 = fork();
-    die "fork: $!" unless defined $pid2;
-    if ($pid2 == 0) {
-        delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
-        $ENV{CLAUDE_PROJECT_DIR}   = $proj_b;
-        $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
-        exec($^X, $cli_b, 'ask', '--text', 'q one');
-        POSIX::_exit(127);
-    }
-    push @KILL_PIDS, $pid2;
-    waitpid($pid2, 0);
-    @KILL_PIDS = grep { $_ != $pid2 } @KILL_PIDS;
-
     my $qa = slurp("$proj_a/.ccpraxis-local-data/.subagent-guard/questions.md");
-    my $qb = slurp("$proj_b/.ccpraxis-local-data/.subagent-guard/questions.md");
     (my $qa_masked = $qa) =~ s/\[\d{4}-\d\d-\d\dT[\d:.]+Z\]/[ISO]/g;
-    (my $qb_masked = $qb) =~ s/\[\d{4}-\d\d-\d\dT[\d:.]+Z\]/[ISO]/g;
-    is($qa_masked, $qb_masked, 'V12: butler-continuity ask matches bp-continuity.pl ask (masked)');
+    is($qa_masked, "- [ISO] q one\n",
+        'V12: butler-continuity ask writes the pinned legacy-queue line shape');
 
     # embedded newline
     my $proj_c = "$TMPROOT/askproj-c";
-    my $proj_d = "$TMPROOT/askproj-d";
     make_path("$proj_c/.ccpraxis-local-data");
-    make_path("$proj_d/.ccpraxis-local-data");
     run_cmd({ CLAUDE_PROJECT_DIR => $proj_c }, 'ask', '--text', "line one\nline two");
-    my $pid3 = fork();
-    die "fork: $!" unless defined $pid3;
-    if ($pid3 == 0) {
-        delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
-        $ENV{CLAUDE_PROJECT_DIR}   = $proj_d;
-        $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
-        exec($^X, $cli_b, 'ask', '--text', "line one\nline two");
-        POSIX::_exit(127);
-    }
-    push @KILL_PIDS, $pid3;
-    waitpid($pid3, 0);
-    @KILL_PIDS = grep { $_ != $pid3 } @KILL_PIDS;
 
     my $qc = slurp("$proj_c/.ccpraxis-local-data/.subagent-guard/questions.md");
-    my $qd = slurp("$proj_d/.ccpraxis-local-data/.subagent-guard/questions.md");
     (my $qc_masked = $qc) =~ s/\[\d{4}-\d\d-\d\dT[\d:.]+Z\]/[ISO]/g;
-    (my $qd_masked = $qd) =~ s/\[\d{4}-\d\d-\d\dT[\d:.]+Z\]/[ISO]/g;
-    is($qc_masked, $qd_masked, 'V12: an embedded newline is flattened identically by both commands');
+    is($qc_masked, "- [ISO] line one line two\n",
+        'V12: an embedded newline is flattened to a single space in the pinned line shape');
 }
 
 # ===========================================================================

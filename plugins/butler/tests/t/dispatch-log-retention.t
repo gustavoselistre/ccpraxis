@@ -362,19 +362,26 @@ sub run_cli {
 #    track-dispatch.sh end to end needs a live Claude Code hook payload, so what
 #    is checked here is that the branch calls the prune at all -- the behaviour
 #    of that prune is covered above.
+#
+#    Package 16 batch B: the over-2000 bash branch this used to pin moved into
+#    BpHook::Guards::TrackDispatch::_over_cap_alarm_and_prune
+#    (plugins/butler/scripts/BpHook/Guards/TrackDispatch.pm) when
+#    hooks/track-dispatch.sh became an exec shim into it (SRC). Re-pointed at
+#    the perl module's own source instead of the retired bash branch text.
 # ===========================================================================
 {
+    my $module = "$Bin/../../scripts/BpHook/Guards/TrackDispatch.pm";
   SKIP: {
-        skip('track-dispatch.sh not present', 3) unless -f $HOOK;
-        my $src = slurp($HOOK) // '';
-        my ($branch) = $src =~ /-gt 2000 \]; then(.*?)\n          fi/s;
-        ok(defined $branch, 'F1: the over-cap branch is still recognisable in the hook');
+        skip('TrackDispatch.pm not present', 3) unless -f $module;
+        my $src = slurp($module) // '';
+        my ($branch) = $src =~ /sub _over_cap_alarm_and_prune\s*\{(.*?)\n\}/s;
+        ok(defined $branch, 'F1: the over-cap branch is still recognisable in the module');
       SKIP: {
             skip('over-cap branch not found', 2) unless defined $branch;
-            like($branch, qr/bp-dispatch-log\.pl"?\s+prune\b/,
+            like($branch, qr/BpDispatchLog::prune_records\b/,
                  'F2: over cap the hook RUNS THE PRUNE -- standing aside alone was the one-way '
                . 'door: past 2000 it stopped calling the only thing that could shrink the store');
-            like($branch, qr/retention-alarm\.log/,
+            like($branch, qr/went unrecorded/,
                  'F3: and leaves a line saying the dispatch went unrecorded');
         }
     }

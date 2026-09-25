@@ -5,9 +5,9 @@
 # criterion 6 ("coordination, not a dependency" with e03) is satisfied by
 # documenting the dispatch-log bracket and the interrupt doctrine somewhere
 # a headless coordinator's own Task dispatch can adopt it from, WITHOUT
-# adding a DAG edge and WITHOUT documenting gate-drive-loop.sh here (that
+# adding a DAG edge and WITHOUT documenting stop-gate.sh here (that
 # gate is drive-solo-scoped by construction — coordinator-protocol's own
-# stop discipline is gate-stop.sh, untouched by this package).
+# stop discipline is stop-gate.sh, untouched by this package).
 #
 # Spec: .../specs/w02-dispatch-budget-and-interrupt-spec.md §2.5, §3
 # behavior 15, §4 AC6. AC6 is explicit that "the doctrine text exists and
@@ -18,7 +18,7 @@
 # Written against the file's CURRENT (pre-w02) content: B1 is RED today by
 # construction (the file does not mention bp-dispatch-log.pl at all yet).
 # B2/B3 are regression guards that also hold true TODAY (the file mentions
-# neither gate-drive-loop.sh nor duplicates the canonical prompt) — they
+# neither stop-gate.sh nor duplicates the canonical prompt) — they
 # are not red-before-green assertions, they are invariants meant to hold
 # across the edit, same class as t/137's I1.
 #
@@ -26,6 +26,7 @@
 #   perl this file
 use strict;
 use warnings;
+BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 } # package 16 post-fix-batch (Decision 80): this file names a wake-lock actuator, in prose or a path check, never a real invocation -- the guard is the cheap side of test-wakelock-hygiene.t's deliberate over-matching.
 use FindBin qw($Bin);
 use Test::More;
 
@@ -69,18 +70,27 @@ if (length $dispatch_section) {
 }
 
 # ===========================================================================
-# C (behavior 15 / AC6, docs-consistency). gate-drive-loop.sh is
-# drive-solo-scoped by construction (exits immediately whenever BP_LEDGER
-# is set — i.e. inside every coordinator, per gate-drive-loop.sh:48). A
-# coordinator's own stop discipline is gate-stop.sh, untouched by w02.
-# Documenting the fold HERE would be actively misleading: it would tell a
-# coordinator to expect a gate that never runs in its own session.
+# C (behavior 15, regression guard -- fix-batch F11/review m5). E2's
+# mechanical rename left this block's own comment and description false
+# and self-contradicting: it claimed stop-gate.sh "exits immediately
+# whenever BP_LEDGER is set" (false -- post-cutover, stop-gate.sh's own
+# coordinator branch is what a BP_LEDGER-bearing session's Stop actually
+# runs; see BpHook::StopGate::_coordinator) while also saying "a
+# coordinator's own stop discipline is stop-gate.sh", and the description
+# claimed the regex checks "does NOT mention stop-gate.sh" when the regex
+# it names (gate-drive-loop, the RETIRED predecessor hook, batch E1) can no
+# longer fail either way -- vacuous under its own stated description.
+#
+# What this assertion actually is, and remains: a residue guard (code DEL)
+# that the retired gate-drive-loop hook is never named here again. It is
+# NOT a claim that coordinator-protocol/SKILL.md must avoid "the stop
+# gate" generically -- it legitimately does describe the one shared gate
+# now (see lines mentioning "the stop gate" / "the Stop gate" elsewhere in
+# this file).
 # ===========================================================================
-unlike($content, qr/gate-drive-loop\.sh/,
-       'C1 CANONICAL (behavior 15 / docs-consistency): coordinator-protocol/SKILL.md does '
-     . 'NOT mention gate-drive-loop.sh anywhere — that gate is drive-solo-scoped, and '
-     . 'documenting it here would mislead a coordinator into expecting a gate that never '
-     . 'runs inside a BP_LEDGER-bearing session');
+unlike($content, qr/gate-drive-loop/,
+       'C1 (regression guard, code DEL): coordinator-protocol/SKILL.md does NOT name '
+     . 'the retired gate-drive-loop hook');
 
 # ===========================================================================
 # D (§2.5). The interrupt-and-report doctrine is dispatch-shape-agnostic

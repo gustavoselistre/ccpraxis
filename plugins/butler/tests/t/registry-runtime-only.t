@@ -20,6 +20,7 @@
 # the step-3 report, not self-tested here (same convention as t/159's DC7).
 use strict;
 use warnings;
+BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 } # package 16 post-fix-batch (Decision 80): this file names a wake-lock actuator, in prose or a path check, never a real invocation -- the guard is the cheap side of test-wakelock-hygiene.t's deliberate over-matching.
 use FindBin qw($Bin);
 use Test::More;
 use JSON::PP;
@@ -30,7 +31,11 @@ my $SCRIPTS_DIR = "$Bin/../../scripts";
 my $ORCH_PATH   = "$SCRIPTS_DIR/bp-orchestrator.pl";
 my $LIB_PATH    = "$SCRIPTS_DIR/bp-lib.sh";
 my $LAUNCH_PATH = "$SCRIPTS_DIR/bp-launch.sh";
-my $GATESTOP_PATH   = "$Bin/../../hooks/gate-stop.sh";
+# Retargeted per package 16's batch B (Decision 34): the old Stop gate hook
+# was renamed stop-gate.sh in the flatten, and its registry-sync logic moved
+# into BpHook/StopGate.pm's _registry_sync_locked (the {status} => $status
+# assignment there is this file's byte-for-byte successor).
+my $GATESTOP_PATH   = "$Bin/../../scripts/BpHook/StopGate.pm";
 my $LIFECYCLE_PATH  = "$SCRIPTS_DIR/bp-lifecycle.pl";
 my $ANSWER_PATH     = "$SCRIPTS_DIR/bp-answer-decision.pl";
 my $SWEEP_PATH      = "$SCRIPTS_DIR/bp-resume-sweep.sh";
@@ -163,8 +168,9 @@ PERL
 my @ALLOWLIST = (
     { label => 'bp-launch.sh:150 (launch-time status:"running")', path => $LAUNCH_PATH,
       pattern => qr/status:"running"/ },
-    { label => 'gate-stop.sh:~150 (best-effort status sync, jq {status:$st})', path => $GATESTOP_PATH,
-      pattern => qr/\{status:\$st\}/ },
+    { label => 'BpHook/StopGate.pm _registry_sync_locked (best-effort status sync, replacing the '
+             . 'pre-cutover stop-gate.sh jq {status:$st} line)', path => $GATESTOP_PATH,
+      pattern => qr/\{status\}\s*=\s*\$status/ },
     # REMOVED for s05-retire-reconciler-drift-paths (AC-16), not retargeted.
     # This entry pinned bp-lifecycle.pl's $entry->{status} = $ledger_status
     # line (reconcile_one's step-3 status-reconciliation half) as a
@@ -219,7 +225,7 @@ my @ALLOWLIST = (
 #   - registry_merge CALLNAME ... (bash function-call form, not the `()`
 #     definition) whose trailing JSON argument contains "status"
 #   - a raw jq filter (bash) targeting `.packages[$pkg]` whose filter string
-#     also contains "status" (gate-stop.sh's own shape, generalized)
+#     also contains "status" (stop-gate.sh's own shape, generalized)
 {
     my %allow_path = map { $_->{path} => 1 } @ALLOWLIST;
     $allow_path{$ORCH_PATH} = 1;   # exhaustively scanned in section 1 already
@@ -270,7 +276,7 @@ my @ALLOWLIST = (
                 push @hits, "registry_merge call span contains 'status': " . substr($span, 0, 100) if $span =~ /status/;
             }
             # raw jq writing .packages[$pkg] with a status field in the same
-            # filter string (gate-stop.sh's own shape, generalized to catch a
+            # filter string (stop-gate.sh's own shape, generalized to catch a
             # copy-paste elsewhere).
             while ($src =~ /\.packages\[\$\w+\]\s*=/g) {
                 my $from = pos($src);
@@ -291,7 +297,7 @@ my @ALLOWLIST = (
 # 4. DC3 / behavior 6: registry_get(bp, pkg, "status") refuses -- prints
 #    nothing to stdout, a one-line error to stderr, non-zero exit. Any other
 #    field is unchanged (jq-dependent value round-trip is $have_jq-gated,
-#    matching this suite's existing house convention, e.g. t/graceful-stop-gate.t).
+#    matching this suite's existing house convention, e.g. the retired graceful-stop-gate coverage).
 # ===========================================================================
 {
     my $have_jq = do { my $o = `bash -c 'command -v jq' 2>/dev/null`; (defined $o && $o =~ /\S/) ? 1 : 0 };

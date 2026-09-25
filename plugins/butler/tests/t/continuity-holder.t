@@ -59,7 +59,7 @@ $SIG{$_} = sub { exit 1 } for qw(TERM INT HUP);
 # ---------------------------------------------------------------------------
 # fixtures / environment
 # ---------------------------------------------------------------------------
-delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
 
 my $TMPROOT = tempdir(CLEANUP => 1); $TMPROOT =~ s{\\}{/}g;
 (my $PROJECT = "$TMPROOT/proj") =~ s{\\}{/}g;
@@ -163,7 +163,7 @@ sub spawn_hold {
     my $pid = fork();
     die "fork: $!" unless defined $pid;
     if ($pid == 0) {
-        delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+        delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
         $ENV{HOME}                  = $FAKE_HOME;
         $ENV{USERPROFILE}           = $FAKE_HOME;
         $ENV{BUTLER_STATE_DIR}      = $STATE_DIR;
@@ -1321,7 +1321,7 @@ SKIP: {
     my $pid = fork();
     die "fork: $!" unless defined $pid;
     if ($pid == 0) {
-        delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+        delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
         $ENV{HOME}                  = $FAKE_HOME;
         $ENV{USERPROFILE}           = $FAKE_HOME;
         $ENV{BUTLER_STATE_DIR}      = $STATE_DIR;
@@ -1434,7 +1434,7 @@ SKIP: {
     my $pid = fork();
     die "fork: $!" unless defined $pid;
     if ($pid == 0) {
-        delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+        delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
         $ENV{HOME}                  = $FAKE_HOME;
         $ENV{USERPROFILE}           = $FAKE_HOME;
         $ENV{BUTLER_STATE_DIR}      = $STATE_DIR;
@@ -1561,7 +1561,7 @@ SKIP: {
         my $pid_off = fork();
         die "fork: $!" unless defined $pid_off;
         if ($pid_off == 0) {
-            delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+            delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
             $ENV{HOME}                  = $FAKE_HOME;
             $ENV{USERPROFILE}           = $FAKE_HOME;
             $ENV{BUTLER_STATE_DIR}      = $STATE_DIR;

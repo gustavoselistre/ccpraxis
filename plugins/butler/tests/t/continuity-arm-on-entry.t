@@ -13,7 +13,7 @@
 # fails with a non-zero rc / "No such file or directory" until the hook file
 # is written.
 #
-# BpHook.pm and hooks/next/run-hook.sh belong to package 03 and are already
+# BpHook.pm and hooks/run-hook.sh belong to package 03 and are already
 # implemented; this file requires the real copies and never edits or
 # recreates them.
 use strict;
@@ -30,7 +30,7 @@ use Cwd qw(getcwd);
 my $BUTLER_DIR = "$Bin/../..";
 my $S = "$BUTLER_DIR/scripts";
 $S =~ s{\\}{/}g;
-my $HOOKSH = "$BUTLER_DIR/hooks/next/arm-on-entry.sh";
+my $HOOKSH = "$BUTLER_DIR/hooks/arm-on-entry.sh";
 $HOOKSH =~ s{\\}{/}g;
 my $ARMPM  = "$S/BpHook/ArmOnEntry.pm";
 my $BPHOOK = "$S/BpHook.pm";
@@ -85,7 +85,7 @@ sub read_json_bytes {
 # to a decoy tempdir (defense in depth, guard-asserted at the bottom of this
 # file), leave BUTLER_STATE_DIR to be set per-case below.
 # ---------------------------------------------------------------------------
-delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
 $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
 
 my $REAL_HOME        = $ENV{HOME};
@@ -203,7 +203,7 @@ sub run_wrapper {
     my (undef, $err_path) = tempfile();
 
     local %ENV = %ENV;
-    delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+    delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
     $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
     $ENV{HOME}        = $FAKE_HOME;
     $ENV{USERPROFILE} = $FAKE_HOME;
@@ -278,7 +278,7 @@ sub run_shim {
     my (undef, $err_path) = tempfile();
 
     local %ENV = %ENV;
-    delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+    delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
     $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
     $ENV{HOME}        = $FAKE_HOME;
     $ENV{USERPROFILE} = $FAKE_HOME;
@@ -560,6 +560,16 @@ for my $prior_role (qw(manual reporter)) {
 
 # ===========================================================================
 # AC12 -- Decision 36: an off session is not re-armed, for either actor.
+#
+# REASON CODE F2 (package 16 fix-batch, red-team H1): Decision 36's "not
+# re-armed" is now enforced by an explicit DENY (exit 2, with a one-line
+# "run `butler-continuity on` first" instruction), not a silent allow.
+# Before this fix an off session's `next` returned 0 with nothing armed,
+# so the director handed out concurrent packages to a caller bind-dispatch
+# and guard-writes never covered (H1's reproduction). This assertion is
+# widened, not weakened: it still requires "armed/S was not created" and
+# "off/S byte-identical" exactly as before, and additionally requires the
+# call be REFUSED rather than merely inert.
 # ===========================================================================
 for my $actor (qw(agent operator)) {
     fresh_base();
@@ -567,8 +577,9 @@ for my $actor (qw(agent operator)) {
     ok(BpHook::disarm($sid, actor => $actor, reason => 'done for today'), "AC12 ($actor) setup: off written");
     my $before = read_bytes(off_path($sid));
 
-    my ($ret) = run_captured(payload_for(session_id => $sid, command => $AC1_CMDS[0]));
-    is($ret, 0, "AC12 ($actor): run() returns 0");
+    my ($ret, undef, $err) = run_captured(payload_for(session_id => $sid, command => $AC1_CMDS[0]));
+    is($ret, 2, "AC12 ($actor): run() returns 2 (F2: denied, not silently allowed)");
+    like($err, qr/butler-continuity on/, "AC12 ($actor): the denial tells the agent to run `butler-continuity on` first");
     ok(!-e armed_path($sid), "AC12 ($actor): armed/S was not created");
     is(read_bytes(off_path($sid)), $before, "AC12 ($actor): off/S byte-identical");
 }

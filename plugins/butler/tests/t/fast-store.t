@@ -14,7 +14,7 @@
 #     independence (2.10) and the fixed execution order (3.1).
 #   * coordinator-protocol/SKILL.md — the documented pattern (3.8 / 7).
 #
-# Style follows t/graceful-stop-gate.t (tempdir fixture + %CLEAN_ENV scrubbing + list-form
+# Style follows the retired graceful-stop-gate coverage (tempdir fixture + %CLEAN_ENV scrubbing + list-form
 # `bash -c` + a per-block SKIP: guard) and t/durable-checkpoint-commits.t
 # (spit/slurp_raw scaffolding, done_testing()).
 #
@@ -36,7 +36,7 @@
 #   * t/21:16 declares "no bash/sh -c anywhere", which t/09 and t/14 contradict
 #     in practice. The artifact under test IS a bash script, so bash is probed
 #     once and the shell-dependent subtests SKIP (never fail) on a bash-less
-#     host, per the t/graceful-stop-gate.t:223 SKIP: idiom (spec 4.0).
+#     host, per the the retired graceful-stop-gate coverage:223 SKIP: idiom (spec 4.0).
 #
 # One spec-internal conflict, reconciled here rather than silently: §2.2's
 # MANDATED skeleton carries the comment lines "bp_project_root is NEVER called"
@@ -97,7 +97,7 @@ my $RATIONALE    = 'container-native pnpm store via gitignored pnpm-workspace.ya
 sub spit { my ($p, $c) = @_; open my $f, '>:raw', $p or die "spit $p: $!"; print $f $c; close $f; return $p }
 sub slurp_raw { my ($p) = @_; open my $f, '<:raw', $p or return undef; local $/; my $c = <$f>; close $f; return $c }
 sub slurp { my ($p) = @_; return slurp_raw($p) // '' }
-sub fwd { (my $p = shift) =~ s{\\}{/}g; $p }            # t/graceful-stop-gate.t:30
+sub fwd { (my $p = shift) =~ s{\\}{/}g; $p }            # the retired graceful-stop-gate coverage:30
 
 my $ROOT_RAW = tempdir(CLEANUP => 1);
 my $ROOT     = abs_path($ROOT_RAW) // $ROOT_RAW;        # pwd -P vs a symlinked /tmp (spec 4)
@@ -109,7 +109,7 @@ my @CANARIES       = ('/project/pnpm-workspace.yaml', '/project/.gitignore', '/p
                       '/root/.pnpm-store', '/root/my-proj-vstore', '/root/p-vstore');
 my %CANARY_BEFORE  = map { ($_ => (-e $_ ? 1 : 0)) } @CANARIES;
 
-# Copied from t/graceful-stop-gate.t:61-69 (the idiom spec §4.0 makes mandatory). This
+# Copied from the retired graceful-stop-gate coverage:61-69 (the idiom spec §4.0 makes mandatory). This
 # suite is executed BY butler coordinators and harvest judges, which export BP_*
 # into the test process. bp-lib.sh's bp_project_root reads BP_PROJECT_ROOT
 # first, so an unscrubbed run could resolve to /project while this file believes
@@ -119,7 +119,7 @@ my %CANARY_BEFORE  = map { ($_ => (-e $_ ? 1 : 0)) } @CANARIES;
 # CCPRAXIS_* (bp_data_dir reads CCPRAXIS_DATA_DIR — AC-29 re-supplies it as a
 # decoy on purpose) and IS_SANDBOX (so AC-24's "both unset" is honest).
 my %CLEAN_ENV = map { ($_ => $ENV{$_}) }
-                grep { !/^BP_/ && !/^CCPRAXIS_/ && $_ ne 'IS_SANDBOX' } keys %ENV;
+                grep { (!/^BP_/ && !/^CCPRAXIS_/ && $_ ne 'IS_SANDBOX') || $_ eq 'CCPRAXIS_NO_WAKELOCK' } keys %ENV;
 my $BASE_PATH = $CLEAN_ENV{PATH} // '/usr/bin:/bin';
 
 # pnpm PATH stub (C2). It writes a witness on EVERY invocation; AC-17 asserts
@@ -175,7 +175,7 @@ my $STUB_PATH = "$STUB_DIR:$BASE_PATH";
 # run_fs(args => [...], path => $PATH, env => {...}, cwd => $dir, pwd => $spoof)
 #   -> ($exit, $stdout, $stderr)
 #
-# DELIBERATE DEVIATION from the suite's merged-capture idiom (t/graceful-stop-gate.t:72-80
+# DELIBERATE DEVIATION from the suite's merged-capture idiom (the retired graceful-stop-gate coverage:72-80
 # uses `2>&1`): AC-8 pins the STDOUT contract in ISOLATION — stdout must be
 # exactly the one /backpack:add line while every progress/error line goes to
 # stderr — and a merge makes that unassertable. So stdout and stderr get
@@ -317,7 +317,7 @@ sub count_lines_like { my ($t, $re) = @_; return scalar grep { $_ =~ $re } @{ li
 
 # ===========================================================================
 # Everything that executes bp-fast-store.sh. Skipped, never failed, on a host
-# without bash (t/graceful-stop-gate.t:223-224 idiom).
+# without bash (the retired graceful-stop-gate coverage:223-224 idiom).
 # ===========================================================================
 SKIP: {
     skip "bash is unavailable on this host and bp-fast-store.sh is a bash script (the shell-level contract cannot be observed without it)", 24

@@ -1,6 +1,6 @@
 # BpProjectRoot.pm — which PROJECT a butler script is working on.
 #
-# One rule, previously written out separately in bp-continuity.pl,
+# One rule, previously written out separately in the retired continuity CLI,
 # bp-drive-next.pl, bp-spend.pl, bp-lib.sh and the retired bp-runstate.pl:
 #
 #   $CLAUDE_PROJECT_DIR > $BP_PROJECT_ROOT > git toplevel

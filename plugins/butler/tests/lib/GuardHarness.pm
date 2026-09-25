@@ -48,7 +48,7 @@ use Cwd ();
 (my $MY_DIR = Cwd::abs_path(dirname(__FILE__))) =~ s{\\}{/}g;
 my $BUTLER_DIR = "$MY_DIR/../..";  # plugins/butler, from plugins/butler/tests/lib
 my $SCRIPTS_DIR = "$BUTLER_DIR/scripts";
-my $GUARDS_DIR  = "$BUTLER_DIR/hooks/next/guards";
+my $GUARDS_DIR  = "$BUTLER_DIR/hooks";
 my $BPHOOK_PM   = "$SCRIPTS_DIR/BpHook.pm";
 
 # Production runs "perl -I$s" (run-hook.sh:250, $s = plugins/butler/scripts)
@@ -237,7 +237,7 @@ sub read_bytes {
 # does), or the mutation leaks into the rest of the suite.
 # ---------------------------------------------------------------------------
 sub isolate_env {
-    delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+    delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
     $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
     my $decoy_root = tempdir(CLEANUP => 1);
     (my $decoy = "$decoy_root/decoy-home") =~ s{\\}{/}g;

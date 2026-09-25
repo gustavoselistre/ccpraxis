@@ -32,7 +32,7 @@ use POSIX qw(_exit);
 use Cwd qw(getcwd);
 
 my $BUTLER_DIR      = "$Bin/../..";                                  # plugins/butler
-my $REAL_RUN_HOOK    = "$BUTLER_DIR/hooks/next/run-hook.sh";
+my $REAL_RUN_HOOK    = "$BUTLER_DIR/hooks/run-hook.sh";
 my $REAL_BPHOOK      = "$BUTLER_DIR/scripts/BpHook.pm";
 my $REAL_BPPROJROOT  = "$BUTLER_DIR/scripts/BpProjectRoot.pm";
 
@@ -59,7 +59,7 @@ sub H {
 }
 
 sub scrub_env {
-    delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+    delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
 }
 
 sub read_bytes {

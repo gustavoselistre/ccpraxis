@@ -7,7 +7,7 @@
 # module now serves BOTH old registrations (the Task registration and the
 # edit-tool registration), per spec sec 3.5's closing line.
 #
-# hooks/next/guards/gate-shutdown.sh and BpHook/Guards/GateShutdown.pm DO
+# hooks/gate-shutdown.sh and BpHook/Guards/GateShutdown.pm DO
 # NOT EXIST YET. Every in-process call goes through GuardHarness::run_module()
 # (batch 1's harness, plugins/butler/tests/lib/GuardHarness.pm), which
 # mirrors BpHook::main()'s own require-and-call contract, so a missing
@@ -17,15 +17,15 @@
 # the implementer writes it.
 #
 # WRITTEN BLIND TO THE IMPLEMENTATION: derived only from the spec text
-# above and the CASES (not the source bash) of graceful-stop-gate.t and
+# above and the CASES (not the source bash) of the retired graceful-stop-gate coverage and
 # timestamp-authorship.t -- never from reading gate-shutdown.sh itself.
 #
 # NOT RE-EXPRESSED (per spec sec 4.8 "Not:" list and sec 4.2's codes):
 #   old file / assertion label                                     | code
 #   --------------------------------------------------------------- | ----
-#   graceful-stop-gate.t, the gate-stop.sh-specific parts            | OTHER (package 06 owns gate-stop.sh;
+#   the retired graceful-stop-gate coverage, the stop-gate.sh-specific parts            | OTHER (package 06 owns stop-gate.sh;
 #                                                                       this successor is gate-shutdown only)
-#   graceful-stop-gate.t, jq-availability skips                      | JQ
+#   the retired graceful-stop-gate coverage, jq-availability skips                      | JQ
 #   timestamp-authorship.t AC-03 (source-text grep)                  | SRC
 #   timestamp-authorship.t AC-20 source-text grep half                | SRC (the behavioural half is
 #                                                                       re-expressed as GS-4's AC-20 line)
@@ -33,7 +33,7 @@
 #                                                                       this successor writes no file, ever)
 #   hooks-selftest.t                                                  | OTHER/REG (registration self-test;
 #                                                                       package 16's concern)
-#   repeat-guard.t AC-21 (duplicate stop-signal matrix)                | LIB (the matrix itself is this
+#   the retired repeat-guard coverage AC-21 (duplicate stop-signal matrix)                | LIB (the matrix itself is this
 #                                                                       file's GS-2/GS-3, not repeated
 #                                                                       there; listed here as the sibling
 #                                                                       that would otherwise duplicate it)
@@ -64,7 +64,7 @@ use GuardHarness;
 # individual block wraps its own env changes in local %ENV = %ENV" was
 # false (no such wrap exists anywhere in this file) and is removed.
 # ---------------------------------------------------------------------------
-delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
 $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
 
 # This file's own GS-*/SH-* fixtures never touch session arm state (spec
@@ -178,7 +178,7 @@ my $FORCESTOP_L2 = "Record a concrete '## Next action', then stop.";
 # SH-1/SH-2 -- static shape.
 # ===========================================================================
 {
-    my $wrapper = "$BUTLER_DIR/hooks/next/guards/gate-shutdown.sh";
+    my $wrapper = "$BUTLER_DIR/hooks/gate-shutdown.sh";
     my $module  = "$BUTLER_DIR/scripts/BpHook/Guards/GateShutdown.pm";
     ok(-f $wrapper, 'SH-1 precondition: gate-shutdown.sh exists on disk')
         or diag("missing: $wrapper (package 14 has not written it yet)");
@@ -517,7 +517,7 @@ for my $sig (qw(shutdown forcestop paused)) {
 # ===========================================================================
 {
     GuardHarness::fresh_state();  # a fixed BUTLER_STATE_DIR for arm() and run_shim/run_module below to agree on
-    my $stopgate = "$BUTLER_DIR/hooks/next/stop-gate.sh";
+    my $stopgate = "$BUTLER_DIR/hooks/stop-gate.sh";
     ok(-f $stopgate, 'self-check precondition: stop-gate.sh (package 06) exists on disk');
 
     my $res_wrapper = GuardHarness::run_wrapper($stopgate,

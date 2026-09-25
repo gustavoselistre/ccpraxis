@@ -4,27 +4,7 @@
          {
             "hooks" : [
                {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/log-dispatch.sh\"",
-                  "timeout" : 15,
-                  "type" : "command"
-               }
-            ],
-            "matcher" : "Task"
-         },
-         {
-            "hooks" : [
-               {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/track-dispatch.sh\"",
-                  "timeout" : 15,
-                  "type" : "command"
-               }
-            ],
-            "matcher" : "Task"
-         },
-         {
-            "hooks" : [
-               {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/untrack-worker-solo.sh\"",
+                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/track-dispatch.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                }
@@ -34,79 +14,34 @@
          {
             "hooks" : [
                {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/context-ceiling-guidance.sh\"",
+                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/context-ceiling.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                }
             ],
-            "matcher" : "Task|Bash"
-         },
-         {
-            "hooks" : [
-               {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch-discipline-nudge.sh\"",
-                  "timeout" : 15,
-                  "type" : "command"
-               }
-            ],
-            "matcher" : "Bash|Read|Edit|Grep"
+            "matcher" : "Task|Agent|Bash"
          }
       ],
       "PreToolUse" : [
          {
             "hooks" : [
                {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gate-shutdown.sh\"",
+                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/guard-bash.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                },
                {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-writes.sh\"",
+                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/guard-git-mutations.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\" --only-during-butler-run",
                   "timeout" : 15,
                   "type" : "command"
                },
                {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/ledger-guard.sh\"",
-                  "timeout" : 15,
-                  "type" : "command"
-               }
-            ],
-            "matcher" : "Edit|Write|MultiEdit|NotebookEdit"
-         },
-         {
-            "hooks" : [
-               {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-git-mutations.sh\" --only-during-butler-run",
+                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/arm-on-entry.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                },
                {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-bash.sh\"",
-                  "timeout" : 15,
-                  "type" : "command"
-               },
-               {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/mark-wakeup.sh\"",
-                  "timeout" : 15,
-                  "type" : "command"
-               },
-               {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gate-headless-background.sh\"",
-                  "timeout" : 15,
-                  "type" : "command"
-               },
-               {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-judge-checks.sh\"",
-                  "timeout" : 15,
-                  "type" : "command"
-               },
-               {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-validation-interlock.sh\"",
-                  "timeout" : 15,
-                  "type" : "command"
-               },
-               {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-run-finish.sh\"",
+                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/continuity-off-check.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                }
@@ -116,45 +51,17 @@
          {
             "hooks" : [
                {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gate-shutdown.sh\"",
+                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/guard-writes.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                },
                {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/track-dispatch.sh\"",
+                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/ledger-guard.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                },
                {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/mark-wakeup.sh\"",
-                  "timeout" : 15,
-                  "type" : "command"
-               }
-            ],
-            "matcher" : "Task"
-         },
-         {
-            "hooks" : [
-               {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/repeat-guard.sh\"",
-                  "timeout" : 15,
-                  "type" : "command"
-               }
-            ]
-         },
-         {
-            "hooks" : [
-               {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/wait-shape-guard.sh\"",
-                  "timeout" : 15,
-                  "type" : "command"
-               }
-            ]
-         },
-         {
-            "hooks" : [
-               {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-blueprint-write.sh\"",
+                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/guard-blueprint-write.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                }
@@ -164,22 +71,22 @@
          {
             "hooks" : [
                {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/mark-wakeup.sh\"",
+                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/gate-shutdown.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                }
             ],
-            "matcher" : "Agent"
+            "matcher" : "Edit|Write|MultiEdit|NotebookEdit|Task|Agent"
          },
          {
             "hooks" : [
                {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/track-worker-solo.sh\"",
+                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/bind-dispatch.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                },
                {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/record-dispatch-package.sh\"",
+                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/track-dispatch.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                }
@@ -189,49 +96,49 @@
          {
             "hooks" : [
                {
-                  "command" : "\"$CLAUDE_PLUGIN_ROOT\"/hooks/guard-ask-operator.sh",
+                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/context-ceiling.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Task|Agent|Bash"
+         },
+         {
+            "hooks" : [
+               {
+                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/wait-shape-guard.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ]
+         },
+         {
+            "hooks" : [
+               {
+                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/guard-ask-operator.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                }
             ],
             "matcher" : "AskUserQuestion"
-         },
+         }
+      ],
+      "SubagentStop" : [
          {
             "hooks" : [
                {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/context-ceiling-flush.sh\"",
+                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/track-dispatch.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                }
-            ],
-            "matcher" : "Task|Bash"
-         },
-         {
-            "hooks" : [
-               {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-ledger-create.sh\"",
-                  "timeout" : 15,
-                  "type" : "command"
-               }
-            ],
-            "matcher" : "Edit|Write|MultiEdit|NotebookEdit"
+            ]
          }
       ],
       "Stop" : [
          {
             "hooks" : [
                {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gate-stop.sh\"",
-                  "timeout" : 15,
-                  "type" : "command"
-               },
-               {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gate-drive-loop.sh\"",
-                  "timeout" : 30,
-                  "type" : "command"
-               },
-               {
-                  "command" : "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gate-continuity.sh\"",
+                  "command" : "f=\"${CLAUDE_PLUGIN_ROOT}/hooks/stop-gate.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; unset BASH_ENV ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                }

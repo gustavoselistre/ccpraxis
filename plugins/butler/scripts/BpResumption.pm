@@ -2,9 +2,9 @@
 #
 # One question, asked by two guards that were answering it separately:
 #
-#   * guard-subagent-stall.sh + bp-runstate.pl guard a RUN. `pause` records a
+#   * wait-shape-guard.sh + bp-runstate.pl guard a RUN. `pause` records a
 #     watcher pid and a deadline; `effective` re-verifies both on every read.
-#   * gate-continuity.sh + bp-continuity.pl guard a SESSION. `hold` records a
+#   * stop-gate.sh + butler-continuity guard a SESSION. `hold` records a
 #     deadline and a pid; the Stop gate re-verifies them.
 #
 # They guard different SCOPES and should stay separate -- a run outlives a
@@ -17,7 +17,7 @@
 # cannot be verified must not hold a gate open, so the fallback asks tasklist.
 #
 # LESSON TWO, AND THE ONE THAT MATTERS MOST HERE: A LIVE PID IS NOT THE SAME
-# PID. `hold` and `bp-watch.pl` both EXIT when their wait ends -- that is their
+# PID. `hold` and `butler-hold` both EXIT when their wait ends -- that is their
 # whole purpose -- and the OS is then free to hand that number to anything. A
 # bare liveness check cannot tell the difference. The run side's red-team
 # demonstrated it concretely: an unrelated `sleep &` occupying the recorded pid
@@ -31,8 +31,8 @@
 # every caller MUST treat that as UNVERIFIED rather than as a match.
 #
 # The gate is bash and this is perl. Rather than translate the rules a second
-# time and re-open the parity gap this module exists to close, the gate shells
-# out to bp-resumption.pl. One implementation, one place to fix.
+# time and re-open the parity gap this module exists to close, callers on the
+# perl side load this module directly. One implementation, one place to fix.
 package BpResumption;
 use strict;
 use warnings;

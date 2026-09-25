@@ -203,7 +203,7 @@ for my $cmd (
 #    is expected to FAIL (rc=0, wrongly ALLOWED) against the pre-fix tree,
 #    since the old walk X-masked every quoted span unconditionally regardless
 #    of internal whitespace or position. Scope matches the reported defect
-#    and mirrors guard-run-finish.sh's own fix: only the word immediately
+#    and mirrors continuity-off-check.sh's own fix: only the word immediately
 #    after an UNQUOTED "git" (verb-adjacent) is unmasked. ────────────────────
 for my $cmd (
     q{git 'stash'},

@@ -49,8 +49,8 @@ package BpContinuityLease;
 # with no Stop hook and no `hold` tick in between, which is exactly the long
 # unattended turn the lock exists to protect.
 #
-# So arming starts a detached refresher process (`bp-continuity.pl lease
-# --daemon`) whose ONLY job is to re-assert both leases every tick for as long
+# So arming starts a detached refresher process (this module's own `lease
+# --daemon` CLI entry) whose ONLY job is to re-assert both leases every tick for as long
 # as any session is armed, and to release and exit once none is. Disarm does not
 # have to kill it — it notices within a tick — but disarm re-syncs anyway so the
 # release is immediate.
@@ -67,7 +67,7 @@ package BpContinuityLease;
 # marker behind, and the lease follows the marker: the refresher holds until
 # nothing is armed, and the marker stops counting at the continuity TTL (12h by
 # default, CCPRAXIS_CONTINUITY_TTL_H). So the worst case is a display held on for
-# as long as the arm itself is still considered valid — and gate-continuity.sh
+# as long as the arm itself is still considered valid — and stop-gate.sh
 # usually reaps such a marker much sooner, on the next Stop of ANY session.
 #
 # That horizon is deliberate rather than merely inherited. A shorter one just
@@ -90,12 +90,9 @@ use JSON::PP ();
 
 my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
 require "$DIR/bp-keepawake.pl";
-# Guarded on the module, not the path -- see bp-continuity.pl's require for the
-# full reasoning. This site and that one computed $DIR differently (Cwd::abs_path
-# here, File::Spec->rel2abs there), which is what produced two %INC keys for one
-# file and redefined every sub in it.
-require "$DIR/BpSession.pm"
-    unless grep { m{(?:^|/)BpSession\.pm$} } keys %INC;
+# Batch C (spec 16-cutover, criterion C-6): the BpSession require is gone --
+# it existed solely for _marker_is_live's BpSession::find_transcript call,
+# and _marker_is_live (with the legacy registry it served) is deleted below.
 
 # The refresher's cadence, and the pid-file heartbeat window derived from it.
 # 60s is an order of magnitude inside both leases it refreshes (keep-awake.ps1's
@@ -104,7 +101,7 @@ require "$DIR/BpSession.pm"
 our $TICK_SECONDS = 60;
 
 # STALE_TICKS — how many missed ticks make the daemon's pid file "dead" to a
-# cheap mtime-only reader (gate-continuity.sh). Liveness by mtime rather than by
+# cheap mtime-only reader (stop-gate.sh). Liveness by mtime rather than by
 # pid is deliberate: bash cannot tell a live native Windows pid from a dead one
 # (kill -0 lies there — see BpKeepAwake::_pid_alive), but a heartbeat file's age
 # is the same fact on every platform and costs one stat.
@@ -122,7 +119,7 @@ sub stale_ticks { return $STALE_TICKS }
 #     each iteration costs a tasklist — measured at 2.3s of system time in 3s of
 #     wall clock, which is the 2026-08-13 process-storm signature exactly.
 #
-#   Too large decouples this from gate-continuity.sh, which must hardcode its
+#   Too large decouples this from stop-gate.sh, which must hardcode its
 #     staleness window (300s = 60 * 5) because a hook cannot read a perl
 #     constant. At tick=100000 the daemon asserts once and sleeps for a day
 #     holding lease.lock, the gate calls its heartbeat stale on every Stop and
@@ -202,9 +199,9 @@ sub busy_path { return $ENV{BP_BUSY_PATH} // '/tmp/.butler-busy' }
 sub daemon_pid_file { my ($dir) = @_; return "$dir/lease.pid" }
 sub wakelock_pid_file { my ($dir) = @_; return "$dir/keepawake.pid" }
 
-# ttl_hours — mirrors bp_continuity_ttl_hours in hooks/lib.sh (12h, sanitised).
-# A fourth leg of that rule, for the same reason the other three exist: this is
-# perl, lib.sh is bash, and they must agree about when an arm has expired.
+# ttl_hours — this session's continuity TTL rule (12h, sanitised). The bash
+# side no longer mirrors this rule; it was retired when the old bash TTL
+# check was folded away, so this perl copy is now the only implementation.
 sub ttl_hours {
     my $h = $ENV{CCPRAXIS_CONTINUITY_TTL_H};
     return 12 unless defined $h && $h =~ /^\d+$/ && $h > 0;
@@ -212,16 +209,14 @@ sub ttl_hours {
 }
 
 # ---------------------------------------------------------------------------
-# Package 04 additions: bridging to BpHook's new per-session arm store, so
-# the wake-lock follows continuity's new arm state, not just the old
-# registry, until package 16 retires the registry outright. Additive only
-# (Decision 19); every sub above keeps its name and signature, and
-# _legacy_any_active is that original logic, unchanged.
+# Package 04 additions: bridging to BpHook's new per-session arm store.
+# Batch C (spec 16-cutover, C-6) retired the old registry from any_active
+# outright -- see any_active's own header below.
 # ---------------------------------------------------------------------------
 
-# $STATE_ROOT -- a test seam, same shape as $PLATFORM and $FIND_TRANSCRIPT
-# above. Production never sets it; store_root_for() resolves through
-# BpHook::state_dir() instead.
+# $STATE_ROOT -- a test seam, same shape as $PLATFORM above. Production
+# never sets it; store_root_for() resolves through BpHook::state_dir()
+# instead.
 our $STATE_ROOT;
 
 sub _is_abs_legacy {
@@ -234,7 +229,7 @@ sub _is_abs_legacy {
     return 0;
 }
 
-# legacy_dir() -- exactly bp-continuity.pl's continuity_active_dir rule:
+# legacy_dir() -- exactly the retired continuity CLI's continuity_active_dir rule:
 # CCPRAXIS_CONTINUITY_ACTIVE_DIR if absolute (undef if set but relative);
 # otherwise $HOME (then $USERPROFILE) plus the fixed suffix; otherwise
 # undef. Backslashes are folded to forward slashes on the way out, matching
@@ -284,8 +279,8 @@ sub store_root_for {
 }
 
 # new_store_active($root) -> 1 iff $root/armed/ holds a regular file whose
-# name matches a session id and is LIVE. Never deletes anything -- same
-# non-reaping discipline as _legacy_any_active.
+# name matches a session id and is LIVE. Never deletes anything -- reaping
+# an expired arm file is the Stop gate's job, not a detached process's.
 #
 # R6-D53 (Decision 53, hook-continuity-remake blueprint.md): "an idle armed
 # session keeps the machine awake for at most ONE HOUR... The lease counts
@@ -313,7 +308,7 @@ sub new_store_active {
         next unless -f $f;
         my $tp = _arm_file_transcript_path($f);
         if (defined $tp) {
-            next unless _transcript_path_is_live($tp);
+            next unless _transcript_path_is_live($tp, $f);
         }
         else {
             next if ((stat($f))[9] // 0) < $cutoff;
@@ -350,14 +345,6 @@ sub _slurp_small {
     return $c;
 }
 
-# $FIND_TRANSCRIPT — a seam, not a setting, same shape as $PLATFORM above.
-# Production never sets it; any_active() falls back to
-# BpSession::find_transcript. Tests set
-# `local $BpContinuityLease::FIND_TRANSCRIPT = sub { ... }` so the liveness
-# filter can be exercised against fixture paths instead of the real
-# ~/.claude/projects tree.
-our $FIND_TRANSCRIPT;
-
 # TRANSCRIPT_LIVENESS_SECONDS — how stale a resolved transcript may be before
 # its session is treated as provably dead rather than merely quiet.
 #
@@ -372,38 +359,37 @@ our $FIND_TRANSCRIPT;
 # on purpose — different clocks, different owners.
 our $TRANSCRIPT_LIVENESS_SECONDS = 3600;
 
-# _marker_is_live($session_id) -> 1|0
-#
-# A READ-ONLY liveness filter, never a reaper: it only ever changes whether a
-# marker counts toward "something is armed" in THIS process's answer, and
-# never touches the marker file itself (see any_active's own header on why
-# non-reaping is deliberate here). Resolution and the stat both fail SAFE —
-# every undeterminable case answers "live" — mirroring vault-sync.pl's
-# lock_holder_is_dead, which returns "not dead" on any errno it cannot
-# interpret. Getting this backwards would turn a merely-quiet session into a
-# released lock out from under a live one; getting the fail-open direction
-# right just means the 12h TTL keeps doing the job it already did.
-sub _marker_is_live {
-    my ($session_id) = @_;
-    my $find = $FIND_TRANSCRIPT // \&BpSession::find_transcript;
-    my $path = eval { $find->($session_id) };
-    return 1 if $@;              # the resolver itself blew up -- undeterminable
-    return 1 unless defined $path && length $path;   # no transcript found
-    return _transcript_path_is_live($path);
-}
+# F3 (red-team H2): the refresher itself must periodically reap ghost arm
+# files (BpHook::gc_sessions), not just exclude them from any_active --
+# otherwise the registry only ever grows, and hook-architecture.md's own
+# claim ("the lease daemon runs it at most once an hour") stays fiction.
+# Rate-limited to at most once per $GC_SESSIONS_INTERVAL, same shape as
+# BindDispatch's own $GC_INTERVAL.
+our $GC_SESSIONS_INTERVAL = 3600;
 
-# _transcript_path_is_live($path) -- the SAME rule and threshold
-# (TRANSCRIPT_LIVENESS_SECONDS) as _marker_is_live above, factored out so
-# new_store_active (R4-M2 / redteam MEDIUM-2) can apply it directly to a new-
-# store arm file's own transcript_path, without resolving a session id
-# through BpSession::find_transcript first. Every undeterminable case
-# answers "live", same fail-safe direction as _marker_is_live.
+# _transcript_path_is_live($path, $armfile) -- applies
+# TRANSCRIPT_LIVENESS_SECONDS to a new-store arm file's own transcript_path
+# (R4-M2 / redteam MEDIUM-2). A stat FAILURE (missing transcript) is
+# "undeterminable" and answers "live" -- but only for as long as the arm
+# file ITSELF is fresh (F3 / red-team H2): treating a permanently-missing
+# transcript as live forever is exactly how the wake-lock got held with no
+# armed session anywhere -- once the arm file's own mtime passes the same
+# one-hour window, a ghost arm (transcript gone) must stop counting. $armfile
+# is optional; omitting it (or an unstat-able arm file) keeps the old
+# fail-safe "live" answer, since there is then nothing to bound it by.
 sub _transcript_path_is_live {
-    my ($path) = @_;
+    my ($path, $armfile) = @_;
     return 1 unless defined $path && length $path;
 
     my @st = stat($path);
-    return 1 unless @st;         # stat failed -- undeterminable
+    unless (@st) {
+        return 1 unless defined $armfile;
+        my @ast = stat($armfile);
+        return 1 unless @ast && defined $ast[9];
+        my $age = time() - $ast[9];
+        return 1 if $age < 0;
+        return $age <= $TRANSCRIPT_LIVENESS_SECONDS ? 1 : 0;
+    }
 
     my $age = time() - $st[9];
     return 1 if $age < 0;        # future mtime: clock skew, not evidence of death
@@ -413,83 +399,22 @@ sub _transcript_path_is_live {
 # ---------------------------------------------------------------------------
 # any_active($dir) -> 0|1
 #
-# Is ANY session on this machine currently armed? Registry-wide, not
-# per-session, because the lease is a machine-level resource: two armed sessions
-# share one wake-lock, and the last one to disarm is what releases it.
+# Batch C (spec 16-cutover, criterion C-6): the legacy registry is gone from
+# this decision. Is ANY session on this machine currently armed, per the new
+# store alone? Registry-wide, not per-session, because the lease is a
+# machine-level resource: two armed sessions share one wake-lock, and the
+# last one to disarm is what releases it. $dir is still the legacy registry
+# path (callers resolve it the same way as before); store_root_for($dir)
+# maps it to the new-store root new_store_active actually reads.
 #
-# Counts BOTH a bound primary marker and an unbound pending ticket. A ticket is
-# an arm that has not yet learned which session it belongs to (see cmd_arm) —
-# and the window before it binds is a full turn long, which is precisely a turn
-# during which the machine must not sleep.
-#
-# DELIBERATELY NON-REAPING, unlike lib.sh's bp_continuity_any_active. That
-# function is the reap point because it runs inside a Stop hook, where deleting
-# an expired marker is part of the gate's own job. This one is read by a
-# detached background process, and a background process quietly deleting other
-# sessions' state is a much worse failure than one that merely stops holding a
-# lock. Expiry is still honoured — a marker past the TTL does not count — so the
-# lease releases at the right moment either way; the file is simply left for the
-# next Stop hook to reap.
-#
-# A LIVENESS FILTER SITS ON TOP OF THE TTL, FOR THE SAME NON-REAPING REASON.
-# A crashed session's marker is fresh by mtime — nothing touched it after the
-# crash — so the 12h TTL alone holds the machine-global wake-lock for up to 12h
-# past the crash, self-healing only when some UNRELATED session's Stop hook
-# happens to sweep. _marker_is_live resolves the marker's basename (the
-# session id) to its transcript via BpSession::find_transcript and skips the
-# marker when that transcript is provably stale — never deletes it, exactly
-# like the TTL check above. It is strictly additive: it can only make this
-# function skip a marker the TTL would have counted, never count one the TTL
-# already rejected, and every undeterminable case (no transcript, a failed
-# stat, a future mtime) counts the marker as active, same as before this
-# filter existed.
+# _legacy_any_active and _marker_is_live (the old registry-only logic and its
+# BpSession::find_transcript-based liveness filter) are deleted outright, not
+# kept as a fallback: a fresh legacy-registry marker with an empty new store
+# must answer 0, which is exactly what a fallback would have prevented.
 sub any_active {
     my ($dir) = @_;
-    return 1 if _legacy_any_active($dir);
     my $root = store_root_for($dir);
     return new_store_active($root) if defined $root;
-    return 0;
-}
-
-# _legacy_any_active($dir) -- the original registry-only logic (package 04
-# adds the new-store OR above it; nothing below this point changed).
-sub _legacy_any_active {
-    my ($dir) = @_;
-    return 0 unless defined $dir && -d $dir;
-    my $cutoff = time() - ttl_hours() * 3600;
-
-    # Pending tickets are bounded by the SAME TTL as markers, not by the much
-    # shorter wake-up TTL. A ticket binds at the next Stop, so a short bound
-    # looks tempting — but a turn may legitimately run for hours before that
-    # Stop arrives, and that is the exact turn this lease protects.
-    if (opendir(my $pdh, "$dir/pending")) {
-        while (defined(my $e = readdir $pdh)) {
-            next if $e eq '.' || $e eq '..';
-            my $f = "$dir/pending/$e";
-            next unless -f $f;
-            next if ((stat($f))[9] // 0) < $cutoff;
-            closedir $pdh;
-            return 1;
-        }
-        closedir $pdh;
-    }
-
-    # Primary markers are the dot-free basenames at the top level; everything
-    # dotted is a companion (.wakeup-pending, .stop-blocks) or ours
-    # (keepawake.pid, lease.pid). Same discrimination as lib.sh's sweep, which
-    # is also why continuity_marker() refuses a dot in a session id.
-    opendir(my $dh, $dir) or return 0;
-    while (defined(my $e = readdir $dh)) {
-        next if $e eq '.' || $e eq '..';
-        next if index($e, '.') >= 0;
-        my $f = "$dir/$e";
-        next unless -f $f;
-        next if ((stat($f))[9] // 0) < $cutoff;
-        next unless _marker_is_live($e);
-        closedir $dh;
-        return 1;
-    }
-    closedir $dh;
     return 0;
 }
 
@@ -677,7 +602,7 @@ sub converge {
 # daemon on every call — the precise shape of the 2026-08-13 leak. The heartbeat
 # answers the question that actually matters ("is something still refreshing
 # this?"), means the same thing on every platform, costs one stat, and is the
-# same signal gate-continuity.sh reads from bash.
+# same signal stop-gate.sh reads from bash.
 sub ensure_daemon {
     my ($dir, %opts) = @_;
     return 'refused' unless defined $dir && length $dir;
@@ -738,8 +663,12 @@ sub _spawn_daemon {
     # and never reach this sub.
     return undef if defined $0 && $0 =~ /\.t\z/;
 
-    my $script = "$DIR/bp-continuity.pl";
-    die "continuity script missing: $script\n" unless -f $script;
+    # Batch C (spec 16-cutover, 1.3 departure #7): the old CLI script is on
+    # the deletion list (batch E1); the daemon's entry point is this module's
+    # own script main (see _script_main / spec 2.9), invoked with the same
+    # `lease --daemon` argv it always used.
+    my $script = "$DIR/BpContinuityLease.pm";
+    die "continuity module missing: $script\n" unless -f $script;
     require POSIX;
     my $pid = fork();
     die "fork: $!\n" unless defined $pid;
@@ -755,6 +684,37 @@ sub _spawn_daemon {
         exec($^X, $script, 'lease', '--daemon') or POSIX::_exit(127);
     }
     return $pid;
+}
+
+# ---------------------------------------------------------------------------
+# _script_main(@argv) — the module's own CLI entry (spec 2.9), so
+# _spawn_daemon has somewhere to exec now that the old CLI script is deleted (E1).
+#
+#   lease --daemon [--tick N]   runs daemon_loop(legacy_dir(), tick => N) and
+#                               exits 0. legacy_dir() undef prints one stderr
+#                               line and exits 1 instead of looping forever
+#                               against nothing.
+#   anything else               one-line usage to stderr, exit 1.
+# ---------------------------------------------------------------------------
+sub _script_main {
+    my ($class, @argv) = @_;
+    if (@argv && $argv[0] eq 'lease' && grep { $_ eq '--daemon' } @argv[1 .. $#argv]) {
+        my $tick;
+        for my $i (1 .. $#argv) {
+            next unless $argv[$i] eq '--tick';
+            $tick = $argv[$i + 1] if defined $argv[$i + 1];
+        }
+        my $dir = legacy_dir();
+        unless (defined $dir) {
+            print STDERR "BpContinuityLease: no continuity registry directory resolvable (HOME/USERPROFILE unset)\n";
+            return 1;
+        }
+        my %opts = defined $tick ? (tick => $tick) : ();
+        daemon_loop($dir, %opts);
+        return 0;
+    }
+    print STDERR "usage: perl BpContinuityLease.pm lease --daemon [--tick N]\n";
+    return 1;
 }
 
 # ---------------------------------------------------------------------------
@@ -833,11 +793,19 @@ sub daemon_loop {
     # process happens to have started. A second cap derived from the same clock
     # and the same files could only either duplicate it or contradict it.
     my $iter = 0;
+    my $last_gc = 0;
 
     while (1) {
         last unless any_active($dir);
         sync($dir, %opts, active => 1);
         my $now = time;
+        if (($now - $last_gc) >= $GC_SESSIONS_INTERVAL) {
+            $last_gc = $now;
+            eval {
+                require "$DIR/BpHook.pm" unless grep { m{(?:^|/)BpHook\.pm$} } keys %INC;
+                BpHook::gc_sessions();
+            };
+        }
         utime($now, $now, $pf);          # the heartbeat cheap readers rely on
         $iter++;
         last if defined $opts{max_iterations} && $iter >= $opts{max_iterations};
@@ -856,5 +824,7 @@ sub _write_pid {
     close $fh;
     return 1;
 }
+
+exit(__PACKAGE__->_script_main(@ARGV)) unless caller;
 
 1;

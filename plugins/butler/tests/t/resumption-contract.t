@@ -3,7 +3,7 @@
 # 186 — ONE answer to "will anything bring this back?"
 #
 # WHY THIS FILE EXISTS. Two guards were answering that question separately:
-# bp-runstate.pl for a RUN, gate-continuity.sh for a SESSION. The scopes are
+# bp-runstate.pl for a RUN, stop-gate.sh for a SESSION. The scopes are
 # genuinely different and stay separate. The MECHANISM was duplicated, and the
 # duplication was not free -- the run side had already learned two things the
 # session side had not:
@@ -16,7 +16,7 @@
 #     `sleep &` on the recorded pid made a pause read as verified); the session
 #     side then shipped a liveness check with exactly that hole.
 #
-# BpResumption.pm is now the single implementation, and bp-resumption.pl is how
+# BpResumption.pm is now the single implementation, and the old resumption CLI is how
 # the bash gate reaches it -- shell cannot compute a process fingerprint, so
 # translating the rules into shell a second time could only reproduce the gap.
 #
@@ -26,51 +26,34 @@
 # AC4  an unbounded marker is refused however fresh
 # AC5  a passed deadline is refused however alive
 # AC6  a marker with no pid, or no identity, is refused as UNVERIFIABLE
-# AC7  the CLI and the module agree, since the gate only sees the CLI
+# AC7  REMOVED (reason DEL, package 16 batch E1): the old resumption CLI, the CLI
+#      this compared the module against, is on the deletion list. The module
+#      behaviour AC7 exercised through the CLI is still pinned directly, via
+#      AC1-AC6 against BpResumption.pm itself.
 # AC8  bp-runstate and the continuity gate use the SAME implementation
 use strict;
 use warnings;
 
-# A TEST MUST NEVER ACTUATE A REAL WAKE-LOCK. This file drives bp-continuity.pl /
-# bp-runstate.pl / gate-continuity.sh, which hold the machine awake for an armed
+# A TEST MUST NEVER ACTUATE A REAL WAKE-LOCK. This file drives butler-continuity /
+# bp-runstate.pl / stop-gate.sh, which hold the machine awake for an armed
 # session -- and they do it as SUBPROCESSES, where bp-keepawake.pl's `$0 =~ /\.t\z/`
 # guard cannot reach (its $0 is the .pl). CCPRAXIS_NO_WAKELOCK is the supported
 # opt-out and IS inherited across exec. Enforced by t/test-wakelock-hygiene.t.
 BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
 use Test::More;
 use FindBin qw($Bin);
-use File::Temp qw(tempdir);
 
 my $SCRIPTS = "$Bin/../../scripts";
 my $MOD     = "$SCRIPTS/BpResumption.pm";
-my $CLI     = "$SCRIPTS/bp-resumption.pl";
 ok(-f $MOD, 'BpResumption.pm exists') or BAIL_OUT('module missing');
-ok(-f $CLI, 'bp-resumption.pl exists') or BAIL_OUT('cli missing');
 require $MOD;
-
-my $dir = tempdir(CLEANUP => 1);
-my $n = 0;
-sub write_marker {
-    my ($line) = @_;
-    my $p = "$dir/m" . ++$n;
-    open my $fh, '>', $p or die $!;
-    print {$fh} $line;
-    close $fh;
-    return $p;
-}
-
-sub cli_verify {
-    my ($file) = @_;
-    my $out = `perl "$CLI" verify --file "$file" 2>&1`;
-    return ($? >> 8, $out // '');
-}
 
 # A process that is alive for the duration of this test, to stand in for a live
 # hold. Its identity is real, so AC1/AC2 differ ONLY in the recorded fingerprint.
 my $live = fork();
 if (defined $live && $live == 0) { sleep 60; exit 0 }
 SKIP: {
-    skip 'fork unavailable', 20 unless defined $live && $live > 0;
+    skip 'fork unavailable', 16 unless defined $live && $live > 0;
     ok(BpResumption::pid_alive($live), 'fixture: the stand-in process is alive');
     my $fp = BpResumption::pid_fingerprint($live);
     ok(defined $fp, 'fixture: and it can be fingerprinted');
@@ -81,10 +64,6 @@ SKIP: {
         my ($ok, $why) = BpResumption::verify_line($line);
         ok($ok, 'AC1 a marker for a live, fingerprinted process with a future deadline verifies')
             or diag("refused: " . ($why // ''));
-
-        my ($rc, $out) = cli_verify(write_marker($line));
-        is($rc, 0, 'AC7 and the CLI agrees (exit 0)');
-        like($out, qr/REASON: ok/, 'AC7 reporting ok');
     }
 
     # ── AC2 — THE ONE THAT MATTERS: a recycled pid ────────────────────────
@@ -98,9 +77,6 @@ SKIP: {
         my ($ok, $why) = BpResumption::verify_line($line);
         ok(!$ok, 'AC2 CANONICAL: a LIVE pid whose identity does not match is REFUSED');
         like($why // '', qr/recycled/i, 'AC2 and the refusal names the reason');
-
-        my ($rc, $out) = cli_verify(write_marker($line));
-        is($rc, 1, 'AC7 the CLI refuses it too');
     }
 
     # ── AC4/AC5 — bounded, and still ahead ────────────────────────────────
@@ -155,7 +131,7 @@ SKIP: {
 # entry): bp-runstate.pl is DELETED, not merely edited, so it can no longer
 # be the subject of "uses the shared module" / "no longer carries its own
 # fingerprint implementation". Both assertions are repointed at the two
-# files that now load BpResumption.pm DIRECTLY (spec §2.2): bp-watch.pl and
+# files that now load BpResumption.pm DIRECTLY (spec §2.2): butler-hold and
 # bp-worker.pl. Same intent, unweakened: "if anybody grew their own copy
 # again, this fails."
 #
@@ -164,8 +140,11 @@ SKIP: {
 # that cost a fix batch was that knowledge living in one file cannot be
 # reached from the other.
 {
-    for my $f (['bp-watch.pl', "$SCRIPTS/bp-watch.pl"],
-               ['bp-worker.pl', "$SCRIPTS/bp-worker.pl"]) {
+    # butler-hold -- REMOVED (reason DEL, package 16 batch E1): it is on the
+    # deletion list and gone. Trimmed to what bp-worker.pl uses, per the
+    # spec's own forward note. The behavior this protected -- nothing
+    # growing its own pid_alive/pid_fingerprint copy -- is unweakened below.
+    for my $f (['bp-worker.pl', "$SCRIPTS/bp-worker.pl"]) {
         my ($name, $path) = @$f;
         open my $fh, '<', $path or die "$path: $!";
         local $/;
@@ -179,13 +158,12 @@ SKIP: {
                "AC8 MIGRATED: $name does not define its own sub pid_fingerprint");
     }
 
-    open my $gh, '<', "$Bin/../../hooks/gate-continuity.sh" or die $!;
-    my $gate = do { local $/; <$gh> };
-    close $gh;
-    like($gate, qr/bp-resumption\.pl/,
-         'AC8 the continuity gate verifies through the same module, via the CLI');
-    unlike($gate, qr/WBOUND|WALIVE/,
-           'AC8 and no longer re-implements the rules in shell');
+    # The stop-gate.sh block that used to close this AC8 -- REMOVED
+    # (reason DEL, package 16 batch B): stop-gate.sh is on the
+    # deletion list (Decision 5 collapses the Stop gate to the single
+    # stop-gate.sh) and has no successor that re-verifies resumption
+    # through the old resumption CLI's CLI; that role is not carried forward as a
+    # shell-side check any more.
 }
 
 done_testing();

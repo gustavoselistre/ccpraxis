@@ -6,7 +6,7 @@
 # successor (GuardBlueprintWrite, which absorbs guard-ledger-create),
 # running on the package-03 hook core.
 #
-# hooks/next/guards/guard-blueprint-write.sh and
+# hooks/guard-blueprint-write.sh and
 # BpHook/Guards/GuardBlueprintWrite.pm DO NOT EXIST YET. Every in-process
 # call goes through GuardHarness::run_module() (batch 1's harness,
 # plugins/butler/tests/lib/GuardHarness.pm), which mirrors BpHook::main()'s
@@ -16,7 +16,7 @@
 # gets a plain "No such file or directory" until the implementer writes it.
 #
 # WRITTEN BLIND TO THE IMPLEMENTATION: derived only from the spec text
-# above, never from reading guard-blueprint-write.sh or guard-ledger-create.sh.
+# above, never from reading guard-blueprint-write.sh or guard-blueprint-write.sh.
 #
 # NOT RE-EXPRESSED (per spec sec 4.6 "Not:" list and sec 4.2's codes):
 #   old file / assertion label                                    | code
@@ -24,12 +24,12 @@
 #   blueprint-write-api.t, everything but G9's two hook verdicts   | OTHER (bp-blueprint.pl CLI)
 #   blueprint-set-title.t, everything but AC10's hook verdict      | OTHER (bp-blueprint.pl CLI)
 #   blueprint-write-api.t G9's hooks.json registration checks      | REG
-#   guard-ledger-create.t B-39 (jq availability plumbing)          | JQ
-#   guard-ledger-create.t B-40 (source-text pin)                   | SRC
-#   guard-ledger-create.t AC-16 literals 5-9 and the ordering check| MSG (20-line denial/escape
+#   the retired guard-ledger-create coverage B-39 (jq availability plumbing)          | JQ
+#   the retired guard-ledger-create coverage B-40 (source-text pin)                   | SRC
+#   the retired guard-ledger-create coverage AC-16 literals 5-9 and the ordering check| MSG (20-line denial/escape
 #                                                                      recipe retired by the budget)
-#   driver-guard-reach.t AC-20 (source-text pin)                   | SRC
-#   driver-guard-reach.t AC-21..24, AC-26 (package 13's guard-writes| OTHER
+#   the retired driver-guard-reach coverage AC-20 (source-text pin)                   | SRC
+#   the retired driver-guard-reach coverage AC-21..24, AC-26 (package 13's guard-writes| OTHER
 #     hatch, not this successor)                                    |
 #
 # Runs standalone: perl this file
@@ -56,7 +56,7 @@ use GuardHarness;
 # individual block wraps its own env changes in local %ENV = %ENV" was
 # false (no such wrap exists anywhere in this file) and is removed.
 # ---------------------------------------------------------------------------
-delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
 $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
 
 my $BUTLER_DIR = dirname(__FILE__) . '/../..';
@@ -132,7 +132,7 @@ my $LEDGER_L2_CONSUME = "A valid ledger-write-override was found but could not b
 # SH-1/SH-2 -- static shape.
 # ===========================================================================
 {
-    my $wrapper = "$BUTLER_DIR/hooks/next/guards/guard-blueprint-write.sh";
+    my $wrapper = "$BUTLER_DIR/hooks/guard-blueprint-write.sh";
     my $module  = "$BUTLER_DIR/scripts/BpHook/Guards/GuardBlueprintWrite.pm";
     ok(-f $wrapper, 'SH-1 precondition: guard-blueprint-write.sh exists on disk')
         or diag("missing: $wrapper (package 14 has not written it yet)");
@@ -507,7 +507,7 @@ my $LEDGER_L2_CONSUME = "A valid ledger-write-override was found but could not b
 # this file must stand on its own when the runner parallelises files.
 # ===========================================================================
 {
-    my $stopgate = "$BUTLER_DIR/hooks/next/stop-gate.sh";
+    my $stopgate = "$BUTLER_DIR/hooks/stop-gate.sh";
     ok(-f $stopgate, 'self-check precondition: stop-gate.sh (package 06) exists on disk');
 
     my $res_wrapper = GuardHarness::run_wrapper($stopgate,

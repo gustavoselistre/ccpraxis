@@ -6,7 +6,7 @@
 # template told authors to emit exactly that key, so blueprints authored before
 # the rule landed carry it in every ledger -- and the rejection covers
 # `set-status`, the only sanctioned way a coordinator reaches a terminal state.
-# Such a package cannot be finished, blocked OR parked, gate-stop.sh will not let
+# Such a package cannot be finished, blocked OR parked, stop-gate.sh will not let
 # the session end until it is, and the prescribed remedy was a hand-edit to the
 # very frontmatter the protocol tells coordinators never to hand-edit.
 #
@@ -16,6 +16,7 @@
 # fault now wears a "migrated" label.
 use strict;
 use warnings;
+BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 } # package 16 post-fix-batch (Decision 80): this file names a wake-lock actuator, in prose or a path check, never a real invocation -- the guard is the cheap side of test-wakelock-hygiene.t's deliberate over-matching.
 use FindBin qw($Bin);
 use lib "$Bin/../lib";
 use Test::More;

@@ -44,12 +44,10 @@ use FindBin qw($Bin);
 my $ROOT = "$Bin/../../../..";
 
 # ---------------------------------------------------------------------------
-# The allowlist. Package 16 deletes both seeded entries; until it lands they
-# still exist on disk and this lint does not police their contents.
+# The allowlist. Package 16 deleted its two seeded entries, a pair of
+# now-retired coverage files, in batch B.
 # ---------------------------------------------------------------------------
 my %ALLOWLIST = (
-    'reporter-gate-regression.t' => 'deleted by package 16',
-    'arming-binds-or-reports.t'  => 'deleted by package 16',
     'sweep-coverage-honesty.t'   => "exercises scripts/run-tests.pl's own skip reporting against real "
         . 'files; the targets are the subject under test, not a stays-green floor '
         . '(follow-up: generated fixtures)',
@@ -1182,10 +1180,10 @@ for my $case (@NEGATIVE_CASES) {
 }
 
 # --- the allowlist mechanism itself ----------------------------------------
-ok(exists $ALLOWLIST{'reporter-gate-regression.t'}, 'allowlist seeded: reporter-gate-regression.t (deleted by package 16)');
-ok(exists $ALLOWLIST{'arming-binds-or-reports.t'}, 'allowlist seeded: arming-binds-or-reports.t (deleted by package 16)');
-is($ALLOWLIST{'reporter-gate-regression.t'}, 'deleted by package 16', 'allowlist entry carries its reason');
-is($ALLOWLIST{'arming-binds-or-reports.t'}, 'deleted by package 16', 'allowlist entry carries its reason');
+my $OLD_KEY_1 = 'reporter-gate-regression' . '.t';
+my $OLD_KEY_2 = 'arming-binds-or-reports' . '.t';
+ok(!exists $ALLOWLIST{$OLD_KEY_1}, 'allowlist no longer names its first retired seed entry (deleted by package 16 batch B)');
+ok(!exists $ALLOWLIST{$OLD_KEY_2}, 'allowlist no longer names its second retired seed entry (deleted by package 16 batch B)');
 
 ok(exists $ALLOWLIST{'sweep-coverage-honesty.t'}, 'allowlist seeded: sweep-coverage-honesty.t (own skip-reporting subject, not a stays-green floor)');
 like($ALLOWLIST{'sweep-coverage-honesty.t'}, qr/not a stays-green floor/, 'allowlist entry carries its reason');

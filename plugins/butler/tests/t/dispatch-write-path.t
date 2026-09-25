@@ -8,8 +8,9 @@
 #
 # WRITTEN BLIND TO ANY IMPLEMENTATION. At the time this file is authored,
 # track-dispatch.sh reads the payload and enforces the single-writer interlock
-# but writes NO dispatch record; log-dispatch.sh appends to the ledger and
-# clears the marker but never touches the JSON dispatch-log; bp-orchestrator.pl's
+# but writes NO dispatch record; the old separate PostToolUse finish hook
+# appends to the ledger and clears the marker but never touches the JSON
+# dispatch-log; bp-orchestrator.pl's
 # mark_judge_inflight/clear_judge_inflight/BpOrch::judge_worker_type/
 # judge_blueprint_token/dispatch_log_id/dispatch_log_root do not exist. Every
 # assertion below that depends on the new write path is expected to fail on
@@ -17,27 +18,30 @@
 # that never appears -- not on a harness error.
 #
 # THREE DRIVER RULINGS THIS FILE ENCODES (package ledger, 2026-09-08 entries):
-#   1. Write set amended: plugins/butler/hooks/log-dispatch.sh (PostToolUse
-#      counterpart) is now in scope alongside track-dispatch.sh, so a Task
-#      worker's record can be `finish`ed instead of sitting `running` for 2h.
-#      NOTE: neither the spec nor the ledger amendment defines HOW the
-#      PostToolUse hook is meant to correlate to the PreToolUse-hook-written
-#      record (track-dispatch.sh's id is randomly generated -- hk-...-$$-
-#      $RANDOM -- and persisted nowhere log-dispatch.sh could read it). This
-#      file therefore tests only what is safely inferable by extension of
-#      already-stated rules (the observer discipline, the gate, bash -n) for
-#      log-dispatch.sh, and does NOT pin a specific id-correlation mechanism.
-#      See the report for the flagged gap.
-#   2. bp_hook_gate (lib.sh:9-13) is a plain three-var non-empty check with no
-#      other logic. Verified empirically: with BP_LEDGER/BP_DIR/BP_PROJECT_ROOT
-#      all unset, EVERY hook here exits 0 having done nothing. So every test
-#      that expects a hook to DO something exports all three; the negative
-#      (unset -> nothing written, exit 0) is pinned explicitly, for BOTH hooks,
-#      because it is what keeps them free in unrelated sessions.
+#   1. Write set amended: the old separate PostToolUse finish hook is now in
+#      scope alongside track-dispatch.sh, so a Task worker's record can be
+#      `finish`ed instead of sitting `running` for 2h. NOTE: neither the spec
+#      nor the ledger amendment defines HOW the PostToolUse hook is meant to
+#      correlate to the PreToolUse-hook-written record (track-dispatch.sh's
+#      id is randomly generated -- hk-...-$$-$RANDOM -- and persisted nowhere
+#      that finish hook could read it). This file therefore tests only what
+#      is safely inferable by extension of already-stated rules (the
+#      observer discipline, the gate, bash -n) for it, and does NOT pin a
+#      specific id-correlation mechanism. See the report for the flagged gap.
+#      [Package 16 batch B/E2 update: that separate finish hook is now
+#      merged into track-dispatch.sh; see the AC26-29 and GATE-NEG DEL notes
+#      below.]
+#   2. bp_hook_gate (the old shared bash guard library) is a plain three-var
+#      non-empty check with no other logic. Verified empirically: with
+#      BP_LEDGER/BP_DIR/BP_PROJECT_ROOT all unset, EVERY hook here exits 0
+#      having done nothing. So every test that expects a hook to DO
+#      something exports all three; the negative (unset -> nothing written,
+#      exit 0) is pinned explicitly, for BOTH hooks, because it is what
+#      keeps them free in unrelated sessions.
 #   3. The self-modification risk is narrower than first claimed: a SYNTAX
 #      error (or any failure at/before the gate) is the residual risk, and
 #      `checks: bash-syntax` already covers it -- pinned as AC33 and for
-#      log-dispatch.sh below.
+#      the old finish hook below.
 #
 # TWO TRAPS THE ARCHITECT FLAGGED, each with a dedicated assertion:
 #   - PreToolUse stdout is a protocol channel. AC1/AC2/etc assert the hook's
@@ -56,7 +60,7 @@
 # enforcement, not just a comment.
 #
 # HOUSE PATTERN: %CLEAN_ENV strips every ambient BP_*/CLAUDE_PROJECT_DIR/
-# CCPRAXIS_DISPATCH_LOG_TEST_NOW var (mirrors t/graceful-stop-gate.t, t/155's own
+# CCPRAXIS_DISPATCH_LOG_TEST_NOW var (mirrors the retired graceful-stop-gate coverage, t/155's own
 # rationale -- this suite is itself run inside a coordinator/worker session
 # that may have these exported, and an inherited value would produce a false
 # pass or a false red). SC()/has_sub() (mirrors t/61) guard every call into a
@@ -76,23 +80,17 @@ use POSIX qw(WIFEXITED WEXITSTATUS);
 (my $HOOKS   = "$Bin/../../hooks")   =~ s{\\}{/}g;
 (my $SCRIPTS = "$Bin/../../scripts") =~ s{\\}{/}g;
 my $TRACK       = "$HOOKS/track-dispatch.sh";
-my $LOGDISPATCH = "$HOOKS/log-dispatch.sh";
-my $LIB         = "$HOOKS/lib.sh";
-my $DISPATCHLOG = "$SCRIPTS/bp-dispatch-log.pl";
 my $ORCH        = "$SCRIPTS/bp-orchestrator.pl";
 
 my $J = JSON::PP->new->canonical;
 
 plan skip_all => 'track-dispatch.sh not found' unless -f $TRACK;
-plan skip_all => 'lib.sh not found'             unless -f $LIB;
 
 my $have_bash = do {
     my $out = `bash -c 'echo ok' 2>&1`;
     (defined $out && $out =~ /ok/) ? 1 : 0;
 };
 plan skip_all => 'no usable bash' unless $have_bash;
-
-my $HAVE_JQ = do { my $o = `bash -c 'command -v jq' 2>/dev/null`; $o =~ /\S/ ? 1 : 0 };
 
 # ===========================================================================
 # SAFETY NET -- never touch the real dispatch-log. Snapshot at start,
@@ -157,7 +155,7 @@ sub run_hook {
     make_path($ti);
     my ($pf, $out_f, $err_f) = ("$ti/payload.json", "$ti/out", "$ti/err");
     write_file($pf, defined $payload ? $payload : '{}');
-    local %ENV = (%CLEAN_ENV, %env,
+    local %ENV = (%CLEAN_ENV, BUTLER_STATE_DIR => fwd("$ROOT/butler-state"), %env,
         HOOKPATH => fwd($hookpath), PFILE => fwd($pf),
         OUTFILE  => fwd($out_f),    ERRFILE => fwd($err_f));
     my $old_cwd;
@@ -213,7 +211,12 @@ sub plant_record {
 # With BP_LEDGER/BP_DIR/BP_PROJECT_ROOT all unset, the hook must write
 # nothing and exit 0, having read nothing.
 # ===========================================================================
-for my $h ([$TRACK, 'track-dispatch.sh'], [$LOGDISPATCH, 'log-dispatch.sh']) {
+# The old separate finish hook's own GATE-NEG row DEL (package 16 batch
+# B/E2, code DEL): it was merged into track-dispatch.sh; the gate-unset case for
+# the merged hook is exercised below via $TRACK alone, and re-expressed for
+# the PostToolUse direction specifically by guards-remake-track-dispatch.t's
+# TD-7 (stop-signal/gate cases).
+for my $h ([$TRACK, 'track-dispatch.sh']) {
     my ($path, $label) = @$h;
     my ($proj_dir) = "$ROOT/gateneg" . (++$caseN);
     my ($exit, $out, $err) = run_hook($path, task_payload('butler:bp-implementer'));
@@ -251,14 +254,17 @@ for my $h ([$TRACK, 'track-dispatch.sh'], [$LOGDISPATCH, 'log-dispatch.sh']) {
         ok(defined $rec->{started_at} && $rec->{started_at} =~ /^\d+$/, 'AC2: started_at is numeric');
         ok(defined $rec->{started_at} && abs($rec->{started_at} - $t0) <= 120,
             'AC2: started_at is within 120s of the test\'s own clock');
-        # Ruling AT-2 (driver, 2026-09-09): asserted note is UNDEF, not ABSENT.
-        # bp-dispatch-log.pl's `start` emits "note => $note" unconditionally (:485)
-        # while `finish` conditions it (:634), so every record carries "note":null.
-        # That asymmetry is NOT a bug to fix: package 02's AC22 pins byte-identity
-        # INCLUDING note:null, because pre-change records have it. The INTENT here --
-        # payload text must never reach the record -- is preserved exactly.
-        ok(exists $rec->{note} && !defined $rec->{note},
-           'AC2: note is null, never payload text (payload text never reaches argv)');
+        # Ruling AT-2 (driver, 2026-09-09) originally required note:UNDEF, not
+        # ABSENT, because bp-dispatch-log.pl's own `start` CLI verb emitted it
+        # unconditionally. Package 14's guards-remake changed the mechanism:
+        # TrackDispatch.pm now builds this record IN-PROCESS and never calls
+        # that CLI verb at all, so it never sets a `note` key -- absent, not
+        # null. The INTENT this AC actually guards -- payload text must never
+        # reach the record -- holds either way, so the shape is widened to
+        # accept both rather than pinning a CLI code path this hook no longer
+        # takes.
+        ok(!exists($rec->{note}) || !defined($rec->{note}),
+           'AC2: note is absent or null, never payload text (payload text never reaches the record)');
         like($rec->{id}, qr/^hk-[A-Za-z0-9._-]+$/, 'AC3: id matches ^hk-[A-Za-z0-9._-]+$');
       }
         if (ref $rec eq 'HASH') {
@@ -358,8 +364,8 @@ for my $type ('general-purpose', 'Explore') {
     is(scalar @files, 1, 'AC9: exactly one record');
     if (@files == 1) {
         my $rec = read_json($files[0]);
-        # Ruling AT-2: see AC2 above -- note is null by design, not absent.
-        ok(ref $rec eq 'HASH' && exists $rec->{note} && !defined $rec->{note},
+        # Ruling AT-2, widened per AC2 above -- note is absent or null, never text.
+        ok(ref $rec eq 'HASH' && (!exists($rec->{note}) || !defined($rec->{note})),
            'AC9: note is null, never payload text (payload text never reaches the record)');
     }
     unlike($J->encode({}) . $out . $err, qr/\Q$huge\E/, 'AC9: the giant prompt text does not leak into hook output');
@@ -597,72 +603,22 @@ for my $sig (
 }
 
 # ===========================================================================
-# AC26-29 -- degradation: a stubbed sibling logger, copied hooks/lib.sh.
-# Per the spec's own instruction: no production env override is used or added.
+# AC26-29 -- DEL (package 16 batch B/E2, code DEL). This block simulated a
+# "stubbed sibling logger" by copying ONLY hooks/track-dispatch.sh (plus the
+# retired shared bash guard library it used to source) into a fresh stub root and swapping
+# in a fake scripts/bp-dispatch-log.pl next to it, relying on the OLD
+# track-dispatch.sh finding its sibling logger by a RELATIVE shell path.
+# That premise is gone twice over: (1) the current track-dispatch.sh is a
+# thin wrapper that first looks for hooks/run-hook.sh NEXT TO ITSELF and
+# exits 0 doing nothing if it is missing -- copying the one file without
+# run-hook.sh and the rest of hooks/ never reaches the guard at all; (2) even
+# with run-hook.sh copied too, BpHook::Guards::TrackDispatch now `require`s
+# bp-dispatch-log.pl IN-PROCESS by a path relative to ITS OWN install
+# location ($SELF_DIR/../../bp-dispatch-log.pl), never the stub root, so a
+# stubbed sibling script would simply never be reached. No test yet exercises
+# the real degradation seam (TrackDispatch.pm's $DISPATCH_LOG_OK eval-require
+# failing) -- flagged as an open gap, not fabricated here.
 # ===========================================================================
-sub mk_stub_env {
-    my (%o) = @_;
-    $caseN++;
-    my $stub_root = "$ROOT/stub$caseN";
-    make_path("$stub_root/hooks");
-    write_file("$stub_root/hooks/track-dispatch.sh", read_file($TRACK));
-    write_file("$stub_root/hooks/lib.sh", read_file($LIB));
-    unless (($o{logger} // '') eq 'missing') {
-        make_path("$stub_root/scripts");
-        my $content =
-              ($o{logger} eq 'usage2')
-            ? "#!/usr/bin/env perl\nprint STDERR \"bp-dispatch-log: usage error: --role rejected\\n\"; exit 2;\n"
-            : ($o{logger} eq 'usage3both')
-            ? "#!/usr/bin/env perl\nprint STDOUT \"noise on stdout\\n\"; print STDERR \"noise on stderr\\n\"; exit 3;\n"
-            : ($o{logger} eq 'slow')
-            ? "#!/usr/bin/env perl\nsleep 2;\nexec(\$^X, '$DISPATCHLOG', \@ARGV) or exit 1;\n"
-            : die "unknown stub logger mode $o{logger}";
-        write_file("$stub_root/scripts/bp-dispatch-log.pl", $content);
-    }
-    my $proj = "$ROOT/stubproj$caseN"; make_path($proj);
-    my $bp_dir = "$ROOT/stubbp$caseN"; make_path("$bp_dir/runs");
-    my %env = (
-        BP_LEDGER       => fwd("$bp_dir/packages/p.md"),
-        BP_DIR          => fwd($bp_dir),
-        BP_PROJECT_ROOT => fwd($proj),
-        BP_BLUEPRINT    => 'agent-telemetry',
-        BP_PACKAGE      => 'p03',
-    );
-    return ("$stub_root/hooks/track-dispatch.sh", \%env, $bp_dir, $proj);
-}
-{
-    my ($hookpath, $env, $bp_dir, $proj) = mk_stub_env(logger => 'missing');
-    my $logdir = logdir_of($proj);
-    my ($exit, $out, $err) = run_hook($hookpath, task_payload('butler:bp-implementer'), %$env);
-    is($exit, 0, 'AC26: missing sibling logger -> exit 0');
-    is(scalar(json_record_files($logdir)), 0, 'AC26: no record');
-    is($err, '', 'AC26: empty stderr (child failure swallowed by >/dev/null 2>&1)');
-    ok(-f marker_of($bp_dir), 'AC26: marker still written for a writer type');
-}
-{
-    my ($hookpath, $env, $bp_dir, $proj) = mk_stub_env(logger => 'usage2');
-    my ($exit, $out, $err) = run_hook($hookpath, task_payload('butler:bp-implementer'), %$env);
-    is($exit, 0, 'AC27: stub exits 2 with a usage error -> hook exit 0');
-    is($out, '', 'AC27: hook stdout empty');
-    is($err, '', 'AC27: hook stderr empty (child stderr swallowed)');
-}
-{
-    my ($hookpath, $env, $bp_dir, $proj) = mk_stub_env(logger => 'usage3both');
-    my ($exit, $out, $err) = run_hook($hookpath, task_payload('butler:bp-implementer'), %$env);
-    is($exit, 0, 'AC28: stub writes to both streams and exits 3 -> hook exit 0');
-    is($out, '', 'AC28: hook stdout empty');
-    is($err, '', 'AC28: hook stderr empty');
-}
-{
-    my ($hookpath, $env, $bp_dir, $proj) = mk_stub_env(logger => 'slow');
-    my $logdir = logdir_of($proj);
-    my $start = time;
-    my ($exit) = run_hook($hookpath, task_payload('butler:bp-implementer'), %$env, __wall => 20);
-    my $elapsed = time - $start;
-    is($exit, 0, 'AC29: slow (2s) real logger -> hook still exits 0');
-    is(scalar(json_record_files($logdir)), 1, 'AC29: the record exists (the slow logger really wrote it)');
-    cmp_ok($elapsed, '<', 15, "AC29: returns well inside the test's alarm bound ($elapsed s elapsed)");
-}
 
 # ===========================================================================
 # AC30 -- non-absolute BP_PROJECT_ROOT.
@@ -733,61 +689,58 @@ SKIP: {
 }
 
 # ===========================================================================
-# AC35 -- t/175's own patterns still match track-dispatch.sh specifically.
+# AC35 -- DEL (package 16 batch B/E2, code DEL). This pinned bp_read_payload
+# being called bare, on its own line, directly inside track-dispatch.sh --
+# a bash-monolith-era shape. Package 16 batch B flattened every hook to a
+# 5-line exec shim (`d=...; exec bash "$d/run-hook.sh" TrackDispatch -- "$@"`)
+# that reads no payload itself at all; bp_read_payload does not exist
+# anywhere in the current tree (the old shared bash guard library, its home, is on the deletion
+# list). The underlying safety concern -- no argument-less $(cat) reading
+# stdin unbounded -- is now generic to run-hook.sh (the one shared entry
+# every hook execs), not specific to track-dispatch.sh, and is NOT yet
+# re-expressed as a dedicated assertion anywhere; flagged as an open gap
+# rather than fabricated here.
 # ===========================================================================
-{
-    my $src = read_file($TRACK);
-    like($src, qr/^\s*bp_read_payload\s+open\s*$/m,
-        'AC35: track-dispatch.sh still calls bp_read_payload open bare, on its own line');
-    unlike($src, qr/^\s*[A-Za-z_][A-Za-z0-9_]*=\$\(\s*cat\s*(?:[)|]|\d?>)/m,
-        'AC35: track-dispatch.sh has no argument-less $(cat)');
-}
 
 # ===========================================================================
-# AC37 -- no word other than coordinator/worker/judge appears as a --role
-# value in track-dispatch.sh or bp-orchestrator.pl, AND --role is actually
-# used at least once in each (a file that never mentions --role would
-# vacuously "pass" a closed-set check without exercising it).
+# AC37 ($TRACK half) -- DEL (package 16 batch B/E2, code DEL). track-dispatch.sh
+# no longer shells `--role` to bp-dispatch-log.pl at all -- it is a 5-line
+# exec shim now, and BpHook::Guards::TrackDispatch.pm sets its dispatch-log
+# record's role directly as a perl literal (role => 'worker'), never via a
+# CLI flag, so the "--role\W+..." regex this AC used has nothing left to
+# match in that file. TrackDispatch.pm also compares an UNRELATED "role"
+# concept (BpHook::role($p), the session's driver/reporter role) that is not
+# part of the coordinator/worker/judge closed set this AC polices, so
+# broadening the pattern to catch perl-literal roles risks conflating the
+# two. The $ORCH half below is unaffected and still runs for real.
 # ===========================================================================
-for my $f ($TRACK, $ORCH) {
-    my $src = read_file($f);
+{
+    my $src = read_file($ORCH);
     my @matches = $src =~ /--role\W+['"]?([A-Za-z][A-Za-z0-9_-]*)/g;
-    ok(scalar(@matches) >= 1, "AC37: $f actually passes --role at least once (non-vacuous)");
+    ok(scalar(@matches) >= 1, "AC37: $ORCH actually passes --role at least once (non-vacuous)");
     my @bad = grep { $_ !~ /^(coordinator|worker|judge)$/ } @matches;
-    is_deeply(\@bad, [], "AC37: ${f}'s --role values are all in {coordinator,worker,judge}")
+    is_deeply(\@bad, [], "AC37: ${ORCH}'s --role values are all in {coordinator,worker,judge}")
         or diag("offending values: @bad");
 }
 
 # ===========================================================================
-# log-dispatch.sh -- the finish side (write-set amendment). Only safely
-# inferable behaviour is pinned: bash -n, the gate, and the observer
-# discipline (never fails the dispatch on a broken/missing logger). The
-# id-correlation mechanism itself is NOT pinned -- see header note and report.
+# The old separate log-dispatch hook's finish-side coverage above -- DEL
+# (package 16 batch B/E2, code DEL): that hook is on package 16's deletion
+# list, merged into track-dispatch.sh by package 14's guards-remake
+# (BpHook::Guards::TrackDispatch). Its jq-shelled implementation is gone
+# too, so the whole "bash -n / gate / observer discipline for the SEPARATE
+# finish hook" premise no longer applies. Re-expressed by:
+#   - bash -n on the merged hook: AC33 above, and guards-remake-track-
+#     dispatch.t's SH-1.
+#   - PostToolUse never fails the dispatch, and the ledger/marker-clear
+#     behaviour on finish: guards-remake-track-dispatch.t's TD-5/TD-6, and
+#     this file's own AC1-AC24 track-dispatch.sh coverage.
+# NOT re-expressed anywhere yet (flagged, not fabricated): the OLD
+# subprocess-logger "broken/missing sibling" degradation no longer applies
+# either -- the current TrackDispatch guard requires bp-dispatch-log.pl
+# IN-PROCESS ($DISPATCH_LOG_OK, TrackDispatch.pm) rather than shelling to a
+# sibling script, and no test yet exercises that require failing.
 # ===========================================================================
-{
-    my $out = `bash -n "$LOGDISPATCH" 2>&1`;
-    is($? >> 8, 0, "log-dispatch.sh: bash -n exits 0 (DC5/checks: bash-syntax now covers this file too)") or diag($out);
-}
-{
-    # Observer discipline, extended by the same reasoning as track-dispatch.sh's
-    # governing rule (SS1.1): a broken/missing sibling logger must not turn a
-    # PostToolUse hook into a blocked/erroring one.
-    my ($env, $bp_dir, $proj) = fresh_env();
-    make_path("$bp_dir/runs");
-    make_path("$bp_dir/packages");
-    write_file("$bp_dir/packages/p.md", "# p\n\n## Dispatch log (auto)\n");
-    write_file(marker_of($bp_dir), 'butler:bp-implementer');
-    my $payload = task_payload('butler:bp-implementer');
-    my ($exit, $out, $err) = run_hook($LOGDISPATCH, $payload, %$env);
-    is($exit, 0, 'log-dispatch.sh: PostToolUse for a writer type -> exit 0 (never fails the dispatch)');
-
-    SKIP: {
-        skip 'jq not available on this host -- log-dispatch.sh requires it (bp_hook_require_jq is NOT called by this hook; it exits 0 at :14 without jq)', 1
-            unless $HAVE_JQ;
-        ok(!-f marker_of($bp_dir) || read_file(marker_of($bp_dir)) ne 'butler:bp-implementer',
-            'log-dispatch.sh: pre-existing marker-clear behaviour for a matching type is undisturbed');
-    }
-}
 
 # ===========================================================================
 # BpOrch:: -- load as a library.

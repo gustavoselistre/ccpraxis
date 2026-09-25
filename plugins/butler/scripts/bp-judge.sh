@@ -11,7 +11,7 @@
 #
 # Hook scoping: judges export the same BP_* env contract as coordinators so
 # guard-writes.sh contains their writes — but with BP_ROLE != coordinator, so
-# gate-stop.sh / track-dispatch.sh skip them (a judge is one-shot; coordinator
+# stop-gate.sh / track-dispatch.sh skip them (a judge is one-shot; coordinator
 # stop-discipline would wedge it). The harvest judge gets an EMPTY write_set
 # (read-only: only its verdict, which lands under BP_DIR, is writable); the resolve
 # judge gets the package's real write_set so its fix is contained.

@@ -113,7 +113,7 @@ Write exactly one JSON object to **verdict_path** (and nothing else to it):
 ## Hard limits
 
 - Foreground only for validation/checks: never `run_in_background`, and never end a turn expecting a
-  later one to resume it — you have no guaranteed follow-up turn. `gate-headless-background.sh`
+  later one to resume it — you have no guaranteed follow-up turn. `guard-bash.sh`
   enforces this mechanically wherever `BP_LEDGER` is set.
 - **Read-only, absolutely.** No `Edit`, no `Write` beyond `verdict_path` (you have neither tool at
   all), no `Bash`, no re-running commands, no code edits. You classify and propose; you never fix.

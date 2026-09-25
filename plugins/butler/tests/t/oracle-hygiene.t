@@ -98,6 +98,18 @@ for my $line (split /\n/, $out) {
         $reason =~ s/[^A-Za-z0-9]+//g;
         next if length($reason) >= 3;
     }
+    # hook-registration-resilience.t (package 16 batch B) is on the
+    # coordinator's immutable-oracle list -- this test's own write set does
+    # not include it, so no `# shape-lint: intentional` marker can be added
+    # to its source. Its B6a "exactly 18 commands" pin is a deliberate count
+    # of the spec 2.3 registration SET itself (17 hooks.json entries + 1
+    # settings.json entry), which package 16 is the one package mandated to
+    # define exactly -- hooks-json-route-registration.t is the shape
+    # authority for any future extension of that set, not this file. Exempt
+    # by basename + assertion label rather than by line number, so a later
+    # unrelated edit inside the file cannot silently re-trigger or silently
+    # stop covering this exemption.
+    next if $file =~ m{hook-registration-resilience\.t\z} && $src =~ /\bB6a\b/;
     push @unexcused, "$file:$lineno";
 }
 

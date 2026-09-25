@@ -196,20 +196,20 @@ bp_require_sandbox() {
 # comment, or heredoc body.
 #
 # fixbatch step7 / w03 F2. BYTE-IDENTICAL algorithm to the one
-# mark-wakeup.sh authored first (fixbatch step7 / g03 F1, verified live
+# arm-on-entry.sh authored first (fixbatch step7 / g03 F1, verified live
 # against three independent bypass techniques: a bash comment, a
 # single-quoted string, a heredoc body). Lifted here so a THIRD copy of this
-# logic is never written: hooks/guard-validation-interlock.sh is the second
+# logic is never written: hooks/guard-bash.sh is the second
 # consumer of this one implementation.
 #
 # 2026-08-19 d03-one-shell-noise-stripper (almanac report 20260814-093113-34a0):
-# mark-wakeup.sh's own inline copy is GONE. This sentence used to claim it was
+# arm-on-entry.sh's own inline copy is GONE. This sentence used to claim it was
 # "deliberately left as-is rather than refactored to call this" because "only
 # a genuinely NEW caller needs to reuse rather than reinvent" -- that claim is
 # now FALSE and would contradict the code next to it if left standing. Both of
-# mark-wakeup.sh's arms (the reporter-arm block and the driver-arm block) now
+# arm-on-entry.sh's arms (the reporter-arm block and the driver-arm block) now
 # call this function via a conditional source of this file, mirroring
-# guard-validation-interlock.sh:70-74. This is the third and last treatment of
+# guard-bash.sh:70-74. This is the third and last treatment of
 # one problem collapsing to one implementation, not two independent copies
 # plus a shared one.
 #
@@ -223,7 +223,7 @@ bp_require_sandbox() {
 # that executes their contents regardless of surrounding quotes or the outer
 # command, and this function's own $(...)/backtick handling (below, inside
 # the dquote branch) and its callers' segment-boundary treatment of them
-# (mark-wakeup.sh's bp_wakeup_arm_check) exist specifically so that content
+# (arm-on-entry.sh's bp_wakeup_arm_check) exist specifically so that content
 # is NOT treated as inert the way a genuinely-inert residual would be.
 #
 # Returns EMPTY (not the original text) if perl is unavailable or the input

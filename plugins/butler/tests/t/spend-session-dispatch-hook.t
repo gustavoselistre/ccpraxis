@@ -3,7 +3,7 @@
 # report-session's exact attribution path and its data-root default:
 #
 #   * a subagent whose sidecar toolUseId has a record written at dispatch
-#     time by hooks/record-dispatch-package.sh is attributed from it (source
+#     time by hooks/track-dispatch.sh is attributed from it (source
 #     dispatch-hook), ahead of the dispatch-log time-window match;
 #   * two records disagreeing about one tool_use_id attribute nothing;
 #   * the rolled-over attribution.jsonl.1 is read too;

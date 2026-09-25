@@ -1,8 +1,8 @@
 #!/usr/bin/env perl
 # platform: any
 # Oracle for package 13-guards-per-subagent (blueprint hook-continuity-remake),
-# specs/13-guards-per-subagent-spec.md AC-1..AC-28. plugins/butler/hooks/next/
-# guard-writes.sh, plugins/butler/hooks/next/ledger-guard.sh and
+# specs/13-guards-per-subagent-spec.md AC-1..AC-28. plugins/butler/hooks/
+# guard-writes.sh, plugins/butler/hooks/ledger-guard.sh and
 # plugins/butler/scripts/BpHook/WriteGuards.pm DO NOT EXIST YET at the time
 # this file is written -- every in-process case goes through
 # GuardHarness::run_module()/a local resolve()-only twin, which mirrors
@@ -98,13 +98,13 @@ use GuardHarness;
 # Ambient isolation up front (GuardHarness itself isolates at "use", this is
 # just belt-and-suspenders for readers, per the house idiom).
 # ---------------------------------------------------------------------------
-delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
 $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
 
 my $J = JSON::PP->new->utf8->canonical;
 (my $BUTLER_DIR = Cwd::abs_path(dirname(__FILE__) . '/../..')) =~ s{\\}{/}g;
-my $GUARD_WRITES_SH  = "$BUTLER_DIR/hooks/next/guard-writes.sh";
-my $LEDGER_GUARD_SH  = "$BUTLER_DIR/hooks/next/ledger-guard.sh";
+my $GUARD_WRITES_SH  = "$BUTLER_DIR/hooks/guard-writes.sh";
+my $LEDGER_GUARD_SH  = "$BUTLER_DIR/hooks/ledger-guard.sh";
 my $WRITEGUARDS_PM   = "$BUTLER_DIR/scripts/BpHook/WriteGuards.pm";
 
 # =============================================================================

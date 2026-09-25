@@ -15,11 +15,12 @@
 # Monday evening waiting for it.
 #
 # THE ACTION MUST NOT CHANGE. This decides only whether the machine is held
-# awake. Anything consuming the director's JSON -- gate-drive-loop.sh,
-# bp-watchdog.pl, the reporter -- must see byte-identical output either way, so
+# awake. Anything consuming the director's JSON -- stop-gate.sh,
+# the watchdog logic, the reporter -- must see byte-identical output either way, so
 # AC-4 pins that rather than trusting it.
 use strict;
 use warnings;
+BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 } # package 16 post-fix-batch (Decision 80): this file names a wake-lock actuator, in prose or a path check, never a real invocation -- the guard is the cheap side of test-wakelock-hygiene.t's deliberate over-matching.
 # Both the horizon constant and the BpKeepAwake::apply override are referenced
 # exactly once, which is what 'once' warns about; here that is the intent.
 no warnings 'once';

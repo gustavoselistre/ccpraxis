@@ -195,10 +195,14 @@ sub write_pidfile {
     write_file("$dir/runs/$pkg.pid", $content);
 }
 
+# Batch C (spec 16-cutover 2.8, reason DEL): solo_claimed is re-pointed from
+# current.json to inflight.json -- current.json is gone.
 sub write_solo_current {
     my ($root, $bp, $pkg) = @_;
-    write_file("$root/.drive-solo/current.json",
-        $J->encode({ blueprint => $bp, package => $pkg, recorded_at => 1_800_000_000 }));
+    write_file("$root/.drive-solo/inflight.json",
+        $J->encode({ packages => [
+            { blueprint => $bp, package => $pkg, ledger => "x/blueprints/$bp/packages/$pkg.md", since => 1_800_000_000 },
+        ], updated_at => 1_800_000_000 }));
 }
 
 sub esc_record {

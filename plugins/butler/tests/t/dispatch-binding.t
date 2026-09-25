@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 # platform: any
 # Oracle for package 12-dispatch-binding (blueprint hook-continuity-remake),
-# specs/12-dispatch-binding-spec.md AC-1..AC-20. plugins/butler/hooks/next/
+# specs/12-dispatch-binding-spec.md AC-1..AC-20. plugins/butler/hooks/
 # bind-dispatch.sh and BpHook/BindDispatch.pm DO NOT EXIST YET at the time
 # this file is written -- every in-process case goes through GuardHarness::
 # run_module() (plugins/butler/tests/lib/GuardHarness.pm), which mirrors
@@ -16,7 +16,7 @@
 #
 # Not re-expressed here (spec sec 6 "Out of scope"): any fork/subagent
 # dispatch rule (package 19), registering bind-dispatch or deleting
-# record-dispatch-package.sh (package 16), write-guard resolution from
+# the old record-dispatch-package hook (package 16), write-guard resolution from
 # bindings (package 13), pruning terminal members or locking inflight.json
 # from the hook, a `reclaimed` key on the director's action.
 #
@@ -42,7 +42,7 @@ use GuardHarness;
 # Ambient isolation for the WHOLE file, up front, before any fixture or arm()
 # call runs (binding lesson: isolate_env()/fresh_state() before ANY arm).
 # ---------------------------------------------------------------------------
-delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
 $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
 GuardHarness::isolate_env();
 
@@ -50,7 +50,7 @@ GuardHarness::isolate_env();
 # @INC, which no longer contains "." on modern perl -- a relative path here
 # would fail to locate bp-drive-next.pl regardless of whether it exists).
 (my $BUTLER_DIR = Cwd::abs_path(dirname(__FILE__) . '/../..')) =~ s{\\}{/}g;
-my $WRAPPER    = 'plugins/butler/hooks/next/bind-dispatch.sh';
+my $WRAPPER    = 'plugins/butler/hooks/bind-dispatch.sh';
 my $J = JSON::PP->new->utf8->canonical;
 
 # ---------------------------------------------------------------------------
@@ -479,9 +479,11 @@ sub bd {
 }
 
 # ===========================================================================
-# AC-11: 0 members allows and writes nothing; no inflight.json but a
-# current.json binds to it; a malformed inflight.json falls back to
-# current.json.
+# AC-11 (batch C, spec 16-cutover C-2/C-3, reason DEL): 0 members allows and
+# writes nothing. The current.json fallback is deleted -- a pre-existing
+# current.json with no inflight.json now binds NOTHING (0 members, allowed),
+# and a malformed inflight.json also gives 0 members rather than falling back
+# to current.json. current.json itself is left byte-identical either way.
 # ===========================================================================
 {
     my $data = fresh_data();
@@ -496,14 +498,16 @@ sub bd {
 {
     my $data = fresh_data();
     write_current($data, 'bpx', 'p1-a');
+    my $current_before = read_json("$data/.drive-solo/current.json");
     my $sid = 'ac11b-sid';
     GuardHarness::fresh_state();
     GuardHarness::arm($sid, 'driver');
     my %env = (CCPRAXIS_DATA_DIR => $data);
     my $res = bd(payload(session_id => $sid, tool_use_id => 'T1'), env => \%env);
-    is($res->{rc}, 0, 'AC-11: no inflight.json, current.json present -> binds');
-    my $rec = read_json(bindings_dir($data) . '/T1.json');
-    is(ref $rec eq 'HASH' ? $rec->{package} : undef, 'p1-a', 'AC-11: bound to current.json\'s package');
+    is($res->{rc}, 0, 'AC-11 (DEL, C-3): no inflight.json, current.json present -> 0 members, allowed');
+    ok(!-e (bindings_dir($data) . '/T1.json'), 'AC-11 (DEL, C-3): nothing written -- current.json no longer seeds a member');
+    is_deeply(read_json("$data/.drive-solo/current.json"), $current_before,
+        'AC-11 (DEL, C-3): current.json itself is left byte-identical');
 }
 {
     my $data = fresh_data();
@@ -515,9 +519,8 @@ sub bd {
     GuardHarness::arm($sid, 'driver');
     my %env = (CCPRAXIS_DATA_DIR => $data);
     my $res = bd(payload(session_id => $sid, tool_use_id => 'T1'), env => \%env);
-    is($res->{rc}, 0, 'AC-11: malformed inflight.json falls back to current.json');
-    my $rec = read_json(bindings_dir($data) . '/T1.json');
-    is(ref $rec eq 'HASH' ? $rec->{package} : undef, 'p1-a', 'AC-11: bound to current.json\'s package');
+    is($res->{rc}, 0, 'AC-11 (DEL, C-2): a malformed inflight.json gives 0 members (no current.json fallback), allowed');
+    ok(!-e (bindings_dir($data) . '/T1.json'), 'AC-11 (DEL, C-2): nothing written');
 }
 
 # ===========================================================================
@@ -690,14 +693,20 @@ sub bd {
 }
 
 # ===========================================================================
-# AC-18: not registered anywhere.
+# AC-18: registration. Package 12 built bind-dispatch.sh additive-only, not
+# registered anywhere (Decision 19) -- but package 16's cutover is exactly
+# what wires it in, so the pre-cutover "not registered anywhere" premise is
+# retired here (Decision 34, SW: the switch from unregistered to registered
+# is what this package does). hooks.json now registers it on PreToolUse
+# Task|Agent (spec 16 sec 2.3); settings.json never has and still does not.
 # ===========================================================================
 {
     my $hooks_json = "$BUTLER_DIR/hooks/hooks.json";
     my $settings_json = "$BUTLER_DIR/../../.claude/settings.json";
     ok(-f $hooks_json, 'AC-18 precondition: hooks.json exists');
     ok(-f $settings_json, 'AC-18 precondition: .claude/settings.json exists');
-    unlike(read_bytes($hooks_json) // '', qr/bind-dispatch/, 'AC-18: hooks.json does not mention bind-dispatch');
+    like(read_bytes($hooks_json) // '', qr/bind-dispatch/,
+        'AC-18: hooks.json registers bind-dispatch.sh now that package 16 has cut over');
     unlike(read_bytes($settings_json) // '', qr/bind-dispatch/, 'AC-18: .claude/settings.json does not mention bind-dispatch');
 }
 
@@ -915,7 +924,9 @@ sub ac20_decode_line {
             isnt($act_key, 'run-package/p1-a', 'AC-20(running): a running ledger is never reclaimed');
         }
 
-        # ── case 5: switch off -> byte-identical to a run without the rule ──
+        # ── case 5 (batch C, spec 16-cutover, reason SW): the reclaim rule
+        # fires regardless of BUTLER_CONCURRENCY's value -- there is no more
+        # "switch off" state in which it is suppressed.
         {
             my $data = tempdir(CLEANUP => 1);
             ac20_make_bp_dir($data, 'bpx', [{ key => 'p1-a', status => 'pending', write_set => 'a/' }]);
@@ -929,11 +940,12 @@ sub ac20_decode_line {
             local $ENV{BUTLER_CONCURRENCY};
             delete $ENV{BUTLER_CONCURRENCY};
             my ($rc, $out) = ac20_run_next($data, ['next', '--scope', 'all'], { now => sub { $NOW20 } });
-            is($rc, 0, 'AC-20(switch-off): exits 0');
-            my $expected = $J->encode({ action => 'run-package', blueprint => 'bpx', package => 'p1-a' }) . "\n";
-            is($out, $expected, 'AC-20(switch-off): byte-identical to a run with no reclaim rule at all');
+            is($rc, 0, 'SW: exits 0');
+            my $act = $J->decode($out);
+            is($act->{action}, 'run-package', 'SW: reclaim still hands out p1-a with BUTLER_CONCURRENCY unset');
+            is($act->{package}, 'p1-a', 'SW: p1-a is the reclaimed package');
             my $run_md = read_bytes("$dsdir/run.md") // '';
-            unlike($run_md, qr/RECLAIM/, 'AC-20(switch-off): no RECLAIM line is ever written');
+            like($run_md, qr/RECLAIM bpx\/p1-a/, 'SW: the RECLAIM line IS written -- the rule is unconditional now');
         }
     }
 }
@@ -1125,25 +1137,25 @@ sub ledger_decl {
 # R9-LOW: three independent low-severity fixes from the red-team round.
 # ===========================================================================
 
-# (a) the kill switch also disables the deny.
-{
+# (a) batch C (spec 16-cutover C-3, reason SW): the kill switch is gone --
+# a naming-none dispatch with 2+ members is ALWAYS denied now, with
+# BUTLER_CONCURRENCY unset, "0" or any other value making no difference
+# (nothing in non-test code reads it any more).
+for my $conc (undef, '0', '1') {
     my $data = fresh_data();
     my @members = ({ bp => 'bpx', pkg => 'p1-a' }, { bp => 'bpx', pkg => 'p2-b' });
     write_inflight($data, @members);
-    my $sid = 'r9low-switch-sid';
+    my $sid = 'r9low-switch-sid-' . (defined $conc ? $conc : 'unset');
     GuardHarness::fresh_state();
     GuardHarness::arm($sid, 'driver');
-    my %env = (CCPRAXIS_DATA_DIR => $data, BUTLER_CONCURRENCY => '0');
+    my %env = (CCPRAXIS_DATA_DIR => $data);
+    $env{BUTLER_CONCURRENCY} = $conc if defined $conc;
 
     my $res = bd(payload(session_id => $sid, tool_use_id => 'T1', prompt => 'nothing named here'), env => \%env);
-    is($res->{rc}, 0, 'R9-LOW(switch-off): a naming-none dispatch is never denied with the switch off');
-    my $rec = read_json(bindings_dir($data) . '/T1.json');
-    is(ref $rec eq 'HASH' ? $rec->{package} : undef, 'p1-a',
-        'R9-LOW(switch-off): it degrades to a bind (the first member, set order) instead of a deny');
-
-    delete $env{BUTLER_CONCURRENCY};
-    my $res2 = bd(payload(session_id => $sid, tool_use_id => 'T2', prompt => 'nothing named here'), env => \%env);
-    is($res2->{rc}, 0, 'R9-LOW(switch-unset): unset behaves the same as switch off -- never denied');
+    is($res->{rc}, 2,
+        'SW (C-3): a naming-none dispatch with 2+ members is denied regardless of BUTLER_CONCURRENCY ('
+      . (defined $conc ? $conc : 'unset') . ')');
+    ok(!-e (bindings_dir($data) . '/T1.json'), 'SW (C-3): nothing bound on the deny');
 }
 
 # (b) hook and director agree on the data dir.

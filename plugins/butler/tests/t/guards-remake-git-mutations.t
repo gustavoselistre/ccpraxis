@@ -5,7 +5,7 @@
 # specs/14-guards-remake-spec.md sec 3.2/4.3/4.5: the guard-git-mutations
 # successor (GuardGitMutations), running on the package-03 hook core.
 #
-# hooks/next/guards/guard-git-mutations.sh and BpHook/Guards/GuardGitMutations.pm
+# hooks/guard-git-mutations.sh and BpHook/Guards/GuardGitMutations.pm
 # DO NOT EXIST YET. Every in-process call goes through GuardHarness::run_module
 # (batch 1's harness, plugins/butler/tests/lib/GuardHarness.pm), which mirrors
 # BpHook::main()'s own require-and-call contract, so a missing module fails
@@ -41,8 +41,8 @@
 #   guard-git-mutations-quote-mask.t / -heredoc-strip.t / -prose-  | JQ
 #     not-invocation.t: no case in any of the three actually reads  |  (n/a; noted for
 #     jq -- nothing to exclude on that code, listed for completeness)|  completeness only)
-#   hook-payload-read-bound.t (bp_read_payload bound)              | LIB
-#   read-payload-idempotent.t (bp_read_payload re-entrancy)        | LIB
+#   the retired hook-payload-read-bound coverage (bp_read_payload bound)              | LIB
+#   the retired read-payload-idempotent coverage (bp_read_payload re-entrancy)        | LIB
 #
 # GG-1's corpus below is deliberately EXHAUSTIVE of every case (not a sample)
 # in git-mutation-guard-reach.t section C, guard-git-mutations-quote-mask.t,
@@ -75,7 +75,7 @@ use GuardHarness;
 # individual block wraps its own env changes in local %ENV = %ENV" was
 # false (no such wrap exists anywhere in this file) and is removed.
 # ---------------------------------------------------------------------------
-delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
 $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
 
 my $BUTLER_DIR = dirname(__FILE__) . '/../..';
@@ -123,7 +123,7 @@ my $V = 'st' . 'ash';
 # SH-1/SH-2 -- static shape.
 # ===========================================================================
 {
-    my $wrapper = "$BUTLER_DIR/hooks/next/guards/guard-git-mutations.sh";
+    my $wrapper = "$BUTLER_DIR/hooks/guard-git-mutations.sh";
     my $module  = "$BUTLER_DIR/scripts/BpHook/Guards/GuardGitMutations.pm";
     ok(-f $wrapper, 'SH-1 precondition: guard-git-mutations.sh exists on disk')
         or diag("missing: $wrapper (package 14 has not written it yet)");
@@ -467,7 +467,7 @@ my $V = 'st' . 'ash';
 # on its own when the runner parallelises files.
 # ===========================================================================
 {
-    my $stopgate = "$BUTLER_DIR/hooks/next/stop-gate.sh";
+    my $stopgate = "$BUTLER_DIR/hooks/stop-gate.sh";
     ok(-f $stopgate, 'self-check precondition: stop-gate.sh (package 06) exists on disk');
 
     my $res_wrapper = GuardHarness::run_wrapper($stopgate,

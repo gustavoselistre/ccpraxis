@@ -1,9 +1,9 @@
 # BpHook::Guards::GuardBlueprintWrite -- denies a direct Write/Edit/
 # MultiEdit/NotebookEdit that targets a blueprint.md path or a package
 # ledger path, forcing both kinds of mutation through their typed APIs
-# (bp-blueprint.pl and bp-ledger.pl create). Absorbs guard-ledger-create
-# (package 14 of blueprint hook-continuity-remake), successor to
-# guard-blueprint-write.sh and guard-ledger-create.sh.
+# (bp-blueprint.pl and bp-ledger.pl create). Absorbs the old separate
+# ledger-creation guard (package 14 of blueprint hook-continuity-remake),
+# successor to both, now merged into hooks/guard-blueprint-write.sh.
 #
 # Contract: .ccpraxis-local-data/blueprints/hook-continuity-remake/specs/
 # 14-guards-remake-spec.md sec 3.3. Architecture:
@@ -35,6 +35,56 @@ require "$SELF_DIR/Common.pm"
 my $LEDGER_L2_CREATE  = 'Create a package ledger only with bp-ledger.pl create, which validates model:/effort: and refuses a ledger its own validate verb would reject.';
 my $LEDGER_L2_CONSUME = 'A valid ledger-write-override was found but could not be consumed; remove it by hand and retry through bp-ledger.pl create.';
 my $BLUEPRINT_L2      = 'Change blueprint.md only through plugins/butler/scripts/bp-blueprint.pl (add-package, set-deps, add-decision, set-field) via Bash, then retry.';
+
+# ---------------------------------------------------------------------------
+# Decision 69 A2 (package 16 spec sec 2.6): $CASE_INSENSITIVE, duplicated
+# minimally from BpHook::WriteGuards' own _is_ci/_foldc (same auto rule --
+# undef means "auto-detect from $^O": true on msys, MSWin32, cygwin, darwin).
+# ---------------------------------------------------------------------------
+our $CASE_INSENSITIVE;
+
+sub _is_ci {
+    return $CASE_INSENSITIVE ? 1 : 0 if defined $CASE_INSENSITIVE;
+    return ($^O =~ /\A(?:msys|MSWin32|cygwin|darwin)\z/) ? 1 : 0;
+}
+
+sub _foldc {
+    my ($s) = @_;
+    return $s unless defined $s;
+    my $t = $s;
+    $t =~ tr/A-Z/a-z/;
+    return $t;
+}
+
+# ---------------------------------------------------------------------------
+# _cmp_of($abs) -- package 16 spec sec 2.6: segments matching an 8.3 alias of
+# "blueprints" or "packages" read as their long name; then ASCII-folded when
+# case-insensitive.
+# ---------------------------------------------------------------------------
+sub _seg_expand {
+    my ($seg) = @_;
+    return 'blueprints' if $seg =~ /\ABLUEPR~[0-9]+\z/i;
+    return 'packages'   if $seg =~ /\APACKAG~[0-9]+\z/i;
+    return $seg;
+}
+
+sub _cmp_of {
+    my ($abs) = @_;
+    my @segs = split m{/}, $abs;
+    my $cmp = join('/', map { _seg_expand($_) } @segs);
+    $cmp = _foldc($cmp) if _is_ci();
+    return $cmp;
+}
+
+# ---------------------------------------------------------------------------
+# _has_8dot3_basename($raw_base) -- the raw basename matches the 8.3 alias
+# of blueprint.md, on every host (independent of $CASE_INSENSITIVE).
+# ---------------------------------------------------------------------------
+sub _has_8dot3_basename {
+    my ($raw_base) = @_;
+    return 0 unless defined $raw_base;
+    return ($raw_base =~ /\ABLUEPR~[0-9]+\.MD\z/i) ? 1 : 0;
+}
 
 # ---------------------------------------------------------------------------
 # _deny_ledger($tool, $path_disp, $l2) -> 2.
@@ -90,18 +140,38 @@ sub run {
     return 0 unless defined $abs && length $abs;
     my $path_disp = BpHook::Guards::Common::path_echo($abs);
 
-    # Rule 1: a direct write to blueprint.md itself, except the template
-    # bp-blueprint.pl init reads from.
-    if ($abs =~ m{/blueprint\.md$} && $abs !~ m{/plugins/.*/templates/blueprint\.md$}) {
-        return BpHook::deny(
-            BpHook::Guards::Common::fit("BLUEPRINT-GUARD: BLOCKED -- direct $tool refused: $path_disp"),
-            BpHook::Guards::Common::fit($BLUEPRINT_L2),
-        );
+    # Decision 69 A2 (package 16 spec sec 2.6): $cmp reads an 8.3 alias
+    # directory segment as its long name, then folds ASCII case when this
+    # host (or the test) is case-insensitive.
+    my $cmp = _cmp_of($abs);
+    my ($raw_base) = $abs =~ m{([^/]+)\z};
+    my ($cmp_base)  = $cmp =~ m{([^/]+)\z};
+
+    # Rule 1: a direct write to blueprint.md itself (by its long name, a
+    # case variant of it, or its 8.3 alias basename), except the template
+    # bp-blueprint.pl init reads from (tested on $cmp).
+    my $is_8dot3_basename = _has_8dot3_basename($raw_base);
+    my $hits_blueprint_name = (defined $cmp_base && $cmp_base eq 'blueprint.md') ? 1 : 0;
+    if ($is_8dot3_basename || $hits_blueprint_name) {
+        my $templated = ($cmp =~ m{/plugins/[^/]+/templates/blueprint\.md\z}) ? 1 : 0;
+        unless ($templated) {
+            if ($is_8dot3_basename) {
+                return BpHook::deny(BpHook::Guards::Common::fit(sprintf(
+                    'BLOCKED: %s uses a Windows short (8.3) name; write it by its long name.', $path_disp)));
+            }
+            return BpHook::deny(
+                BpHook::Guards::Common::fit("BLUEPRINT-GUARD: BLOCKED -- direct $tool refused: $path_disp"),
+                BpHook::Guards::Common::fit($BLUEPRINT_L2),
+            );
+        }
+        return 0;
     }
 
     # Rule 2: a package ledger path -- the evidence-gated override check.
-    my $norm = lc($abs);
-    $norm =~ s/::\$data\z//;
+    # Today's regex, applied to $cmp instead of lc($abs) (package 16 spec
+    # sec 2.6).
+    my $norm = $cmp;
+    $norm =~ s/::\$data\z//i;
     $norm =~ s/[.\s]+\z//;
     if ($norm =~ m{/blueprints/.*/packages/.*\.md\z}) {
         my $root = $ENV{CLAUDE_PROJECT_DIR};

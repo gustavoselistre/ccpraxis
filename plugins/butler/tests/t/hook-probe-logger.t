@@ -356,7 +356,7 @@ sub dir_listing {
 #
 # CHOICE OF MECHANISM: fork(), not `system 1, ...`. fork() is already
 # exercised successfully on this exact host elsewhere in this suite
-# (hook-payload-read-bound.t's FIFO-writer case; hook-path-walk-and-scope.t
+# (the retired hook-payload-read-bound coverage's FIFO-writer case; the retired hook-path-walk-and-scope coverage
 # section H), so it is the proven-working primitive here.
 # ===========================================================================
 {

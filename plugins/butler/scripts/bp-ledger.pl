@@ -249,7 +249,7 @@ sub iso_now {
 
 # =====================================================================================
 # last_updated VALUE integrity (b19-ledger-timestamp-integrity) — an AUDIT-TRAIL check,
-# not a run-control one (bp-status.sh uses mtime; gate-stop.sh and the watchdog never
+# not a run-control one (bp-status.sh uses mtime; stop-gate.sh and the watchdog never
 # parse this field at all, per the spec's own retracted impact claim). ONE
 # implementation, enforced at BOTH this API (below) and the b12 hook, which `require`s
 # THIS FILE rather than reimplementing the check — two copies would drift, and the
@@ -344,7 +344,7 @@ sub last_updated_check {
 
 my @REQUIRED_KEYS = qw(package blueprint status write_set last_updated);
 # `dropped` added 2026-08-13, the THIRD home of the same defect (07d28a2 fixed
-# bp-blueprint.pl, 8cc98d8 fixed ledger-guard.sh and gate-stop.sh). This is the
+# bp-blueprint.pl, 8cc98d8 fixed ledger-guard.sh and stop-gate.sh). This is the
 # sanctioned WRITER of package ledgers, so without it a coordinator that
 # legitimately dropped its package could not record that through the typed API
 # at all -- while bp-drive-next.pl and bp-orchestrator.pl both read the field and
@@ -1482,7 +1482,7 @@ sub op_set_next_action {
     if ($first eq '' || $first =~ /^#/) {
         arg_error('set-next-action',
             "the first line of --body must be non-blank and must not begin with '#': bp-status.sh renders the "
-          . "first non-blank line as the human-facing summary while gate-stop.sh additionally skips '#'-leading "
+          . "first non-blank line as the human-facing summary while stop-gate.sh additionally skips '#'-leading "
           . "lines, so the two readers would disagree about what the next action is");
     }
     if (grep { /^\s*-\s*\[[xX]\]/ } @lines) {
@@ -1497,7 +1497,7 @@ sub op_set_next_action {
 # `widen-write-set` -- ADD paths to a package ledger's write_set, and only when a
 # blueprint Decision names each one. This is how a Decision 29 re-scope reaches the
 # contract the write-guards enforce. Before this verb, a recorded re-scope had no typed
-# path into the ledger: guard-ledger-create.sh rightly refuses a hand edit, and
+# path into the ledger: guard-blueprint-write.sh rightly refuses a hand edit, and
 # bp-answer-decision.pl's --widen-write-set is reachable only through the fleet's
 # decision queue, whose direct --package actions all change the package's status.
 #
@@ -1525,6 +1525,124 @@ sub _decision_text {
     my ($B, $id) = @_;
     for my $line (split /\n/, $B) {
         return $1 if $line =~ /^\|\s*\Q$id\E\s*\|(.*)\|\s*[^|]*\|\s*[^|]*\|\s*$/;
+    }
+    return undef;
+}
+
+# =====================================================================================
+# F5 (red-team M1 + L5, package 16 fix-batch): a widening must not make this
+# package's write set overlap another IN-FLIGHT package's write set
+# (.drive-solo/inflight.json) -- with the switch gone, two or more packages
+# are routinely in flight together, and nothing else re-checks this once a
+# widening happens after hand-out. The overlap test folds ASCII case on a
+# case-insensitive host, same rule BpHook::WriteGuards/BindDispatch use
+# (auto-detect from $^O; no override needed here since bp-ledger.pl is a
+# standalone CLI, never require'd alongside those modules).
+# =====================================================================================
+
+sub _widen_ws_is_ci {
+    return ($^O =~ /\A(?:msys|MSWin32|cygwin|darwin)\z/) ? 1 : 0;
+}
+
+sub _widen_ws_fold {
+    my ($s) = @_;
+    return $s unless _widen_ws_is_ci();
+    (my $v = $s) =~ tr/A-Z/a-z/;
+    return $v;
+}
+
+# _widen_ws_prefixes(\@paths) -- same shape as bp-drive-next.pl's own
+# BpDrive::_ws_prefixes: cut at the first glob, drop a trailing slash.
+sub _widen_ws_prefixes {
+    my ($paths) = @_;
+    my @out;
+    for my $p (@$paths) {
+        next unless defined $p && length $p;
+        (my $q = $p) =~ s{\*.*$}{};
+        $q =~ s{/+$}{};
+        push @out, $q;
+    }
+    return @out;
+}
+
+sub _widen_prefix_related {
+    my ($a, $b) = @_;
+    $a = _widen_ws_fold($a);
+    $b = _widen_ws_fold($b);
+    return 1 if $a eq $b;
+    return 1 if $a eq '' || $b eq '';       # empty prefix matches anything (Landmine #4)
+    return 1 if index("$b/", "$a/") == 0;   # a is ancestor dir of b
+    return 1 if index("$a/", "$b/") == 0;   # b is ancestor dir of a
+    return 0;
+}
+
+# _widen_check_inflight_conflict($ledger, \@new_paths) -> "$bp/$pkg" | undef.
+# Reads .drive-solo/inflight.json alongside $ledger's own data dir (4 levels
+# up: packages/ -> <bp>/ -> blueprints/ -> data). Any failure to resolve or
+# read is treated as "no conflict" (fail open -- this is an additive safety
+# check, not the widen op's own I/O path).
+sub _widen_check_inflight_conflict {
+    my ($ledger, $new_paths) = @_;
+
+    my $pkg_dir        = op_create_dirname($ledger);
+    my $bp_dir         = op_create_dirname($pkg_dir);
+    my $blueprints_dir = op_create_dirname($bp_dir);
+    my $data_dir       = op_create_dirname($blueprints_dir);
+    return undef unless length $data_dir;
+
+    my $inflight_path = "$data_dir/.drive-solo/inflight.json";
+    return undef unless -f $inflight_path;
+
+    my $raw = do {
+        open(my $fh, '<:raw', $inflight_path) or return undef;
+        local $/;
+        my $c = <$fh>;
+        close $fh;
+        $c;
+    };
+    return undef unless defined $raw && length $raw;
+    my $data = eval { JSON::PP->new->utf8->decode($raw) };
+    return undef unless ref $data eq 'HASH' && ref $data->{packages} eq 'ARRAY';
+
+    (my $own_bp  = $bp_dir) =~ s{.*[\\/]}{};
+    (my $own_pkg = $ledger) =~ s{.*[\\/]}{};
+    $own_pkg =~ s{\.md\z}{};
+
+    my @new_prefixes = _widen_ws_prefixes($new_paths);
+
+    for my $e (@{ $data->{packages} }) {
+        next unless ref $e eq 'HASH';
+        my $obp  = $e->{blueprint};
+        my $opkg = $e->{package};
+        next unless defined $obp && !ref($obp) && defined $opkg && !ref($opkg);
+        next if $obp eq $own_bp && $opkg eq $own_pkg; # never conflict with self
+
+        my $oledger = $e->{ledger};
+        next unless defined $oledger && !ref($oledger) && length $oledger;
+        (my $oledger_fs = $oledger) =~ tr{\\}{/};
+        unless ($oledger_fs =~ m{\A(?:/|[A-Za-z]:/)}) {
+            $oledger_fs = "$data_dir/$oledger_fs";
+        }
+        next unless -f $oledger_fs;
+
+        my $ocontent = do {
+            open(my $ofh, '<:raw', $oledger_fs) or next;
+            local $/;
+            my $c = <$ofh>;
+            close $ofh;
+            $c;
+        };
+        next unless defined $ocontent;
+        my $ows = extract_frontmatter_value($ocontent, 'write_set');
+        next unless defined $ows && length $ows;
+        my @oset = grep { length } split /:/, $ows;
+        my @other_prefixes = _widen_ws_prefixes(\@oset);
+
+        for my $np (@new_prefixes) {
+            for my $op (@other_prefixes) {
+                return "$obp/$opkg" if _widen_prefix_related($np, $op);
+            }
+        }
     }
     return undef;
 }
@@ -1558,6 +1676,12 @@ sub op_widen_write_set {
         arg_error('widen-write-set', "Decision $opt{decision} does not name '$p' (verbatim) -- record the "
             . 're-scope in blueprint.md first (bp-blueprint.pl add-decision)')
             unless index($dtext, $p) >= 0;
+    }
+
+    my $conflict = _widen_check_inflight_conflict($opt{ledger}, $opt{path});
+    if (defined $conflict) {
+        arg_error('widen-write-set',
+            "would overlap in-flight package ${conflict}'s write set; refusing (nothing written)");
     }
 
     my $entry = '- ' . iso_now() . " ${EMDASH} write_set widened per Decision $opt{decision}: "
@@ -2306,7 +2430,7 @@ sub op_validate {
 #
 # That is worse than a normal refusal. The rejection covers `set-status`, which
 # is the only sanctioned way a coordinator reaches a terminal state, so such a
-# package cannot be finished, blocked OR parked -- and `gate-stop.sh` will not
+# package cannot be finished, blocked OR parked -- and `stop-gate.sh` will not
 # let the session end until it is. The prescribed remedy was an edit to the very
 # frontmatter the protocol tells coordinators never to hand-edit: the escape
 # hatch was also the thing the doctrine forbids. Measured blast radius: all five

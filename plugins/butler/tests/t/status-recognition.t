@@ -14,7 +14,7 @@
 #
 # The script calls `require_cmd jq` before anything else runs, so every fixture-based case
 # (T1-T18) sits inside one SKIP block gated on `command -v jq`, mirroring the idiom in
-# t/repeat-guard.t:33,388-390 and t/graceful-stop-gate.t:22,223-224. T19/T20 (live regression against
+# the retired repeat-guard coverage:33,388-390 and the retired graceful-stop-gate coverage:22,223-224. T19/T20 (live regression against
 # this repo's real .ccpraxis-local-data) are nested inside a second SKIP gated on the real
 # sandbox-butler-overhaul blueprint directory being present, so this file degrades gracefully
 # when run outside this repo/environment.
@@ -46,8 +46,8 @@ plan tests => $PLANNED;
 
 sub fwd { (my $p = shift) =~ s{\\}{/}g; return $p; }
 
-# A CLI test must control the script's environment completely -- t/graceful-stop-gate.t:61-69 /
-# t/repeat-guard.t:54-58 idiom. Strip ambient BP_* (coordinators/judges export it) and any
+# A CLI test must control the script's environment completely -- the retired graceful-stop-gate coverage:61-69 /
+# the retired repeat-guard coverage:54-58 idiom. Strip ambient BP_* (coordinators/judges export it) and any
 # ambient CCPRAXIS_DATA_DIR so every case starts from a clean, explicit environment.
 my %CLEAN_ENV = map { ($_ => $ENV{$_}) } grep { !/^BP_/ && $_ ne 'CCPRAXIS_DATA_DIR' } keys %ENV;
 

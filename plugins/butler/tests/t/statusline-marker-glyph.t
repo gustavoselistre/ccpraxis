@@ -14,7 +14,7 @@
 # statusline-badge.t's own conventions for spawning this exact file -- only
 # what this file's assertions need is copied, not the whole file.
 #
-# NEVER touches real state: HOME and CCPRAXIS_CONTINUITY_ACTIVE_DIR are always
+# NEVER touches real state: HOME and BUTLER_STATE_DIR are always
 # File::Temp tempdirs; PATH is overridden to a shim dir so no real `git`/
 # `tput` on this machine is ever consulted; CCPRAXIS_SANDBOX is scoped with
 # `local %ENV` per run and never touches the operator's actual environment.
@@ -92,7 +92,10 @@ sub payload_for {
 }
 
 # run_statusline(\%payload, %opt) -> ($stdout_bytes, $rc)
-# opt: cdir (CCPRAXIS_CONTINUITY_ACTIVE_DIR), home, sandbox (0|1)
+# opt: cdir (batch C, spec 16-cutover C-8: BUTLER_STATE_DIR -- the arg name is
+# kept as "cdir" for minimal diff against every call site below, but it now
+# sets BUTLER_STATE_DIR rather than the retired CCPRAXIS_CONTINUITY_ACTIVE_DIR),
+# home, sandbox (0|1)
 sub run_statusline {
     my ($payload, %opt) = @_;
     my ($infh, $inpath) = tempfile(DIR => $TMPROOT);
@@ -103,8 +106,8 @@ sub run_statusline {
     local %ENV = %ENV;
     $ENV{PATH} = "$SHIM_DIR:$ENV{PATH}";
     $ENV{HOME} = $opt{home} // tempdir(CLEANUP => 1);
-    if (defined $opt{cdir}) { $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR} = $opt{cdir} }
-    else                    { delete $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR} }
+    if (defined $opt{cdir}) { $ENV{BUTLER_STATE_DIR} = $opt{cdir} }
+    else                    { delete $ENV{BUTLER_STATE_DIR} }
     if ($opt{sandbox}) { $ENV{CCPRAXIS_SANDBOX} = '1' } else { delete $ENV{CCPRAXIS_SANDBOX} }
 
     my $out = `timeout 20 perl "$STATUSLINE" < "$inpath" 2>/dev/null`;
@@ -112,11 +115,15 @@ sub run_statusline {
     return (defined($out) ? $out : '', $rc);
 }
 
+# plant_marker($butler_state_dir, $sid) -- creates
+# <butler_state_dir>/continuity/armed/<sid>, exactly where statusline.pl's
+# _state_dir() resolves BUTLER_STATE_DIR to (batch C, spec 16-cutover C-8).
 sub plant_marker {
     my ($cdir, $sid) = @_;
-    mkdir $cdir unless -d $cdir;
-    open my $fh, '>', "$cdir/$sid" or die "plant $cdir/$sid: $!";
-    print {$fh} "agent 2026-01-01T00:00:00Z\n";
+    my $dir = "$cdir/continuity/armed";
+    require File::Path;
+    File::Path::make_path($dir) unless -d $dir;
+    open my $fh, '>', "$dir/$sid" or die "plant $dir/$sid: $!";
     close $fh;
 }
 
@@ -436,7 +443,7 @@ for my $sb (0, 1) {
 # ===========================================================================
 # AC14/AC15 REMOVED 2026-08-26 -- duplicate EXECUTION, not extra coverage.
 #
-# They ran continuity-statusline-badge.t and continuity-gate.t as full
+# They ran continuity-statusline-badge.t and the (now also retired) continuity-gate coverage as full
 # subprocesses, as "non-regression tripwires: 151 and 150 must both stay green".
 # But the suite runs 151 and 150. Asserting it here does not add a check; it
 # adds a second execution of the same one, and it cost 22 seconds every time
@@ -468,7 +475,7 @@ for my $sb (0, 1) {
     $ENV{PATH} = "$SHIM_DIR:$ENV{PATH}";
     delete $ENV{HOME};
     delete $ENV{USERPROFILE};
-    delete $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR};
+    delete $ENV{BUTLER_STATE_DIR};
     delete $ENV{CCPRAXIS_SANDBOX};
     my $out = `timeout 20 perl "$STATUSLINE" < "$inpath" 2>/dev/null`;
     my $rc  = $? >> 8;

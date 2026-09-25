@@ -36,9 +36,15 @@ HOOKS="$PLUGIN_ROOT/hooks"
 # selftest_cache_key — a stable key over the hook scripts + the claude version,
 # so a changed hook or a claude upgrade invalidates a cached PASS.
 selftest_cache_key() {
-  local ver h
+  local ver h scripts
   ver=$(claude --version 2>/dev/null | head -n1 | tr -dc '0-9.')
-  h=$(cat "$HOOKS/guard-writes.sh" "$HOOKS/gate-shutdown.sh" "$HOOKS/track-dispatch.sh" "$HOOKS/lib.sh" 2>/dev/null \
+  scripts="$PLUGIN_ROOT/scripts"
+  # m3 (fix-batch F9, package 16-cutover): the wrapper files alone do not
+  # cover the containment logic any more -- it lives in BpHook.pm and
+  # BpHook/**/*.pm. A changed guard module must invalidate a cached PASS
+  # the same way a changed wrapper does.
+  h=$(cat "$HOOKS/guard-writes.sh" "$HOOKS/gate-shutdown.sh" "$HOOKS/track-dispatch.sh" "$HOOKS/run-hook.sh" \
+          "$scripts/BpHook.pm" "$scripts"/BpHook/*.pm "$scripts"/BpHook/Guards/*.pm 2>/dev/null \
         | sha256sum | awk '{print $1}')
   printf 'claude=%s hooks=%s\n' "${ver:-unknown}" "${h:-unknown}"
 }

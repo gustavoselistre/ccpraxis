@@ -20,6 +20,7 @@
 
 use strict;
 use warnings;
+BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 } # package 16 post-fix-batch (Decision 80): this file names a wake-lock actuator, in prose or a path check, never a real invocation -- the guard is the cheap side of test-wakelock-hygiene.t's deliberate over-matching.
 use Test::More;
 use FindBin qw($Bin);
 use File::Temp qw(tempdir);
@@ -57,7 +58,7 @@ my $G_DROPPED = "\xF0\x9F\x97\x91";
 # all, so it needs no vocabulary to validate against). That deletion is
 # CORRECT and not a regression of the defect this file exists to pin --
 # `dropped` remains a valid LEDGER status with live guards (A6-A8, UNTOUCHED
-# below: bp-drive-next.pl, bp-orchestrator.pl, ledger-guard.sh, gate-stop.sh,
+# below: bp-drive-next.pl, bp-orchestrator.pl, ledger-guard.sh, stop-gate.sh,
 # bp-ledger.pl); it simply stops being a TABLE concept.
 #
 # This block replaces A1-A5 with the deletion verification the spec asks
@@ -151,23 +152,30 @@ for my $s (qw(bp-drive-next.pl bp-orchestrator.pl)) {
 # the blueprint.md summary table has no use for. These are two vocabularies on
 # purpose; asserting them separately is the point, not an oversight.
 # ---------------------------------------------------------------------------
-my $lg = slurp_raw("$PROJ/plugins/butler/hooks/ledger-guard.sh");
-ok(defined $lg, 'A7: ledger-guard.sh is readable');
+# Retargeted per package 16's batch B (Decision 34): ledger-guard.sh and
+# stop-gate.sh are both now thin run-hook.sh dispatchers (package 13/06's
+# guards-remake); the @STATUSES vocabulary and the terminal-status test live
+# in the Perl modules behind them, BpHook/WriteGuards.pm and
+# BpHook/StopGate.pm. that hook itself was renamed stop-gate.sh in the
+# same flatten.
+my $lg = slurp_raw("$BUTLER/scripts/BpHook/WriteGuards.pm");
+ok(defined $lg, 'A7: BpHook/WriteGuards.pm is readable');
 like($lg, qr/\@STATUSES\s*=\s*qw\([^)]*\bdropped\b[^)]*\)/,
-    'A7: ledger-guard.sh accepts `dropped` as a ledger frontmatter status');
+    'A7: BpHook/WriteGuards.pm accepts `dropped` as a ledger frontmatter status');
 like($lg, qr/\@STATUSES\s*=\s*qw\([^)]*\bconverging\b[^)]*\)/,
-    'A7: ledger-guard.sh still accepts `converging` (ledger-only, by design)');
+    'A7: BpHook/WriteGuards.pm still accepts `converging` (ledger-only, by design)');
 
-my $gs = slurp_raw("$PROJ/plugins/butler/hooks/gate-stop.sh");
-ok(defined $gs, 'A7: gate-stop.sh is readable');
+ok(-f "$PROJ/plugins/butler/hooks/stop-gate.sh", 'A7: stop-gate.sh (a prior-name rename) exists');
+my $gs = slurp_raw("$BUTLER/scripts/BpHook/StopGate.pm");
+ok(defined $gs, 'A7: BpHook/StopGate.pm is readable');
 
-# Both terminal-status case arms must list dropped. Counting them separately
-# matters: the first pass of this very fix corrected one site of three.
-my @gs_terminal = $gs =~ /^\s*(?:parked\|done\|blocked|done\|blocked\|parked)\|dropped\)/mg;
-cmp_ok(scalar @gs_terminal, '>=', 2,
-    'A7: BOTH of gate-stop.sh terminal-status arms list `dropped`');
-unlike($gs, qr/^\s*done\|blocked\|parked\)\s*:/m,
-    'A7: no gate-stop.sh terminal arm omits `dropped`');
+# The pre-cutover version of this hook had two separate case arms testing terminal
+# status; BpHook/StopGate.pm unifies that into one regex (DEL: the "two
+# arms" shape is retired along with the monolithic script, Decision 34).
+like($gs, qr/\bdone\|blocked\|parked\|dropped\b/,
+    'A7: BpHook/StopGate.pm\'s terminal-status regex lists `dropped`');
+unlike($gs, qr/\bdone\|blocked\|parked\)\s*\)\s*\?\s*1\s*:\s*0/,
+    'A7: no terminal-status regex in BpHook/StopGate.pm omits `dropped`');
 
 # ---------------------------------------------------------------------------
 # A8 -- bp-ledger.pl, the sanctioned WRITER of package ledgers.

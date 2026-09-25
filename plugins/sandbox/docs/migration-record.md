@@ -197,7 +197,7 @@ a remote-tracking ref.
 **GATE — expected literally:**
 - `git -C "$NEW" branch -a` lists `remotes/origin/ccpraxis-sandbox-workcopy`;
 - `git -C "$NEW" log --oneline -1` shows the Phase A commit;
-- a known fleet-changed file is present: `grep -c CLEAN_ENV "$NEW/plugins/butler/tests/t/graceful-stop-gate.t"` → **4**;
+- a known fleet-changed file is present: `grep -c CLEAN_ENV` against the graceful-stop-gate test file (since retired by package 16) → **4**;
 - p01 landed: `test -f "$NEW/plugins/sandbox/tests/t/refuse-in-place.t"` succeeds **and**
   `test -e "$NEW/plugins/sandbox/scripts/ccpraxis-mergeback.pl"` **fails** (it must be gone).
 

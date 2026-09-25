@@ -6,6 +6,7 @@
 # Script does NOT exist yet → tests must FAIL because functions/script are undefined.
 use strict;
 use warnings;
+BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 } # package 16 post-fix-batch (Decision 80): this file names a wake-lock actuator, in prose or a path check, never a real invocation -- the guard is the cheap side of test-wakelock-hygiene.t's deliberate over-matching.
 use FindBin qw($Bin);
 use Test::More;
 use JSON::PP;
@@ -901,8 +902,8 @@ sub capture_run {
 # The `next` walk iterates the RECORDED ORDER, so an in-scope blueprint absent
 # from it is never looked at -- and the walk fell through to {"action":"done"},
 # which asserts "every in-scope blueprint is done-or-parked". Two mechanisms
-# believe that assertion and both stop the run on it: gate-drive-loop.sh lets
-# the turn end, and bp-watchdog.pl short-circuits to SETTLED.
+# believe that assertion and both stop the run on it: stop-gate.sh lets
+# the turn end, and the watchdog logic short-circuits to SETTLED.
 #
 # Observed 2026-08-12: `next --scope butler-and-dashboard-overhaul` returned
 # done on a 22-package blueprint with every package pending, because order.json

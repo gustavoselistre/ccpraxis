@@ -6,7 +6,7 @@
 # successor (ContextCeiling), which absorbs context-ceiling-flush and
 # context-ceiling-guidance, running on the package-03 hook core.
 #
-# hooks/next/guards/context-ceiling.sh and BpHook/Guards/ContextCeiling.pm
+# hooks/context-ceiling.sh and BpHook/Guards/ContextCeiling.pm
 # DO NOT EXIST YET. Every in-process case goes through
 # GuardHarness::run_module() (batch 1's harness), which mirrors
 # BpHook::main()'s own require-and-call contract, so a missing module fails
@@ -19,13 +19,13 @@
 # (sec 3.8 for ContextCeiling's own contract, sec 2.2/2.6 for the shared
 # module/message conventions) and the BEHAVIOURAL CASES (never the source
 # bash) of the two source files this batch's oracle absorbs -- never from
-# reading context-ceiling-flush.sh, context-ceiling-guidance.sh, or
+# reading context-ceiling.sh, context-ceiling.sh, or
 # bp-orchestrator.pl/bp-dispatch-log.pl's own implementations (only their
 # already-pinned PUBLIC contracts named in spec sec 3.8/2.2, exercised here
 # purely as observed hook behaviour, exactly as an old-hook test observed
 # them as subprocess behaviour).
 #
-# A DELIBERATE READING, mined verbatim from context-ceiling-flush.t's own
+# A DELIBERATE READING, mined verbatim from the retired context-ceiling-flush coverage's own
 # expectation helper: the overrun-log line's "<pkg>" and this rule's own
 # "runs/<pkg>.ctx-flush-overrun.log" phrase in the flush-turn-past-cap
 # message are LITERAL text, not a substituted package name (today's hook
@@ -36,27 +36,27 @@
 # NOT RE-EXPRESSED (per spec sec 4.11 "Not:" list and sec 4.2's codes):
 #   old file / assertion label                                        | code
 #   ------------------------------------------------------------------ | ----
-#   context-ceiling-flush.t AC25's no-perl and no-JSON-parser cases    | JQ (the new module never shells out
+#   the retired context-ceiling-flush coverage AC25's no-perl and no-JSON-parser cases    | JQ (the new module never shells out
 #                                                                       |   to jq or perl at all -- it is a
 #                                                                       |   pure in-process require, so there
 #                                                                       |   is no "no interpreter on PATH"
 #                                                                       |   degrade left to re-express; CC-5
 #                                                                       |   re-expresses the surviving case,
 #                                                                       |   "measurement unavailable -> allow")
-#   context-ceiling-flush.t AC27, context-ceiling-guidance.t AC27      | SRC (bash -n / perl -c against the
+#   the retired context-ceiling-flush coverage AC27, the retired context-ceiling-guidance coverage AC27      | SRC (bash -n / perl -c against the
 #     (source-syntax checks against the OLD bash files)                |   OLD files; this file's own
 #                                                                       |   SH-1/SH-2 re-express the shape
 #                                                                       |   check against the NEW successor)
-#   context-ceiling-guidance.t AC14 (the outstanding-summary sentence)  | MSG (Decision carried in this
+#   the retired context-ceiling-guidance coverage AC14 (the outstanding-summary sentence)  | MSG (Decision carried in this
 #                                                                       |   package: guidance now tells the
 #                                                                       |   agent to RUN bp-dispatch-log.pl
 #                                                                       |   outstanding itself, rather than
 #                                                                       |   running it and quoting a summary
 #                                                                       |   sentence -- there is no successor
 #                                                                       |   summary text to re-express)
-#   context-ceiling-guidance.t AC15 (source-text grep for the           | SRC
+#   the retired context-ceiling-guidance coverage AC15 (source-text grep for the           | SRC
 #     --blueprint/--package scoping of the retired outstanding call)   |
-#   context-ceiling-guidance.t AC30, and context-ceiling-flush.t's      | REG (hooks.json registration,
+#   the retired context-ceiling-guidance coverage AC30, and the retired context-ceiling-flush coverage's      | REG (hooks.json registration,
 #     hooks.json-registration subtest                                  |   package 16's concern)
 #   context-growth-checkpoint.t (whole file)                           | OTHER (BpOrch::context_tokens_from_usage
 #                                                                       |   / context_growth_ceiling_breached
@@ -91,7 +91,7 @@ use GuardHarness;
 # atom is "coordinator" alone (BP_LEDGER non-empty and BP_ROLE empty/
 # coordinator), never a per-session armed-file lookup.
 # ---------------------------------------------------------------------------
-delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
 $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
 GuardHarness::isolate_env();
 
@@ -238,7 +238,7 @@ my $HARD = 350_000;
 # SH-1/SH-2 -- static shape.
 # =====================================================================================
 {
-    my $wrapper = "$BUTLER_DIR/hooks/next/guards/context-ceiling.sh";
+    my $wrapper = "$BUTLER_DIR/hooks/context-ceiling.sh";
     my $module  = "$BUTLER_DIR/scripts/BpHook/Guards/ContextCeiling.pm";
     ok(-f $wrapper, 'SH-1 precondition: context-ceiling.sh exists on disk')
         or diag("missing: $wrapper (package 14 has not written it yet)");
@@ -644,7 +644,7 @@ for my $tokens (10_000, 300_000) {
 # =====================================================================================
 {
     GuardHarness::fresh_state();
-    my $stopgate = "$BUTLER_DIR/hooks/next/stop-gate.sh";
+    my $stopgate = "$BUTLER_DIR/hooks/stop-gate.sh";
     ok(-f $stopgate, 'self-check precondition: stop-gate.sh (package 06) exists on disk');
 
     my $res_shim = GuardHarness::run_shim($stopgate,

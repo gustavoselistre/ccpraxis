@@ -43,15 +43,12 @@ use POSIX qw(WIFEXITED WEXITSTATUS);
 (my $SCRIPTS = "$Bin/../../scripts") =~ s{\\}{/}g;
 (my $SKILLS  = "$Bin/../../skills")  =~ s{\\}{/}g;
 my $TRACK       = "$HOOKS/track-dispatch.sh";
-my $LIB         = "$HOOKS/lib.sh";
 my $DISPATCHLOG = "$SCRIPTS/bp-dispatch-log.pl";
-my $HOOKS_JSON  = "$HOOKS/hooks.json";
 my $SKILL_MD    = "$SKILLS/coordinator-protocol/SKILL.md";
 
 my $J = JSON::PP->new->canonical;
 
 plan skip_all => 'track-dispatch.sh not found'  unless -f $TRACK;
-plan skip_all => 'lib.sh not found'             unless -f $LIB;
 plan skip_all => 'bp-dispatch-log.pl not found' unless -f $DISPATCHLOG;
 
 my $have_bash = do {
@@ -970,46 +967,20 @@ subtest 'AC27: existing verbs unchanged end to end (B16)' => sub {
 };
 
 # ===========================================================================
-# AC28 (B18) -- hooks.json registration.
+# AC28 (B18) -- DEL (package 16 batch B/E2, code REG): this subtest's premise
+# was a hooks.json with the old separate log-dispatch hook and track-dispatch.sh in TWO separate
+# PostToolUse:Task blocks. Package 14's guards-remake merged log-dispatch,
+# track-worker-solo and untrack-worker-solo into ONE TrackDispatch guard
+# (hooks/track-dispatch.sh); package 16 batch B then flattened hooks.json to
+# exactly one PostToolUse:Task block naming that single successor. There is
+# no separate old-hook block left to stay separate from, so this
+# subtest's own "NOT_MATCH" / two-block assertions no longer describe
+# anything -- the registration itself (one PreToolUse:Task, one
+# PostToolUse:Task, one SubagentStop entry, all naming track-dispatch.sh) is
+# re-expressed byte-exactly by hooks-json-route-registration.t's @EXPECT
+# table and h01-settings-registration.t's B3d, both package 16's own concern
+# per guards-remake-track-dispatch.t's NOT-RE-EXPRESSED table (code REG).
 # ===========================================================================
-subtest 'AC28: hooks.json registers track-dispatch.sh on PreToolUse and a NEW PostToolUse Task block (B18, amended post-review MF-2)' => sub {
-    my $raw = read_file($HOOKS_JSON);
-    ok(defined $raw, 'hooks.json is readable');
-    my $j = eval { JSON::PP->new->decode($raw) };
-    ok(ref $j eq 'HASH', 'hooks.json parses as JSON') or diag($@);
-    SKIP: {
-        skip 'hooks.json did not parse', 6 unless ref $j eq 'HASH';
-        my @pre_task = grep { ($_->{matcher} // '') eq 'Task' } @{ $j->{hooks}{PreToolUse} || [] };
-        my $pre_has_track = grep { my $b = $_; grep { ($_->{command} // '') =~ /track-dispatch\.sh/ } @{ $b->{hooks} || [] } } @pre_task;
-        ok($pre_has_track, 'track-dispatch.sh present in a PreToolUse Task block');
-
-        # track-dispatch.sh must be in its OWN, separate PostToolUse:Task
-        # block -- never appended into the existing one that holds
-        # log-dispatch.sh, whose exact command list is pinned by three other
-        # test files (repeat-guard.t AC-20, ledger-guard.t AC-36,
-        # wait-shape-guard.t AC-34; 2026-08-14 driver adjudication).
-        my @post_task = grep { ($_->{matcher} // '') eq 'Task' } @{ $j->{hooks}{PostToolUse} || [] };
-        my ($log_block_idx, $track_block_idx);
-        for my $i (0 .. $#post_task) {
-            my @cmds = map { $_->{command} // '' } @{ $post_task[$i]{hooks} || [] };
-            $log_block_idx   = $i if !defined($log_block_idx)   && grep { /log-dispatch\.sh/ } @cmds;
-            $track_block_idx = $i if !defined($track_block_idx) && grep { /track-dispatch\.sh/ } @cmds;
-        }
-        ok(defined $track_block_idx, 'track-dispatch.sh present in a PostToolUse Task block');
-        ok(defined $log_block_idx && defined $track_block_idx && $log_block_idx != $track_block_idx,
-            'track-dispatch.sh is in a SEPARATE block from log-dispatch.sh, not appended to it');
-        if (defined $log_block_idx) {
-            my @log_cmds = map { $_->{command} // '' } @{ $post_task[$log_block_idx]{hooks} || [] };
-            is(scalar(@log_cmds), 1, 'the existing log-dispatch.sh block still holds exactly one command');
-            like($log_cmds[0], qr/log-dispatch\.sh/, '...and it is log-dispatch.sh');
-            unlike($log_cmds[0], qr/track-dispatch\.sh/, '...not track-dispatch.sh appended onto it');
-        } else {
-            fail('the existing log-dispatch.sh block still holds exactly one command');
-            fail('...and it is log-dispatch.sh');
-            fail('no PostToolUse Task block contains log-dispatch.sh at all');
-        }
-    }
-};
 
 # ===========================================================================
 # AC29 -- coordinator-protocol/SKILL.md documents the signal.

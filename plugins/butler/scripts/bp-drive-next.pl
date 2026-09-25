@@ -55,19 +55,14 @@
 #   order.json      {"order":[…],"recorded_at":<epoch>}
 #   parks.json      [{"blueprint":…,"reason":…,"at":<epoch>}, …]
 #   announced.json  {"announced":[…]}   blueprints whose blueprint-done already fired
-#   current.json    {"blueprint":…,"package":…,"recorded_at":<epoch>}   the CURRENT
-#                   package pointer (07-guards-reach-the-driver): written on
-#                   run-package, removed on done/stop, left alone otherwise
-#                   (including in-flight). This is what lib.sh's
-#                   bp_driver_context reads to let guard-writes.sh/ledger-guard.sh
-#                   reach a driver session; the write is never fatal.
 #   inflight.json   {"packages":[{"blueprint":…,"package":…,"ledger":…,"since":<epoch>}],
 #                   "updated_at":<epoch>}   the project-level in-flight set
 #                   (package 11): a package is added on run-package, removed
-#                   once its ledger turns terminal. BUTLER_CONCURRENCY=1
-#                   enables concurrent hand-out (a further ready package
-#                   whose write set is disjoint from every in-flight one);
-#                   off, this file still records one entry, exactly as today.
+#                   once its ledger turns terminal. Batch C (spec 16-cutover):
+#                   concurrent hand-out (a further ready package whose write
+#                   set is disjoint from every in-flight one) is unconditional
+#                   now; current.json and the old concurrency-switch env var
+#                   no longer exist.
 #   inflight.lock   exclusive-lock file guarding one `next` call's read+prune
 #                   +write of inflight.json (never deleted; contents unused).
 #   keepawake.pid   PID of the wake-lock process (host only; sandbox = no file)
@@ -128,13 +123,6 @@ require "$DIR/bp-keepawake.pl";    # the shared wake-lock (also used by the flee
 # --- terminal status: done|dropped|blocked|parked
 # Mirrored from BpOrch::_is_terminal (bp-orchestrator.pl line 66).
 sub _is_terminal { my $s = shift // ''; $s =~ /^(done|dropped|blocked|parked)$/ ? 1 : 0 }
-
-# --- Decision 19 switch (package 11, spec §2.1). Read once per `next` call.
-# Exactly the string "1" is on; unset, empty, "0", "true", " 1", "1\n" and
-# anything else are off. No opts override — tests set `local $ENV{...}`.
-sub concurrency_on {
-    return (defined $ENV{BUTLER_CONCURRENCY} && $ENV{BUTLER_CONCURRENCY} eq '1') ? 1 : 0;
-}
 
 # --- inflight.json entry name validity (spec §2.2): the same regex parse_dag
 # already uses for a dependency name.
@@ -391,61 +379,13 @@ sub _write_json_atomic {
     rename $tmp, $path or do { unlink $tmp; die "bp-drive-next: rename $tmp -> $path: $!"; };
 }
 
-# 07-guards-reach-the-driver §2.7: the current-package pointer,
-# <data>/.drive-solo/current.json — the ONE machine-readable record of what a
-# driver session is currently working on, which is what lib.sh's
-# bp_driver_context reads to reach guard-writes.sh / ledger-guard.sh in a
-# driver session. NEVER FATAL: a write failure here (unwritable dir,
-# current.json existing as a directory, rename failure) must never change the
-# emitted action, the exit code, or the keep-awake side effect — the director
-# must still direct even if it cannot record where it is.
-sub _write_current_pointer {
-    my ($dsdir, $bp, $pkg, $now) = @_;
-    eval {
-        make_path($dsdir) unless -d $dsdir;
-        _write_json_atomic("$dsdir/current.json",
-            { blueprint => $bp, package => $pkg, recorded_at => $now });
-    };
-    return;
-}
-
-# Removed only where the run is genuinely OVER (the `done` branch and the
-# token-refresh-failed `stop` branch) — never on `in-flight`, which would
-# switch the driver guards off for exactly the window a write-capable worker
-# is running. Best-effort: an unlink failure (already absent, etc.) is not an
-# error.
-sub _remove_current_pointer {
-    my ($dsdir) = @_;
-    eval { unlink "$dsdir/current.json" };
-    return;
-}
-
 # ===========================================================================
 # IN-FLIGHT SET (package 11, spec §2.2/2.5/2.6/2.7) — project-level, written
-# only by the director. current.json stays the per-driver pointer (unchanged
-# above); this is the NEW multi-package set behind the Decision 19 switch.
+# only by the director. Batch C (spec 16-cutover, 1.3 departure #9/#10):
+# current.json is gone. The director never creates, reads or removes it, and
+# seed_from_current is removed rather than kept as a migration path (the live
+# director already writes inflight.json before promotion).
 # ===========================================================================
-
-# seed_from_current($data, $dsdir, $now) -> () | ({blueprint,package,ledger,since})
-# Migration/recovery path (spec §2.5): if current.json parses to a hash whose
-# blueprint/package pass _valid_name and whose ledger file exists with a
-# non-terminal status, seed one entry from it. `since` is current.json's
-# recorded_at when that is a positive integer, else $now.
-sub seed_from_current {
-    my ($data, $dsdir, $now) = @_;
-    my $cur = _read_json_file("$dsdir/current.json");
-    return () unless ref $cur eq 'HASH';
-    my ($bp, $pkg) = ($cur->{blueprint}, $cur->{package});
-    return () unless _valid_name($bp) && _valid_name($pkg);
-    my $bpdir = "$data/blueprints/$bp";
-    return () unless -f "$bpdir/packages/$pkg.md";
-    my $status = ledger_fm($bpdir, $pkg, 'status') // 'pending';
-    return () if _is_terminal($status);
-    my $recorded = $cur->{recorded_at};
-    my $since = (defined $recorded && !ref $recorded && $recorded =~ /^\d+$/ && $recorded > 0)
-              ? ($recorded + 0) : $now;
-    return ({ blueprint => $bp, package => $pkg, ledger => _ledger_str($data, $bp, $pkg), since => $since });
-}
 
 # load_inflight($data, $dsdir, $now) -> (\@entries, $dirty) (spec §2.5)
 sub load_inflight {
@@ -453,9 +393,7 @@ sub load_inflight {
     my $existed = -e "$dsdir/inflight.json" ? 1 : 0;
     my $raw = _read_json_file("$dsdir/inflight.json", $dsdir);
     unless (ref $raw eq 'HASH' && ref $raw->{packages} eq 'ARRAY') {
-        my @seeded = seed_from_current($data, $dsdir, $now);
-        my $dirty  = $existed || (@seeded ? 1 : 0);
-        return (\@seeded, $dirty ? 1 : 0);
+        return ([], $existed ? 1 : 0);
     }
     my @entries;
     my %seen;
@@ -874,16 +812,15 @@ sub _cmd_next {
     # Read all state from disk
     make_path($dsdir) unless -d $dsdir;
 
-    # In-flight set (package 11, spec §2.1/2.4-2.6, amended by the fix-batch):
-    # read the switch once here, but do NOT take the lock or load the set yet.
-    # Fix-batch red-team M2: the lock must never be held across network I/O
-    # (the usage/governor verdict fetch, token recovery, the `done` branch's
-    # `system()`), so it is acquired lazily, just before the load/prune/write/
-    # hand-out sequence that actually needs it -- see the "ok or degraded"
-    # branch below, which is reached only AFTER that bp's verdict has already
-    # been fetched. $inflight_entries is populated there (and reused for the
-    # in-flight action's `inflight` key), never here.
-    my $concurrency_on   = concurrency_on();
+    # In-flight set (package 11, spec §2.1/2.4-2.6, amended by the fix-batch;
+    # batch C: concurrent hand-out is unconditional): do NOT take the lock or
+    # load the set yet. Fix-batch red-team M2: the lock must never be held
+    # across network I/O (the usage/governor verdict fetch, token recovery,
+    # the `done` branch's `system()`), so it is acquired lazily, just before
+    # the load/prune/write/hand-out sequence that actually needs it -- see the
+    # "ok or degraded" branch below, which is reached only AFTER that bp's
+    # verdict has already been fetched. $inflight_entries is populated there
+    # (and reused for the in-flight action's `inflight` key), never here.
     my $inflight_entries;
 
     my $state = read_state($data, $dsdir, \@candidates);
@@ -928,7 +865,7 @@ sub _cmd_next {
     # need-order with candidates:[] anyway. That prompt is UNANSWERABLE, and it
     # is a closed loop rather than a stall: record-order refuses an empty list,
     # so the session cannot answer it; `next` returns it again on every call;
-    # gate-drive-loop.sh treats any non-done/pause action as actionable work and
+    # stop-gate.sh treats any non-done/pause action as actionable work and
     # blocks the stop for it; and keepawake_apply('active') holds the machine
     # awake over a run containing no work at all.
     #
@@ -946,7 +883,7 @@ sub _cmd_next {
     # Candidate discovery requires blueprint.md, so a directory under
     # blueprints/ that HAS packages but no blueprint.md is silently skipped and
     # lands here looking identical to "nothing is there". Reporting `done` over
-    # it is actively dangerous: bp-watchdog.pl branches on the action string and
+    # it is actively dangerous: the watchdog logic branches on the action string and
     # treats `done` as absolute ("The director reports no remaining work. Do not
     # re-arm."), so a package ledger sitting at status: running would be
     # declared settled and the dead-man's switch disarmed over a wedged run.
@@ -981,7 +918,6 @@ sub _cmd_next {
 
     if (!@candidates) {
         _append_run_log($dsdir, 'DONE (nothing in scope: no blueprint matches the scope spec)');
-        _remove_current_pointer($dsdir);
         print _encode_action({ action => 'done' }), "\n";
         keepawake_apply('settled', $dsdir, $opts);
         return 0;
@@ -1001,7 +937,7 @@ sub _cmd_next {
     # looked at -- and the walk then falls through to 'done', which asserts
     # "every in-scope blueprint is done-or-parked". That assertion is false, and
     # it is believed by the two mechanisms named at the in-flight branch below:
-    # gate-drive-loop.sh allows the turn to end, and bp-watchdog.pl short-circuits
+    # stop-gate.sh allows the turn to end, and the watchdog logic short-circuits
     # to SETTLED. So the run reports finished having never considered the work.
     #
     # This is the same false-settled class as the in-flight bug documented there,
@@ -1117,7 +1053,6 @@ sub _cmd_next {
                 # achieving nothing. Release it and say why, once.
                 _append_run_log($dsdir,
                     "ERROR token refresh failed — stopping. $detail");
-                _remove_current_pointer($dsdir);
                 my $action = { action => 'stop', reason => 'token-refresh-failed',
                                detail => $detail };
                 print _encode_action($action), "\n";
@@ -1144,9 +1079,9 @@ sub _cmd_next {
             return 0;
         }
 
-        # ok or degraded → find first ready package (spec §2.7: the switch
-        # decides whether a SECOND disjoint ready package may be handed out
-        # while others are in flight).
+        # ok or degraded → find first ready package (spec §2.7, batch C: a
+        # SECOND disjoint ready package may always be handed out while others
+        # are in flight -- concurrent hand-out is unconditional now).
         #
         # Fix-batch red-team M2: the lock is acquired HERE, after this bp's own
         # verdict fetch (above) has already completed -- never across it. The
@@ -1164,97 +1099,83 @@ sub _cmd_next {
             _write_inflight_set($dsdir, $inflight_entries, $now) if $dirty;
 
             # Decision 65 / package 12 AC-20: reclaim a claimed-but-undriven
-            # in-flight entry, switch-on only. Carried from package 11's
-            # red-team M1/M4 (this ledger, 2026-09-24T12:50:48Z): with the
-            # switch on, an inflight.json entry can be claimed but never
-            # driven. Reclaiming means handing it out again -- a director
-            # act, done here rather than in the hook (spec sec 3.5).
-            if ($concurrency_on) {
-                my $bd_ok = eval {
-                    require "$DIR/BpHook/BindDispatch.pm"
-                        unless defined &BpHook::BindDispatch::bound_since;
-                    1;
-                };
-                if ($bd_ok) {
-                    my $reclaim_after = $opts->{reclaim_after} // 1800;
-                    my @reclaimable =
-                        sort { $a->{package} cmp $b->{package} }
-                        grep {
-                            $_->{blueprint} eq $bp
-                            && (($status->{ $_->{package} } // 'pending') eq 'pending')
-                            && (($now - $_->{since}) >= $reclaim_after)
-                            && !BpHook::BindDispatch::bound_since($data, $bp, $_->{package}, $_->{since})
-                        } @$inflight_entries;
-                    if (@reclaimable) {
-                        my $entry = $reclaimable[0];
-                        my $pkg   = $entry->{package};
-                        my $action = { action => 'run-package', blueprint => $bp, package => $pkg };
-                        _write_current_pointer($dsdir, $bp, $pkg, $now);
-                        _append_run_log($dsdir, "RECLAIM $bp/$pkg (no dispatch bound since $entry->{since})");
-                        _append_run_log($dsdir, "RUN $bp/$pkg");
-                        $entry->{since}  = $now;
-                        $entry->{ledger} = _ledger_str($data, $bp, $pkg);
-                        _write_inflight_set($dsdir, $inflight_entries, $now);
-                        print _encode_action($action), "\n";
-                        keepawake_apply('active', $dsdir, $opts);
-                        return 0;
-                    }
+            # in-flight entry. Carried from package 11's red-team M1/M4 (this
+            # ledger, 2026-09-24T12:50:48Z): an inflight.json entry can be
+            # claimed but never driven. Reclaiming means handing it out again
+            # -- a director act, done here rather than in the hook (spec sec
+            # 3.5).
+            my $bd_ok = eval {
+                require "$DIR/BpHook/BindDispatch.pm"
+                    unless defined &BpHook::BindDispatch::bound_since;
+                1;
+            };
+            if ($bd_ok) {
+                my $reclaim_after = $opts->{reclaim_after} // 1800;
+                my @reclaimable =
+                    sort { $a->{package} cmp $b->{package} }
+                    grep {
+                        $_->{blueprint} eq $bp
+                        && (($status->{ $_->{package} } // 'pending') eq 'pending')
+                        && (($now - $_->{since}) >= $reclaim_after)
+                        && !BpHook::BindDispatch::bound_since($data, $bp, $_->{package}, $_->{since})
+                    } @$inflight_entries;
+                if (@reclaimable) {
+                    my $entry = $reclaimable[0];
+                    my $pkg   = $entry->{package};
+                    my $action = { action => 'run-package', blueprint => $bp, package => $pkg };
+                    _append_run_log($dsdir, "RECLAIM $bp/$pkg (no dispatch bound since $entry->{since})");
+                    _append_run_log($dsdir, "RUN $bp/$pkg");
+                    $entry->{since}  = $now;
+                    $entry->{ledger} = _ledger_str($data, $bp, $pkg);
+                    _write_inflight_set($dsdir, $inflight_entries, $now);
+                    print _encode_action($action), "\n";
+                    keepawake_apply('active', $dsdir, $opts);
+                    return 0;
                 }
             }
 
-            if ($concurrency_on) {
-                my @here = map { $_->{package} } grep { $_->{blueprint} eq $bp } @$inflight_entries;
-                # Driver decision (Decision 31 / red-team H1 / review M2): a
-                # package whose LEDGER status is `running` counts as in flight
-                # whether or not it is recorded in inflight.json.
-                push @here, grep { ($status->{$_} // '') eq 'running' } keys %$meta;
-                my %here_seen = map { $_ => 1 } @here;
-                my @ready = ready_packages($meta, $status, [ keys %here_seen ]);
-                @ready = grep { !$here_seen{$_} } @ready;   # in-flight-but-pending is never re-handed
+            my @here = map { $_->{package} } grep { $_->{blueprint} eq $bp } @$inflight_entries;
+            # Driver decision (Decision 31 / red-team H1 / review M2): a
+            # package whose LEDGER status is `running` counts as in flight
+            # whether or not it is recorded in inflight.json.
+            push @here, grep { ($status->{$_} // '') eq 'running' } keys %$meta;
+            my %here_seen = map { $_ => 1 } @here;
+            my @ready = ready_packages($meta, $status, [ keys %here_seen ]);
+            @ready = grep { !$here_seen{$_} } @ready;   # in-flight-but-pending is never re-handed
 
-                my @other_ws;
-                for my $e (grep { $_->{blueprint} ne $bp } @$inflight_entries) {
-                    push @other_ws, ledger_fm("$data/blueprints/$e->{blueprint}", $e->{package}, 'write_set') // '';
-                }
-                for my $obp (@$order) {
-                    next if $obp eq $bp;
-                    my $ometa   = $bp_meta{$obp}   // {};
-                    my $ostatus = $bp_status{$obp} // {};
-                    for my $opkg (keys %$ometa) {
-                        next unless ($ostatus->{$opkg} // '') eq 'running';
-                        push @other_ws, $ometa->{$opkg}{write_set};
-                    }
-                }
-                @ready = grep {
-                    my $ws = $meta->{$_}{write_set};
-                    !grep { write_sets_overlap($ws, $_) } @other_ws
-                } @ready;
-                $handed = $ready[0] if @ready;
-            } else {
-                my @ready = ready_packages($meta, $status, []);
-                $handed = $ready[0] if @ready;   # sorted by key (ready_packages uses sort keys)
+            my @other_ws;
+            for my $e (grep { $_->{blueprint} ne $bp } @$inflight_entries) {
+                push @other_ws, ledger_fm("$data/blueprints/$e->{blueprint}", $e->{package}, 'write_set') // '';
             }
+            for my $obp (@$order) {
+                next if $obp eq $bp;
+                my $ometa   = $bp_meta{$obp}   // {};
+                my $ostatus = $bp_status{$obp} // {};
+                for my $opkg (keys %$ometa) {
+                    next unless ($ostatus->{$opkg} // '') eq 'running';
+                    push @other_ws, $ometa->{$opkg}{write_set};
+                }
+            }
+            @ready = grep {
+                my $ws = $meta->{$_}{write_set};
+                !grep { write_sets_overlap($ws, $_) } @other_ws
+            } @ready;
+            $handed = $ready[0] if @ready;
 
             if (defined $handed) {
                 my $pkg    = $handed;
                 my $action = { action => 'run-package', blueprint => $bp, package => $pkg };
-                _write_current_pointer($dsdir, $bp, $pkg, $now);
                 _append_run_log($dsdir, "RUN $bp/$pkg");
 
-                # §2.7: switch off REPLACES the whole set with this one entry
-                # (keeping the old `since` if the same pair was already present);
-                # switch on APPENDS to it.
+                # §2.7 (batch C: always APPENDS to the set, keeping the old
+                # `since` if the same pair was already present).
                 my ($existing) = grep { $_->{blueprint} eq $bp && $_->{package} eq $pkg } @$inflight_entries;
                 my $since = $existing ? $existing->{since} : $now;
                 my $new_entry = { blueprint => $bp, package => $pkg, ledger => _ledger_str($data, $bp, $pkg), since => $since };
-                if ($concurrency_on) {
-                    @$inflight_entries = (
-                        (grep { !($_->{blueprint} eq $bp && $_->{package} eq $pkg) } @$inflight_entries),
-                        $new_entry,
-                    );
-                } else {
-                    @$inflight_entries = ($new_entry);
-                }
+                @$inflight_entries = (
+                    (grep { !($_->{blueprint} eq $bp && $_->{package} eq $pkg) } @$inflight_entries),
+                    $new_entry,
+                );
                 _write_inflight_set($dsdir, $inflight_entries, $now);
 
                 print _encode_action($action), "\n";
@@ -1277,12 +1198,12 @@ sub _cmd_next {
         # at the top of this file), which is simply false while work is in
         # flight -- and two safety mechanisms believe that assertion:
         #
-        #   * gate-drive-loop.sh, the Stop hook that keeps an unattended driver
+        #   * stop-gate.sh, the Stop hook that keeps an unattended driver
         #     from ending a turn with nothing scheduled to continue the run,
         #     treats 'done' as "run settled" and allows the stop. So the run
         #     dies silently mid-package, looking finished -- the exact failure
         #     that hook was written to prevent.
-        #   * bp-watchdog.pl short-circuits to VERDICT: SETTLED on 'done',
+        #   * the watchdog logic short-circuits to VERDICT: SETTLED on 'done',
         #     ahead of its own movement analysis, so an armed watchdog reports
         #     all-clear over a wedged run.
         #
@@ -1314,24 +1235,22 @@ sub _cmd_next {
             packages  => $f->{packages},
             running   => $f->{running},
         };
-        # §2.8: with the switch ON ONLY, gain an `inflight` key carrying the
+        # §2.8 (batch C: unconditional): gain an `inflight` key carrying the
         # current set verbatim — never a re-issued run-package, which would
         # tell the session to start a second pipeline over a ledger it is
         # already driving.
-        if ($concurrency_on) {
-            # The set is loaded lazily inside the hand-out block; if this call
-            # never reached it, read (and prune, read-only) it here rather than
-            # letting @$inflight_entries autovivify into an empty list, which
-            # would tell a recovering session that nothing is in flight.
-            unless (ref $inflight_entries eq 'ARRAY') {
-                ($inflight_entries) = load_inflight($data, $dsdir, $now);
-                _prune_inflight($data, $inflight_entries);
-            }
-            $action->{inflight} = [ map {
-                { blueprint => $_->{blueprint}, package => $_->{package},
-                  ledger    => $_->{ledger},    since   => $_->{since} }
-            } @$inflight_entries ];
+        # The set is loaded lazily inside the hand-out block; if this call
+        # never reached it, read (and prune, read-only) it here rather than
+        # letting @$inflight_entries autovivify into an empty list, which
+        # would tell a recovering session that nothing is in flight.
+        unless (ref $inflight_entries eq 'ARRAY') {
+            ($inflight_entries) = load_inflight($data, $dsdir, $now);
+            _prune_inflight($data, $inflight_entries);
         }
+        $action->{inflight} = [ map {
+            { blueprint => $_->{blueprint}, package => $_->{package},
+              ledger    => $_->{ledger},    since   => $_->{since} }
+        } @$inflight_entries ];
         print _encode_action($action), "\n";
         keepawake_apply('active', $dsdir, $opts);
         return 0;
@@ -1339,7 +1258,6 @@ sub _cmd_next {
 
     # B6: all blueprints in the order are settled+announced (or parked)
     _append_run_log($dsdir, 'DONE');
-    _remove_current_pointer($dsdir);
 
     # Close the books before announcing done.
     #
@@ -1574,17 +1492,11 @@ STATE  (<data>/.drive-solo/, all director-owned)
   order.json      {"order":[…],"recorded_at":<epoch>}
   parks.json      [{"blueprint":…,"reason":…,"at":<epoch>}, …]
   announced.json  {"announced":[…]}   blueprints whose blueprint-done already fired
-  current.json    {"blueprint":…,"package":…,"recorded_at":<epoch>}   the CURRENT
-                  package pointer: written on run-package, removed on done/stop,
-                  left alone otherwise (including in-flight); read by
-                  lib.sh's bp_driver_context so the write/ledger guards reach a
-                  driver session; the write is never fatal to `next`.
   inflight.json   {"packages":[{"blueprint":…,"package":…,"ledger":…,"since":<epoch>}],
                   "updated_at":<epoch>}   the project-level in-flight set:
                   added on run-package, pruned once its ledger turns terminal.
-                  BUTLER_CONCURRENCY=1 enables concurrent hand-out (a further
-                  ready package disjoint from every in-flight write set); off,
-                  one entry at a time, exactly as today.
+                  Concurrent hand-out (a further ready package disjoint from
+                  every in-flight write set) is unconditional.
   keepawake.pid   PID of the wake-lock process (host only; sandbox = no file)
   run.md          append-only structured run log
 END_HELP
@@ -1688,7 +1600,7 @@ sub run {
         # TEST / DIAGNOSTIC SEAM, honoured only for well-formed JSON carrying an
         # 'action'. The production path below shells out to bp-usage-gate.pl,
         # which reads the host's REAL OAuth state -- so every consumer of the
-        # director inherits that state, including gate-drive-loop.sh and any
+        # director inherits that state, including stop-gate.sh and any
         # assertion about it. On 2026-08-08 t/94's stop-gate assertions went red
         # for exactly this reason: the host token aged under the relogin floor
         # mid-run, the director began answering pause/token, the gate correctly

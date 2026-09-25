@@ -47,8 +47,12 @@ ok(-f $RUNNER, 'run-tests.pl is present') or BAIL_OUT("no runner at $RUNNER");
 # never LOADED TestSandbox, so under the new loads-not-mentions rule it is one
 # of the seven files that correctly moved to parallel -- it can no longer serve
 # as "the serial sample". Swapped to a file that genuinely loads TestSandbox.
+# $PARALLEL was the old repeat-guard coverage until package 16 (blueprint
+# hook-continuity-remake) deleted it in batch B (its subject hook
+# was absorbed into wait-shape-guard.sh). Swapped to another real,
+# non-TestSandbox-loading file that is not on any deletion list.
 my $SERIAL   = "plugins/sandbox/tests/t/runtime-detection.t";
-my $PARALLEL = "plugins/butler/tests/t/repeat-guard.t";
+my $PARALLEL = "plugins/butler/tests/t/hooks-selftest.t";
 ok(-f "$ROOT/$SERIAL",   'the serial-classified sample exists');
 ok(-f "$ROOT/$PARALLEL", 'the parallel sample exists');
 

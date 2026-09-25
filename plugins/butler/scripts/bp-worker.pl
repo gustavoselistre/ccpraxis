@@ -3,9 +3,10 @@
 #
 # Implements plugins/butler/tests/../specs/b32-worker-backend-dispatcher-spec.md.
 # Invoked by a coordinator via Bash instead of Task when the resolved
-# `worker_backend:` is not `claude`. Re-implements no policy of its own: it
-# sources hooks/lib.sh for the marker/lock/stop-signal primitives and
-# reproduces track-dispatch.sh's and log-dispatch.sh's side effects
+# `worker_backend:` is not `claude`. Re-implements no policy of its own:
+# it inlines the marker/lock/stop-signal paths hooks/track-dispatch.sh (and
+# BpHook::Guards::TrackDispatch) also use -- package 16 spec sec 2.7 --
+# and reproduces track-dispatch.sh's side effects
 # byte-for-byte, because a Bash subprocess dispatch fires no PreToolUse /
 # PostToolUse Task hooks.
 #
@@ -192,25 +193,25 @@ my $BP_PACKAGE  = $ENV{BP_PACKAGE};
 my $BP_LEDGER   = $ENV{BP_LEDGER};
 
 # ---------------------------------------------------------------------------
-# 3. Source hooks/lib.sh (once) for marker_path / ledger_lock / bp_active_stop_signal.
+# 3. Marker / lock / stop-signal paths (package 16 spec sec 2.7) -- inlined,
+# no hook-script source, no bash -c. These equal the paths
+# BpHook::Guards::TrackDispatch uses for coordinators, so the one-writer
+# rule still spans Task dispatches and bp-worker.pl dispatches.
 # ---------------------------------------------------------------------------
-(my $LIB = "$Bin/../hooks/lib.sh") =~ s{\\}{/}g;
-
-sub sh_fn {
-    my ($fn) = @_;
-    my $o = `bash -c '. "\$1" >/dev/null 2>&1; $fn' bash "$LIB" 2>/dev/null`;
-    $o = '' unless defined $o;
-    chomp $o;
-    return $o;
-}
-
-my $MARKER  = sh_fn('marker_path');
-my $LOCKFILE = sh_fn('ledger_lock');
+my $BP_PACKAGE_OR_PKG = (defined $BP_PACKAGE && length $BP_PACKAGE) ? $BP_PACKAGE : 'pkg';
+my $MARKER   = "$BP_DIR/runs/$BP_PACKAGE_OR_PKG.active-worker";
+my $LOCKFILE = "$BP_DIR/runs/$BP_PACKAGE_OR_PKG.ledger.lock";
 
 # ---------------------------------------------------------------------------
 # 4. Stop-signal gate (§2.11 step 4) -> exit 5, NO marker, checked first.
 # ---------------------------------------------------------------------------
-my $stop = sh_fn('bp_active_stop_signal');
+my $stop = '';
+{
+    my $runs = "$BP_DIR/runs";
+    if (-f "$runs/.shutdown") { $stop = 'shutdown' }
+    elsif (-f "$runs/$BP_PACKAGE_OR_PKG.force-stop") { $stop = 'forcestop' }
+    elsif (-f "$runs/.paused") { $stop = 'paused' }
+}
 if (defined $stop && length $stop) {
     print STDERR "bp-worker.pl: a fleet stop signal ('$stop') is in force; refusing to dispatch $CANON\n";
     exit 5;

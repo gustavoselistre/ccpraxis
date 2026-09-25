@@ -66,6 +66,11 @@ re-establish the facts you intend to carry:
 
 If a check is slow, still do the cheap ones. A handover built on stale claims is the failure mode.
 
+<!-- continuity:begin -->
+If `butler-continuity` exists, run `butler-continuity status`; if armed, make `butler-continuity on` the first command of "Re-orient first" (add `--role reporter` when it reports role reporter), or name `/butler:drive-solo <scope>` for a driver instead.
+The fresh session has a new id and starts unarmed.
+<!-- continuity:end -->
+
 ### 2. Ask the user — only what genuinely blocks the next step
 
 Use `AskUserQuestion` for decisions the next session would otherwise have to guess at, where guessing

@@ -26,7 +26,7 @@ use POSIX qw(WNOHANG _exit);
 use Time::HiRes qw(sleep time);
 
 (my $BUTLER = "$Bin/../..") =~ s{\\}{/}g;
-my $HOOK = "$BUTLER/hooks/next/stop-gate.sh";
+my $HOOK = "$BUTLER/hooks/stop-gate.sh";
 my $S    = "$BUTLER/scripts";
 
 require "$S/BpHook.pm";    # package 03 -- real and already implemented
@@ -43,7 +43,7 @@ END {
 }
 $SIG{$_} = sub { exit 1 } for qw(TERM INT HUP);
 
-delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
 
 my ($REAL_BSTATE, $REAL_BSTATE_EXISTS, $REAL_BSTATE_MTIME);
 {
@@ -89,7 +89,7 @@ sub run_gate {
     my (undef, $epath) = tempfile();
 
     local %ENV = %ENV;
-    delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+    delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
     for my $k (keys %env) {
         if (defined $env{$k}) { $ENV{$k} = $env{$k} } else { delete $ENV{$k} }
     }
@@ -148,7 +148,7 @@ sub read_json_file {
 
 # ---------------------------------------------------------------------------
 # mk_bp(status, next, %sig) -- ledger fixture, same shape as
-# graceful-stop-gate.t's mk_bp: <bp>/packages/p.md with frontmatter
+# the retired graceful-stop-gate coverage's mk_bp: <bp>/packages/p.md with frontmatter
 # package/status/last_updated, then "## Next action" + body.
 # %sig: paused/shutdown/forcestop (as there), plus this file's own:
 #   registry => \%hash (writes runs/registry.json, JSON::PP-encoded)
@@ -197,7 +197,7 @@ sub env_for {
 }
 
 # ===========================================================================
-# C1-C7 -- re-expressed from graceful-stop-gate.t, one assertion each, named.
+# C1-C7 -- re-expressed from the retired graceful-stop-gate coverage, one assertion each, named.
 # ===========================================================================
 {
     # RV-M2: mk_bp fixtures always start with last_updated:
@@ -212,7 +212,7 @@ sub env_for {
         'C1 precondition: fixture starts with the old last_updated stamp');
     my $res = run_gate(payload_json(next_sid()), env_for($dir, $led));
     is($res->{rc}, 0,
-        'C1 (re-expresses graceful-stop-gate.t "gate-stop: paused + non-terminal + Next action -> allowed (resumable)"): exit 0');
+        'C1 (re-expresses the retired graceful-stop-gate coverage "gate-stop: paused + non-terminal + Next action -> allowed (resumable)"): exit 0');
     my ($new_stamp) = (ledger_bytes($led) =~ /^last_updated: (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)$/m);
     ok(defined $new_stamp, 'C1: last_updated matches the fresh timestamp shape');
     SKIP: {
@@ -228,47 +228,47 @@ sub env_for {
     my ($dir, $led) = mk_bp('running', '', paused => 1);
     my $res = run_gate(payload_json(next_sid()), env_for($dir, $led));
     is($res->{rc}, 2,
-        'C2 (re-expresses graceful-stop-gate.t "gate-stop: paused + empty Next action -> blocked"): exit 2');
+        'C2 (re-expresses the retired graceful-stop-gate coverage "gate-stop: paused + empty Next action -> blocked"): exit 2');
     like((lines_of($res->{err}))[0] // '', qr/'## Next action' is empty or a placeholder/, 'C2: line 1 contains R4');
 }
 {
     my ($dir, $led) = mk_bp('running', 'something', paused => 1, shutdown => 1);
     my $res = run_gate(payload_json(next_sid()), env_for($dir, $led));
     is($res->{rc}, 2,
-        'C3 (re-expresses graceful-stop-gate.t "gate-stop: paused+shutdown + non-terminal -> blocked (shutdown wants terminal park)"): exit 2');
+        'C3 (re-expresses the retired graceful-stop-gate coverage "gate-stop: paused+shutdown + non-terminal -> blocked (shutdown wants terminal park)"): exit 2');
     like((lines_of($res->{err}))[0] // '', qr/status 'running' is not terminal/, "C3: R2 status 'running' is not terminal");
 }
 {
     my ($dir, $led) = mk_bp('running', 'keep going');
     my $res = run_gate(payload_json(next_sid()), env_for($dir, $led));
     is($res->{rc}, 2,
-        'C4 (re-expresses graceful-stop-gate.t "gate-stop: no signal + non-terminal -> blocked (regression: unchanged)"): exit 2');
+        'C4 (re-expresses the retired graceful-stop-gate coverage "gate-stop: no signal + non-terminal -> blocked (regression: unchanged)"): exit 2');
     like((lines_of($res->{err}))[0] // '', qr/status 'running' is not terminal/, 'C4: R2');
 }
 {
     my ($dir, $led) = mk_bp('parked', 'Awaiting the API-shape decision (see escalation).');
     my $res = run_gate(payload_json(next_sid()), env_for($dir, $led));
     is($res->{rc}, 0,
-        'C5 (re-expresses graceful-stop-gate.t "gate-stop: no signal + parked + Next action -> allowed (regression: unchanged)"): exit 0');
+        'C5 (re-expresses the retired graceful-stop-gate coverage "gate-stop: no signal + parked + Next action -> allowed (regression: unchanged)"): exit 0');
 }
 {
     my ($dir, $led) = mk_bp('parked', 'Re-run the implementer.', paused => 1);
     my $res = run_gate(payload_json(next_sid()), env_for($dir, $led));
     is($res->{rc}, 2,
-        'C6 (re-expresses graceful-stop-gate.t "gate-stop: paused + terminal status -> blocked (no stranding)"): exit 2');
+        'C6 (re-expresses the retired graceful-stop-gate coverage "gate-stop: paused + terminal status -> blocked (no stranding)"): exit 2');
     like((lines_of($res->{err}))[0] // '', qr/a fleet pause is active and status 'parked' is terminal/, "C6: R5 with 'parked'");
 
     # R6-M1 (red-team MEDIUM-1): on the pause+terminal (R5) path the holder is
     # never consulted and "finish or park the ledger: status
     # done|blocked|parked" is unfollowable (the ledger is ALREADY terminal --
-    # that is exactly why R5 fired). The retired gate-stop.sh instead told the
-    # agent, verbatim (gate-stop.sh:89): "Set status back to a non-terminal
+    # that is exactly why R5 fired). The retired stop-gate.sh instead told the
+    # agent, verbatim (stop-gate.sh:89): "Set status back to a non-terminal
     # value (running/converging) with a concrete '## Next action', then
     # stop." This coordinator denial must carry that exact old-gate guidance
     # line on this path, and must NOT carry the generic (unfollowable) line.
     like($res->{err},
         qr/Set status back to a non-terminal value \(running\/converging\) with a concrete '## Next action', then stop\./,
-        "R6-M1: paused+terminal denial carries gate-stop.sh's exact pause guidance line (gate-stop.sh:89), not a park instruction it cannot follow");
+        "R6-M1: paused+terminal denial carries stop-gate.sh's exact pause guidance line (stop-gate.sh:89), not a park instruction it cannot follow");
     unlike($res->{err}, qr/Otherwise finish or park the ledger/,
         'R6-M1: ...and does NOT carry the generic "finish or park the ledger: status done|blocked|parked" line (unfollowable: the status is already terminal)');
 }
@@ -277,12 +277,12 @@ sub env_for {
     utime(time - 1800, time - 1800, $led);
     my $res = run_gate(payload_json(next_sid()), env_for($dir, $led));
     is($res->{rc}, 2,
-        'C7 (re-expresses graceful-stop-gate.t "gate-stop: paused + stale ledger -> blocked") (mtime -30 min): exit 2');
+        'C7 (re-expresses the retired graceful-stop-gate coverage "gate-stop: paused + stale ledger -> blocked") (mtime -30 min): exit 2');
     like((lines_of($res->{err}))[0] // '', qr/the ledger is 30m stale \(limit 15m\)/, 'C7: R3 exact text');
 }
 
 # ===========================================================================
-# C8 -- re-expressed from run-continuity-gaps.t (bug 20260922-231428-6c0d),
+# C8 -- re-expressed from the retired run-continuity-gaps coverage (bug 20260922-231428-6c0d),
 # against CURRENT behaviour: a hold is never a reasonless pause.
 # ===========================================================================
 my $HAVE_PROC_CMDLINE = -r '/proc/self/cmdline' ? 1 : 0;

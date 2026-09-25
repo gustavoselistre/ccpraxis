@@ -701,7 +701,7 @@ SKIP: {
          'A15a: the heading is preceded by a blank line');
     like($ledger_after,
          qr/^- \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z \x{00b7} butler:bp-implementer \x{00b7} first line of the a15 prompt$/m,
-         'A15a: the appended line matches the log-dispatch.sh format exactly, DESC = first prompt line');
+         'A15a: the appended line matches the track-dispatch.sh format exactly, DESC = first prompt line');
 
     # (b) heading already present with a prior entry -> not duplicated, new entry appended.
     my ($bp2, $proj2) = mk_bp('opencode');

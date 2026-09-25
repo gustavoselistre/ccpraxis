@@ -108,7 +108,7 @@ my $SCRATCH;
 
 # A runner timeout or Ctrl-C signal exits perl WITHOUT running END blocks,
 # so the reaper below would never run and every fixture would outlive the
-# test (watcher-probe-liveness.t leaked fourteen that way, 2026-09-23).
+# test (the old watcher-probe-liveness coverage leaked fourteen that way, 2026-09-23).
 # Routing the signal through exit() runs END.
 $SIG{$_} = sub { exit 1 } for qw(TERM INT HUP);
 END {

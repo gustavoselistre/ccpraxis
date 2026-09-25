@@ -59,7 +59,7 @@ require "$DIR/bp-validate-dag.pl";
 # /butler:status -- never via this script's write verbs. The seven-glyph
 # vocabulary that used to live here (and its legend/help/normalize machinery) is
 # retired along with the table column; `dropped` remains a live LEDGER status
-# (bp-drive-next.pl, bp-orchestrator.pl, ledger-guard.sh, gate-stop.sh,
+# (bp-drive-next.pl, bp-orchestrator.pl, ledger-guard.sh, stop-gate.sh,
 # bp-ledger.pl all still enforce it there -- none of those files are touched by
 # this retirement).
 # =====================================================================================

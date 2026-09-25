@@ -15,8 +15,8 @@
 # NO SESSION SELECTOR. This command never reads the caller's environment for
 # a session identity; it learns its session only from a hook-written ticket
 # (see BpHook::take_ticket) or, when a Stop denial minted one, a one-shot
-# token passed with --token. Additive only (Decision 19): bp-continuity.pl,
-# the old registry and every live hook are untouched by this file.
+# token passed with --token. Additive only (Decision 19): the old continuity
+# CLI, the old registry and every live hook are untouched by this file.
 use strict;
 use warnings;
 use FindBin qw($Bin);

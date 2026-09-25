@@ -116,7 +116,7 @@ require File::Spec->catfile($ROOT_ABS, qw(plugins butler tests lib TestPlatform.
 #
 # bp-keepawake.pl and BpContinuityLease.pm each refuse when $0 ends in ".t", and
 # that covers a test calling them in-process. It does NOT cover the common case:
-# a test that shells out to `perl bp-continuity.pl arm`, whose child sees $0 as a
+# a test that shells out to `perl butler-continuity.pl arm`, whose child sees $0 as a
 # .pl and happily fork+execs a detached refresher and a real keep-awake.ps1 with
 # its -PidFile pointing into a File::Temp directory. That is how 53 orphaned
 # helpers once filled this machine and forced a restart.
@@ -286,7 +286,7 @@ sub _relpath {
     # state file rather than by reasoning about it. It currently holds TWO
     # SHAPES FOR THE SAME TREE:
     #
-    #   plugins/butler/tests/t/repeat-guard.t                    <- one shape
+    #   plugins/butler/tests/t/wait-shape-guard.t                <- one shape
     #   scripts/../plugins/butler/tests/t/cache-state.t          <- the other
     #
     # abs2rel does no `..` folding, so an $abs that arrived with an interior

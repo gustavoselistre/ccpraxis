@@ -256,10 +256,13 @@ sub _find_files {
     # its two known, legitimate, non-executable references (the *bp-runstate*
     # case pattern and the runstate_re regex) -- a new/different reference
     # changes the count and fails, which is the point.
-    is(scalar(@exempt_hits), 2,
-       'AC-2/D1 exemption is BOUNDED, not blanket: guard-run-finish.sh shows exactly the 2 '
-     . 'known references (its *bp-runstate* case arm and its runstate_re pattern) -- a third '
-     . 'reference added to this file would change this count and fail')
+    # guard-run-finish.sh itself is on package 16's deletion list (batch B);
+    # its runstate exemption goes with it (spec 16 sec 4 batch B note) -- the
+    # file is simply absent from @files now, so the exemption branch never
+    # fires and @exempt_hits is always empty (DEL: subject file deleted).
+    is(scalar(@exempt_hits), 0,
+       'AC-2/D1 exemption is now VACUOUS, not bounded: guard-run-finish.sh no longer exists '
+     . '(package 16 batch B deletion), so its exemption branch never fires')
         or diag("guard-run-finish.sh D1 hit(s):\n  " . join("\n  ", @exempt_hits));
 }
 
@@ -353,10 +356,13 @@ for my $skill (qw(drive-solo reporter coordinator-protocol)) {
     # it currently carries (all `run_guard(command => 'perl .../bp-runstate.pl
     # finish ...')` proof text for the authorization guard), rather than
     # skipping the file unconditionally.
-    is(scalar(@exempt_hits2), 11,
-       'AC-2/D2 exemption is BOUNDED, not blanket: run-finish-guard.t shows exactly its 11 '
-     . 'known fixture-string references -- a new/different reference added to this file would '
-     . 'change this count and fail')
+    # run-finish-guard.t is itself on package 16's deletion list (batch B,
+    # its subject guard-run-finish.sh is gone); the exemption branch never
+    # fires now that the file is absent from plugins/butler/tests/t/*.t
+    # (DEL: subject test file deleted).
+    is(scalar(@exempt_hits2), 0,
+       'AC-2/D2 exemption is now VACUOUS, not bounded: run-finish-guard.t no longer exists '
+     . '(package 16 batch B deletion), so its exemption branch never fires')
         or diag("run-finish-guard.t D2 hit(s):\n  " . join("\n  ", @exempt_hits2));
 }
 

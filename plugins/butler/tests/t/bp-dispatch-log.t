@@ -28,8 +28,8 @@
 use strict;
 use warnings;
 
-# A TEST MUST NEVER ACTUATE A REAL WAKE-LOCK. This file drives bp-continuity.pl /
-# bp-runstate.pl / gate-continuity.sh, which hold the machine awake for an armed
+# A TEST MUST NEVER ACTUATE A REAL WAKE-LOCK. This file drives butler-continuity.pl /
+# bp-runstate.pl / stop-gate.sh, which hold the machine awake for an armed
 # session -- and they do it as SUBPROCESSES, where bp-keepawake.pl's `$0 =~ /\.t\z/`
 # guard cannot reach (its $0 is the .pl). CCPRAXIS_NO_WAKELOCK is the supported
 # opt-out and IS inherited across exec. Enforced by t/test-wakelock-hygiene.t.
@@ -128,7 +128,7 @@ for my $sub (qw(record_path elapsed_seconds is_over_budget median read_history w
 
 # B8: record_path — a plain, predictable path under .dispatch-log/, keyed by
 # id, ending .json. Not pinning the exact root computation (that convention
-# lives in BpProjectRoot.pm, shared with bp-continuity.pl; the default-root
+# lives in BpProjectRoot.pm, shared with butler-continuity.pl; the default-root
 # behaviour is pinned by dispatch-log-project-root.t) — only the shape a
 # caller can rely on.
 {

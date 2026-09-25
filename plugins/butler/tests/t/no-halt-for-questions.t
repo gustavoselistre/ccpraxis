@@ -34,8 +34,8 @@
 use strict;
 use warnings;
 
-# A TEST MUST NEVER ACTUATE A REAL WAKE-LOCK. This file drives bp-continuity.pl /
-# bp-runstate.pl / gate-continuity.sh, which hold the machine awake for an armed
+# A TEST MUST NEVER ACTUATE A REAL WAKE-LOCK. This file drives butler-continuity /
+# bp-runstate.pl / stop-gate.sh, which hold the machine awake for an armed
 # session -- and they do it as SUBPROCESSES, where bp-keepawake.pl's `$0 =~ /\.t\z/`
 # guard cannot reach (its $0 is the .pl). CCPRAXIS_NO_WAKELOCK is the supported
 # opt-out and IS inherited across exec. Enforced by t/test-wakelock-hygiene.t.
@@ -48,7 +48,10 @@ use JSON::PP ();
 use Cwd qw(getcwd abs_path);
 
 my $GUARD = "$Bin/../../hooks/guard-ask-operator.sh";
-my $CONT  = "$Bin/../../scripts/bp-continuity.pl";
+# butler-continuity was the CLI here; it is on the deletion list and gone
+# (package 16 batch E1). butler-continuity.pl is the one continuity CLI
+# left, and shares the same BpProjectRoot::resolve() ladder (reason DEL).
+my $CONT  = "$Bin/../../scripts/butler-continuity.pl";
 
 ok(-f $GUARD, 'guard-ask-operator.sh exists') or BAIL_OUT('guard missing');
 # The old ok(-f $RUNSTATE...) or BAIL_OUT is RETIRED along with $RUNSTATE
@@ -67,34 +70,46 @@ sub new_project {
 
 sub run_guard {
     my ($root, @questions) = @_;
-    # Optional trailing hashref: { reg => <continuity-active-dir> } -- makes
+    # Optional trailing hashref: { state => <BUTLER_STATE_DIR> } -- makes
     # the session ARMED (the guard's one remaining unattended signal, per
     # package 03-retire-runstate §2.3(a)) for callers that need a real
     # denial to happen so the queue actually gets written to.
+    #
+    # Package 16 batch-B fix round: BpHook::Guards::GuardAskOperator (the
+    # hooks/guard-ask-operator.sh successor, package 14) reads armed state
+    # ONLY from BpHook::is_armed() against the NEW store (bug
+    # 20260922-210421-0468 / Decision 3: no legacy .continuity-active/
+    # registry is ever consulted any more). The old CCPRAXIS_CONTINUITY_
+    # ACTIVE_DIR fixture this sub used to set is retired with that read;
+    # arm_state() below builds the new store's on-disk shape instead.
     my %opt = (ref $questions[-1] eq 'HASH') ? %{ pop @questions } : ();
     my $payload = JSON::PP->new->canonical->encode({
         session_id => 'sess-q', cwd => $root, tool_name => 'AskUserQuestion',
         tool_input => { questions => [ map { { question => $_ } } @questions ] },
     });
     my $env = "CLAUDE_PROJECT_DIR='$root'";
-    $env .= " CCPRAXIS_CONTINUITY_ACTIVE_DIR='$opt{reg}'" if defined $opt{reg};
+    $env .= " BUTLER_STATE_DIR='$opt{state}'" if defined $opt{state};
     my $out = `$env bash "$GUARD" <<'PAYLOAD_EOF' 2>&1
 $payload
 PAYLOAD_EOF`;
     return ($? >> 8, $out // '');
 }
 
-# arm_registry(ROOT) -> REG_DIR -- the same fixture shape AC4 below uses to
-# make session 'sess-q' (run_guard's fixed session_id) ARMED, without going
-# through the real bp-continuity.pl arm verb.
-sub arm_registry {
-    my ($root) = @_;
-    my $reg = "$root/reg";
-    make_path($reg);
-    open my $fh, '>', "$reg/sess-q" or die $!;
-    print {$fh} "operator 2026-09-10T00:00:00Z\n";
+# arm_state(ROOT, SID) -> STATE_DIR -- the new store's on-disk shape
+# (<STATE_DIR>/continuity/armed/<SID>), suitable for BUTLER_STATE_DIR.
+# Defaults SID to 'sess-q' (run_guard's fixed session_id) so existing call
+# sites need only pass ROOT. BpHook::is_armed() only checks -e on this path,
+# so any non-empty content is enough to arm.
+sub arm_state {
+    my ($root, $sid) = @_;
+    $sid = 'sess-q' unless defined $sid && length $sid;
+    my $state = "$root/state";
+    my $dir   = "$state/continuity/armed";
+    make_path($dir);
+    open my $fh, '>', "$dir/$sid" or die $!;
+    print {$fh} qq({"role":"manual","by":"operator","since":"2026-09-10T00:00:00Z"}\n);
     close $fh;
-    return $reg;
+    return $state;
 }
 
 sub queue_contents {
@@ -115,7 +130,7 @@ sub queue_contents {
 # caller, but it WAS produced on READ: `BpRunState::effective` manufactured
 # it from any stale `paused` record (dead watcher pid, mismatched
 # fingerprint, or elapsed `until`), and `paused` records were written by the
-# now-retired `bp-watch.pl --self-pause`, doctrinal until package 12 -- so
+# now-retired `butler-hold --self-pause`, doctrinal until package 12 -- so
 # the arm genuinely fired, on real sessions, once such a lease went stale.
 # Package 03 deletes the arm outright anyway (not merely disables it): the
 # `[ -f "$RUNSTATE" ] || exit 0` early-exit and the
@@ -156,20 +171,14 @@ sub queue_contents {
 # (await-operator) is gone -- an armed session ending its turn to ask something
 # is the halt, not the remedy.
 {
-    my $root = new_project();
-    my $reg  = "$root/reg";
-    make_path($reg);
-
-    # No run at all. Only the arm.
-    open my $fh, '>', "$reg/sess-armed" or die $!;
-    print {$fh} "operator 2026-09-10T00:00:00Z\n";
-    close $fh;
+    my $root  = new_project();
+    my $state = arm_state($root, 'sess-armed');   # No run at all. Only the arm.
 
     my $payload = JSON::PP->new->canonical->encode({
         session_id => 'sess-armed', cwd => $root, tool_name => 'AskUserQuestion',
         tool_input => { questions => [ { question => 'Should I rename it?' } ] },
     });
-    my $out = `CLAUDE_PROJECT_DIR='$root' CCPRAXIS_CONTINUITY_ACTIVE_DIR='$reg' bash "$GUARD" <<'PAYLOAD_EOF' 2>&1
+    my $out = `CLAUDE_PROJECT_DIR='$root' BUTLER_STATE_DIR='$state' bash "$GUARD" <<'PAYLOAD_EOF' 2>&1
 $payload
 PAYLOAD_EOF`;
     my $rc = $? >> 8;
@@ -179,27 +188,29 @@ PAYLOAD_EOF`;
     like($out, qr/ARMED/, 'AC4 and the refusal names the real reason rather than claiming a run');
     like(queue_contents($root), qr/Should I rename it\?/, 'AC5 the question is queued');
 
-    # AC8/B10 (spec §2.3(c)): the denial stops naming a dead verb. The old
-    # remedy #3 was `bp-runstate.pl finish --reason "blocked: <what you
-    # need>"`; it is replaced by the operator-only marker, matching
-    # guard-subagent-stall.sh's own wording and Decision 7/16.
+    # AC8/B10 (spec §2.3(c)): the denial stops naming a dead verb. Reason MSG
+    # (Decision 68(c)): package 14's GuardAskOperator.pm dropped the old
+    # remedy text entirely rather than swap it for another verb -- there is
+    # no ".run-finished"/"only the operator" wording left to pin, so those
+    # two checks are retargeted to the module's actual remedy sentences
+    # (BpHook::Guards::GuardAskOperator::run: "Decide it yourself..." /
+    # "escalate-product-decisions-only.md"), which the old wording's own
+    # intent (do not hand out a dead verb; point at real guidance) survives.
     unlike($out, qr/bp-runstate/,
         'AC8: the denial never names bp-runstate -- no verb, flag or argument ends a run any more');
-    like($out, qr/\.run-finished/,
-        'AC8: ...and names the .run-finished marker instead');
-    like($out, qr/only the operator/i,
-        'AC8: ...stating plainly that only the OPERATOR ends a run');
+    like($out, qr/Decide it yourself/i,
+        'AC8: ...and tells the agent to decide it itself');
+    like($out, qr/escalate-product-decisions-only\.md/,
+        'AC8: ...naming the real product-decision guidance instead of a dead verb');
 
     # An UNARMED session with no run is free to ask. Over-blocking is the real
     # risk with a guard like this.
     my $root2 = new_project();
-    my $reg2  = "$root2/reg";
-    make_path($reg2);
     my $p2 = JSON::PP->new->canonical->encode({
         session_id => 'sess-free', cwd => $root2, tool_name => 'AskUserQuestion',
         tool_input => { questions => [ { question => 'Fine?' } ] },
     });
-    `CLAUDE_PROJECT_DIR='$root2' CCPRAXIS_CONTINUITY_ACTIVE_DIR='$reg2' bash "$GUARD" <<'PAYLOAD_EOF' 2>&1
+    `CLAUDE_PROJECT_DIR='$root2' bash "$GUARD" <<'PAYLOAD_EOF' 2>&1
 $p2
 PAYLOAD_EOF`;
     is($? >> 8, 0, 'AC4 CANONICAL: an unarmed session with no run may still ask -- talking to '
@@ -207,23 +218,27 @@ PAYLOAD_EOF`;
 }
 
 # ── AC6 — the halting verb is gone ────────────────────────────────────────
+#
+# MIGRATED (reason DEL, package 16 batch E1): butler-continuity is on the
+# deletion list and gone. butler-continuity.pl is the one continuity CLI
+# left, and it never grew an await-operator verb either -- the arm/session
+# dance the old fixture needed (butler-continuity's own registry-based arm) is
+# dropped: butler-continuity.pl's ask never required an armed session to
+# begin with, so nothing here needed it in the first place.
 {
     my $root = new_project();
-    my $reg  = "$root/reg";
-    my $cont = "$Bin/../../scripts/bp-continuity.pl";
-    system("CLAUDE_PROJECT_DIR='$root' CCPRAXIS_CONTINUITY_ACTIVE_DIR='$reg' "
-         . "$^X '$cont' arm --session s1 >/dev/null 2>&1");
-    my $out = `CLAUDE_PROJECT_DIR='$root' CCPRAXIS_CONTINUITY_ACTIVE_DIR='$reg' $^X '$cont' await-operator --reason 'x' 2>&1`;
+    my $cont = "$Bin/../../scripts/butler-continuity.pl";
+    my $out = `CLAUDE_PROJECT_DIR='$root' $^X '$cont' await-operator --reason 'x' 2>&1`;
     isnt($? >> 8, 0,
          'AC6 CANONICAL: await-operator is REMOVED. A retired escape hatch that still works '
        . 'is not retired, and this one ended turns for questions -- the exact halt being '
        . 'designed out');
 
     # ...and `ask` is what replaced it: it records and returns, never permitting a stop.
-    my $q = `CLAUDE_PROJECT_DIR='$root' CCPRAXIS_CONTINUITY_ACTIVE_DIR='$reg' $^X '$cont' ask --text 'A or B?' 2>&1`;
+    my $q = `CLAUDE_PROJECT_DIR='$root' $^X '$cont' ask --text 'A or B?' 2>&1`;
     is($? >> 8, 0, 'AC6 ask succeeds');
-    like($q, qr/STATUS:\s*queued/, 'AC6 and reports the question queued');
-    like($q, qr/QUEUED:\s*\d+/,    'AC6 with a count the statusline also shows');
+    like($q, qr/queued/i, 'AC6 and reports the question queued');
+    like($q, qr/\(\d+\s+waiting\)/, 'AC6 with a count the statusline also shows');
 }
 
 # ── AC7 — the queue accumulates ───────────────────────────────────────────
@@ -231,14 +246,14 @@ PAYLOAD_EOF`;
 # MIGRATED (package 03-retire-runstate): the fixture used to call
 # `bp-runstate.pl activate` to make the session unattended, so the guard
 # would deny and actually write to the queue. The guard's only unattended
-# signal now is continuity-ARMED (§2.3(a)), so arm_registry() takes its
-# place -- same shape as AC4's fixture below, reused rather than duplicated.
+# signal now is continuity-ARMED (§2.3(a)), so arm_state() takes its
+# place -- same shape as AC4's fixture above, reused rather than duplicated.
 {
-    my $root = new_project();
-    my $reg  = arm_registry($root);
-    run_guard($root, 'First question?', { reg => $reg });
-    run_guard($root, 'Second question?', { reg => $reg });
-    run_guard($root, 'Third question?', 'And a fourth in the same call?', { reg => $reg });
+    my $root  = new_project();
+    my $state = arm_state($root);
+    run_guard($root, 'First question?', { state => $state });
+    run_guard($root, 'Second question?', { state => $state });
+    run_guard($root, 'Third question?', 'And a fourth in the same call?', { state => $state });
 
     my $q = queue_contents($root);
     like($q, qr/First question\?/,  'AC7 first survives');
@@ -250,7 +265,7 @@ PAYLOAD_EOF`;
 }
 
 # ═══════════════════════════════════════════════════════════════════════
-# NEW — bp-continuity.pl's questions_path: PROJECT-ANCHORED ROOT RESOLUTION.
+# NEW — butler-continuity's questions_path: PROJECT-ANCHORED ROOT RESOLUTION.
 # MIGRATED from runstate-root-resolution.t (DELETED by this package; spec
 # §5.1's own migration table names this file, or a sibling, as the target).
 #
@@ -262,7 +277,7 @@ PAYLOAD_EOF`;
 # `ask` call and a hook's read landed on DIFFERENT roots -- a wrong answer
 # anchored to the project is recoverable, one anchored to the install is a
 # different repo's state file entirely. Spec §2.4 lifts _resolve_project_
-# root() into bp-continuity.pl itself, ladder and comment block together:
+# root() into butler-continuity itself, ladder and comment block together:
 #   $CLAUDE_PROJECT_DIR > $BP_PROJECT_ROOT > git toplevel
 #     > walk up from cwd for a dir holding .ccpraxis-local-data > cwd
 # ═══════════════════════════════════════════════════════════════════════
@@ -302,7 +317,7 @@ PAYLOAD_EOF`;
         _cont_ask($proj2, \%CLEAR2, 'root-resolution A fixture');
         my $qpath = "$proj2/.ccpraxis-local-data/.subagent-guard/questions.md";
         (my $qpath_n = $qpath) =~ s{\\}{/}g;
-        ok(-f $qpath, 'ROOT-A: bp-continuity.pl ask (no CLAUDE_PROJECT_DIR/BP_PROJECT_ROOT, cwd '
+        ok(-f $qpath, 'ROOT-A: butler-continuity ask (no CLAUDE_PROJECT_DIR/BP_PROJECT_ROOT, cwd '
                     . 'inside the project) writes questions.md under the project it was run from');
 
         my ($guess) = ($INSTALL_GUESS2 =~ s{\\}{/}gr);
@@ -319,7 +334,7 @@ PAYLOAD_EOF`;
     }
 
     # ---- D. BP_PROJECT_ROOT-only (no CLAUDE_PROJECT_DIR): the hook and
-    #      bp-continuity.pl::questions_path must still agree. Redteam
+    #      butler-continuity::questions_path must still agree. Redteam
     #      MEDIUM-3: this is the one leg ROOT-BPPR (script only) and ROOT-B/C
     #      (CLAUDE_PROJECT_DIR set) never exercised together on the HOOK.
   SKIP: {
@@ -329,26 +344,26 @@ PAYLOAD_EOF`;
         my $proj4 = abs_path(tempdir(CLEANUP => 1));
         make_path("$proj4/.ccpraxis-local-data");
 
-        # writer: bp-continuity.pl, BP_PROJECT_ROOT set, no CLAUDE_PROJECT_DIR
+        # writer: butler-continuity, BP_PROJECT_ROOT set, no CLAUDE_PROJECT_DIR
         my $wout4 = _cont_ask($ORIG2, { %CLEAR2, BP_PROJECT_ROOT => $proj4 },
                                'ROOT-D writer question');
-        like($wout4, qr/STATUS:\s*queued/, 'ROOT-D setup: the writer\'s ask call queues');
+        like($wout4, qr/queued/i, 'ROOT-D setup: the writer\'s ask call queues');
 
         # reader: the HOOK itself, BP_PROJECT_ROOT set, no CLAUDE_PROJECT_DIR --
         # run_guard always sets CLAUDE_PROJECT_DIR, so invoke the guard
         # directly here to isolate the BP_PROJECT_ROOT-only leg.
-        my $reg4 = arm_registry($proj4);
+        my $state4 = arm_state($proj4);
         my $payload4 = JSON::PP->new->canonical->encode({
             session_id => 'sess-q', cwd => $proj4, tool_name => 'AskUserQuestion',
             tool_input => { questions => [ { question => 'ROOT-D reader question' } ] },
         });
-        `env -u CLAUDE_PROJECT_DIR BP_PROJECT_ROOT='$proj4' CCPRAXIS_CONTINUITY_ACTIVE_DIR='$reg4' bash "$GUARD" <<'PAYLOAD_EOF' 2>&1
+        `env -u CLAUDE_PROJECT_DIR BP_PROJECT_ROOT='$proj4' BUTLER_STATE_DIR='$state4' bash "$GUARD" <<'PAYLOAD_EOF' 2>&1
 $payload4
 PAYLOAD_EOF`;
 
         my $q4 = queue_contents($proj4);
         like($q4, qr/ROOT-D writer question/,
-            'ROOT-D: the writer (bp-continuity.pl, BP_PROJECT_ROOT-only) and the reader '
+            'ROOT-D: the writer (butler-continuity, BP_PROJECT_ROOT-only) and the reader '
           . '(the guard hook, BP_PROJECT_ROOT-only) land on the SAME questions.md');
         like($q4, qr/ROOT-D reader question/,
             'ROOT-D: ...and the hook\'s own append under BP_PROJECT_ROOT-only lands there too');
@@ -368,12 +383,12 @@ PAYLOAD_EOF`;
         # BP_PROJECT_ROOT, cwd inside the project -- exactly AC6's own
         # documented invocation, just run from inside $proj3 this time.
         my $wout = _cont_ask($proj3, \%CLEAR2, 'the writer\'s own question');
-        like($wout, qr/STATUS:\s*queued/, 'ROOT-B setup: the writer\'s ask call queues');
+        like($wout, qr/queued/i, 'ROOT-B setup: the writer\'s ask call queues');
 
         # The reader's call, verbatim in shape: CLAUDE_PROJECT_DIR set, an
         # ARMED session, exactly what a real hook invocation looks like.
-        my $reg3 = arm_registry($proj3);
-        run_guard($proj3, "the reader's own question", { reg => $reg3 });
+        my $state3 = arm_state($proj3);
+        run_guard($proj3, "the reader's own question", { state => $state3 });
 
         my $q3 = queue_contents($proj3);
         like($q3, qr/the writer's own question/,

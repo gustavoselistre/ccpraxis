@@ -60,6 +60,13 @@ This is **code** (`bp-orchestrator.pl`), unit-tested decision-by-decision — no
 - **Soft ordering constraint (`b22-soft-ordering-constraint`, `requires_clean_tree`).** Beside the write-set gate, a package ledger may declare `requires_clean_tree: true` — "do not launch me while ANY other package is running", deliberately not scoped to write-set overlap (the incident this closes was two packages with disjoint write-sets that still broke each other's build). This lives in ledger frontmatter only, read via `ledger_fm` exactly like `priority` — it never enters the DAG, so `parse_dag`/`deps_met`/b08's deadlock detector are unaffected, and a soft-constrained package that never runs never blocks anyone (soft ≠ hard: it gates on the *running* set, never on `done`). Once such a package is otherwise-ready but blocked only by something currently running, the orchestrator **quiesces**: it launches no new package at all that round, until the running set drains — a suppression of that round's return value, never a park (no status change, no `runs/.paused`, no queued decision). Two mutually-constrained packages cannot deadlock: with nothing running both are eligible and `order_ready` (priority ascending, then name) admits exactly one deterministically.
 - **Graceful-stop gate (Decision #10/#18).** In-flight workers can't be cancelled, so a pause/shutdown reaches *live* coordinators through a **`PreToolUse` gate** (`gate-shutdown.sh`, fires inside each coordinator): when a stop signal is set it denies new work (`Task`, worksite edits) but allows the ledger park-write, so the coordinator drains its current worker (≈ 1 tool-call) and stops cleanly. Three signals share the gate — `runs/.shutdown` (graceful-shutdown-all → terminal **park**, stays down), `runs/.paused` (usage/telemetry → **non-terminal resumable** stop, auto-resumed warm), `runs/<pkg>.force-stop` (per-package). The orchestrator never kills a coordinator for a pause/shutdown; it lets the gate funnel each to a clean stop and then winds down once none are running.
 
+<!-- continuity:begin -->
+A coordinator is armed by construction and stops only on a terminal, fresh ledger, or while
+`butler-hold` holds a running background subagent. `off` and `silence` refuse there. The three
+fleet files remain: `runs/.paused` (a resumable stop), `runs/.shutdown` (a terminal park) and
+`runs/<pkg>.force-stop` (that coordinator may stop once).
+<!-- continuity:end -->
+
 ### Checkpoint commits (Decisions #2/#17)
 
 Long unattended runs must survive a coordinator dying mid-step, so the orchestrator makes **inline WIP commits** of in-flight work as it goes.

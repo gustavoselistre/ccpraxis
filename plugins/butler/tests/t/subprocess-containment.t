@@ -42,7 +42,7 @@ diag("subject under test: $AUDIT "
         ? "(present)"
         : "(ABSENT -- every criterion below that runs it is expected to fail on MISSING BEHAVIOUR)"));
 
-my %CLEAN_ENV = map { ($_ => $ENV{$_}) } grep { !/^(BP_|CCPRAXIS_)/ } keys %ENV;
+my %CLEAN_ENV = map { ($_ => $ENV{$_}) } grep { !/^(BP_|CCPRAXIS_)/ || $_ eq 'CCPRAXIS_NO_WAKELOCK' } keys %ENV;
 my $REAL_PATH = $CLEAN_ENV{PATH} // '/usr/bin:/bin';
 
 # TEST_BASE must sit OUTSIDE /tmp, and that is a correctness requirement rather

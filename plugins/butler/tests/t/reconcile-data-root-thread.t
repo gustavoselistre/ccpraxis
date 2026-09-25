@@ -6,8 +6,8 @@
 # from its cwd. When that guess differs from the data root the caller is
 # actually running against, the P4 solo-driver claim check in the
 # orphan_running repair (solo_claimed(), which reads
-# <data-root>/.drive-solo/current.json) looks in the wrong place, reads a
-# missing file, and silently returns false -- so a genuinely live,
+# <data-root>/.drive-solo/inflight.json, spec 16-cutover 2.8) looks in the
+# wrong place, reads a missing file, and silently returns false -- so a genuinely live,
 # solo-claimed package loses its protection and gets repaired out from under
 # a real driver.
 #
@@ -202,8 +202,12 @@ MD
     # p1 carries NO marker, NO registry row, NO pidfile -- the AC4d/e shape
     # from t/unreapable-running.t: nothing else claims it alive, so only the
     # solo-claim pointer stands between it and the orphan_running repair.
-    write_file("$proj/.ccpraxis-local-data/.drive-solo/current.json",
-        $J->encode({ blueprint => 'T1', package => 'p1', recorded_at => 1_800_000_000 }));
+    # Batch C (spec 16-cutover 2.8, reason DEL): solo_claimed is re-pointed
+    # from current.json to inflight.json -- current.json is gone.
+    write_file("$proj/.ccpraxis-local-data/.drive-solo/inflight.json",
+        $J->encode({ packages => [
+            { blueprint => 'T1', package => 'p1', ledger => 'x/blueprints/T1/packages/p1.md', since => 1_800_000_000 },
+        ], updated_at => 1_800_000_000 }));
 
     write_file("$bpdir/creds.json", $J->encode({ claudeAiOauth => {
         accessToken => 'sk-ant-AAA-aaaaaaaaaaaaaaaaaaaa', refreshToken => 'sk-ant-RRR-bbbbbbbbbbbbbbbb',
