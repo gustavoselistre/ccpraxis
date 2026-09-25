@@ -18,6 +18,25 @@
 # See:
 # .ccpraxis-local-data/blueprints/coordinator-context-discipline/specs/04-model-effort-ledger-validation-spec.md
 #
+# Plus three more (22-ledger-rescope, Decisions 84, 87 & 89 of hook-continuity-remake):
+# a re-scope must never again mean "drop this package and create a new one".
+# `set-write-set` / `set-test-paths` REPLACE write_set/test_paths wholesale (narrow or
+# widen in one call, unlike the additive-only `widen-write-set`); every path the new
+# set adds over the old one must be named verbatim in the given blueprint Decision
+# (removals need no naming), and the call is refused outright -- leaving the ledger
+# byte-identical -- while its own status is done/dropped (Decision 89: NOT while the
+# package is listed in <data>/.drive-solo/inflight.json, and NOT for status running --
+# rescoping a running package between worker dispatches is exactly the use case). An
+# ADDED path (never a removed one) is separately refused if it overlaps the write_set
+# of ANOTHER in-flight package, naming the conflicting package. `set-section` replaces
+# the body of exactly
+# one of Scope/Done criteria/Inputs/Out of scope, leaving the frontmatter byte-
+# identical; every other heading is refused (Pipeline/Decisions & attempt log/Next
+# action each already have a dedicated verb; Outputs/Escalation are simply outside the
+# allow-list). `widen-write-set --edit-target` widens write_set only, never test_paths
+# (task 25's "a widened test file also joins test_paths" behaviour is unchanged
+# without the flag).
+#
 # Exit codes (an interface, fixed): 0 success, 2 validation rejection (byte-identical
 # file), 3 usage/argument error (nothing read), 4 I/O/lock/atomicity failure
 # (byte-identical), 5 target region not found (byte-identical).
@@ -1652,7 +1671,7 @@ sub op_widen_write_set {
     my %opt = (path => []);
     my $ok;
     { local $SIG{__WARN__} = sub { };
-      $ok = GetOptionsFromArray(\@args, \%opt, 'ledger=s', 'path=s@', 'decision=s'); }
+      $ok = GetOptionsFromArray(\@args, \%opt, 'ledger=s', 'path=s@', 'decision=s', 'edit-target'); }
     arg_error('widen-write-set', 'unrecognised option') unless $ok;
     arg_error('widen-write-set', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
     arg_error('widen-write-set', 'missing required --ledger') unless defined $opt{ledger};
@@ -1701,7 +1720,13 @@ sub op_widen_write_set {
         # test-writer write only under test_paths, so a re-scope that adds a
         # tests/t/*.t to write_set alone leaves the test-writer refused
         # (hook-continuity-remake 06, 2026-09-24). Add it to test_paths too.
-        my @tests = grep { m{(?:\A|/)tests/t/[^/]+\.t\z} } @{ $opt{path} };
+        # 22-ledger-rescope / Decision 87 (task 33): --edit-target means this widening
+        # is EDIT TARGETS, never oracles -- task 25's own coupling (a widened .t path
+        # also joins test_paths) is exactly what turned an edit target into an
+        # immutable oracle and blocked package 21's test fixes. Skip it under the flag;
+        # unchanged (today's behaviour) without it.
+        my @tests = $opt{'edit-target'} ? ()
+                  : grep { m{(?:\A|/)tests/t/[^/]+\.t\z} } @{ $opt{path} };
         if (@tests) {
             $new =~ /\A---\s*\n(.*?)\n---/s;
             my ($ts, $te) = ($-[1], $+[1]);
@@ -1716,6 +1741,176 @@ sub op_widen_write_set {
         }
         return splice_insert_entry($new, qr/^##\s+Decisions & attempt log\b/m, $entry);
     });
+}
+
+# =====================================================================================
+# `set-write-set` / `set-test-paths` (22-ledger-rescope, Decision 84) -- REPLACE
+# write_set/test_paths wholesale, narrow or widen in one call. Unlike widen-write-set
+# (additive only), this is the typed path for a genuine re-scope: before it, a
+# narrowing (or a widen mixed with a narrow) had no legal move except dropping the
+# package and creating a new one -- exactly the operator-named defect this package
+# fixes ("if your solution was dropping a package and creating a new one, then that
+# means there's missing functionality ... Bugfix it.").
+#
+# Every path the NEW set adds over the OLD set must be named verbatim in the given
+# Decision's row text (same naming rule widen-write-set already enforces); a removed
+# path needs no naming at all. Refused outright, leaving the ledger byte-for-byte
+# unchanged, when its own ledger status is done or dropped (bp-drive-next.pl/
+# bp-orchestrator.pl already treat those two as terminal -- there is no package left
+# to re-scope). Decision 89 (correcting Decision 84's own first draft, caught before
+# commit): rescoping a RUNNING package between worker dispatches is exactly the use
+# case this exists for, so neither the package's own status of `running` nor its own
+# membership in <data>/.drive-solo/inflight.json is a reason to refuse. Separately,
+# when the call ADDS a path (one not already in the field), it is refused if that
+# added path overlaps the write_set of ANOTHER in-flight package (the same overlap
+# semantics widen-write-set already applies via _widen_check_inflight_conflict),
+# naming the conflicting package; a removal-only call never triggers this check, even
+# when the remaining paths still overlap another in-flight package.
+# =====================================================================================
+
+# _rescope_refusal_reason($ledger) -> a one-sentence refusal reason, or undef. Reads
+# only the ledger's own status (Decision 89: in-flight membership and a `running`
+# status are no longer refusal reasons on their own -- see _widen_check_inflight_conflict
+# for the separate, added-path-only overlap check). Any I/O failure reading the ledger
+# is treated as "no refusal" -- this is an additive safety gate, not the op's own
+# read/validate path (run_op still re-reads and re-validates for real).
+sub _rescope_refusal_reason {
+    my ($ledger) = @_;
+
+    if (open(my $fh, '<:raw', $ledger)) {
+        local $/;
+        my $B = <$fh>;
+        close $fh;
+        if (defined $B) {
+            my $status = extract_frontmatter_value($B, 'status');
+            if (defined $status && grep { $_ eq $status } qw(done dropped)) {
+                return "this ledger's own status is '$status'; refusing to re-scope a package that is "
+                     . 'done or dropped';
+            }
+        }
+    }
+    return undef;
+}
+
+# Shared by op_set_write_set / op_set_test_paths -- same shape, differing only in
+# which frontmatter field is replaced (Decision 84 says explicitly they share it).
+sub _op_set_scope_field {
+    my ($field, $verb, @args) = @_;
+    my %opt = (path => []);
+    my $ok;
+    { local $SIG{__WARN__} = sub { };
+      $ok = GetOptionsFromArray(\@args, \%opt, 'ledger=s', 'path=s@', 'decision=s'); }
+    arg_error($verb, 'unrecognised option') unless $ok;
+    arg_error($verb, 'unexpected extra arguments: ' . join(' ', @args)) if @args;
+    arg_error($verb, 'missing required --ledger') unless defined $opt{ledger};
+    arg_error($verb, 'missing required --decision') unless defined $opt{decision};
+    arg_error($verb, 'missing required --path (repeatable)') unless @{ $opt{path} };
+    arg_error($verb, "--decision '$opt{decision}' is not a positive integer")
+        unless $opt{decision} =~ /\A[1-9][0-9]*\z/;
+
+    for my $p (@{ $opt{path} }) {
+        my $err = _widen_path_error($p);
+        arg_error($verb, "--path $err") if defined $err;
+    }
+
+    my $refusal = _rescope_refusal_reason($opt{ledger});
+    arg_error($verb, $refusal) if defined $refusal;
+
+    my $bp = op_create_dirname(op_create_dirname($opt{ledger})) . '/blueprint.md';
+    open(my $bfh, '<:raw', $bp)
+        or arg_error($verb, "cannot read the blueprint for this ledger ($bp): $!");
+    my $bytes = do { local $/; <$bfh> };
+    close $bfh;
+    my $dtext = _decision_text($bytes // '', $opt{decision});
+    arg_error($verb, "Decision $opt{decision} not found in $bp") unless defined $dtext;
+
+    my $cur_B;
+    {
+        open(my $lfh, '<:raw', $opt{ledger}) or arg_error($verb, "cannot read $opt{ledger}: $!");
+        local $/;
+        $cur_B = <$lfh>;
+        close $lfh;
+        $cur_B = '' unless defined $cur_B;
+    }
+    my %existing = map { ($_ => 1) } ledger_field_segments($cur_B, $field);
+
+    my @added;
+    for my $p (@{ $opt{path} }) {
+        next if $existing{$p};
+        arg_error($verb, "Decision $opt{decision} does not name '$p' (verbatim) -- record the re-scope in "
+            . 'blueprint.md first (bp-blueprint.pl add-decision)')
+            unless index($dtext, $p) >= 0;
+        push @added, $p;
+    }
+
+    # Decision 89: only an ADDED path can trigger the overlap-with-another-in-flight-
+    # package refusal -- a removal-only call (no @added at all) never checks this, even
+    # when the paths that remain still overlap another in-flight package's write_set.
+    if (@added) {
+        my $conflict = _widen_check_inflight_conflict($opt{ledger}, \@added);
+        if (defined $conflict) {
+            arg_error($verb,
+                "would overlap in-flight package ${conflict}'s write set; refusing (nothing written)");
+        }
+    }
+
+    my $entry = '- ' . iso_now() . " ${EMDASH} $field replaced per Decision $opt{decision}: "
+              . join(':', @{ $opt{path} });
+
+    run_op($verb, $opt{ledger}, sub {
+        my ($B) = @_;
+        return (undef, 'no frontmatter block to update') unless $B =~ /\A---\s*\n(.*?)\n---/s;
+        my ($fs, $fe) = ($-[1], $+[1]);
+        my $new = replace_first_key_line($B, $fs, $fe, $field, "$field: " . join(':', @{ $opt{path} }));
+        return (undef, "$field: key not found in frontmatter") unless defined $new;
+        return splice_insert_entry($new, qr/^##\s+Decisions & attempt log\b/m, $entry);
+    });
+}
+
+sub op_set_write_set  { return _op_set_scope_field('write_set',  'set-write-set',  @_) }
+sub op_set_test_paths { return _op_set_scope_field('test_paths', 'set-test-paths', @_) }
+
+# =====================================================================================
+# `set-section` (22-ledger-rescope, Decision 84) -- replace the BODY of exactly one of
+# Scope / Done criteria / Inputs / Out of scope, leaving the frontmatter byte-
+# identical (unlike every other mutating verb here, which is free to bump
+# last_updated). Every other heading is refused: Pipeline / Decisions & attempt log /
+# Next action already have their own dedicated verb (tick-step / append-attempt /
+# set-next-action), and Outputs / Escalation are simply outside the allow-list.
+# =====================================================================================
+
+my @SET_SECTION_ALLOWED = ('Scope', 'Done criteria', 'Inputs', 'Out of scope');
+
+sub splice_set_section {
+    my ($B, $section, $text) = @_;
+    my $head_re = qr/^##\s+\Q$section\E\b/m;
+    my $loc = locate_section($B, $head_re);
+    return (undef, "## $section section not found") unless $loc;
+    return (undef, 'section ends inside an unterminated fenced code block; refusing to replace inside a fence')
+        if $loc->{unterminated};
+    my $has_term = ($loc->{body_end} < length($B)) ? 1 : 0;
+    my $new_span = "\n" . $text . ($has_term ? "\n\n" : "\n");
+    return (substr($B, 0, $loc->{body_start}) . $new_span . substr($B, $loc->{body_end}), undef);
+}
+
+sub op_set_section {
+    my @args = @_;
+    my %opt;
+    my $ok;
+    { local $SIG{__WARN__} = sub { };
+      $ok = GetOptionsFromArray(\@args, \%opt, 'ledger=s', 'section=s', 'text=s', 'text-file=s'); }
+    arg_error('set-section', 'unrecognised option') unless $ok;
+    arg_error('set-section', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
+    arg_error('set-section', 'missing required --ledger') unless defined $opt{ledger};
+    arg_error('set-section', 'missing required --section') unless defined $opt{section};
+    unless (grep { $_ eq $opt{section} } @SET_SECTION_ALLOWED) {
+        arg_error('set-section', "'--section $opt{section}' is not one of the sections this verb may replace "
+            . '(' . join(', ', @SET_SECTION_ALLOWED) . '); Pipeline, Decisions & attempt log and Next action '
+            . 'each have their own dedicated verb, and every other heading is outside the allow-list');
+    }
+    my $text = get_freetext_arg(sub => 'set-section', opt => \%opt, primary => 'text', filekey => 'text-file');
+
+    run_op('set-section', $opt{ledger}, sub { return splice_set_section($_[0], $opt{section}, $text) });
 }
 
 sub op_add_output {
@@ -2774,6 +2969,9 @@ my %DISPATCH = (
     'set-next-action'  => \&op_set_next_action,
     'add-output'       => \&op_add_output,
     'widen-write-set'  => \&op_widen_write_set,
+    'set-write-set'    => \&op_set_write_set,
+    'set-test-paths'   => \&op_set_test_paths,
+    'set-section'      => \&op_set_section,
     'rotate'           => \&op_rotate,
     'validate'         => \&op_validate,
     'claim-check'      => \&op_claim_check,
