@@ -13,7 +13,7 @@
 #
 # Every child process this file forks (A5, A7, A8) is pushed onto @KILL_PIDS;
 # the END block below TERMs then KILLs everything left standing, routed
-# through exit() so the reaper always runs (see watcher-probe-liveness.t's
+# through exit() so the reaper always runs (see the retired watcher-probe-liveness coverage's
 # note on why exit() rather than the signal's default action matters here).
 #
 # Runs standalone: perl this file

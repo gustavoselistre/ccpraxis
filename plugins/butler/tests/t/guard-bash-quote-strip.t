@@ -6,7 +6,7 @@
 #
 # THIS IS GUARD-BASH.SH'S FIRST BEHAVIOR TEST, EVER (spec AC19 / scout open question 5).
 # The scout confirmed only registration/route tests existed before this file
-# (hooks-json-route-registration.t, mark-wakeup-agent-dispatch.t) -- neither
+# (hooks-json-route-registration.t, the retired mark-wakeup-agent-dispatch coverage) -- neither
 # exercises guard-bash.sh's own matcher logic. This file IS the "baseline before edit"
 # the ledger's done criterion 5 demands for this hook: it is a FRESHLY-AUTHORED
 # baseline, not an inherited one, exactly as AC19 rules. Run once against the pre-fix
@@ -18,7 +18,7 @@
 # jq AVAILABILITY. guard-bash.sh hard-requires jq (bp_hook_require_jq, fail-closed) --
 # unlike guard-git-mutations.sh's jq-or-perl bp_json_get. jq does not exist on this
 # Windows host, so every subprocess assertion below is gated behind a runtime check and
-# SKIPped on a jq-less host, matching guard-judge-checks.t's own documented
+# SKIPped on a jq-less host, matching the retired guard-judge-checks coverage's own documented
 # convention -- a SKIP here reads as "not exercised on this host", never as a false
 # green or a harness bug.
 #

@@ -41,8 +41,8 @@
 #   guard-git-mutations-quote-mask.t / -heredoc-strip.t / -prose-  | JQ
 #     not-invocation.t: no case in any of the three actually reads  |  (n/a; noted for
 #     jq -- nothing to exclude on that code, listed for completeness)|  completeness only)
-#   hook-payload-read-bound.t (bp_read_payload bound)              | LIB
-#   read-payload-idempotent.t (bp_read_payload re-entrancy)        | LIB
+#   the retired hook-payload-read-bound coverage (bp_read_payload bound)              | LIB
+#   the retired read-payload-idempotent coverage (bp_read_payload re-entrancy)        | LIB
 #
 # GG-1's corpus below is deliberately EXHAUSTIVE of every case (not a sample)
 # in git-mutation-guard-reach.t section C, guard-git-mutations-quote-mask.t,

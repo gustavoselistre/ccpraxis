@@ -42,7 +42,7 @@
 # encoding, and every command string stays a byte string -- the bytes a real command carries.
 #
 # KNOWN-RED, NOT THIS FILE'S BUSINESS (spec §7 E-1): registering the fifth PreToolUse block turns
-# exactly one assertion red in t/repeat-guard.t and one in t/ledger-guard.t. Both are outside
+# exactly one assertion red in the retired repeat-guard coverage and one in t/ledger-guard.t. Both are outside
 # b15's write set and this file deliberately asserts nothing about them.
 #
 # DELIBERATE OMISSION: AC-37 ("perl t/67 exits 0 with zero not ok") is
@@ -51,8 +51,8 @@
 use strict;
 use warnings;
 
-# A TEST MUST NEVER ACTUATE A REAL WAKE-LOCK. This file drives bp-continuity.pl /
-# bp-runstate.pl / gate-continuity.sh, which hold the machine awake for an armed
+# A TEST MUST NEVER ACTUATE A REAL WAKE-LOCK. This file drives butler-continuity /
+# bp-runstate.pl / stop-gate.sh, which hold the machine awake for an armed
 # session -- and they do it as SUBPROCESSES, where bp-keepawake.pl's `$0 =~ /\.t\z/`
 # guard cannot reach (its $0 is the .pl). CCPRAXIS_NO_WAKELOCK is the supported
 # opt-out and IS inherited across exec. Enforced by t/test-wakelock-hygiene.t.
@@ -65,7 +65,6 @@ use POSIX qw(mkfifo);
 
 (my $HOOKS = "$Bin/../../hooks") =~ s{\\}{/}g;
 my $HOOK       = "$HOOKS/wait-shape-guard.sh";
-my $LIB        = "$HOOKS/lib.sh";
 my $HOOKSJSON  = "$HOOKS/hooks.json";
 
 my $J    = JSON::PP->new->canonical;
@@ -210,11 +209,11 @@ sub count_window {
 }
 
 # The session-token sanitiser (spec §2.6): batch B's fix round re-points this from
-# shelling out to the now-deleted hooks/lib.sh (its bp_repeat_session_token) to a
+# shelling out to the now-deleted hooks/the old shared bash guard library (its bp_repeat_session_token) to a
 # pure-perl mirror of BpHook::Guards::WaitShapeGuard::_token
 # (plugins/butler/scripts/BpHook/Guards/WaitShapeGuard.pm) -- the successor's own
 # token sanitiser, same rule: non-alnum/underscore/hyphen -> "_", truncate to 16,
-# empty falls back to a placeholder. Reason DEL (lib.sh gone); behavior preserved.
+# empty falls back to a placeholder. Reason DEL (the old shared bash guard library gone); behavior preserved.
 sub session_token {
     my ($raw) = @_;
     $raw = '' unless defined $raw && !ref($raw);
@@ -402,7 +401,7 @@ my $P7 = join("\n", q{perl plugins/butler/tests/t/ledger-guard.t 2>&1 | tail -20
 my $CORRECT_FORM = q{cmd > /tmp/out.txt 2>&1; echo "exit=$?"};
 
 my @AC11 = (
-    ['t/62 into tail -20 then EXIT=$?',      q{perl plugins/butler/tests/t/repeat-guard.t 2>&1 | tail -20; echo "EXIT=$?"}],
+    ['t/62 into tail -20 then EXIT=$?',      q{perl plugins/butler/tests/t/wait-shape-guard.t 2>&1 | tail -20; echo "EXIT=$?"}],
     ['t/73 into tail -5 then exit=$?',       q{perl plugins/butler/tests/t/status-recognition.t 2>&1 | tail -5; echo "exit=$?"}],
     ['timeout perl t/52 into tail -60',      q{timeout 120 perl plugins/sandbox/tests/t/detector-hardening.t 2>&1 | tail -60; echo "EXIT=$?"}],
     ['run-tests.pl into tail -25',           q{perl plugins/sandbox/tests/run-tests.pl 2>&1 | tail -25; echo "EXIT=$?"}],
@@ -413,7 +412,7 @@ my @AC11 = (
 
 # AC-13: a pipe into tail/head with NO $? read. THE SECOND NEGATIVE CRITERION.
 my @AC13 = (
-    ['ls -la repeat-guard.sh | tail -1',  q{ls -la /project/plugins/butler/hooks/repeat-guard.sh 2>&1 | tail -1}],
+    ['ls -la wait-shape-guard.sh | tail -1',  q{ls -la /project/plugins/butler/hooks/wait-shape-guard.sh 2>&1 | tail -1}],
     ['ls -la specs/ | tail -20',          q{ls -la .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/ 2>&1 | tail -20}],
     ['| while read ... done | head -60',  $AC9],
 );
@@ -421,7 +420,7 @@ my @AC13 = (
 # AC-14: the CORRECT forms -- 287 in-corpus instances the naive matcher would have denied.
 my @AC14 = (
     ['redirect then echo "exit=$?" then tail (287 instances)', q{prove plugins/sandbox/tests/t/detector-hardening.t > /tmp/prove2.txt 2>&1; echo "exit=$?"; tail -3 /tmp/prove2.txt}],
-    ['command substitution then rc=$?',                        q{out=$(perl plugins/butler/tests/t/repeat-guard.t 2>&1); rc=$?}],
+    ['command substitution then rc=$?',                        q{out=$(perl plugins/butler/tests/t/wait-shape-guard.t 2>&1); rc=$?}],
 );
 
 # AC-15: META-04's regex must NOT be implemented.
@@ -448,7 +447,7 @@ my $AC17_ALLOW = q{for id in a49213afc416089fd a712a884417c60e49; do printf '%s 
 # §2.13 rule precedence R1 -> R3b -> R2, first match wins.
 my $PREC_R1_R3B = q{until [ -s /tmp/claude-0/-project/x/tasks/a8f15ee1ec26598b5.output ]; do sleep 10; done};
 my $PREC_R3B_R2 = q{sleep 30; cat /tmp/claude-0/-project/x/tasks/a8f15ee1ec26598b5.output | tail -20; echo "EXIT=$?"};
-my $PREC_R1_R2  = q{for i in $(seq 1 3); do sleep 6; done; perl plugins/butler/tests/t/repeat-guard.t 2>&1 | tail -20; echo "EXIT=$?"};
+my $PREC_R1_R2  = q{for i in $(seq 1 3); do sleep 6; done; perl plugins/butler/tests/t/wait-shape-guard.t 2>&1 | tail -20; echo "EXIT=$?"};
 
 # index()-based substring assertions: a literal like `rc=$?` or `${BASH_SOURCE[0]}` cannot go inside
 # an interpolating qr// without perl eating it, and \Q...\E does NOT prevent interpolation.
@@ -546,7 +545,7 @@ sub lacks_str{ my ($hay, $needle, $label) = @_; ok(index($hay, $needle) <  0, $l
 # codes DEL/SRC/REG): three whole groups pinned the retired bash implementation --
 # bp_ws_is_wait_loop/bp_ws_is_false_green_pipe/bp_ws_is_task_artifact_poll/
 # bp_ws_action_of/bp_ws_state_path/bp_ws_count_window called directly after sourcing
-# hooks/lib.sh (DEL: lib.sh is on the deletion list, gone), the BP_WS_*_RE/main-guard
+# hooks/the old shared bash guard library (DEL: the old shared bash guard library is on the deletion list, gone), the BP_WS_*_RE/main-guard
 # source-text pins and the AC-26/AC-27/AC-21/AC-5 source greps (SRC: the matcher now
 # lives in BpHook::Guards::WaitShapeGuard, plugins/butler/scripts/BpHook/Guards/
 # WaitShapeGuard.pm, as perl, not bash source text to pin), and the AC-32..AC-35
@@ -557,7 +556,7 @@ sub lacks_str{ my ($hay, $needle, $label) = @_; ok(index($hay, $needle) <  0, $l
 # and the registration shape) is re-expressed in guards-remake-wait-shape.t's WS-1..
 # WS-12 corpus, per that file's own header note (spec sec 4.10). No behavior
 # assertion is weakened; only the OLD monolith's now-nonexistent source and its
-# lib.sh-sourced pure calls are dropped.
+# the old shared bash guard library-sourced pure calls are dropped.
 # =====================================================================================
 # =====================================================================================
 # Every remaining group drives the hook PROCESS, which needs jq present to get past

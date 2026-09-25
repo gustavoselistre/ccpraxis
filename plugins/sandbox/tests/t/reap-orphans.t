@@ -188,7 +188,7 @@ sub pad {
     # COMMENTS STRIPPED FIRST. The script DESCRIBES the removed kill(0,...) at
     # length in the comment explaining why it went, so a raw scan finds the very
     # string it is asserting is absent. Same non-comment scan lane-routing.t and
-    # hook-payload-read-bound.t use -- forgetting it here cost a red run.
+    # the retired hook-payload-read-bound coverage use -- forgetting it here cost a red run.
     my $code = $src;
     $code =~ s/^[ \t]*#[^\n]*$//mg;
 

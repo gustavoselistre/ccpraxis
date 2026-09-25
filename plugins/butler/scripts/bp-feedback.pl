@@ -39,7 +39,7 @@ use JSON::PP ();
 use File::Basename qw(dirname);
 
 my $BP_SCRIPT_DIR = dirname(File::Spec->rel2abs(__FILE__));
-# Guarded on the module, not the path -- see bp-continuity.pl's require.
+# Guarded on the module, not the path.
 require "$BP_SCRIPT_DIR/BpSession.pm"
     unless grep { m{(?:^|/)BpSession\.pm$} } keys %INC;
 

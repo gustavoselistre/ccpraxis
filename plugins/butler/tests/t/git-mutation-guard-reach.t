@@ -183,7 +183,7 @@ SKIP: {
     # SOMEWHERE KNOWN rather than hope the machine is quiet.
     #
     # bp_drive_active_dir already honours CCPRAXIS_DRIVE_ACTIVE_DIR and
-    # validates it as absolute (lib.sh:688), so an empty File::Temp dir is all
+    # validates it as absolute (the old shared bash guard library:688), so an empty File::Temp dir is all
     # the construction needed -- no production change, and the same shape the
     # continuity tests already use for CCPRAXIS_CONTINUITY_ACTIVE_DIR.
     #
@@ -224,7 +224,7 @@ SKIP: {
     # And the predicate that covers the case this whole report was about: a
     # drive-solo Task subagent inherits no BP_* at all, so liveness has to be
     # readable from disk rather than from the environment.
-    # bp_drive_any_active (lib.sh) is retired; the successor's scope predicate
+    # bp_drive_any_active (the old shared bash guard library) is retired; the successor's scope predicate
     # is the run-hook.sh --pre clause "ledger,armed" on the run-scoped
     # registration branch, which run-hook.sh resolves by reading the on-disk
     # armed/<sid> file (never just the environment) -- retargeted per

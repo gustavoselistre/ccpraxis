@@ -509,7 +509,7 @@ subtest 'AC31: ctx_ceiling / BP_CONTEXT_CEILING_TOKENS (whole word) appear nowhe
     my $SKILL = "$Bin/../../skills/coordinator-protocol/SKILL.md";
     # Retargeted per package 16's batch B (Decision 34, spec 16 sec 4 batch B
     # note "context-growth-checkpoint AC31 (retarget to hooks/context-ceiling.sh)"):
-    # context-ceiling-guidance.sh and context-ceiling-flush.sh were merged
+    # the old separate context-ceiling guidance and flush guards were merged
     # into one guard, hooks/context-ceiling.sh, by package 14's guards-remake.
     my $CEILING_HOOK = "$Bin/../../hooks/context-ceiling.sh";
     my $sub_re = sub {
@@ -549,7 +549,7 @@ subtest 'AC32: SKILL.md documents the two-tier model per SS2.11' => sub {
     like($section, qr/CTX_CEILING_DEFAULT/, 'names %CTX_CEILING_DEFAULT as the canonical source');
     like($section, qr/BP_CONTEXT_CEILING_SOFT_TOKENS/, 'contains BP_CONTEXT_CEILING_SOFT_TOKENS');
     like($section, qr/BP_CONTEXT_CEILING_HARD_TOKENS/, 'contains BP_CONTEXT_CEILING_HARD_TOKENS');
-    # [PIN, package 16 batch D]: context-ceiling-guidance.sh and context-ceiling-flush.sh
+    # [PIN, package 16 batch D]: the old separate context-ceiling guidance and flush guards
     # were merged into one guard, hooks/context-ceiling.sh, by package 14's guards-remake
     # (same retarget rationale as AC31 above).
     like($section, qr/context-ceiling\.sh/, 'names context-ceiling.sh (guidance tier)');

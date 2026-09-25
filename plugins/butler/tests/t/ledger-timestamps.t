@@ -13,7 +13,7 @@
 # real breaks", which is trivially true while no check exists at all.
 #
 # SCOPE DISCIPLINE (spec §1): this is an AUDIT-TRAIL defect, not a run-control one.
-# bp-status.sh uses mtime, gate-stop.sh and the watchdog never parse last_updated:.
+# bp-status.sh uses mtime, stop-gate.sh and the watchdog never parse last_updated:.
 # Nothing here asserts run-control behaviour, staleness detection, or watchdog firing.
 #
 # THE VACUITY GATE (spec §4, mandatory). C1/C2 are an opposite pair over the SAME

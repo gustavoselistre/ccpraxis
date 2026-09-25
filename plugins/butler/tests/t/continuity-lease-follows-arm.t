@@ -5,7 +5,7 @@
 # NEW BpHook arm state, through legacy_dir(), store_root_for() and
 # new_store_active() -- none of which exist yet. Runs in-process, using the
 # same $PLATFORM, $STATE_ROOT, spawn/kill_pid/powershell_available seams as
-# continuity-lease-held.t (Decision 45, unedited and untouched by this file).
+# the sibling continuity-lease-held coverage (Decision 45, unedited and untouched by this file).
 #
 # EVERY CALL TO A NOT-YET-WRITTEN SUB goes through LZ(), which turns
 # "Undefined subroutine" into a plain undef instead of dying -- see
@@ -152,7 +152,7 @@ sub slurp {
     # -- the refresher decision alone (spec 2.5: "converge's held branch only
     # ensures the refresher, and apply happens on the refresher's tick"). Its
     # spawn seam is called as spawn($dir), same contract as
-    # continuity-lease-held.t's own converge case ("spawn => sub { push
+    # the sibling continuity-lease-held coverage's own converge case ("spawn => sub { push
     # @daemons, $_[0]; 7777 }") -- NOT BpKeepAwake::apply's spawn seam, which
     # is called with a PID-FILE PATH and is expected to write a real pid into
     # it. Feeding ensure_daemon's spawn seam something that tries to open
@@ -175,7 +175,7 @@ sub slurp {
     # tick (daemon_loop -> sync(..., active=>1)), never from converge's held
     # branch directly. To exercise the kill_pid seam on release we simulate
     # that a real helper claim already exists -- exactly as
-    # continuity-lease-held.t's own converge case does (manually writing
+    # the sibling continuity-lease-held coverage's own converge case does (manually writing
     # keepawake.pid before the release-side converge call) -- rather than
     # relying on the held branch above to have written one.
     my $pf = "$legacy/keepawake.pid";
@@ -305,7 +305,7 @@ sub slurp {
 }
 
 # ===========================================================================
-# L6 -- legacy_dir() agrees with bp-continuity.pl's continuity_active_dir
+# L6 -- legacy_dir() agrees with the old continuity CLI's continuity_active_dir
 # ===========================================================================
 {
     my $t = tempdir(CLEANUP => 1);
@@ -328,14 +328,14 @@ sub slurp {
         local $ENV{HOME} = '/h/home1';
         delete local $ENV{USERPROFILE};
         is(LZ('legacy_dir'), '/h/home1/.claude/ccpraxis/.continuity-active',
-           'L6: HOME alone resolves as bp-continuity.pl would');
+           'L6: HOME alone resolves as the old continuity CLI would');
     }
     {
         delete local $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR};
         delete local $ENV{HOME};
         local $ENV{USERPROFILE} = 'C:\\Users\\l6user';
         is(LZ('legacy_dir'), 'C:/Users/l6user/.claude/ccpraxis/.continuity-active',
-           'L6: USERPROFILE alone resolves as bp-continuity.pl would');
+           'L6: USERPROFILE alone resolves as the old continuity CLI would');
     }
 }
 

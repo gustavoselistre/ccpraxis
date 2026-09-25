@@ -14,7 +14,7 @@
 # ("at least one blueprint name required"), so the session has no way to
 # satisfy it, and every subsequent `next` re-emits it.
 #
-# It is not merely a stall. gate-drive-loop.sh allows a driver's turn to end
+# It is not merely a stall. stop-gate.sh allows a driver's turn to end
 # only for action `done` or `pause`; `need-order` is neither, so the stop is
 # BLOCKED and the driver is told to "do the next thing NOW" over zero
 # blueprints. Meanwhile B2 calls keepawake_apply('active'), holding the
@@ -206,10 +206,10 @@ sub capture_run {
 # at the empty-scope branch looking exactly like "nothing is there".
 #
 # Reporting `done` over it is a FALSE-SETTLED bug, not a cosmetic one:
-# bp-watchdog.pl treats `done` as absolute ("The director reports no remaining
+# the watchdog logic treats `done` as absolute ("The director reports no remaining
 # work. Do not re-arm."), so a ledger sitting at status: running would be
 # declared settled and the run's dead-man's switch disarmed on top of it.
-# drive-loop-watchdog.t's own fixture is precisely this shape -- packages/p1.md with
+# the retired drive-loop-watchdog coverage's own fixture is precisely this shape -- packages/p1.md with
 # no blueprint.md -- and it went red the moment the empty-scope fix landed
 # without this distinction. Pinned here so the two cases can never re-merge.
 # ===========================================================================

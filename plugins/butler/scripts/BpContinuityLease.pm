@@ -49,8 +49,8 @@ package BpContinuityLease;
 # with no Stop hook and no `hold` tick in between, which is exactly the long
 # unattended turn the lock exists to protect.
 #
-# So arming starts a detached refresher process (`bp-continuity.pl lease
-# --daemon`) whose ONLY job is to re-assert both leases every tick for as long
+# So arming starts a detached refresher process (this module's own `lease
+# --daemon` CLI entry) whose ONLY job is to re-assert both leases every tick for as long
 # as any session is armed, and to release and exit once none is. Disarm does not
 # have to kill it — it notices within a tick — but disarm re-syncs anyway so the
 # release is immediate.
@@ -67,7 +67,7 @@ package BpContinuityLease;
 # marker behind, and the lease follows the marker: the refresher holds until
 # nothing is armed, and the marker stops counting at the continuity TTL (12h by
 # default, CCPRAXIS_CONTINUITY_TTL_H). So the worst case is a display held on for
-# as long as the arm itself is still considered valid — and gate-continuity.sh
+# as long as the arm itself is still considered valid — and stop-gate.sh
 # usually reaps such a marker much sooner, on the next Stop of ANY session.
 #
 # That horizon is deliberate rather than merely inherited. A shorter one just
@@ -101,7 +101,7 @@ require "$DIR/bp-keepawake.pl";
 our $TICK_SECONDS = 60;
 
 # STALE_TICKS — how many missed ticks make the daemon's pid file "dead" to a
-# cheap mtime-only reader (gate-continuity.sh). Liveness by mtime rather than by
+# cheap mtime-only reader (stop-gate.sh). Liveness by mtime rather than by
 # pid is deliberate: bash cannot tell a live native Windows pid from a dead one
 # (kill -0 lies there — see BpKeepAwake::_pid_alive), but a heartbeat file's age
 # is the same fact on every platform and costs one stat.
@@ -119,7 +119,7 @@ sub stale_ticks { return $STALE_TICKS }
 #     each iteration costs a tasklist — measured at 2.3s of system time in 3s of
 #     wall clock, which is the 2026-08-13 process-storm signature exactly.
 #
-#   Too large decouples this from gate-continuity.sh, which must hardcode its
+#   Too large decouples this from stop-gate.sh, which must hardcode its
 #     staleness window (300s = 60 * 5) because a hook cannot read a perl
 #     constant. At tick=100000 the daemon asserts once and sleeps for a day
 #     holding lease.lock, the gate calls its heartbeat stale on every Stop and
@@ -199,9 +199,9 @@ sub busy_path { return $ENV{BP_BUSY_PATH} // '/tmp/.butler-busy' }
 sub daemon_pid_file { my ($dir) = @_; return "$dir/lease.pid" }
 sub wakelock_pid_file { my ($dir) = @_; return "$dir/keepawake.pid" }
 
-# ttl_hours — mirrors bp_continuity_ttl_hours in hooks/lib.sh (12h, sanitised).
-# A fourth leg of that rule, for the same reason the other three exist: this is
-# perl, lib.sh is bash, and they must agree about when an arm has expired.
+# ttl_hours — this session's continuity TTL rule (12h, sanitised). The bash
+# side no longer mirrors this rule; it was retired when the old bash TTL
+# check was folded away, so this perl copy is now the only implementation.
 sub ttl_hours {
     my $h = $ENV{CCPRAXIS_CONTINUITY_TTL_H};
     return 12 unless defined $h && $h =~ /^\d+$/ && $h > 0;
@@ -229,7 +229,7 @@ sub _is_abs_legacy {
     return 0;
 }
 
-# legacy_dir() -- exactly bp-continuity.pl's continuity_active_dir rule:
+# legacy_dir() -- exactly the retired continuity CLI's continuity_active_dir rule:
 # CCPRAXIS_CONTINUITY_ACTIVE_DIR if absolute (undef if set but relative);
 # otherwise $HOME (then $USERPROFILE) plus the fixed suffix; otherwise
 # undef. Backslashes are folded to forward slashes on the way out, matching
@@ -581,7 +581,7 @@ sub converge {
 # daemon on every call — the precise shape of the 2026-08-13 leak. The heartbeat
 # answers the question that actually matters ("is something still refreshing
 # this?"), means the same thing on every platform, costs one stat, and is the
-# same signal gate-continuity.sh reads from bash.
+# same signal stop-gate.sh reads from bash.
 sub ensure_daemon {
     my ($dir, %opts) = @_;
     return 'refused' unless defined $dir && length $dir;
@@ -667,7 +667,7 @@ sub _spawn_daemon {
 
 # ---------------------------------------------------------------------------
 # _script_main(@argv) — the module's own CLI entry (spec 2.9), so
-# _spawn_daemon has somewhere to exec once bp-continuity.pl is deleted (E1).
+# _spawn_daemon has somewhere to exec now that the old CLI script is deleted (E1).
 #
 #   lease --daemon [--tick N]   runs daemon_loop(legacy_dir(), tick => N) and
 #                               exits 0. legacy_dir() undef prints one stderr

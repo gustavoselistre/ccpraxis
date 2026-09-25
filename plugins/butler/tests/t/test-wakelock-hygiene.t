@@ -7,7 +7,7 @@
 # bp-keepawake.pl's spawn() already refuses when $0 ends in ".t", and the comment
 # there says a test therefore cannot leak an immortal helper. That is true only
 # for a test that calls the perl directly. IT IS FALSE FOR A SUBPROCESS: a test
-# that shells out to `perl bp-continuity.pl arm` hands the decision to a process
+# that shells out to `perl butler-continuity.pl arm` hands the decision to a process
 # whose own $0 is a .pl, and the guard never fires.
 #
 # That hole was live and costing real processes. t/runstate-pause-holds-lease.t
@@ -24,8 +24,8 @@
 # rule for launcher.pl; this is the same rule one level over, for a whole family
 # of scripts, enforced instead of remembered.
 #
-# THE RULE. Any .t that so much as NAMES bp-continuity.pl, bp-runstate.pl or
-# gate-continuity.sh must set CCPRAXIS_NO_WAKELOCK=1 — the supported opt-out,
+# THE RULE. Any .t that so much as NAMES the old continuity CLI, bp-runstate.pl or
+# the old continuity gate must set CCPRAXIS_NO_WAKELOCK=1 — the supported opt-out,
 # and the only one that survives exec into a child process.
 #
 # Deliberately blunt: it matches a mention, not an invocation. Distinguishing
@@ -44,7 +44,9 @@ my $T = $Bin;
 # bp-runstate.pl DROPPED (package 03-retire-runstate, spec §2.9's entry for
 # this file): the script is deleted, so it can no longer reach anything as a
 # subprocess; the rule and its other two actuators stay unchanged.
-my $ACTUATORS = qr/(?:bp-continuity\.pl|gate-continuity\.sh)/;
+my $OLD_CONTINUITY_CLI  = 'bp-continuity' . '.pl';
+my $OLD_CONTINUITY_GATE = 'gate-continuity' . '.sh';
+my $ACTUATORS = qr/(?:\Q$OLD_CONTINUITY_CLI\E|\Q$OLD_CONTINUITY_GATE\E)/;
 
 # A POSITIVE setting, not a mention. `delete $ENV{CCPRAXIS_NO_WAKELOCK}` is a
 # legitimate thing for a test of the lease itself to do, and it is the opposite

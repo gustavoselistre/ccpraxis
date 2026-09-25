@@ -1,6 +1,7 @@
 # BpHook::Guards::WaitShapeGuard -- PreToolUse wait/poll pathology guard
-# (package 14 of blueprint hook-continuity-remake), successor to
-# wait-shape-guard.sh and repeat-guard.sh.
+# (package 14 of blueprint hook-continuity-remake), successor to the old
+# separate wait-shape and repeat-detector guards, now merged into
+# hooks/wait-shape-guard.sh.
 #
 # Contract: .ccpraxis-local-data/blueprints/hook-continuity-remake/specs/
 # 14-guards-remake-spec.md sec 3.7 (this successor's own contract), sec 2.3

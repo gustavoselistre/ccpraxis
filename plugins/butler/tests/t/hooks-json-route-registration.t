@@ -3,8 +3,8 @@
 # REWRITTEN oracle for batch B of blueprint hook-continuity-remake, package
 # 16-cutover (specs/16-cutover-spec.md sec 2.2/2.3/2.4, acceptance B-1).
 #
-# The file's ORIGINAL subject (gate-headless-background.sh and
-# guard-judge-checks.sh's settings.json-vs-hooks.json route, packages g02/h01)
+# The file's ORIGINAL subject (guard-bash.sh's predecessors'
+# settings.json-vs-hooks.json route, packages g02/h01)
 # is retired here rather than carried: both scripts are on the batch-B
 # deletion list (spec sec 4 batch-B file list), so a route decision about a
 # deleted script cannot be an oracle for the tree this package leaves behind.

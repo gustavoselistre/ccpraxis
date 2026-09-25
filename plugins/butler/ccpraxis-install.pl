@@ -2,9 +2,9 @@
 # ccpraxis-install.pl — butler plugin install hook.
 # Wires plugins/butler/bin/ (the bp-* command shims) into the user's PATH.
 #
-# WHY THERE IS A SHIM AT ALL. gate-continuity.sh blocks a turn and tells the
+# WHY THERE IS A SHIM AT ALL. stop-gate.sh blocks a turn and tells the
 # agent what to run instead. Those instructions used to carry the fully
-# resolved path to bp-continuity.pl -- around eighty characters of it, complete
+# resolved path to the old continuity CLI -- around eighty characters of it, complete
 # with a `/../` -- printed twice in one message. A remedy that unwieldy invites
 # being retyped wrongly, and it made an already long block message longer.
 #

@@ -20,7 +20,7 @@
 #     Invoking via `bash` (never by executing the file directly) means a missing exec bit cannot
 #     produce a false red.
 #   * done_testing(), NOT a hand-counted `plan tests => N`. A hardcoded plan count is exactly what
-#     makes repeat-guard.t brittle (:39) and is half of the blocker this package already carries.
+#     makes wait-shape-guard.t brittle (:39) and is half of the blocker this package already carries.
 #   * ALL fixtures are SYNTHESIZED under File::Temp. No live ledger under
 #     .ccpraxis-local-data/blueprints/*/packages/ is read, and above all none is written -- those
 #     are live orchestration state for a running fleet.
@@ -44,8 +44,8 @@
 use strict;
 use warnings;
 
-# A TEST MUST NEVER ACTUATE A REAL WAKE-LOCK. This file drives bp-continuity.pl /
-# bp-runstate.pl / gate-continuity.sh, which hold the machine awake for an armed
+# A TEST MUST NEVER ACTUATE A REAL WAKE-LOCK. This file drives butler-continuity /
+# bp-runstate.pl / stop-gate.sh, which hold the machine awake for an armed
 # session -- and they do it as SUBPROCESSES, where bp-keepawake.pl's `$0 =~ /\.t\z/`
 # guard cannot reach (its $0 is the .pl). CCPRAXIS_NO_WAKELOCK is the supported
 # opt-out and IS inherited across exec. Enforced by t/test-wakelock-hygiene.t.
@@ -68,7 +68,7 @@ my $have_jq = do { my $o = `bash -c 'command -v jq' 2>/dev/null`; $o =~ /\S/ ? 1
 
 sub fwd { (my $p = shift) =~ s{\\}{/}g; $p }
 
-# A hook test must control the hook's environment COMPLETELY (repeat-guard.t:54-58).
+# A hook test must control the hook's environment COMPLETELY (wait-shape-guard.t:54-58).
 my %CLEAN_ENV = map { ($_ => $ENV{$_}) } grep { !/^BP_/ } keys %ENV;
 
 sub realpath_m {
@@ -277,7 +277,7 @@ my @STATUSES = qw(pending running converging reviewing done blocked parked);
 # NUL-bearing content used by every "this would be blocked if it were in scope" assertion.
 sub nul_ledger { return inject_byte_at_line(kg(), 12, "\x00") }
 
-# PATH containing every executable on the ambient PATH EXCEPT $name (repeat-guard.t:392-410).
+# PATH containing every executable on the ambient PATH EXCEPT $name (wait-shape-guard.t:392-410).
 sub path_without {
     my ($name) = @_;
     my $d = "$ROOT/no-$name-bin";
@@ -344,7 +344,7 @@ sub nonblank_lines { return grep { /\S/ } split /\n/, $_[0] }
 # block). Package 16 rewrote hooks.json to the flattened 2.3 registration set (one
 # PreToolUse/Edit-family block with gate-shutdown.sh/guard-writes.sh/ledger-guard.sh/
 # guard-blueprint-write.sh, a single Stop entry naming stop-gate.sh, no
-# gate-drive-loop.sh or gate-continuity.sh anywhere). That shape is now the
+# old duplicate Stop registration anywhere). That shape is now the
 # concern of, and proven by, hooks-json-route-registration.t and
 # hook-registration-resilience.t (both immutable oracles for this package). No
 # behavior assertion is weakened; only the OLD registration-shape pin is dropped.
@@ -358,7 +358,7 @@ sub nonblank_lines { return grep { /\S/ } split /\n/, $_[0] }
 # Every remaining group drives the hook process, which requires jq to be PRESENT (spec §2.2:
 # bp_hook_require_jq sits immediately after the gate, so without jq every ledger write is M9).
 # One SKIP keeps this file useful on the jq-less Git-for-Windows host, mirroring
-# repeat-guard.t:388-390. AC-31 (jq scrubbed from PATH) lives INSIDE it only because it
+# wait-shape-guard.t:388-390. AC-31 (jq scrubbed from PATH) lives INSIDE it only because it
 # still needs the hook to run at all.
 # =====================================================================================
 SKIP: {
@@ -998,7 +998,7 @@ SKIP: {
     }
 
     # =================================================================================
-    # AC-31 [M9] fail-CLOSED with jq missing from PATH. M9's text is verbatim lib.sh:18 --
+    # AC-31 [M9] fail-CLOSED with jq missing from PATH. M9's text is verbatim the old shared bash guard library --
     # emitted by bp_hook_require_jq, never reimplemented.
     # =================================================================================
     {
@@ -1039,7 +1039,7 @@ SKIP: {
 
     # =================================================================================
     # AC-34 *** NON-NEGOTIABLE *** the graceful-stop park-write MUST be allowed.
-    # Under a stop, bp_gate_verdict denies Task and every worksite edit, and gate-stop.sh
+    # Under a stop, bp_gate_verdict denies Task and every worksite edit, and stop-gate.sh
     # refuses to end the session until the park-write lands. A guard that rejects it leaves a
     # stopping coordinator with NO LEGAL MOVE and traps the session. All three stop flavours,
     # each as the SEQUENCE of Edit payloads a stopping coordinator actually emits (the disk is

@@ -5,7 +5,7 @@
 # per-dispatch budget stamp (§2.4 step 1), the interrupt-and-report move
 # positioned between waiting and killing (§2.4 step 4, Decision 8,
 # criterion 4/5), and the "Known residual" paragraph's replacement (§2.4
-# step 5), which t/bp-watch-doctrine.t does NOT pin (confirmed by the
+# step 5), which the retired bp-watch-doctrine coverage does NOT pin (confirmed by the
 # architect's own re-read, spec §2.1 "SKILL.md consequence").
 #
 # Spec: .../specs/w02-dispatch-budget-and-interrupt-spec.md §2.4, §3
@@ -40,7 +40,7 @@ ok(defined $content && length $content, 'A1: drive-solo/SKILL.md is readable');
 
 # ===========================================================================
 # B (behavior 13a). The "Arm the watcher" section stamps the dispatch with
-# bp-dispatch-log.pl start, foreground, BEFORE the bp-watch.pl arm — Decision
+# bp-dispatch-log.pl start, foreground, BEFORE the butler-hold arm — Decision
 # 7's "elapsed time measured driver-side, from launch".
 # ===========================================================================
 my ($arm_section) = $content =~ /(^## Wedged workers.*?)(?=^## |\z)/ms;
@@ -76,7 +76,7 @@ like($arm_section, qr/--budget-seconds/,
 my $table_end_idx = index($arm_section, 'bp-dispatch-log.pl start');
 ok($table_end_idx >= 0,
    'C0: the "bp-dispatch-log.pl start" stamp is present (landmark for positioning; '
- . '[PIN: the bp-watch.pl verdict table this landmark used, STATUS-CHANGE, was deleted '
+ . '[PIN: the butler-hold verdict table this landmark used, STATUS-CHANGE, was deleted '
  . 'by package 16 batch B/C, so the landmark moves to the step-before-the-prompt stamp])');
 
 if ($table_end_idx >= 0) {
@@ -140,7 +140,7 @@ like($content, qr/do not defer again/i,
 # the fold (this same package) closes it.
 # ===========================================================================
 unlike($content, qr/Known residual \(not closed by/,
-       'F1 CANONICAL (behavior 14): the "Known residual (not closed by bp-watch.pl alone)" '
+       'F1 CANONICAL (behavior 14): the "Known residual (not closed by butler-hold alone)" '
      . 'paragraph naming the gap as still-open is GONE — replaced per §2.4 step 5, because '
      . 'the fold (this same package) closes it');
 # F2 removed: [PIN, package 16 batch D] the "closed by the fold" replacement wording was

@@ -57,7 +57,7 @@ my $G_DROPPED = "\xF0\x9F\x97\x91";
 # all, so it needs no vocabulary to validate against). That deletion is
 # CORRECT and not a regression of the defect this file exists to pin --
 # `dropped` remains a valid LEDGER status with live guards (A6-A8, UNTOUCHED
-# below: bp-drive-next.pl, bp-orchestrator.pl, ledger-guard.sh, gate-stop.sh,
+# below: bp-drive-next.pl, bp-orchestrator.pl, ledger-guard.sh, stop-gate.sh,
 # bp-ledger.pl); it simply stops being a TABLE concept.
 #
 # This block replaces A1-A5 with the deletion verification the spec asks
@@ -152,10 +152,10 @@ for my $s (qw(bp-drive-next.pl bp-orchestrator.pl)) {
 # purpose; asserting them separately is the point, not an oversight.
 # ---------------------------------------------------------------------------
 # Retargeted per package 16's batch B (Decision 34): ledger-guard.sh and
-# gate-stop.sh are both now thin run-hook.sh dispatchers (package 13/06's
+# stop-gate.sh are both now thin run-hook.sh dispatchers (package 13/06's
 # guards-remake); the @STATUSES vocabulary and the terminal-status test live
 # in the Perl modules behind them, BpHook/WriteGuards.pm and
-# BpHook/StopGate.pm. gate-stop.sh itself was renamed stop-gate.sh in the
+# BpHook/StopGate.pm. that hook itself was renamed stop-gate.sh in the
 # same flatten.
 my $lg = slurp_raw("$BUTLER/scripts/BpHook/WriteGuards.pm");
 ok(defined $lg, 'A7: BpHook/WriteGuards.pm is readable');
@@ -164,11 +164,11 @@ like($lg, qr/\@STATUSES\s*=\s*qw\([^)]*\bdropped\b[^)]*\)/,
 like($lg, qr/\@STATUSES\s*=\s*qw\([^)]*\bconverging\b[^)]*\)/,
     'A7: BpHook/WriteGuards.pm still accepts `converging` (ledger-only, by design)');
 
-ok(-f "$PROJ/plugins/butler/hooks/stop-gate.sh", 'A7: stop-gate.sh (the renamed gate-stop.sh) exists');
+ok(-f "$PROJ/plugins/butler/hooks/stop-gate.sh", 'A7: stop-gate.sh (a prior-name rename) exists');
 my $gs = slurp_raw("$BUTLER/scripts/BpHook/StopGate.pm");
 ok(defined $gs, 'A7: BpHook/StopGate.pm is readable');
 
-# The pre-cutover gate-stop.sh had two separate case arms testing terminal
+# The pre-cutover version of this hook had two separate case arms testing terminal
 # status; BpHook/StopGate.pm unifies that into one regex (DEL: the "two
 # arms" shape is retired along with the monolithic script, Decision 34).
 like($gs, qr/\bdone\|blocked\|parked\|dropped\b/,

@@ -85,7 +85,7 @@ sub is_under_or_eq {
     return 0;
 }
 
-# match_any REL PATTERNS — mirrors plugins/butler/hooks/lib.sh's match_any exactly: colon-
+# match_any REL PATTERNS — mirrors plugins/butler/scripts/bp-lib.sh's match_any exactly: colon-
 # separated patterns; a trailing '/' means a directory prefix; otherwise an exact match.
 sub match_any {
     my ($rel, $patterns) = @_;

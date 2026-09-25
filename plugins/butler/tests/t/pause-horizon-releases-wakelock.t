@@ -15,8 +15,8 @@
 # Monday evening waiting for it.
 #
 # THE ACTION MUST NOT CHANGE. This decides only whether the machine is held
-# awake. Anything consuming the director's JSON -- gate-drive-loop.sh,
-# bp-watchdog.pl, the reporter -- must see byte-identical output either way, so
+# awake. Anything consuming the director's JSON -- stop-gate.sh,
+# the watchdog logic, the reporter -- must see byte-identical output either way, so
 # AC-4 pins that rather than trusting it.
 use strict;
 use warnings;

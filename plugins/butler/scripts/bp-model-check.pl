@@ -3,7 +3,7 @@
 # model:/effort: frontmatter value (04-model-effort-ledger-validation).
 #
 # `bp-ledger.pl create` refuses an unsupported model:/effort: at creation time,
-# and guard-ledger-create.sh denies the hand-written path that would skip it.
+# and guard-blueprint-write.sh denies the hand-written path that would skip it.
 # Neither can see a ledger that PREDATES this package or one that arrived
 # through the guard's escape hatch -- this script is the defense-in-depth
 # backstop for exactly those two populations (D-C). It mirrors bp-checks.pl's

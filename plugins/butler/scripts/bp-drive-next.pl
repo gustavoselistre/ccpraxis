@@ -61,7 +61,8 @@
 #                   once its ledger turns terminal. Batch C (spec 16-cutover):
 #                   concurrent hand-out (a further ready package whose write
 #                   set is disjoint from every in-flight one) is unconditional
-#                   now; current.json and BUTLER_CONCURRENCY no longer exist.
+#                   now; current.json and the old concurrency-switch env var
+#                   no longer exist.
 #   inflight.lock   exclusive-lock file guarding one `next` call's read+prune
 #                   +write of inflight.json (never deleted; contents unused).
 #   keepawake.pid   PID of the wake-lock process (host only; sandbox = no file)
@@ -864,7 +865,7 @@ sub _cmd_next {
     # need-order with candidates:[] anyway. That prompt is UNANSWERABLE, and it
     # is a closed loop rather than a stall: record-order refuses an empty list,
     # so the session cannot answer it; `next` returns it again on every call;
-    # gate-drive-loop.sh treats any non-done/pause action as actionable work and
+    # stop-gate.sh treats any non-done/pause action as actionable work and
     # blocks the stop for it; and keepawake_apply('active') holds the machine
     # awake over a run containing no work at all.
     #
@@ -882,7 +883,7 @@ sub _cmd_next {
     # Candidate discovery requires blueprint.md, so a directory under
     # blueprints/ that HAS packages but no blueprint.md is silently skipped and
     # lands here looking identical to "nothing is there". Reporting `done` over
-    # it is actively dangerous: bp-watchdog.pl branches on the action string and
+    # it is actively dangerous: the watchdog logic branches on the action string and
     # treats `done` as absolute ("The director reports no remaining work. Do not
     # re-arm."), so a package ledger sitting at status: running would be
     # declared settled and the dead-man's switch disarmed over a wedged run.
@@ -936,7 +937,7 @@ sub _cmd_next {
     # looked at -- and the walk then falls through to 'done', which asserts
     # "every in-scope blueprint is done-or-parked". That assertion is false, and
     # it is believed by the two mechanisms named at the in-flight branch below:
-    # gate-drive-loop.sh allows the turn to end, and bp-watchdog.pl short-circuits
+    # stop-gate.sh allows the turn to end, and the watchdog logic short-circuits
     # to SETTLED. So the run reports finished having never considered the work.
     #
     # This is the same false-settled class as the in-flight bug documented there,
@@ -1197,12 +1198,12 @@ sub _cmd_next {
         # at the top of this file), which is simply false while work is in
         # flight -- and two safety mechanisms believe that assertion:
         #
-        #   * gate-drive-loop.sh, the Stop hook that keeps an unattended driver
+        #   * stop-gate.sh, the Stop hook that keeps an unattended driver
         #     from ending a turn with nothing scheduled to continue the run,
         #     treats 'done' as "run settled" and allows the stop. So the run
         #     dies silently mid-package, looking finished -- the exact failure
         #     that hook was written to prevent.
-        #   * bp-watchdog.pl short-circuits to VERDICT: SETTLED on 'done',
+        #   * the watchdog logic short-circuits to VERDICT: SETTLED on 'done',
         #     ahead of its own movement analysis, so an armed watchdog reports
         #     all-clear over a wedged run.
         #
@@ -1599,7 +1600,7 @@ sub run {
         # TEST / DIAGNOSTIC SEAM, honoured only for well-formed JSON carrying an
         # 'action'. The production path below shells out to bp-usage-gate.pl,
         # which reads the host's REAL OAuth state -- so every consumer of the
-        # director inherits that state, including gate-drive-loop.sh and any
+        # director inherits that state, including stop-gate.sh and any
         # assertion about it. On 2026-08-08 t/94's stop-gate assertions went red
         # for exactly this reason: the host token aged under the relogin floor
         # mid-run, the director began answering pause/token, the gate correctly

@@ -1,9 +1,9 @@
 # BpHook::Guards::GuardBlueprintWrite -- denies a direct Write/Edit/
 # MultiEdit/NotebookEdit that targets a blueprint.md path or a package
 # ledger path, forcing both kinds of mutation through their typed APIs
-# (bp-blueprint.pl and bp-ledger.pl create). Absorbs guard-ledger-create
-# (package 14 of blueprint hook-continuity-remake), successor to
-# guard-blueprint-write.sh and guard-ledger-create.sh.
+# (bp-blueprint.pl and bp-ledger.pl create). Absorbs the old separate
+# ledger-creation guard (package 14 of blueprint hook-continuity-remake),
+# successor to both, now merged into hooks/guard-blueprint-write.sh.
 #
 # Contract: .ccpraxis-local-data/blueprints/hook-continuity-remake/specs/
 # 14-guards-remake-spec.md sec 3.3. Architecture:

@@ -5,7 +5,7 @@
 #
 # Why it exists: on 2026-09-24 the hook-continuity-remake driver recorded two
 # re-scopes (Decisions 47 and 48) and then had no way to apply them.
-# guard-ledger-create.sh refuses a hand edit of a ledger, and
+# guard-blueprint-write.sh refuses a hand edit of a ledger, and
 # bp-answer-decision.pl's --widen-write-set is reachable only through the
 # fleet's decision queue. The verb is additive only, and it refuses any path
 # that the named Decision does not contain verbatim.

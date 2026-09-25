@@ -19,7 +19,7 @@
 # would be a regression in the direction that matters: guard-writes.sh exists
 # because a worker writing outside its scope is how an oracle gets edited.
 #
-# guard-writes.sh is GATED (bp_hook_gate, hooks/lib.sh:9) -- it no-ops entirely
+# guard-writes.sh is GATED (bp_hook_gate, the old shared bash guard library) -- it no-ops entirely
 # unless BP_LEDGER, BP_DIR and BP_PROJECT_ROOT are ALL set, so every invocation
 # below sets all three. A test that forgot one would pass vacuously.
 use strict;

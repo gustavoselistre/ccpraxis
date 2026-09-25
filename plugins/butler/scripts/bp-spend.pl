@@ -1957,7 +1957,7 @@ sub load_dispatch_records {
 # ---------------------------------------------------------------------------
 # load_dispatch_attribution($data_root) -> { <tool_use_id> => { blueprint,
 # package, source } } (never dies), from the append-only records
-# hooks/record-dispatch-package.sh writes at dispatch time:
+# hooks/track-dispatch.sh writes at dispatch time:
 # <data_root>/.dispatch-log/attribution.jsonl, plus its one rolled-over
 # predecessor attribution.jsonl.1. A tool_use_id recorded twice with
 # DIFFERENT packages maps to { conflict => 1 } and attributes nothing -- two
@@ -2138,7 +2138,7 @@ sub _resolve_bp_pkg {
 # reads no file, no wall-clock. Entry 0 is always the driver (B6).
 #
 # An agent whose sidecar toolUseId ($tool_use_ids[$i]) has a
-# record-dispatch-package.sh record is attributed from that record, source
+# track-dispatch.sh record is attributed from that record, source
 # `dispatch-hook`: an exact key recorded when the dispatch happened, so it
 # goes before every inference below. The dispatch-log time-window match and
 # the description heuristic (B4) remain for sessions older than the hook,

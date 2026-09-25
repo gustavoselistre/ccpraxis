@@ -40,7 +40,6 @@ use File::Copy qw(copy);
 (my $HOOKS = "$Bin/../../hooks")   =~ s{\\}{/}g;
 (my $SCRIPTS = "$Bin/../../scripts") =~ s{\\}{/}g;
 my $GUARD  = "$HOOKS/guard-git-mutations.sh";
-my $LIBSH  = "$HOOKS/lib.sh";
 my $BPLIB  = "$SCRIPTS/bp-lib.sh";
 
 ok(-f $GUARD, 'guard-git-mutations.sh exists') or BAIL_OUT('subject hook missing');
@@ -123,8 +122,8 @@ for my $row (
 # BpHook::Guards::GuardGitMutations (plugins/butler/scripts/BpHook/Guards/
 # GuardGitMutations.pm), which uses BpHook::Guards::Shell::strip_noise -- a real perl
 # module always require'd in-process, so AC17's "bp-lib.sh unreachable from a sibling
-# hooks/ tree" failure mode cannot occur any more (hooks/lib.sh, the file AC17 copied
-# into its fixture, is itself on the deletion list). guards-remake-git-mutations.t
+# hooks/ tree" failure mode cannot occur any more (the old shared bash guard library
+# AC17 copied into its fixture is itself on the deletion list). guards-remake-git-mutations.t
 # already documents this exact non-re-expression with reason codes, in its own header:
 #   AC1  -> SRC   (header rationale text, no longer at that site)
 #   AC2  -> LIB   (bp_strip_shell_noise SHA-1 pin against bp-lib.sh, a file this

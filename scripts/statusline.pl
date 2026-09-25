@@ -491,7 +491,7 @@ if (length $sid) {
 # queueing acceptable rather than a way of losing them is that the operator can
 # SEE there are some waiting without going to look.
 #
-# Read straight from the file bp-continuity.pl's `ask` appends to, counted the
+# Read straight from the file butler-continuity's `ask` appends to, counted the
 # same way (a leading "- " is one question). No verb is shelled out to: the
 # statusline runs on every render and must stay cheap.
 #

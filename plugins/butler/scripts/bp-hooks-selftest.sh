@@ -38,7 +38,7 @@ HOOKS="$PLUGIN_ROOT/hooks"
 selftest_cache_key() {
   local ver h
   ver=$(claude --version 2>/dev/null | head -n1 | tr -dc '0-9.')
-  h=$(cat "$HOOKS/guard-writes.sh" "$HOOKS/gate-shutdown.sh" "$HOOKS/track-dispatch.sh" "$HOOKS/lib.sh" 2>/dev/null \
+  h=$(cat "$HOOKS/guard-writes.sh" "$HOOKS/gate-shutdown.sh" "$HOOKS/track-dispatch.sh" "$HOOKS/run-hook.sh" 2>/dev/null \
         | sha256sum | awk '{print $1}')
   printf 'claude=%s hooks=%s\n' "${ver:-unknown}" "${h:-unknown}"
 }

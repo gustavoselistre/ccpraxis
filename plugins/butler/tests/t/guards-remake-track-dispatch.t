@@ -19,7 +19,7 @@
 # above (sec 2.5 for the 2.5 marker shape, sec 3.6 for TrackDispatch's own
 # contract) and the CASES (never the source bash/perl) of the five source
 # files this batch's oracle absorbs -- never from reading track-dispatch.sh,
-# log-dispatch.sh, bp-dispatch-log.pl or the retired
+# the old separate log-dispatch hook, bp-dispatch-log.pl or the retired
 # .drive-solo/.active-worker mechanism itself.
 #
 # NOT RE-EXPRESSED (per spec sec 4.9 "Not:" list and sec 4.2's codes):

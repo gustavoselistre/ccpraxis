@@ -268,17 +268,17 @@ sub by_key {
         # =================================================================
         # C5c -- added for blueprint hook-continuity-remake, package
         # 16-cutover (specs/16-cutover-spec.md sec 2.3, acceptance B-4):
-        # after batch B, settings.json's guard-subagent-stall.sh entries
+        # after batch B, settings.json's old subagent-stall-guard entries
         # (PostToolUse Task|Bash and Stop) are gone -- that script is on the
         # batch-B deletion list, and Decision 5 leaves exactly one Stop
         # entry across the whole tree, owned by stop-gate.sh in hooks.json,
         # not by anything in settings.json. RIGHT NOW (before batch B lands)
         # this is red: the tracked settings.json still carries both
-        # guard-subagent-stall.sh entries.
+        # old subagent-stall-guard entries.
         # =================================================================
         unlike($raw, qr/guard-subagent-stall/,
            'C5c: settings.json names no guard-subagent-stall anywhere in the raw file')
-            or diag('guard-subagent-stall.sh is on the batch-B deletion list (16-cutover spec '
+            or diag('the old subagent-stall-guard hook is on the batch-B deletion list (16-cutover spec '
                   . 'sec 4 batch B file list); its settings.json entries must be removed with it');
 
         my $stop_count = 0;

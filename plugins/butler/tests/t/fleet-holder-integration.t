@@ -805,9 +805,9 @@ sub run_once_marker {
     }
 }
 
-# AC-15 deleted [PIN, package 16 batch D]: it pinned the bp-watch.pl coordinator-arming
-# recipe (the switch-off path) that package 16 retires -- bp-watch.pl itself is gone
-# (batch B/E1) and the "scripts/bp-watch.pl --arm" recipe no longer exists anywhere,
+# AC-15 deleted [PIN, package 16 batch D]: it pinned the butler-hold coordinator-arming
+# recipe (the switch-off path) that package 16 retires -- butler-hold itself is gone
+# (batch B/E1) and the "scripts/butler-hold --arm" recipe no longer exists anywhere,
 # per spec 16 section 4 batch D and reports/15-skills-prose/pin-audit.md.
 
 # ===========================================================================

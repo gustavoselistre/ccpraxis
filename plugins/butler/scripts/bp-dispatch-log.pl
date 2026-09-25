@@ -28,7 +28,7 @@
 # treated an absolute state dir as relative and left stray dirs under the
 # repo root — never repeat that).
 #
-# --now EPOCH is a TEST-ONLY SEAM on the CLI layer (mirrors bp-watch.pl /
+# --now EPOCH is a TEST-ONLY SEAM on the CLI layer (mirrors butler-hold /
 # bp-runstate.pl's own pure functions) — it overrides "the driver's own
 # clock" so tests never sleep in real time. The library functions below
 # already take $now as a plain argument.
@@ -92,8 +92,8 @@ our $RATIO_MAX_LINE_BYTES = 1024 * 1024; # a longer line is skipped, never decod
 # abs_path("$DIR/../../.."), named the INSTALL whenever a driver's Bash call
 # lacked CLAUDE_PROJECT_DIR (a driver's Bash tool does not carry it), and 21
 # records from Sep 11-16 were found inside the live install's own data dir.
-# An empty --root, which dispatch-discipline-nudge.sh and
-# context-ceiling-guidance.sh pass when BP_PROJECT_ROOT is unset, used to
+# An empty --root, which wait-shape-guard.sh and
+# context-ceiling.sh pass when BP_PROJECT_ROOT is unset, used to
 # resolve to "/.ccpraxis-local-data"; it now means "resolve it".
 sub log_dir {
     my ($root) = @_;
@@ -1080,7 +1080,7 @@ unless (caller) {
         # fresh --id could previously both pass the "already running" check
         # (neither sees the other's not-yet-written record) and both
         # proceed to write — the later rename() wins silently, with no
-        # error surfaced to either caller. Unlike bp-watch.pl's accepted
+        # error surfaced to either caller. Unlike butler-hold's accepted
         # "no lock, duplicate is wasted cost" stance, this race can RESET a
         # live dispatch's own clock (masking over_budget for a genuinely
         # stalled worker), which is the a01 pattern this primitive exists

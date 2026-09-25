@@ -49,7 +49,7 @@ my $BUTLER = fwd(abs_path("$Bin/../..") // "$Bin/../..");
 my $PROJ   = fwd(abs_path("$Bin/../../../..") // "$Bin/../../../..");
 my $SCRIPT     = "$BUTLER/scripts/bp-ledger.pl";
 my $ORCH       = "$BUTLER/scripts/bp-orchestrator.pl";
-my $GATE_STOP  = "$BUTLER/hooks/gate-stop.sh";
+my $GATE_STOP  = "$BUTLER/hooks/stop-gate.sh";
 
 my $BP_ROOT   = "$PROJ/.ccpraxis-local-data";
 # Resolved through live AND _archive/ -- see t/87 and almanac 20260823-210122-433f.
@@ -66,7 +66,7 @@ diag("subject under test: $SCRIPT "
      . " -- rotate op expected ABSENT at authoring time; every AC below should fail on MISSING "
      . "BEHAVIOUR, not a crash");
 diag("bp-orchestrator.pl (C3's real call path): $ORCH " . (-e $ORCH ? "(present)" : "(ABSENT)"));
-diag("gate-stop.sh (C4): $GATE_STOP " . (-e $GATE_STOP ? "(present)" : "(ABSENT)"));
+diag("stop-gate.sh (C4): $GATE_STOP " . (-e $GATE_STOP ? "(present)" : "(ABSENT)"));
 diag("live corpus dir (C7, read-only, NEVER written): $CORPUS " . (-d $CORPUS ? "(present)" : "(ABSENT)"));
 
 # The REAL parser/classifier/DAG (C3, C4) -- never a reimplementation. `require`d at top-level in
@@ -133,10 +133,12 @@ sub run_sh {
     my $errf = "$ROOT/herr.$n";
     write_file($outf, '');
     write_file($errf, '');
-    local %ENV = (%CLEAN_ENV, %env,
-                  LGT_SH => fwd($script), LGT_OUT => fwd($outf), LGT_ERR => fwd($errf));
+    my $inf  = "$ROOT/hin.$n";   # a real Stop payload: never an inherited, empty stdin
+    write_file($inf, '{"hook_event_name":"Stop","session_id":"lcb-c4","stop_hook_active":false}');
+    local %ENV = (%CLEAN_ENV, BUTLER_STATE_DIR => fwd("$ROOT/butler-state"), %env,
+                  LGT_SH => fwd($script), LGT_OUT => fwd($outf), LGT_ERR => fwd($errf), LGT_IN => fwd($inf));
     my $rc = system('bash', '-c',
-        'timeout 60 bash "$LGT_SH" "$@" > "$LGT_OUT" 2> "$LGT_ERR"',
+        'timeout 60 bash "$LGT_SH" "$@" < "$LGT_IN" > "$LGT_OUT" 2> "$LGT_ERR"',
         'gate-stop', @$args);
     return ($rc >> 8, read_file($outf) // '', read_file($errf) // '');
 }
@@ -468,11 +470,11 @@ ok(scalar(@ALL_ENTRIES) == 26, "FIXTURE-SANITY: main fixture has 26 Decisions & 
 }
 
 # =====================================================================================
-# [C4] stop gate -- gate-stop.sh's verdict identical pre/post on the same ledger; status,
+# [C4] stop gate -- stop-gate.sh's verdict identical pre/post on the same ledger; status,
 # freshness and '## Next action' unchanged in place.
 #
-# NOTE: gate-stop.sh's own bp_stamp_last_updated() rewrites last_updated: on every successful run
-# (see hooks/gate-stop.sh) -- that is a documented, intentional side effect of the hook itself, not
+# NOTE: stop-gate.sh's own bp_stamp_last_updated() rewrites last_updated: on every successful run
+# (see hooks/stop-gate.sh) -- that is a documented, intentional side effect of the hook itself, not
 # something rotate does. So "identical" here means the VERDICT (exit code + stderr message shape)
 # and the frontmatter status / '## Next action' body, not raw last_updated: bytes.
 # =====================================================================================
@@ -494,9 +496,9 @@ ok(scalar(@ALL_ENTRIES) == 26, "FIXTURE-SANITY: main fixture has 26 Decisions & 
                 BP_PROJECT_ROOT => $PROJ, BP_PACKAGE => 'gatepkg-post', BP_ROLE => 'coordinator');
     my ($rc_post, $out_post, $err_post) = run_sh($GATE_STOP, [], %env2);
 
-    is($rc_post, $rc_pre, "C4: gate-stop.sh's exit code is identical pre/post rotation (status: done, fresh ledger)");
-    is($err_post, $err_pre, "C4: gate-stop.sh's stderr is identical pre/post rotation");
-    is($out_post, $out_pre, "C4: gate-stop.sh's stdout is identical pre/post rotation");
+    is($rc_post, $rc_pre, "C4: stop-gate.sh's exit code is identical pre/post rotation (status: done, fresh ledger)");
+    is($err_post, $err_pre, "C4: stop-gate.sh's stderr is identical pre/post rotation");
+    is($out_post, $out_pre, "C4: stop-gate.sh's stdout is identical pre/post rotation");
 
     my $pre_after  = read_file($pre_path);
     my $post_after = read_file($post_src);

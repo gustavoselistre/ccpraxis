@@ -14,7 +14,7 @@
 # plain "No such file or directory" until the implementer writes it.
 #
 # WRITTEN BLIND TO THE IMPLEMENTATION: derived only from the spec text
-# above, never from reading guard-bash.sh, guard-validation-interlock.sh or
+# above, never from reading guard-bash.sh, its old separate validation-interlock counterpart or
 # any other source hook.
 #
 # NOT RE-EXPRESSED (Decision 26/Decision 6 exemptions, and every case the

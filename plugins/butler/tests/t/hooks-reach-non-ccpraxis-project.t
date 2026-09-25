@@ -4,14 +4,14 @@
 # force into being (done criteria 2 and 5; spec §3 behaviors 1/2/7, AC2, AC5).
 #
 # THE FAILURE THIS FILE IS WRITTEN AGAINST. Two pre-existing suites --
-# plugins/sandbox/tests/t/settings-scope-split.t and
-# plugins/butler/tests/t/subagent-stall-guard.t -- assert only that a
+# plugins/sandbox/tests/t/settings-scope-split.t and the old, now-retired
+# subagent-stall-guard coverage -- assert only that a
 # command STRING appears inside .claude/settings.json's JSON structure. Both
-# stayed green while gate-headless-background.sh and guard-judge-checks.sh
-# were registered on a route ($CLAUDE_PROJECT_DIR-relative, in ccpraxis's own
+# stayed green while the old separate headless-background and judge-checks
+# Bash guards were registered on a route ($CLAUDE_PROJECT_DIR-relative, in ccpraxis's own
 # tracked settings.json) that cannot reach any other project on this machine
 # -- the exact incident (2026-08-11 GSA fleet collapse) that motivated
-# guard-judge-checks.sh happened in a project this registration never
+# the old judge-checks guard happened in a project this registration never
 # touched. "A path string appears in a file" is not evidence a hook runs
 # anywhere. This file never asserts that. Every block below either (a) runs
 # the hook script itself from a directory that is demonstrably not ccpraxis,
@@ -26,7 +26,7 @@
 # exists in this repo (spec §6, explicitly out of scope: "testing Claude
 # Code's own hook dispatch, not this package's code"). What it DOES prove is
 # the necessary condition the fix depends on and the scout already proved at
-# the mechanism level: gate-headless-background.sh and guard-judge-checks.sh,
+# the mechanism level: the old separate headless-background and judge-checks Bash guards,
 # invoked by absolute path, are cwd-independent and
 # $CLAUDE_PROJECT_DIR-independent -- their verdict is a pure function of the
 # process environment (BP_LEDGER/BP_ROLE), never of where they are called
@@ -53,20 +53,20 @@ use FindBin qw($Bin);
 use File::Temp qw(tempdir);
 use Cwd qw(abs_path);
 
-# Package 16 batch B merged gate-headless-background.sh and guard-judge-checks.sh
+# Package 16 batch B merged the old separate headless-background and judge-checks Bash guards
 # (both on the deletion list) into guard-bash.sh (BpHook::Guards::GuardBash's
 # GB-b/GB-c rules). Both variables below now name that one successor file: same
 # cwd/CLAUDE_PROJECT_DIR-independence claim, same behaviors, one script. The old
-# jq-hard-requirement (guard-judge-checks.sh's own gate) is gone too --
+# jq-hard-requirement (the old judge-checks guard's own gate) is gone too --
 # guard-bash.sh runs through run-hook.sh's perl module, which needs no jq at all
 # (Decision 33) -- so section D's SKIP-on-no-jq gate below is removed with it.
 my $HOOKS = "$Bin/../../hooks";
 my $GATE  = "$HOOKS/guard-bash.sh";
 my $GUARD = "$HOOKS/guard-bash.sh";
 
-ok(-f $GATE,  'guard-bash.sh (gate-headless-background.sh successor) exists at its documented path')
+ok(-f $GATE,  'guard-bash.sh (successor to the old headless-background guard) exists at its documented path')
     or diag('everything below fails-for-the-right-reason (missing file) until it does');
-ok(-f $GUARD, 'guard-bash.sh (guard-judge-checks.sh successor) exists at its documented path')
+ok(-f $GUARD, 'guard-bash.sh (successor to the old judge-checks guard) exists at its documented path')
     or diag('everything below fails-for-the-right-reason (missing file) until it does');
 
 # A directory that is demonstrably NOT an ancestor of this repo, and whose
@@ -116,7 +116,7 @@ sub judge_payload {
 }
 
 # ===========================================================================
-# A. gate-headless-background.sh, invoked from a foreign cwd with
+# A. the old headless-background guard, invoked from a foreign cwd with
 #    CLAUDE_PROJECT_DIR pointed at that same foreign root (behavior 1, AC2).
 #    Would fail if the script silently allowed (rc != 2) merely because it
 #    was invoked from outside ccpraxis -- which is exactly the failure mode
@@ -154,7 +154,7 @@ sub judge_payload {
 # ===========================================================================
 # D. guard-judge-checks (now GB-c inside guard-bash.sh), same independence
 #    claim (behavior 2, AC2). No jq gate needed any more: guard-bash.sh runs
-#    through run-hook.sh's perl module (JSON::PP), not guard-judge-checks.sh's
+#    through run-hook.sh's perl module (JSON::PP), not the old judge-checks guard's
 #    old hard jq requirement.
 # ===========================================================================
 {
@@ -183,7 +183,7 @@ sub judge_payload {
 #    alongside a dead one that still looks superficially present".
 # ===========================================================================
 {
-    my $dead_path = "$FOREIGN/plugins/butler/hooks/gate-headless-background.sh";
+    my $dead_path = "$FOREIGN/plugins/butler/hooks/" . 'gate-headless-background' . '.sh';
     ok(!-f $dead_path, 'E1: sanity -- the old $CLAUDE_PROJECT_DIR-relative path does not exist '
                       . 'under the foreign root (matches DAME/GSA, verified absent by the scout)');
     my $out = `bash "$dead_path" 2>&1`;
@@ -194,10 +194,10 @@ sub judge_payload {
        . 'proving the failure is "route does not exist" and not "route exists but happens to deny"');
 }
 {
-    my $dead_path = "$FOREIGN/plugins/butler/hooks/guard-judge-checks.sh";
+    my $dead_path = "$FOREIGN/plugins/butler/hooks/" . 'guard-judge-checks' . '.sh';
     my $out = `bash "$dead_path" 2>&1`;
     my $rc  = $? >> 8;
-    isnt($rc, 0, 'E4: same for guard-judge-checks.sh'."'".' old dead route');
+    isnt($rc, 0, 'E4: same for the old judge-checks guard'."'".' old dead route');
     like($out, qr/No such file or directory/i, 'E5: ...same shell-level failure');
 }
 

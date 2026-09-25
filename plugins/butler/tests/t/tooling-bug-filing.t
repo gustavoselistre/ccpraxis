@@ -75,7 +75,7 @@ my $coord_txt     = slurp($COORD);
 #
 # That is defect shape #5 in this run's catalogue: a malformed oracle shaping
 # production code. It already put grep-based workarounds into a live hook once
-# (t/142 -> mark-wakeup.sh). The fix belongs in the scan, not in the prose: a
+# (t/142 -> the old mark-wakeup hook). The fix belongs in the scan, not in the prose: a
 # heading is a line, so match it as one.
 # FIX-BATCH (step 7, F5): the version above (driver, 64105de) anchored a
 # heading to its own physical line but had two remaining gaps, both found by

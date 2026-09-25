@@ -182,8 +182,8 @@ sub _deny_coordinator {
     # R6-M1 (red-team MEDIUM-1): on the pause+terminal path (R5) the ledger
     # is ALREADY terminal -- that is exactly why R5 fired -- so the generic
     # "finish or park the ledger" line 4 is unfollowable, and the holder is
-    # never consulted on this path either. gate-stop.sh's own pause guidance
-    # (gate-stop.sh:89) is what tells the agent what it can actually do:
+    # never consulted on this path either. This module's own pause guidance
+    # (below) is what tells the agent what it can actually do:
     # move the status back off terminal. Swap line 4 for that exact text
     # only on this path; every other reason keeps the generic line.
     my $is_pause_terminal = ($reason =~ /^a fleet pause is active and status /) ? 1 : 0;

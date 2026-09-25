@@ -6,7 +6,7 @@
 # template told authors to emit exactly that key, so blueprints authored before
 # the rule landed carry it in every ledger -- and the rejection covers
 # `set-status`, the only sanctioned way a coordinator reaches a terminal state.
-# Such a package cannot be finished, blocked OR parked, gate-stop.sh will not let
+# Such a package cannot be finished, blocked OR parked, stop-gate.sh will not let
 # the session end until it is, and the prescribed remedy was a hand-edit to the
 # very frontmatter the protocol tells coordinators never to hand-edit.
 #

@@ -17,15 +17,15 @@
 # the implementer writes it.
 #
 # WRITTEN BLIND TO THE IMPLEMENTATION: derived only from the spec text
-# above and the CASES (not the source bash) of graceful-stop-gate.t and
+# above and the CASES (not the source bash) of the retired graceful-stop-gate coverage and
 # timestamp-authorship.t -- never from reading gate-shutdown.sh itself.
 #
 # NOT RE-EXPRESSED (per spec sec 4.8 "Not:" list and sec 4.2's codes):
 #   old file / assertion label                                     | code
 #   --------------------------------------------------------------- | ----
-#   graceful-stop-gate.t, the gate-stop.sh-specific parts            | OTHER (package 06 owns gate-stop.sh;
+#   the retired graceful-stop-gate coverage, the stop-gate.sh-specific parts            | OTHER (package 06 owns stop-gate.sh;
 #                                                                       this successor is gate-shutdown only)
-#   graceful-stop-gate.t, jq-availability skips                      | JQ
+#   the retired graceful-stop-gate coverage, jq-availability skips                      | JQ
 #   timestamp-authorship.t AC-03 (source-text grep)                  | SRC
 #   timestamp-authorship.t AC-20 source-text grep half                | SRC (the behavioural half is
 #                                                                       re-expressed as GS-4's AC-20 line)
@@ -33,7 +33,7 @@
 #                                                                       this successor writes no file, ever)
 #   hooks-selftest.t                                                  | OTHER/REG (registration self-test;
 #                                                                       package 16's concern)
-#   repeat-guard.t AC-21 (duplicate stop-signal matrix)                | LIB (the matrix itself is this
+#   the retired repeat-guard coverage AC-21 (duplicate stop-signal matrix)                | LIB (the matrix itself is this
 #                                                                       file's GS-2/GS-3, not repeated
 #                                                                       there; listed here as the sibling
 #                                                                       that would otherwise duplicate it)

@@ -2,8 +2,8 @@
 # platform: any
 #
 # Batch C (spec 16-cutover, criterion C-7; 1.3 departure #7): the wake-lock
-# refresher's SCRIPT ENTRY moves from bp-continuity.pl into
-# BpContinuityLease.pm itself, because bp-continuity.pl is on the deletion
+# refresher's SCRIPT ENTRY moves from the old continuity CLI into
+# BpContinuityLease.pm itself, because the old continuity CLI is on the deletion
 # list (batch E1) and _spawn_daemon needs somewhere else to exec. Spec 2.9:
 # the module ends with `__PACKAGE__->_script_main(@ARGV) unless caller; 1;`;
 # invoked as `perl BpContinuityLease.pm lease --daemon` it runs
@@ -16,7 +16,7 @@
 #      than the module merely falling off the end of the file with no main
 #      call at all.
 #   2. an unrecognised verb exits 1 with exactly one stderr line.
-#   3. _spawn_daemon's own source names this module and not bp-continuity.pl
+#   3. _spawn_daemon's own source names this module and not the old continuity CLI
 #      (the file it execs is deleted in E1).
 #   4. `require`-ing the module, the way every other test in this suite
 #      already does to reach its functions, executes none of the above: no
@@ -171,7 +171,7 @@ sub run_proc {
 }
 
 # ===========================================================================
-# 3. _spawn_daemon's own source names this module, never bp-continuity.pl.
+# 3. _spawn_daemon's own source names this module, never the old continuity CLI.
 # ===========================================================================
 {
     open my $fh, '<', $MODULE or die "can't read $MODULE: $!";
@@ -184,8 +184,8 @@ sub run_proc {
         or BAIL_OUT('could not locate _spawn_daemon in BpContinuityLease.pm; '
                   . 'this test needs updating for a rename');
 
-    unlike($spawn_body, qr/bp-continuity\.pl/,
-        'C-7: _spawn_daemon no longer names bp-continuity.pl (deleted in E1)');
+    unlike($spawn_body, qr/bp-continuity/,
+        'C-7: _spawn_daemon no longer names the old continuity CLI (deleted in E1)');
     like($spawn_body, qr/BpContinuityLease\.pm/,
         'C-7: _spawn_daemon names BpContinuityLease.pm as the child script');
 }

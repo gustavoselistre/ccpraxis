@@ -55,9 +55,9 @@ my $SCRIPTS = "$PLUGIN/scripts";
 my $REPO    = "$Bin/../../../..";                # repo root
 my $HELPER  = "$REPO/scripts/_install-bin-helper.pl";
 
-# The template shim used to be bp-continuity.sh; package 16 batch E1 deleted
-# it (and bin/bp-watch.sh, and scripts/bp-watch.pl) along with the rest of the
-# old continuity path. bp-drive-next.sh is structurally identical (same
+# The template shim used to be the old continuity CLI's shim; package 16
+# batch E1 deleted it (and the old bin/ hold shim, and its perl script) along
+# with the rest of the old continuity path. bp-drive-next.sh is structurally identical (same
 # BASH_SOURCE resolution, same missing-script diagnostic, same exec tail) and
 # survives the cutover, so it is the template now.
 ok(-f "$BIN_DIR/bp-drive-next.sh", 'sanity: the template shim this oracle is derived from exists')
@@ -126,7 +126,7 @@ sub run_out_err_rc {
 }
 
 # ===========================================================================
-# AC1 -- existence, executable bit, structural match to bp-continuity.sh.
+# AC1 -- existence, executable bit, structural match to the old continuity shim.
 # ===========================================================================
 {
     my $template = slurp("$BIN_DIR/bp-drive-next.sh");
@@ -175,7 +175,7 @@ sub run_out_err_rc {
         like(
             $content,
             qr/\Q$name.pl\E not found at \$SCRIPT/,
-            "AC1 $name.sh: missing-script diagnostic names $name.pl (not a copy-pasted bp-continuity.pl message)"
+            "AC1 $name.sh: missing-script diagnostic names $name.pl (not a copy-pasted message from the old continuity CLI)"
         );
         like($content, qr/exit 1/, "AC1 $name.sh: the missing-script branch exits 1");
         like(

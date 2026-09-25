@@ -26,7 +26,7 @@
 # arm file's own stale mtime, the opposite of what this case asserted.
 #
 # THE REJECTED FIX, AND WHY THIS ONE LOOKS DIFFERENT ON DISK. The report's
-# "minimum" alternative was to have this lease consult lib.sh's REAPING
+# "minimum" alternative was to have this lease consult the old bash registry's REAPING
 # any_active — which would let a detached background process delete another
 # session's state, exactly what the comment above any_active forbids. This
 # fix is read-only: every case below re-asserts that the arm file still

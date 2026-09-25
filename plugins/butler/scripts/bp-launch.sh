@@ -126,10 +126,10 @@ ATTEMPT=$(registry_get "$BP_NAME" "$PKG" attempt); ATTEMPT=$(( ${ATTEMPT:-0} + 1
   export BP_WRITE_SET="$WRITE_SET" BP_TEST_PATHS="$TEST_PATHS"
   export BP_REPORT_DIR="$BPDIR/reports/$PKG"
   export BP_ROLE="coordinator"
-  # Batch C (spec 16-cutover 2.8): the BUTLER_CONCURRENCY condition is gone --
-  # bin/ is always on PATH, and the missing-butler-hold warning always fires
-  # when the file is missing or not executable. BUTLER_CONCURRENCY is no
-  # longer exported.
+  # Batch C (spec 16-cutover 2.8): the old concurrency-switch condition is
+  # gone -- bin/ is always on PATH, and the missing-butler-hold warning
+  # always fires when the file is missing or not executable. That switch's
+  # env var is no longer exported.
   [ -x "$PLUGIN_ROOT/bin/butler-hold" ] || echo "bp-launch: $PLUGIN_ROOT/bin/butler-hold is missing or not executable; the coordinator can only stop on its ledger" >&2
   export PATH="$PLUGIN_ROOT/bin:$PATH"
   if [ -n "$RESUME_SID" ]; then

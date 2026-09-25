@@ -2,12 +2,12 @@
 # platform: any
 # t/101 — a02-api-and-guard-defects, DEFECT 1.
 # guard-writes.sh classifies a path as "a test" by test_paths prefix-match ALONE
-# (hooks/lib.sh:92 match_any, called from guard-writes.sh:46), so a broad
+# (the old shared bash guard library's match_any, called from guard-writes.sh:46), so a broad
 # test_paths prefix ("plugins/butler/") swallows a narrower write_set entry
 # ("plugins/butler/scripts/bp-blueprint.pl") and bp-implementer is wrongly denied
 # its own source file. Spec §2.1 / AC-1..AC-4 / observable behaviors 1-6.
 #
-# guard-writes.sh is GATED (bp_hook_gate: hooks/lib.sh:9) -- it no-ops entirely
+# guard-writes.sh is GATED (bp_hook_gate: the old shared bash guard library) -- it no-ops entirely
 # unless BP_LEDGER, BP_DIR and BP_PROJECT_ROOT are ALL set. Every invocation here
 # sets all three explicitly so the hook actually runs its logic; a test that
 # forgot one of them would pass vacuously (exit 0 no matter what).

@@ -1093,8 +1093,8 @@ sub _observe_cache {
 }
 
 # 08-fleet-on-holder: does $sid have a live, unexpired holder record right
-# now? Batch C (spec 16-cutover 2.8): fleet_holder_on is deleted -- the
-# holder path is unconditional now, so this call site behaves as if it always
+# now? Batch C (spec 16-cutover 2.8): the old holder-toggle check is deleted
+# -- the holder path is unconditional now, so this call site behaves as if it always
 # returned 1. Never dies, never writes. There is deliberately no pid check
 # and no background_tasks check (the orchestrator has no payload); the
 # deadline alone bounds the exemption to at most 1h past the last hold/extend.
@@ -1358,7 +1358,7 @@ sub has_progressable_work {
 }
 
 # --- awaiting-human packages (blocked/parked) that have NO queued needs-you
-# decision. A coordinator can self-block/park in its OWN ledger (gate-stop.sh
+# decision. A coordinator can self-block/park in its OWN ledger (stop-gate.sh
 # permits a terminal stop with a '## Next action') WITHOUT the orchestrator ever
 # running its escalation path — so no decision is filed, the reporter's queue-watcher
 # (bp-wait-for-decision) stays silent, and the run goes quiet. The loop reconciles
@@ -1701,7 +1701,7 @@ sub ledger_age_min {
 }
 
 # b11-progress-heuristic-turns-backstop: has b10's mechanical repeat guard
-# (plugins/butler/hooks/lib.sh, repeat-guard.sh) already flagged THIS package
+# (plugins/butler/hooks/wait-shape-guard.sh) already flagged THIS package
 # recently? The guard's own state lives at runs/<pkg>.repeat-<session-token>.log,
 # one file per coordinator session, each line "TS\tHASH\tFIRED". Read-only, tail
 # only (reuses _last_nonempty_line — no second reader), and best-effort: any glob
@@ -4843,7 +4843,7 @@ sub run {
 
             # ---- RECONCILE ORPHANED ESCALATIONS ----
             # A coordinator can end a package blocked/parked in its OWN ledger
-            # (gate-stop.sh permits a terminal stop) without the orchestrator's
+            # (stop-gate.sh permits a terminal stop) without the orchestrator's
             # escalation path ever running — so no needs-you decision is filed and
             # the reporter's watcher stays silent. Enforce the invariant "every
             # awaiting-human package has a decision the human can act on" so the run

@@ -34,7 +34,7 @@ my $LAUNCHSH = "$BUTLER/scripts/bp-launch.sh";
 my $AUDITOR  = "$PROJ/plugins/blueprint/agents/bp-auditor.md";
 my $HOOKSJ   = "$BUTLER/hooks/hooks.json";
 my $SETTINGSJ = "$PROJ/.claude/settings.json";
-my $GUARD    = "$BUTLER/hooks/guard-ledger-create.sh";
+my $GUARD    = "$BUTLER/hooks/guard-blueprint-write.sh";
 
 diag("subject under test: $SCRIPT " . (-e $SCRIPT ? "(present)" : "(ABSENT -- CLI/module-surface assertions below are expected to fail on a MISSING FILE)"));
 
@@ -354,7 +354,7 @@ ITEM
                      && ref $decoded->{hooks}{PreToolUse} eq 'ARRAY'
                    ? @{ $decoded->{hooks}{PreToolUse} } : ();
 
-    # Retargeted per package 16's batch B (Decision 34): guard-ledger-create.sh
+    # Retargeted per package 16's batch B (Decision 34): the old ledger-create guard
     # is on the deletion list, merged into guard-blueprint-write.sh (package
     # 02's design doc, "Inventory"). B-51's live successor is
     # guard-blueprint-write.sh's own registration in the same block.
@@ -366,7 +366,7 @@ ITEM
     } @pretooluse;
     ok(defined $ledger_create_block,
        "AC-21/B-51: hooks.json has a PreToolUse block, matcher Edit|Write|MultiEdit|NotebookEdit, "
-     . "whose hooks array names guard-blueprint-write.sh (guard-ledger-create.sh's successor)");
+     . "whose hooks array names guard-blueprint-write.sh (successor to the old ledger-create guard)");
 
     # B-52: no PRE-EXISTING guard-writes.sh/ledger-guard.sh block gained the
     # ledger-creation guard's command (it landed in guard-blueprint-write.sh
@@ -376,8 +376,8 @@ ITEM
         next unless ref $block eq 'HASH' && ref $block->{hooks} eq 'ARRAY';
         my @cmds = map { $_->{command} // '' } grep { ref $_ eq 'HASH' } @{ $block->{hooks} };
         next unless grep { /guard-writes\.sh|ledger-guard\.sh/ } @cmds;
-        ok(!(grep { /guard-ledger-create\.sh/ } @cmds),
-           "AC-21/B-52: the guard-writes.sh/ledger-guard.sh block's hooks array does NOT gain guard-ledger-create.sh");
+        ok(!(grep { /guard-ledger-create/ } @cmds),
+           "AC-21/B-52: the guard-writes.sh/ledger-guard.sh block's hooks array does NOT gain the old ledger-create guard");
     }
 }
 {
@@ -396,8 +396,8 @@ ITEM
     my @all_cmds = map { ref $_ eq 'HASH' && ref $_->{hooks} eq 'ARRAY'
                           ? map { $_->{command} // '' } grep { ref $_ eq 'HASH' } @{ $_->{hooks} } : () }
                    @pretooluse;
-    ok(!(grep { /guard-ledger-create\.sh/ } @all_cmds),
-       "AC-21/B-53: .claude/settings.json does NOT name guard-ledger-create.sh");
+    ok(!(grep { /guard-ledger-create/ } @all_cmds),
+       "AC-21/B-53: .claude/settings.json does NOT name the old ledger-create guard");
 }
 
 # =====================================================================================
@@ -410,14 +410,14 @@ SKIP: {
     is($rc, 0, "AC-22: perl -c bp-model-check.pl is syntax-clean");
 }
 SKIP: {
-    skip('AC-22: guard-ledger-create.sh not present yet', 1) unless -e $GUARD;
+    skip('AC-22: guard-blueprint-write.sh not present yet', 1) unless -e $GUARD;
     my $BASH_ABS = do {
         local $ENV{PATH} = $CLEAN_ENV{PATH};
         chomp(my $p = `command -v bash 2>/dev/null`);
         ($p && -x $p) ? $p : 'bash';
     };
     my ($rc, $out, $err) = run_exec($BASH_ABS, ['-n', $GUARD]);
-    is($rc, 0, "AC-22: bash -n guard-ledger-create.sh is syntax-clean");
+    is($rc, 0, "AC-22: bash -n guard-blueprint-write.sh is syntax-clean");
 }
 
 done_testing();

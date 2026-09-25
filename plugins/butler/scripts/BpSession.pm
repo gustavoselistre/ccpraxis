@@ -6,12 +6,12 @@
 #   * ${CLAUDE_SESSION_ID} is a TEMPLATE SUBSTITUTION, replaced inside SKILL.md
 #     before the body runs (references/extending-ccpraxis.md). It is baked into
 #     the text of an instruction at render time, never re-checked, and it is not
-#     an environment variable at all -- bp-continuity.pl's old
+#     an environment variable at all -- the old continuity CLI's own
 #     $ENV{CLAUDE_SESSION_ID} fallback could therefore never fire once.
 #   * $CLAUDE_CODE_SESSION_ID *is* in the Bash environment, but it is one
 #     process-scoped value with nothing to verify it against.
 #
-# That mattered because the consumer disagreed: gate-continuity.sh looks its
+# That mattered because the consumer disagreed: stop-gate.sh looks its
 # marker up by the session_id in its own hook payload and exits SILENTLY when
 # there is none. One unverified writer, one authoritative reader, no comparison
 # -- so any disagreement produced the worst outcome available, arming reported
@@ -40,7 +40,7 @@
 # The one thing it cannot do is answer inside the SAME tool call that plants the
 # nonce: the tool result is written to the transcript after the call returns. So
 # resolution is always "plant now, resolve on a later invocation" -- see
-# bp-continuity.pl's ticket flow, where the later invocation is the Stop hook
+# butler-continuity's ticket flow, where the later invocation is the Stop hook
 # that needs the answer anyway.
 package BpSession;
 use strict;

@@ -341,7 +341,7 @@ my ($S2_ROOT, $S2_SID, $S2_TOKEN);
     my $sid  = next_sid();
     arm_session($root, $sid);
     my $res = run_gate(payload_json($sid), BUTLER_STATE_DIR => $root);
-    is($res->{rc}, 2, 'S2 (re-expresses graceful-stop-gate.t "gate-stop: no signal + non-terminal -> blocked"): subprocess exit 2');
+    is($res->{rc}, 2, 'S2 (re-expresses the retired graceful-stop-gate coverage "gate-stop: no signal + non-terminal -> blocked"): subprocess exit 2');
     is($res->{out}, '', 'S2: stdout empty');
     my @lines = lines_of($res->{err});
     is(scalar(@lines), 7, 'S2: stderr is exactly 7 lines') or diag("stderr:\n$res->{err}");

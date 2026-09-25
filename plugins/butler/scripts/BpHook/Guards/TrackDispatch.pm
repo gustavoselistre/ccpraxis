@@ -1,6 +1,7 @@
 # BpHook::Guards::TrackDispatch -- tracks Task/Agent dispatch (package 14 of
-# blueprint hook-continuity-remake), successor to track-dispatch.sh,
-# log-dispatch.sh, track-worker-solo.sh and untrack-worker-solo.sh.
+# blueprint hook-continuity-remake), successor to the old separate
+# dispatch-logging and solo-worker tracking/untracking hooks, now merged
+# into hooks/track-dispatch.sh.
 #
 # Contract: .ccpraxis-local-data/blueprints/hook-continuity-remake/specs/
 # 14-guards-remake-spec.md sec 2.5 (the driver marker shape) and sec 3.6 (this

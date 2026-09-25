@@ -46,7 +46,7 @@ The blueprint directory path. Read `blueprint.md` and every ledger under `packag
   ```
 
   `bp-ledger.pl create` refuses an unsupported `model:`/`effort:` at creation time, and
-  `guard-ledger-create.sh` denies the hand-written path that would skip it. Neither can see a ledger
+  `guard-blueprint-write.sh` denies the hand-written path that would skip it. Neither can see a ledger
   that predates them or one that came through the guard's escape hatch, and a bad value is not
   caught until `bp-launch.sh` refuses to launch that package — mid-run, with the coordinator already
   scheduled. This is the backstop for exactly those two populations.

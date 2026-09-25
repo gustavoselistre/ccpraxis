@@ -16,7 +16,7 @@
 #
 # Not re-expressed here (spec sec 6 "Out of scope"): any fork/subagent
 # dispatch rule (package 19), registering bind-dispatch or deleting
-# record-dispatch-package.sh (package 16), write-guard resolution from
+# the old record-dispatch-package hook (package 16), write-guard resolution from
 # bindings (package 13), pruning terminal members or locking inflight.json
 # from the hook, a `reclaimed` key on the director's action.
 #

@@ -31,7 +31,7 @@
 #   no-halt-for-questions.t AC8 "like only the operator"          | OVR (Decision 6 retired override:
 #     (the "only the operator" remedy sentence)                    |   same override family as above --
 #                                                                    |   listed for Decision 26)
-#   no-halt-for-questions.t AC6                                   | OTHER (bp-continuity.pl; package 04
+#   no-halt-for-questions.t AC6                                   | OTHER (butler-continuity; package 04
 #                                                                    owns the "ask" verb itself)
 #   no-halt-for-questions.t ROOT-A                                | OTHER (a root-resolution population
 #                                                                    this successor does not have)

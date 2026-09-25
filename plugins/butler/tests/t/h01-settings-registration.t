@@ -3,8 +3,8 @@
 # REWRITTEN oracle for batch B of blueprint hook-continuity-remake, package
 # 16-cutover (specs/16-cutover-spec.md sec 2.2/2.3, acceptance B-2/B-3).
 #
-# The file's ORIGINAL subject (whether gate-headless-background.sh and
-# guard-judge-checks.sh route via settings.json or hooks.json, packages
+# The file's ORIGINAL subject (whether the old separate headless-background
+# and judge-checks Bash guards route via settings.json or hooks.json, packages
 # g02/h01) is retired here: both scripts are on the batch-B deletion list, so
 # a route decision about a deleted script is not an oracle for the tree this
 # package leaves behind. What replaces it: .claude/settings.json carries
@@ -19,7 +19,7 @@
 #
 # RIGHT NOW (before batch B lands) this file is red: settings.json still
 # carries guard-git-mutations.sh in its pre-cutover unguarded form plus the
-# guard-subagent-stall.sh PostToolUse/Stop entries, and hooks.json still
+# old subagent-stall-guard PostToolUse/Stop entries, and hooks.json still
 # carries three old Stop entries and no SubagentStop entry at all. That is
 # the correct shape of red for an oracle written from the spec.
 
@@ -105,8 +105,8 @@ sub settings_template {
         fail('B2e/B2f/B2g/B2h/B2i: skipped, PreToolUse group count was not exactly 1');
     }
 
-    unlike($settings_raw, qr/guard-subagent-stall\.sh/,
-       'B2j: settings.json does not mention guard-subagent-stall.sh anywhere in the raw file');
+    unlike($settings_raw, qr/guard-subagent-stall/,
+       'B2j: settings.json does not mention the old subagent-stall guard anywhere in the raw file');
 }
 
 # ===========================================================================

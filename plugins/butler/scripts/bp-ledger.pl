@@ -249,7 +249,7 @@ sub iso_now {
 
 # =====================================================================================
 # last_updated VALUE integrity (b19-ledger-timestamp-integrity) — an AUDIT-TRAIL check,
-# not a run-control one (bp-status.sh uses mtime; gate-stop.sh and the watchdog never
+# not a run-control one (bp-status.sh uses mtime; stop-gate.sh and the watchdog never
 # parse this field at all, per the spec's own retracted impact claim). ONE
 # implementation, enforced at BOTH this API (below) and the b12 hook, which `require`s
 # THIS FILE rather than reimplementing the check — two copies would drift, and the
@@ -344,7 +344,7 @@ sub last_updated_check {
 
 my @REQUIRED_KEYS = qw(package blueprint status write_set last_updated);
 # `dropped` added 2026-08-13, the THIRD home of the same defect (07d28a2 fixed
-# bp-blueprint.pl, 8cc98d8 fixed ledger-guard.sh and gate-stop.sh). This is the
+# bp-blueprint.pl, 8cc98d8 fixed ledger-guard.sh and stop-gate.sh). This is the
 # sanctioned WRITER of package ledgers, so without it a coordinator that
 # legitimately dropped its package could not record that through the typed API
 # at all -- while bp-drive-next.pl and bp-orchestrator.pl both read the field and
@@ -1482,7 +1482,7 @@ sub op_set_next_action {
     if ($first eq '' || $first =~ /^#/) {
         arg_error('set-next-action',
             "the first line of --body must be non-blank and must not begin with '#': bp-status.sh renders the "
-          . "first non-blank line as the human-facing summary while gate-stop.sh additionally skips '#'-leading "
+          . "first non-blank line as the human-facing summary while stop-gate.sh additionally skips '#'-leading "
           . "lines, so the two readers would disagree about what the next action is");
     }
     if (grep { /^\s*-\s*\[[xX]\]/ } @lines) {
@@ -1497,7 +1497,7 @@ sub op_set_next_action {
 # `widen-write-set` -- ADD paths to a package ledger's write_set, and only when a
 # blueprint Decision names each one. This is how a Decision 29 re-scope reaches the
 # contract the write-guards enforce. Before this verb, a recorded re-scope had no typed
-# path into the ledger: guard-ledger-create.sh rightly refuses a hand edit, and
+# path into the ledger: guard-blueprint-write.sh rightly refuses a hand edit, and
 # bp-answer-decision.pl's --widen-write-set is reachable only through the fleet's
 # decision queue, whose direct --package actions all change the package's status.
 #
@@ -2306,7 +2306,7 @@ sub op_validate {
 #
 # That is worse than a normal refusal. The rejection covers `set-status`, which
 # is the only sanctioned way a coordinator reaches a terminal state, so such a
-# package cannot be finished, blocked OR parked -- and `gate-stop.sh` will not
+# package cannot be finished, blocked OR parked -- and `stop-gate.sh` will not
 # let the session end until it is. The prescribed remedy was an edit to the very
 # frontmatter the protocol tells coordinators never to hand-edit: the escape
 # hatch was also the thing the doctrine forbids. Measured blast radius: all five

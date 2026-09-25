@@ -1,7 +1,7 @@
 # BpHook::Guards::GuardBash -- the merged Bash PreToolUse guard (package 14
-# of blueprint hook-continuity-remake), successor to guard-bash.sh,
-# gate-headless-background.sh, guard-judge-checks.sh and
-# guard-validation-interlock.sh.
+# of blueprint hook-continuity-remake), successor to the old separate
+# headless-background, judge-checks and validation-interlock Bash guards,
+# now merged into hooks/guard-bash.sh.
 #
 # Contract: .ccpraxis-local-data/blueprints/hook-continuity-remake/specs/
 # 14-guards-remake-spec.md sec 3.1. Architecture:

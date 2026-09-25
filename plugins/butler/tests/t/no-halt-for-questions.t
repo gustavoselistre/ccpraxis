@@ -34,8 +34,8 @@
 use strict;
 use warnings;
 
-# A TEST MUST NEVER ACTUATE A REAL WAKE-LOCK. This file drives bp-continuity.pl /
-# bp-runstate.pl / gate-continuity.sh, which hold the machine awake for an armed
+# A TEST MUST NEVER ACTUATE A REAL WAKE-LOCK. This file drives butler-continuity /
+# bp-runstate.pl / stop-gate.sh, which hold the machine awake for an armed
 # session -- and they do it as SUBPROCESSES, where bp-keepawake.pl's `$0 =~ /\.t\z/`
 # guard cannot reach (its $0 is the .pl). CCPRAXIS_NO_WAKELOCK is the supported
 # opt-out and IS inherited across exec. Enforced by t/test-wakelock-hygiene.t.
@@ -48,7 +48,7 @@ use JSON::PP ();
 use Cwd qw(getcwd abs_path);
 
 my $GUARD = "$Bin/../../hooks/guard-ask-operator.sh";
-# bp-continuity.pl was the CLI here; it is on the deletion list and gone
+# butler-continuity was the CLI here; it is on the deletion list and gone
 # (package 16 batch E1). butler-continuity.pl is the one continuity CLI
 # left, and shares the same BpProjectRoot::resolve() ladder (reason DEL).
 my $CONT  = "$Bin/../../scripts/butler-continuity.pl";
@@ -130,7 +130,7 @@ sub queue_contents {
 # caller, but it WAS produced on READ: `BpRunState::effective` manufactured
 # it from any stale `paused` record (dead watcher pid, mismatched
 # fingerprint, or elapsed `until`), and `paused` records were written by the
-# now-retired `bp-watch.pl --self-pause`, doctrinal until package 12 -- so
+# now-retired `butler-hold --self-pause`, doctrinal until package 12 -- so
 # the arm genuinely fired, on real sessions, once such a lease went stale.
 # Package 03 deletes the arm outright anyway (not merely disables it): the
 # `[ -f "$RUNSTATE" ] || exit 0` early-exit and the
@@ -219,10 +219,10 @@ PAYLOAD_EOF`;
 
 # ── AC6 — the halting verb is gone ────────────────────────────────────────
 #
-# MIGRATED (reason DEL, package 16 batch E1): bp-continuity.pl is on the
+# MIGRATED (reason DEL, package 16 batch E1): butler-continuity is on the
 # deletion list and gone. butler-continuity.pl is the one continuity CLI
 # left, and it never grew an await-operator verb either -- the arm/session
-# dance the old fixture needed (bp-continuity.pl's own registry-based arm) is
+# dance the old fixture needed (butler-continuity's own registry-based arm) is
 # dropped: butler-continuity.pl's ask never required an armed session to
 # begin with, so nothing here needed it in the first place.
 {
@@ -265,7 +265,7 @@ PAYLOAD_EOF`;
 }
 
 # ═══════════════════════════════════════════════════════════════════════
-# NEW — bp-continuity.pl's questions_path: PROJECT-ANCHORED ROOT RESOLUTION.
+# NEW — butler-continuity's questions_path: PROJECT-ANCHORED ROOT RESOLUTION.
 # MIGRATED from runstate-root-resolution.t (DELETED by this package; spec
 # §5.1's own migration table names this file, or a sibling, as the target).
 #
@@ -277,7 +277,7 @@ PAYLOAD_EOF`;
 # `ask` call and a hook's read landed on DIFFERENT roots -- a wrong answer
 # anchored to the project is recoverable, one anchored to the install is a
 # different repo's state file entirely. Spec §2.4 lifts _resolve_project_
-# root() into bp-continuity.pl itself, ladder and comment block together:
+# root() into butler-continuity itself, ladder and comment block together:
 #   $CLAUDE_PROJECT_DIR > $BP_PROJECT_ROOT > git toplevel
 #     > walk up from cwd for a dir holding .ccpraxis-local-data > cwd
 # ═══════════════════════════════════════════════════════════════════════
@@ -317,7 +317,7 @@ PAYLOAD_EOF`;
         _cont_ask($proj2, \%CLEAR2, 'root-resolution A fixture');
         my $qpath = "$proj2/.ccpraxis-local-data/.subagent-guard/questions.md";
         (my $qpath_n = $qpath) =~ s{\\}{/}g;
-        ok(-f $qpath, 'ROOT-A: bp-continuity.pl ask (no CLAUDE_PROJECT_DIR/BP_PROJECT_ROOT, cwd '
+        ok(-f $qpath, 'ROOT-A: butler-continuity ask (no CLAUDE_PROJECT_DIR/BP_PROJECT_ROOT, cwd '
                     . 'inside the project) writes questions.md under the project it was run from');
 
         my ($guess) = ($INSTALL_GUESS2 =~ s{\\}{/}gr);
@@ -334,7 +334,7 @@ PAYLOAD_EOF`;
     }
 
     # ---- D. BP_PROJECT_ROOT-only (no CLAUDE_PROJECT_DIR): the hook and
-    #      bp-continuity.pl::questions_path must still agree. Redteam
+    #      butler-continuity::questions_path must still agree. Redteam
     #      MEDIUM-3: this is the one leg ROOT-BPPR (script only) and ROOT-B/C
     #      (CLAUDE_PROJECT_DIR set) never exercised together on the HOOK.
   SKIP: {
@@ -344,7 +344,7 @@ PAYLOAD_EOF`;
         my $proj4 = abs_path(tempdir(CLEANUP => 1));
         make_path("$proj4/.ccpraxis-local-data");
 
-        # writer: bp-continuity.pl, BP_PROJECT_ROOT set, no CLAUDE_PROJECT_DIR
+        # writer: butler-continuity, BP_PROJECT_ROOT set, no CLAUDE_PROJECT_DIR
         my $wout4 = _cont_ask($ORIG2, { %CLEAR2, BP_PROJECT_ROOT => $proj4 },
                                'ROOT-D writer question');
         like($wout4, qr/queued/i, 'ROOT-D setup: the writer\'s ask call queues');
@@ -363,7 +363,7 @@ PAYLOAD_EOF`;
 
         my $q4 = queue_contents($proj4);
         like($q4, qr/ROOT-D writer question/,
-            'ROOT-D: the writer (bp-continuity.pl, BP_PROJECT_ROOT-only) and the reader '
+            'ROOT-D: the writer (butler-continuity, BP_PROJECT_ROOT-only) and the reader '
           . '(the guard hook, BP_PROJECT_ROOT-only) land on the SAME questions.md');
         like($q4, qr/ROOT-D reader question/,
             'ROOT-D: ...and the hook\'s own append under BP_PROJECT_ROOT-only lands there too');

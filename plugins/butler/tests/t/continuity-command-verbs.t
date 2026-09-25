@@ -746,9 +746,9 @@ sub reasons_log_lines {
 # V12 -- ask writes the legacy-queue line shape, pinned literally.
 #
 # Formerly this compared butler-continuity's output against a live
-# bp-continuity.pl subprocess ask (masked for the [ISO] stamp). bp-continuity.pl
-# is on the deletion list and gone (package 16 batch E1); its comparator role
-# is retired, code DEL, and the line shape it used to prove is pinned directly
+# subprocess ask on the old continuity CLI (masked for the [ISO] stamp). That
+# CLI is on the deletion list and gone (package 16 batch E1); its comparator
+# role is retired, code DEL, and the line shape it used to prove is pinned directly
 # instead -- "- [ISO] <flattened text>", one line per queued question, with an
 # embedded newline flattened to a single space (unweakened: same two cases,
 # same masking, same assertions-per-case; only the second-process comparator

@@ -47,13 +47,11 @@ use POSIX qw(WIFEXITED WEXITSTATUS);
 (my $HOOKS   = "$Bin/../../hooks")   =~ s{\\}{/}g;
 (my $SCRIPTS = "$Bin/../../scripts") =~ s{\\}{/}g;
 my $TRACK = "$HOOKS/track-dispatch.sh";
-my $LIB   = "$HOOKS/lib.sh";
 my $ORCH  = "$SCRIPTS/bp-orchestrator.pl";
 
 my $J = JSON::PP->new->canonical;
 
 plan skip_all => 'track-dispatch.sh not found' unless -f $TRACK;
-plan skip_all => 'lib.sh not found'             unless -f $LIB;
 plan skip_all => 'bp-orchestrator.pl not found' unless -f $ORCH;
 
 my $have_bash = do {

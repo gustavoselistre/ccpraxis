@@ -4,9 +4,9 @@
 # Implements plugins/butler/tests/../specs/b32-worker-backend-dispatcher-spec.md.
 # Invoked by a coordinator via Bash instead of Task when the resolved
 # `worker_backend:` is not `claude`. Re-implements no policy of its own:
-# it inlines the marker/lock/stop-signal paths hooks/lib.sh (and
+# it inlines the marker/lock/stop-signal paths hooks/track-dispatch.sh (and
 # BpHook::Guards::TrackDispatch) also use -- package 16 spec sec 2.7 --
-# and reproduces track-dispatch.sh's and log-dispatch.sh's side effects
+# and reproduces track-dispatch.sh's side effects
 # byte-for-byte, because a Bash subprocess dispatch fires no PreToolUse /
 # PostToolUse Task hooks.
 #
@@ -194,7 +194,7 @@ my $BP_LEDGER   = $ENV{BP_LEDGER};
 
 # ---------------------------------------------------------------------------
 # 3. Marker / lock / stop-signal paths (package 16 spec sec 2.7) -- inlined,
-# no lib.sh source, no bash -c. These equal the paths
+# no hook-script source, no bash -c. These equal the paths
 # BpHook::Guards::TrackDispatch uses for coordinators, so the one-writer
 # rule still spans Task dispatches and bp-worker.pl dispatches.
 # ---------------------------------------------------------------------------

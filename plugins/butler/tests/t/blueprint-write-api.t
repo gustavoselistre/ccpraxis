@@ -535,7 +535,7 @@ SKIP: {
     #   { "hooks": { "PreToolUse": [...], "PostToolUse": [...], "Stop": [...] } }
     # Reading $decoded->{PreToolUse} directly yields undef, so G9 reported "no
     # blueprint hook registered" even once one WAS registered — a false negative that
-    # blamed the implementation for an oracle defect. Sibling t/repeat-guard.t and
+    # blamed the implementation for an oracle defect. Sibling t/wait-shape-guard.t and
     # t/ledger-guard.t both read $H->{hooks}{PreToolUse}; match them.
     my @pretooluse = ref $decoded eq 'HASH' && ref $decoded->{hooks} eq 'HASH'
                      && ref $decoded->{hooks}{PreToolUse} eq 'ARRAY'

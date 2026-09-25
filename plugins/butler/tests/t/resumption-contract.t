@@ -3,7 +3,7 @@
 # 186 — ONE answer to "will anything bring this back?"
 #
 # WHY THIS FILE EXISTS. Two guards were answering that question separately:
-# bp-runstate.pl for a RUN, gate-continuity.sh for a SESSION. The scopes are
+# bp-runstate.pl for a RUN, stop-gate.sh for a SESSION. The scopes are
 # genuinely different and stay separate. The MECHANISM was duplicated, and the
 # duplication was not free -- the run side had already learned two things the
 # session side had not:
@@ -16,7 +16,7 @@
 #     `sleep &` on the recorded pid made a pause read as verified); the session
 #     side then shipped a liveness check with exactly that hole.
 #
-# BpResumption.pm is now the single implementation, and bp-resumption.pl is how
+# BpResumption.pm is now the single implementation, and the old resumption CLI is how
 # the bash gate reaches it -- shell cannot compute a process fingerprint, so
 # translating the rules into shell a second time could only reproduce the gap.
 #
@@ -26,7 +26,7 @@
 # AC4  an unbounded marker is refused however fresh
 # AC5  a passed deadline is refused however alive
 # AC6  a marker with no pid, or no identity, is refused as UNVERIFIABLE
-# AC7  REMOVED (reason DEL, package 16 batch E1): bp-resumption.pl, the CLI
+# AC7  REMOVED (reason DEL, package 16 batch E1): the old resumption CLI, the CLI
 #      this compared the module against, is on the deletion list. The module
 #      behaviour AC7 exercised through the CLI is still pinned directly, via
 #      AC1-AC6 against BpResumption.pm itself.
@@ -34,8 +34,8 @@
 use strict;
 use warnings;
 
-# A TEST MUST NEVER ACTUATE A REAL WAKE-LOCK. This file drives bp-continuity.pl /
-# bp-runstate.pl / gate-continuity.sh, which hold the machine awake for an armed
+# A TEST MUST NEVER ACTUATE A REAL WAKE-LOCK. This file drives butler-continuity /
+# bp-runstate.pl / stop-gate.sh, which hold the machine awake for an armed
 # session -- and they do it as SUBPROCESSES, where bp-keepawake.pl's `$0 =~ /\.t\z/`
 # guard cannot reach (its $0 is the .pl). CCPRAXIS_NO_WAKELOCK is the supported
 # opt-out and IS inherited across exec. Enforced by t/test-wakelock-hygiene.t.
@@ -131,7 +131,7 @@ SKIP: {
 # entry): bp-runstate.pl is DELETED, not merely edited, so it can no longer
 # be the subject of "uses the shared module" / "no longer carries its own
 # fingerprint implementation". Both assertions are repointed at the two
-# files that now load BpResumption.pm DIRECTLY (spec §2.2): bp-watch.pl and
+# files that now load BpResumption.pm DIRECTLY (spec §2.2): butler-hold and
 # bp-worker.pl. Same intent, unweakened: "if anybody grew their own copy
 # again, this fails."
 #
@@ -140,7 +140,7 @@ SKIP: {
 # that cost a fix batch was that knowledge living in one file cannot be
 # reached from the other.
 {
-    # bp-watch.pl -- REMOVED (reason DEL, package 16 batch E1): it is on the
+    # butler-hold -- REMOVED (reason DEL, package 16 batch E1): it is on the
     # deletion list and gone. Trimmed to what bp-worker.pl uses, per the
     # spec's own forward note. The behavior this protected -- nothing
     # growing its own pid_alive/pid_fingerprint copy -- is unweakened below.
@@ -158,11 +158,11 @@ SKIP: {
                "AC8 MIGRATED: $name does not define its own sub pid_fingerprint");
     }
 
-    # The gate-continuity.sh block that used to close this AC8 -- REMOVED
-    # (reason DEL, package 16 batch B): gate-continuity.sh is on the
+    # The stop-gate.sh block that used to close this AC8 -- REMOVED
+    # (reason DEL, package 16 batch B): stop-gate.sh is on the
     # deletion list (Decision 5 collapses the Stop gate to the single
     # stop-gate.sh) and has no successor that re-verifies resumption
-    # through bp-resumption.pl's CLI; that role is not carried forward as a
+    # through the old resumption CLI's CLI; that role is not carried forward as a
     # shell-side check any more.
 }
 

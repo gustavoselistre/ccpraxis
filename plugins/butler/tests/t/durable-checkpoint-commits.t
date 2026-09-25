@@ -941,9 +941,9 @@ my $WS_RAW   = 'src/live/:docs/live.md';        # a RAW ledger string, colon and
 }
 
 # ---- AC-29: the pre-existing baseline is untouched ----------------------
-# graceful-stop-gate.t dropped from this list (reason DEL, package 16 batch
+# the retired graceful-stop-gate coverage dropped from this list (reason DEL, package 16 batch
 # B fix round): it is on plugins/butler/docs/hook-architecture.md's
-# deletion list -- its subject was gate-stop.sh/gate-drive-loop.sh's
+# deletion list -- its subject was stop-gate.sh's
 # graceful-shutdown behavior, absorbed into gate-shutdown.sh, and its own
 # shutdown-assertion sibling coverage lives in orchestrate-shutdown-clear.t
 # (still in this baseline below), which is unedited. 20 files remain.

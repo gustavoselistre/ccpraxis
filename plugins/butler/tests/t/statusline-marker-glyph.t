@@ -443,7 +443,7 @@ for my $sb (0, 1) {
 # ===========================================================================
 # AC14/AC15 REMOVED 2026-08-26 -- duplicate EXECUTION, not extra coverage.
 #
-# They ran continuity-statusline-badge.t and continuity-gate.t as full
+# They ran continuity-statusline-badge.t and the (now also retired) continuity-gate coverage as full
 # subprocesses, as "non-regression tripwires: 151 and 150 must both stay green".
 # But the suite runs 151 and 150. Asserting it here does not add a check; it
 # adds a second execution of the same one, and it cost 22 seconds every time

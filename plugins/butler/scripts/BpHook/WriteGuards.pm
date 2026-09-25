@@ -7,10 +7,10 @@
 # NOT RE-EXPRESSED (spec sec 4.1, verbatim, Decision 26 exemptions; codes
 # per package 14's spec sec 4.2 -- OVR/LIB/SRC/D3/OTHER):
 #
-# driver-guard-reach.t
+# the retired driver-guard-reach coverage
 #   assertion                                                          | status
 #   ------------------------------------------------------------------ | ------
-#   lib.sh is present                                                  | LIB
+#   the old shared bash guard library is present                       | LIB
 #   guard-writes.sh is present, ledger-guard.sh is present              | re-expressed: AC-20
 #   guard-blueprint-write.sh is present                                | OTHER (guards-remake-blueprint-write.t, SH-1)
 #   bp-drive-next.pl is present                                        | OTHER (director; drive-next.t)
@@ -29,7 +29,7 @@
 #   AC-12/B11 F9(2), F12(4), F13(2)                                    | re-expressed: AC-15
 #   AC-12/B11 F14(2)                                                   | re-expressed: AC-15 F1 (same mechanism)
 #   AC-13 F1,F2,F5,F9 (4)                                              | re-expressed: AC-19
-#   AC-14 (bp_driver_context defined once, in lib.sh)                  | LIB
+#   AC-14 (bp_driver_context defined once, in the old shared bash lib) | LIB
 #   AC-15 per guard: exactly one bp_driver_context call; regex count;  | LIB
 #     bp_drive_any_active present                                     |
 #   AC-15 per guard: no bp_drive_active_dir/.drive-solo-active/        | re-expressed: AC-20
@@ -50,7 +50,7 @@
 #   RT-6 (future-dated hatch)                                          | OVR (hatch; Decision 68)
 #   RT-7 (empty-scope done removes current.json)                      | OTHER (director; Decision 68)
 #
-# driver-context-session-scope.t
+# the retired driver-context-session-scope coverage
 #   assertion                                                          | status
 #   ------------------------------------------------------------------ | ------
 #   both guards exist                                                  | re-expressed: AC-20
@@ -448,9 +448,9 @@ sub _agent_type_of {
 
 # ---------------------------------------------------------------------------
 # coordinator worker marker -- sec 2.4 / Decision 69 A1 (review B1, red-team
-# H1). The marker lives at "$BP_DIR/runs/<pkg>.active-worker" -- lib.sh:320
-# marker_path() and BpHook::Guards::TrackDispatch.pm:463 are the production
-# writer/reader. NEVER at "<data>/runs/" (BP_DIR is, in general, a strict
+# H1). The marker lives at "$BP_DIR/runs/<pkg>.active-worker" --
+# BpHook::Guards::TrackDispatch.pm:463 is the production writer/reader.
+# NEVER at "<data>/runs/" (BP_DIR is, in general, a strict
 # subdirectory of the data dir, and the two must not be confused).
 # ---------------------------------------------------------------------------
 sub _coordinator_worker {
@@ -605,8 +605,8 @@ sub resolve {
 }
 
 # ---------------------------------------------------------------------------
-# 2.7 write-set matching, carried unchanged from guard-writes.sh / lib.sh
-# match_any.
+# 2.7 write-set matching, carried unchanged from guard-writes.sh's old
+# shared match_any.
 # ---------------------------------------------------------------------------
 sub _glob_to_regex {
     my ($pat) = @_;

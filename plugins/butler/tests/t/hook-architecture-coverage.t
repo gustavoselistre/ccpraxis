@@ -742,8 +742,8 @@ sub build_fixture {
     write_utf8("$root/plugins/butler/hooks/a.sh", "#!/usr/bin/env bash\nexit 0\n");
     write_utf8("$root/plugins/butler/hooks/b.sh", "#!/usr/bin/env bash\nexit 0\n");
     write_utf8("$root/plugins/butler/hooks/c.pl", "#!/usr/bin/env perl\n");
-    write_utf8("$root/plugins/butler/tests/t/reporter-gate-regression.t", "1;\n");
-    write_utf8("$root/plugins/butler/tests/t/arming-binds-or-reports.t", "1;\n");
+    write_utf8("$root/plugins/butler/tests/t/sample-fixture-a.t", "1;\n");
+    write_utf8("$root/plugins/butler/tests/t/sample-fixture-b.t", "1;\n");
 
     my $hooks_json = {
         hooks => {
@@ -909,8 +909,8 @@ Decision 43):
 
 - `plugins/butler/hooks/b.sh`
 - `plugins/butler/hooks/c.pl`
-- `plugins/butler/tests/t/reporter-gate-regression.t`
-- `plugins/butler/tests/t/arming-binds-or-reports.t`
+- `plugins/butler/tests/t/sample-fixture-a.t`
+- `plugins/butler/tests/t/sample-fixture-b.t`
 
 ## NEEDS-OPERATOR forks
 
