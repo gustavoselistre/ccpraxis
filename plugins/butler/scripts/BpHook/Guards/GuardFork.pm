@@ -21,7 +21,6 @@ use warnings;
 use JSON::PP ();
 use File::Basename qw(dirname);
 use Cwd ();
-use B qw(svref_2object SVp_POK);
 
 my $SELF_DIR;
 {
@@ -33,21 +32,11 @@ require "$SELF_DIR/../../BpHook.pm"
     unless grep { m{(?:^|/)BpHook\.pm$} } keys %INC;
 
 # ---------------------------------------------------------------------------
-# small local helpers (the module carries no ticket code of its own).
+# small local aliases -- the real implementations live in BpHook.pm; this
+# module carries no ticket code of its own (review m6).
 # ---------------------------------------------------------------------------
-sub _is_plain_string {
-    my ($v) = @_;
-    return 0 unless defined $v;
-    return 0 if ref $v;
-    my $flags = svref_2object(\$v)->FLAGS;
-    return ($flags & SVp_POK()) ? 1 : 0;
-}
-
-sub _iso_now {
-    my @t = gmtime(time());
-    return sprintf('%04d-%02d-%02dT%02d:%02d:%02dZ',
-        $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
-}
+sub _is_plain_string { return BpHook::_is_plain_string(@_); }
+sub _iso_now { return BpHook::_iso_now(@_); }
 
 # ---------------------------------------------------------------------------
 # deny_lines() -- the exact 2.3.2 text, 3 lines, each at most 160 characters.
@@ -67,6 +56,7 @@ sub deny_lines {
 sub valid_reason {
     my ($r) = @_;
     return 0 unless defined $r && !ref($r) && _is_plain_string($r);
+    $r = BpHook::_decode_maybe($r);
     my @words = grep { length } split /\s+/, $r;
     return 0 if scalar(@words) < 2;
     (my $nospace = $r) =~ s/\s+//g;
@@ -86,6 +76,7 @@ sub record_token {
     return 0 unless defined $root;
     my $cut = BpHook::_decode_maybe($reason);
     $cut = substr($cut, 0, 300);
+    return 0 unless valid_reason($cut);
     my $rec = {
         at         => _iso_now(),
         reason     => $cut,
