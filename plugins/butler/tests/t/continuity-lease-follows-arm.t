@@ -33,7 +33,10 @@ require "$S/BpContinuityLease.pm";
 
 my $CMD = "$S/butler-continuity.pl";
 
-delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+# Deliberate: L1-L6 prove converge()'s real spawn DECISION through an injected `spawn` stub, so the
+# guard that short-circuits it must be off here (run-tests.pl exports it). Only L7 sets it back.
+delete $ENV{CCPRAXIS_NO_WAKELOCK};
 
 # ---------------------------------------------------------------------------
 # Isolation guard (R4 item 11): pin HOME/USERPROFILE to a decoy tempdir for
@@ -353,7 +356,7 @@ sub slurp {
         my $pid = fork();
         die "fork: $!" unless defined $pid;
         if ($pid == 0) {
-            delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+            delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
             $ENV{BUTLER_STATE_DIR}               = $home;
             $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR} = $legacy;
             $ENV{CCPRAXIS_NO_WAKELOCK}           = 1;

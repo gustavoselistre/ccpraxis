@@ -85,7 +85,7 @@ sub read_json_bytes {
 # to a decoy tempdir (defense in depth, guard-asserted at the bottom of this
 # file), leave BUTLER_STATE_DIR to be set per-case below.
 # ---------------------------------------------------------------------------
-delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
 $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
 
 my $REAL_HOME        = $ENV{HOME};
@@ -203,7 +203,7 @@ sub run_wrapper {
     my (undef, $err_path) = tempfile();
 
     local %ENV = %ENV;
-    delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+    delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
     $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
     $ENV{HOME}        = $FAKE_HOME;
     $ENV{USERPROFILE} = $FAKE_HOME;
@@ -278,7 +278,7 @@ sub run_shim {
     my (undef, $err_path) = tempfile();
 
     local %ENV = %ENV;
-    delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+    delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
     $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
     $ENV{HOME}        = $FAKE_HOME;
     $ENV{USERPROFILE} = $FAKE_HOME;

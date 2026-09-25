@@ -75,7 +75,7 @@ $SIG{$_} = sub { exit 1 } for qw(TERM INT HUP);
 # ---------------------------------------------------------------------------
 # fixtures / environment
 # ---------------------------------------------------------------------------
-delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
 
 my $TMPROOT = tempdir(CLEANUP => 1);
 (my $LEGACY    = "$TMPROOT/legacy") =~ s{\\}{/}g;
@@ -214,7 +214,7 @@ sub spawn_cmd {
     my $pid = fork();
     die "fork: $!" unless defined $pid;
     if ($pid == 0) {
-        delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+        delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
         $ENV{BUTLER_STATE_DIR}               = $CURRENT_STATE_BASE;
         $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR} = $LEGACY;
         $ENV{CLAUDE_PROJECT_DIR}             = $PROJECT;

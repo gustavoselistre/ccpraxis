@@ -84,7 +84,7 @@ use GuardHarness;
 # own env changes in local %ENV = %ENV" was false (no such wrap exists
 # anywhere in this file) and is removed rather than repeated.
 # ---------------------------------------------------------------------------
-delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
 $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
 
 my $BUTLER_DIR = dirname(__FILE__) . '/../..';

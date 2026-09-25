@@ -19,6 +19,7 @@
 # lives under File::Temp::tempdir(CLEANUP => 1) — /project is NEVER used as a repo.
 use strict;
 use warnings;
+BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 } # package 16 post-fix-batch (Decision 80): this file names a wake-lock actuator, in prose or a path check, never a real invocation -- the guard is the cheap side of test-wakelock-hygiene.t's deliberate over-matching.
 use FindBin qw($Bin);
 use lib "$Bin/../lib";
 use HostCaps qw(git_path);

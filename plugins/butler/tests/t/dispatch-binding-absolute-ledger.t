@@ -43,7 +43,7 @@ BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
 use lib dirname(__FILE__) . '/../lib';
 use GuardHarness;
 
-delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
 $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
 GuardHarness::isolate_env();
 

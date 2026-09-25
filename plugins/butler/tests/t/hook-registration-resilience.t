@@ -137,7 +137,7 @@ sub run_registered_command {
     my $stdin_content = delete $overrides{__stdin};
 
     local %ENV = %ENV;
-    delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+    delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
     $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
 
     my $t = tempdir(CLEANUP => 1);

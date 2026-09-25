@@ -4,7 +4,7 @@
 # deleted wholesale at a315ef2 although the last_updated stamping behaviour
 # it covered survives in BpHook::StopGate's _stamp_ledger. Re-expressed here,
 # against the REAL plugins/butler/hooks/stop-gate.sh wrapper (never the
-# retired gate-stop.sh), the assertions that stop-gate-coordinator-ledger.t's
+# retired pre-cutover stop hook), the assertions that stop-gate-coordinator-ledger.t's
 # C1/C13 do NOT already cover:
 #   - AC-08: exactly one line differs, and the line count is unchanged.
 #   - AC-09/AC-10: idempotent -- a second run creates no duplicate
@@ -63,7 +63,7 @@ END {
 }
 $SIG{$_} = sub { exit 1 } for qw(TERM INT HUP);
 
-delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
 
 my $FAKE_HOME_ROOT = tempdir(CLEANUP => 1);
 (my $FAKE_HOME = "$FAKE_HOME_ROOT/decoy-home") =~ s{\\}{/}g;
@@ -130,7 +130,7 @@ sub run_gate {
     my (undef, $epath) = tempfile();
 
     local %ENV = %ENV;
-    delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+    delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
     for my $k (keys %env) {
         if (defined $env{$k}) { $ENV{$k} = $env{$k} } else { delete $ENV{$k} }
     }

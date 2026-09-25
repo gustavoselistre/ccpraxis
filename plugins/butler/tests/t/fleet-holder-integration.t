@@ -171,7 +171,7 @@ sub with_captured_stderr {
 sub gate_run {
     my ($payload, %env) = @_;
     local %ENV = %ENV;
-    delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+    delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
     $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
     for my $k (keys %env) {
         if (defined $env{$k}) { $ENV{$k} = $env{$k} } else { delete $ENV{$k} }
@@ -553,7 +553,7 @@ sub run_wedge_sim {
             $pid = fork();
             die "fork: $!" unless defined $pid;
             if ($pid == 0) {
-                delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+                delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
                 $ENV{HOME} = $FAKE_HOME; $ENV{USERPROFILE} = $FAKE_HOME;
                 $ENV{BUTLER_STATE_DIR} = $root;
                 $ENV{BUTLER_HOLD_TEST_MODE}    = 1;
@@ -653,7 +653,7 @@ sub run_wedge_sim {
         my $pid = fork();
         die "fork: $!" unless defined $pid;
         if ($pid == 0) {
-            delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+            delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
             $ENV{HOME} = $FAKE_HOME; $ENV{USERPROFILE} = $FAKE_HOME;
             $ENV{BUTLER_STATE_DIR} = $root;
             $ENV{BUTLER_HOLD_TEST_MODE}    = 1;

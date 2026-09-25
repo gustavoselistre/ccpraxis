@@ -119,7 +119,7 @@ my %CANARY_BEFORE  = map { ($_ => (-e $_ ? 1 : 0)) } @CANARIES;
 # CCPRAXIS_* (bp_data_dir reads CCPRAXIS_DATA_DIR — AC-29 re-supplies it as a
 # decoy on purpose) and IS_SANDBOX (so AC-24's "both unset" is honest).
 my %CLEAN_ENV = map { ($_ => $ENV{$_}) }
-                grep { !/^BP_/ && !/^CCPRAXIS_/ && $_ ne 'IS_SANDBOX' } keys %ENV;
+                grep { (!/^BP_/ && !/^CCPRAXIS_/ && $_ ne 'IS_SANDBOX') || $_ eq 'CCPRAXIS_NO_WAKELOCK' } keys %ENV;
 my $BASE_PATH = $CLEAN_ENV{PATH} // '/usr/bin:/bin';
 
 # pnpm PATH stub (C2). It writes a witness on EVERY invocation; AC-17 asserts

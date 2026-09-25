@@ -390,7 +390,7 @@ subtest 'F-2: hook-architecture.md has none of the three retired phrases' => sub
 # ===========================================================================
 # Real-tree scan setup: git ls-files (the one process this file spawns).
 # ===========================================================================
-my $ls_out = qx(git -C "$ROOT" ls-files 2>&1);
+my $ls_out = qx(git -C "$ROOT" ls-files --cached --others --exclude-standard 2>&1);   # untracked too
 my $ls_rc  = $?;
 BAIL_OUT("git ls-files failed (rc=$ls_rc): $ls_out") if $ls_rc != 0;
 my @tracked = split /\n/, $ls_out;

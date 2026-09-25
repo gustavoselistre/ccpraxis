@@ -237,7 +237,7 @@ sub read_bytes {
 # does), or the mutation leaks into the rest of the suite.
 # ---------------------------------------------------------------------------
 sub isolate_env {
-    delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+    delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
     $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
     my $decoy_root = tempdir(CLEANUP => 1);
     (my $decoy = "$decoy_root/decoy-home") =~ s{\\}{/}g;

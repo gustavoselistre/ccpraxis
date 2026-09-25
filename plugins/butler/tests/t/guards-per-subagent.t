@@ -98,7 +98,7 @@ use GuardHarness;
 # Ambient isolation up front (GuardHarness itself isolates at "use", this is
 # just belt-and-suspenders for readers, per the house idiom).
 # ---------------------------------------------------------------------------
-delete $ENV{$_} for grep { /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
 $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
 
 my $J = JSON::PP->new->utf8->canonical;

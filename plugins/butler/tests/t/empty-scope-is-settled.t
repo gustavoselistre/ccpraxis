@@ -59,6 +59,7 @@
 #     refuse rather than warn-and-write.
 use strict;
 use warnings;
+BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 } # package 16 post-fix-batch (Decision 80): this file names a wake-lock actuator, in prose or a path check, never a real invocation -- the guard is the cheap side of test-wakelock-hygiene.t's deliberate over-matching.
 use FindBin qw($Bin);
 use Test::More;
 use JSON::PP;
