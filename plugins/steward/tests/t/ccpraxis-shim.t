@@ -23,6 +23,8 @@ use FindBin qw($Bin);
 use lib "$Bin/../lib";
 use File::Temp qw(tempdir);
 use File::Path qw(make_path);
+use File::Copy qw(copy);
+use File::Spec;
 use StewardTest qw(ok is like unlike done_testing diag);
 
 my $PLUGIN  = "$Bin/../..";
@@ -128,8 +130,26 @@ if (have_bash()) {
     # actual home or live install.
     my $fixture_home = tempdir(CLEANUP => 1);
     make_path("$fixture_home/.claude/ccpraxis/plugins/steward");
-    symlink($SCRIPTS, "$fixture_home/.claude/ccpraxis/plugins/steward/scripts")
-        or diag("symlink fixture scripts dir failed: $!");
+    my $fixture_scripts = "$fixture_home/.claude/ccpraxis/plugins/steward/scripts";
+    # FIX (m10, review): symlink() reports success but silently DEEP-COPIES
+    # the directory on this host with MSYS unset (no Developer Mode) -- fine.
+    # With MSYS=winsymlinks:nativestrict and no Developer Mode it instead
+    # FAILS outright, and nothing here recovered: AC5 went red for a reason
+    # that has nothing to do with the shim's own passthrough behaviour. Fall
+    # back to a plain File::Copy of every file the shim actually needs
+    # (update-research.pl plus VaultNamespace.pm, both resolved the same way
+    # the real scripts dir would `use lib $FindBin::Bin` for) whenever
+    # symlink() does not leave a real, usable directory behind.
+    unless (symlink($SCRIPTS, $fixture_scripts) && -d $fixture_scripts) {
+        diag("symlink fixture scripts dir unavailable/failed; falling back to a copy: $!");
+        make_path($fixture_scripts) unless -d $fixture_scripts;
+        for my $name (qw(update-research.pl VaultNamespace.pm)) {
+            my $src = File::Spec->catfile($SCRIPTS, $name);
+            next unless -f $src;
+            copy($src, File::Spec->catfile($fixture_scripts, $name))
+                or diag("cannot copy $name into fixture scripts dir: $!");
+        }
+    }
     local $ENV{HOME} = $fixture_home;
     my $json = `bash "$SH" research status 2>/dev/null`;
     like($json, qr/"store"\s*:/, 'AC5 arguments pass through to the target script')

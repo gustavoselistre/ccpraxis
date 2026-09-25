@@ -32,6 +32,7 @@ use strict;
 use warnings;
 use Test::More;
 use FindBin qw($Bin);
+use File::Basename qw(dirname);
 use File::Copy qw(copy);
 use File::Path qw(make_path);
 use File::Spec;
@@ -230,10 +231,217 @@ sub green_fixture_source {
     return "#!/usr/bin/env perl\n# platform: any\nprint \"ok 1 - plain fixture pass\\n\";\nexit 0;\n";
 }
 
+# --- fixture sources added for the review fix-round (M1-M7, m1, m4) --------
+
+# readonly_blocker_source() -- reports its own HOME, then creates a file
+# inside it and chmod 0444s it (the shape a git object file takes), so the
+# sweep's own sandbox teardown has to remove a directory holding a read-only
+# file (M1).
+sub readonly_blocker_source {
+    return <<'SRC';
+#!/usr/bin/env perl
+# platform: any
+use strict;
+use warnings;
+use File::Path qw(make_path);
+my $report = $ENV{FIXTURE_REPORT_DIR};
+die "FIXTURE_REPORT_DIR not set\n" unless defined $report && length $report;
+my $home = defined $ENV{HOME} ? $ENV{HOME} : '';
+open(my $fh, '>', "$report/home-seen.txt") or die "$!";
+print {$fh} $home;
+close $fh;
+if (length $home) {
+    my $dir = "$home/blocker";
+    make_path($dir);
+    my $obj = "$dir/git-object-like-file";
+    open(my $w, '>', $obj) or die "$!";
+    print {$w} "read-only payload\n";
+    close $w;
+    chmod(0444, $obj) or die "cannot chmod $obj read-only: $!";
+}
+print "ok 1 - readonly-blocker fixture ran\n";
+exit 0;
+SRC
+}
+
+# git_config_probe_source() -- reports the GIT_CONFIG_GLOBAL value the test
+# sees, then attempts a `git config --global` write, proving whether that
+# write can reach the real ~/.gitconfig (M2).
+sub git_config_probe_source {
+    return <<'SRC';
+#!/usr/bin/env perl
+# platform: any
+use strict;
+use warnings;
+my $report = $ENV{FIXTURE_REPORT_DIR};
+die "FIXTURE_REPORT_DIR not set\n" unless defined $report && length $report;
+my $gcg = defined $ENV{GIT_CONFIG_GLOBAL} ? $ENV{GIT_CONFIG_GLOBAL} : '<UNSET>';
+open(my $fh, '>', "$report/git-config-global-seen.txt") or die "$!";
+print {$fh} $gcg;
+close $fh;
+system('git', 'config', '--global', 'user.email', 'fixture-m2@example.invalid');
+system('git', 'config', '--global', 'test.fixturemarker', 'written-by-fixture-m2');
+print "ok 1 - git-config-probe fixture ran\n";
+exit 0;
+SRC
+}
+
+# ambient_env_probe_source() -- reports what the test sees for each of the
+# ambient ccpraxis path variables named in M3, so the test file can check
+# they were unset or sandboxed rather than passed straight through.
+sub ambient_env_probe_source {
+    return <<'SRC';
+#!/usr/bin/env perl
+# platform: any
+use strict;
+use warnings;
+my $report = $ENV{FIXTURE_REPORT_DIR};
+die "FIXTURE_REPORT_DIR not set\n" unless defined $report && length $report;
+my @VARS = qw(BP_LEDGER BP_DIR BP_PROJECT_ROOT CCPRAXIS_DATA_DIR CLAUDE_PROJECT_DIR CLAUDE_CONFIG_DIR ALMANAC_HOME);
+open(my $fh, '>', "$report/ambient-env-seen.txt") or die "$!";
+for my $v (@VARS) {
+    my $val = defined $ENV{$v} ? $ENV{$v} : '<UNSET>';
+    print {$fh} "$v=$val\n";
+}
+close $fh;
+print "ok 1 - ambient-env-probe fixture ran\n";
+exit 0;
+SRC
+}
+
+# real_state_writer_source() -- writes a marker file directly into whatever
+# "real" butler-state / continuity-active directories the test passes it
+# through the non-reserved FIXTURE_REAL_* channel names (M4), bypassing
+# whatever sandboxed value the runner hands the test through the reserved
+# BUTLER_STATE_DIR / CCPRAXIS_CONTINUITY_ACTIVE_DIR names themselves.
+sub real_state_writer_source {
+    return <<'SRC';
+#!/usr/bin/env perl
+# platform: any
+use strict;
+use warnings;
+use File::Path qw(make_path);
+for my $v (qw(FIXTURE_REAL_BUTLER_STATE FIXTURE_REAL_CONTINUITY_ACTIVE)) {
+    my $dir = $ENV{$v};
+    next unless defined $dir && length $dir;
+    make_path($dir) unless -d $dir;
+    open(my $fh, '>', "$dir/m4-marker.txt") or die "$!";
+    print {$fh} "written by m4 fixture ($v)\n";
+    close $fh;
+}
+print "ok 1 - real-state-writer fixture ran\n";
+exit 0;
+SRC
+}
+
+# inflight_writer_source() -- creates a stray file at exactly the path
+# another (fixture) in-flight package's write_set claims (M6).
+sub inflight_writer_source {
+    return <<'SRC';
+#!/usr/bin/env perl
+# platform: any
+use strict;
+use warnings;
+use File::Path qw(make_path);
+my $root = $ENV{FIXTURE_REPO_ROOT};
+die "FIXTURE_REPO_ROOT not set\n" unless defined $root && length $root;
+make_path("$root/new-path-outside-tests");
+open(my $fh, '>', "$root/new-path-outside-tests/stray-attributed.txt") or die "$!";
+print {$fh} "stray, but attributed\n";
+close $fh;
+print "ok 1 - inflight-writer fixture ran\n";
+exit 0;
+SRC
+}
+
+# transient_wakelock_source() -- spawns (and does not wait for) a detached
+# process whose argv carries a wake-lock stand-in name, but which exits on
+# its own after one second -- short enough that a pre/post-sweep double
+# snapshot ~2s apart should never see it in both (M5, second half).
+sub transient_wakelock_source {
+    return <<'SRC';
+#!/usr/bin/env perl
+# platform: any
+use strict;
+use warnings;
+my $pid = fork();
+die "fork failed: $!" unless defined $pid;
+if ($pid == 0) {
+    open(STDIN,  '<', '/dev/null');
+    open(STDOUT, '>', '/dev/null');
+    open(STDERR, '>', '/dev/null');
+    exec($^X, '-e', 'sleep(1)', 'bp-keepawake.pl') or exit(127);
+}
+print "ok 1 - transient-wakelock fixture ran\n";
+exit 0;
+SRC
+}
+
+# crash_zero_tests_source() -- prints a bare "1..0" plan (Test::More's own
+# shape for "no tests run", the exact pattern the review names) and exits
+# 255, without ever calling plan skip_all -- so _skip_all_reason's regex
+# should NOT treat this as a legitimate skip (m1).
+sub crash_zero_tests_source {
+    return "#!/usr/bin/env perl\n# platform: any\nprint \"1..0\\n\";\nexit 255;\n";
+}
+
+# interrupt_probe_source() -- reports its HOME immediately, then sleeps far
+# longer than this test needs so the sweep can be SIGTERM'd mid-run (m4,
+# second half: an interrupted run must leave no sandbox directory behind).
+sub interrupt_probe_source {
+    return <<'SRC';
+#!/usr/bin/env perl
+# platform: any
+use strict;
+use warnings;
+my $report = $ENV{FIXTURE_REPORT_DIR};
+die "FIXTURE_REPORT_DIR not set\n" unless defined $report && length $report;
+my $home = defined $ENV{HOME} ? $ENV{HOME} : '';
+open(my $fh, '>', "$report/home-seen.txt") or die "$!";
+print {$fh} $home;
+close $fh;
+sleep(20);
+print "ok 1 - interrupt-probe fixture ran (should never print; sweep should be killed first)\n";
+exit 0;
+SRC
+}
+
+sub read_ambient_env_report {
+    my ($dir) = @_;
+    my $raw = read_report($dir, 'ambient-env-seen.txt');
+    return {} unless defined $raw && length $raw;
+    my %h;
+    for my $line (split /\n/, $raw) {
+        $h{$1} = $2 if $line =~ /^(\S+)=(.*)$/;
+    }
+    return \%h;
+}
+
 sub pid_alive {
     my ($pid) = @_;
     return 0 unless defined $pid && $pid =~ /^\d+$/;
     return kill(0, $pid) ? 1 : 0;
+}
+
+# spawn_named_bg_process($name, $secs) -> $pid
+# Forks and execs a detached "perl -e 'sleep($secs)' $name" directly from
+# THIS file (not through a fixture .t), for review-round scenarios (M5) that
+# need a process alive/gone BEFORE the fake sweep even starts, not one the
+# fixture itself spawns mid-run. $name becomes the child's own argv, which is
+# how the runner's real wake-lock audit is expected to recognise it (the same
+# technique leftover_process_source() already uses for AC-4).
+sub spawn_named_bg_process {
+    my ($name, $secs) = @_;
+    $secs //= 20;
+    my $pid = fork();
+    die "fork failed: $!" unless defined $pid;
+    if ($pid == 0) {
+        open(STDIN,  '<', '/dev/null');
+        open(STDOUT, '>', '/dev/null');
+        open(STDERR, '>', '/dev/null');
+        exec($^X, '-e', "sleep($secs)", $name) or exit(127);
+    }
+    return $pid;
 }
 
 my @KILL_ON_EXIT;   # pids of every fixture-orphaned process this file learns about;
@@ -463,6 +671,400 @@ sub read_report {
     like($res->{out}, qr/all green/,
         'AC-6: the sweep reports "all green"')
         or diag("stdout:\n$res->{out}");
+}
+
+# ===========================================================================
+# Review fix-round additions (21-test-sandbox-review.md): M1-M7, m1, m4.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# M1: a sandbox holding a read-only file (like a git object) is still
+# removed after the run.
+# ---------------------------------------------------------------------------
+{
+    my $repo = build_fake_repo('readonly-blocker.t' => readonly_blocker_source());
+    my $outer_home = File::Temp::tempdir(HostCaps::tempdir_args(), CLEANUP => 1);
+    my $report_dir = File::Temp::tempdir(HostCaps::tempdir_args(), CLEANUP => 1);
+
+    my $res = run_fake_sweep(
+        repo    => $repo,
+        args    => [],
+        env     => { HOME => $outer_home, FIXTURE_REPORT_DIR => $report_dir },
+        timeout => $BOUND,
+    );
+
+    is($res->{rc}, 0,
+        'M1: the readonly-blocker fixture itself runs cleanly')
+        or diag("stdout:\n$res->{out}\nstderr:\n$res->{err}");
+
+    my $home = read_report($report_dir, 'home-seen.txt');
+    ok(defined $home && length $home,
+        'M1: the fixture reported its sandbox HOME');
+
+    if (defined $home && length $home) {
+        ok(!-e $home,
+            'M1: the sandbox is fully removed even though it held a read-only (0444) file')
+            or diag("sandbox still present: $home");
+    } else {
+        fail('M1: the sandbox is fully removed even though it held a read-only (0444) file');
+    }
+
+    unlike($res->{out} . $res->{err}, qr/sandbox not fully removed/,
+        'M1: no "sandbox not fully removed" warning is printed')
+        or diag("stdout:\n$res->{out}\nstderr:\n$res->{err}");
+}
+
+# ---------------------------------------------------------------------------
+# M2: GIT_CONFIG_GLOBAL seen by a test is a copy inside its sandbox, and a
+# `git config --global` inside a test never changes the real file.
+# ---------------------------------------------------------------------------
+{
+    my $repo = build_fake_repo('git-config-probe.t' => git_config_probe_source());
+    my $outer_home = File::Temp::tempdir(HostCaps::tempdir_args(), CLEANUP => 1);
+    my $report_dir = File::Temp::tempdir(HostCaps::tempdir_args(), CLEANUP => 1);
+
+    my $real_gitconfig = File::Spec->catfile($outer_home, '.gitconfig');
+    open(my $fh, '>', $real_gitconfig) or die "cannot write $real_gitconfig: $!";
+    print {$fh} "[user]\n\temail = real-operator\@example.invalid\n";
+    close $fh;
+
+    my $res = run_fake_sweep(
+        repo    => $repo,
+        args    => [],
+        env     => { HOME => $outer_home, FIXTURE_REPORT_DIR => $report_dir },
+        timeout => $BOUND,
+    );
+
+    is($res->{rc}, 0,
+        'M2: the git-config-probe fixture itself runs cleanly')
+        or diag("stdout:\n$res->{out}\nstderr:\n$res->{err}");
+
+    my $seen_gcg = read_report($report_dir, 'git-config-global-seen.txt');
+    ok(defined $seen_gcg && length $seen_gcg,
+        'M2: the fixture reported a GIT_CONFIG_GLOBAL value');
+
+    if (defined $seen_gcg && length $seen_gcg) {
+        (my $seen_norm = $seen_gcg) =~ s{\\}{/}g;
+        (my $real_norm = $real_gitconfig) =~ s{\\}{/}g;
+        isnt($seen_norm, $real_norm,
+            'M2: the GIT_CONFIG_GLOBAL the test sees is not the real ~/.gitconfig path')
+            or diag("seen: $seen_gcg\nreal: $real_gitconfig");
+    } else {
+        fail('M2: the GIT_CONFIG_GLOBAL the test sees is not the real ~/.gitconfig path');
+    }
+
+    my $real_after = slurp_raw($real_gitconfig) // '';
+    unlike($real_after, qr/written-by-fixture-m2/,
+        'M2: a `git config --global` write inside the test never lands in the real ~/.gitconfig')
+        or diag("real ~/.gitconfig now reads:\n$real_after");
+    like($real_after, qr/real-operator/,
+        'M2: the real ~/.gitconfig is otherwise untouched')
+        or diag("real ~/.gitconfig now reads:\n$real_after");
+}
+
+# ---------------------------------------------------------------------------
+# M3: BP_LEDGER, BP_DIR, BP_PROJECT_ROOT, CCPRAXIS_DATA_DIR,
+# CLAUDE_PROJECT_DIR, CLAUDE_CONFIG_DIR and ALMANAC_HOME are unset or
+# sandboxed for the test, even when set in the runner's own environment.
+# ---------------------------------------------------------------------------
+{
+    my @AMBIENT_VARS = qw(
+        BP_LEDGER BP_DIR BP_PROJECT_ROOT CCPRAXIS_DATA_DIR
+        CLAUDE_PROJECT_DIR CLAUDE_CONFIG_DIR ALMANAC_HOME
+    );
+
+    my $repo = build_fake_repo('ambient-env-probe.t' => ambient_env_probe_source());
+    my $outer_home = File::Temp::tempdir(HostCaps::tempdir_args(), CLEANUP => 1);
+    my $report_dir = File::Temp::tempdir(HostCaps::tempdir_args(), CLEANUP => 1);
+
+    my %env = (HOME => $outer_home, FIXTURE_REPORT_DIR => $report_dir);
+    $env{$_} = "REAL-SENTINEL-$_" for @AMBIENT_VARS;
+
+    my $res = run_fake_sweep(repo => $repo, args => [], env => \%env, timeout => $BOUND);
+
+    is($res->{rc}, 0,
+        'M3: the ambient-env-probe fixture itself runs cleanly')
+        or diag("stdout:\n$res->{out}\nstderr:\n$res->{err}");
+
+    my $seen = read_ambient_env_report($report_dir);
+    for my $v (@AMBIENT_VARS) {
+        my $sentinel = "REAL-SENTINEL-$v";
+        my $got = $seen->{$v};
+        ok(!defined($got) || $got eq '<UNSET>' || $got ne $sentinel,
+            "M3: $v is unset or sandboxed for the test (not the runner's own ambient value)")
+            or diag("test saw $v=" . (defined $got ? $got : '<not reported>'));
+    }
+}
+
+# ---------------------------------------------------------------------------
+# M4: a write into a fixture 'real' butler-state dir or continuity active
+# dir during a sweep is reported by the audit.
+# ---------------------------------------------------------------------------
+{
+    my $repo = build_fake_repo('real-state-writer.t' => real_state_writer_source());
+    my $outer_home        = File::Temp::tempdir(HostCaps::tempdir_args(), CLEANUP => 1);
+    my $real_butler_state  = File::Temp::tempdir(HostCaps::tempdir_args(), CLEANUP => 1);
+    my $real_continuity    = File::Temp::tempdir(HostCaps::tempdir_args(), CLEANUP => 1);
+
+    my $res = run_fake_sweep(
+        repo    => $repo,
+        args    => [],
+        env     => {
+            HOME                          => $outer_home,
+            BUTLER_STATE_DIR              => $real_butler_state,
+            CCPRAXIS_CONTINUITY_ACTIVE_DIR => $real_continuity,
+            FIXTURE_REAL_BUTLER_STATE      => $real_butler_state,
+            FIXTURE_REAL_CONTINUITY_ACTIVE => $real_continuity,
+        },
+        timeout => $BOUND,
+    );
+
+    isnt($res->{rc}, 0,
+        'M4: a write into the real butler-state/continuity-active dirs during a sweep fails it')
+        or diag("stdout:\n$res->{out}\nstderr:\n$res->{err}");
+
+    (my $bs_marker = File::Spec->catfile($real_butler_state, 'm4-marker.txt')) =~ s{\\}{/}g;
+    (my $ca_marker = File::Spec->catfile($real_continuity,   'm4-marker.txt')) =~ s{\\}{/}g;
+    my $combined = $res->{out} . $res->{err};
+    (my $combined_norm = $combined) =~ s{\\}{/}g;
+
+    ok(index($combined_norm, $bs_marker) >= 0 || index($combined_norm, $ca_marker) >= 0,
+        'M4: the audit NAMES the real-dir marker file it caught')
+        or diag("stdout:\n$res->{out}\nstderr:\n$res->{err}");
+}
+
+# ---------------------------------------------------------------------------
+# M5: the wake-lock audit ignores a keep-awake pid recorded in the real
+# keepawake.pid, and a short-lived one gone by the second snapshot.
+# ---------------------------------------------------------------------------
+{
+    # M5a: a pid already recorded in the real keepawake.pid is the
+    # operator's own legitimate refresher, not a leak -- it must not fail a
+    # sweep that otherwise does nothing wrong.
+    my $repo = build_fake_repo('plain-pass-m5a.t' => green_fixture_source());
+    my $outer_home       = File::Temp::tempdir(HostCaps::tempdir_args(), CLEANUP => 1);
+    my $real_butler_state = File::Temp::tempdir(HostCaps::tempdir_args(), CLEANUP => 1);
+
+    my $keeper_pid = spawn_named_bg_process('keep-awake.ps1', 30);
+    push @KILL_ON_EXIT, $keeper_pid;
+
+    open(my $fh, '>', "$real_butler_state/keepawake.pid") or die "$!";
+    print {$fh} $keeper_pid;
+    close $fh;
+
+    my $res = run_fake_sweep(
+        repo    => $repo,
+        args    => [],
+        env     => { HOME => $outer_home, BUTLER_STATE_DIR => $real_butler_state },
+        timeout => $BOUND,
+    );
+
+    is($res->{rc}, 0,
+        'M5a: a pid recorded in the real keepawake.pid is exempted from the wake-lock audit')
+        or diag("stdout:\n$res->{out}\nstderr:\n$res->{err}");
+
+    kill('KILL', $keeper_pid);
+    waitpid($keeper_pid, 0);
+}
+{
+    # M5b: a keep-awake-named process that is already gone by the second
+    # snapshot must not fail the sweep either.
+    my $repo = build_fake_repo('transient-wakelock.t' => transient_wakelock_source());
+    my $outer_home = File::Temp::tempdir(HostCaps::tempdir_args(), CLEANUP => 1);
+
+    my $res = run_fake_sweep(
+        repo    => $repo,
+        args    => [],
+        env     => { HOME => $outer_home },
+        timeout => $BOUND,
+    );
+
+    is($res->{rc}, 0,
+        'M5b: a short-lived keep-awake-named process gone by the second snapshot does not fail the audit')
+        or diag("stdout:\n$res->{out}\nstderr:\n$res->{err}");
+}
+
+# ---------------------------------------------------------------------------
+# M6: a new path inside another in-flight package's write_set is listed as
+# not attributed and does not fail the audit.
+# ---------------------------------------------------------------------------
+{
+    my $repo = build_fake_repo('inflight-writer.t' => inflight_writer_source());
+
+    my $ledger_dir = File::Spec->catdir($repo, qw(.ccpraxis-local-data blueprints other-bp packages));
+    make_path($ledger_dir);
+    my $ledger_path = File::Spec->catfile($ledger_dir, 'other-pkg.md');
+    open(my $lfh, '>', $ledger_path) or die "cannot write $ledger_path: $!";
+    print {$lfh} <<'LEDGER';
+---
+package: other-pkg
+blueprint: other-bp
+status: running
+write_set: new-path-outside-tests/stray-attributed.txt
+---
+LEDGER
+    close $lfh;
+
+    my $dsdir = File::Spec->catdir($repo, qw(.ccpraxis-local-data .drive-solo));
+    make_path($dsdir);
+    my $inflight_path = File::Spec->catfile($dsdir, 'inflight.json');
+    open(my $ifh, '>', $inflight_path) or die "cannot write $inflight_path: $!";
+    print {$ifh} <<'INFLIGHT';
+{"packages":[{"blueprint":"other-bp","package":"other-pkg","ledger":".ccpraxis-local-data/blueprints/other-bp/packages/other-pkg.md","since":1}],"updated_at":1}
+INFLIGHT
+    close $ifh;
+
+    my $outer_home = File::Temp::tempdir(HostCaps::tempdir_args(), CLEANUP => 1);
+
+    my $res = run_fake_sweep(
+        repo    => $repo,
+        args    => [],
+        env     => { HOME => $outer_home, FIXTURE_REPO_ROOT => $repo },
+        timeout => $BOUND,
+    );
+
+    is($res->{rc}, 0,
+        "M6: a new path inside another in-flight package's write_set does not fail the audit")
+        or diag("stdout:\n$res->{out}\nstderr:\n$res->{err}");
+    like($res->{out} . $res->{err}, qr/not attributed/i,
+        'M6: the new path is listed under a non-failing "not attributed" heading')
+        or diag("stdout:\n$res->{out}\nstderr:\n$res->{err}");
+    like($res->{out} . $res->{err}, qr/stray-attributed\.txt/,
+        'M6: the not-attributed path is named')
+        or diag("stdout:\n$res->{out}\nstderr:\n$res->{err}");
+}
+
+# ---------------------------------------------------------------------------
+# M7: the process audit has a non-Windows branch.
+# ---------------------------------------------------------------------------
+if ($^O =~ /^(MSWin32|cygwin|msys)$/) {
+    SKIP: {
+        skip('M7: this host is Windows/MSYS, so the process audit\'s non-Windows '
+           . '(POSIX ps) branch cannot be exercised without starting the container '
+           . 'lane, which this suite refuses to do', 1);
+    }
+} else {
+    my $repo = build_fake_repo('leftover-posix.t' => leftover_process_source());
+    my $outer_home = File::Temp::tempdir(HostCaps::tempdir_args(), CLEANUP => 1);
+    my $report_dir = File::Temp::tempdir(HostCaps::tempdir_args(), CLEANUP => 1);
+
+    my $res = run_fake_sweep(
+        repo    => $repo,
+        args    => [],
+        env     => { HOME => $outer_home, FIXTURE_REPORT_DIR => $report_dir },
+        timeout => $BOUND,
+    );
+
+    my $leftover_pid = read_report($report_dir, 'leftover-pid.txt');
+    if (defined $leftover_pid && $leftover_pid =~ /(\d+)/) {
+        push @KILL_ON_EXIT, $1;
+    }
+
+    isnt($res->{rc}, 0,
+        'M7 (non-Windows host): a leftover keep-awake-named process still fails the audit via the POSIX branch')
+        or diag("stdout:\n$res->{out}\nstderr:\n$res->{err}");
+}
+
+# ---------------------------------------------------------------------------
+# m1: a file that crashes with zero tests is RED, not SKIPPED.
+# ---------------------------------------------------------------------------
+{
+    my $repo = build_fake_repo('crash-zero-tests.t' => crash_zero_tests_source());
+    my $outer_home = File::Temp::tempdir(HostCaps::tempdir_args(), CLEANUP => 1);
+
+    my $res = run_fake_sweep(
+        repo    => $repo,
+        args    => [],
+        env     => { HOME => $outer_home },
+        timeout => $BOUND,
+    );
+
+    isnt($res->{rc}, 0,
+        'm1: a file that crashes with zero tests fails the sweep')
+        or diag("stdout:\n$res->{out}\nstderr:\n$res->{err}");
+    unlike($res->{out}, qr/SKIPPED:.*crash-zero-tests\.t/s,
+        'm1: the crashing file is not listed as SKIPPED')
+        or diag("stdout:\n$res->{out}");
+    like($res->{out} . $res->{err}, qr/crash-zero-tests\.t/,
+        'm1: the crashing file is named among the failures')
+        or diag("stdout:\n$res->{out}\nstderr:\n$res->{err}");
+}
+
+# ---------------------------------------------------------------------------
+# m4: sandbox dirs carry a recognisable prefix, and an interrupted run
+# leaves none behind where that's testable.
+# ---------------------------------------------------------------------------
+{
+    my $repo = build_fake_repo('home-probe-m4.t' => home_probe_source());
+    my $outer_home = File::Temp::tempdir(HostCaps::tempdir_args(), CLEANUP => 1);
+    my $report_dir = File::Temp::tempdir(HostCaps::tempdir_args(), CLEANUP => 1);
+
+    my $res = run_fake_sweep(
+        repo    => $repo,
+        args    => [],
+        env     => { HOME => $outer_home, FIXTURE_REPORT_DIR => $report_dir },
+        timeout => $BOUND,
+    );
+
+    my $home = read_report($report_dir, 'home-seen.txt');
+    ok(defined $home && length $home,
+        'm4: the fixture reported a sandbox HOME');
+    if (defined $home && length $home) {
+        like($home, qr/ccpraxis-sweep/i,
+            'm4: the sandbox path carries a recognisable "ccpraxis-sweep" prefix')
+            or diag("sandbox HOME was: $home");
+    } else {
+        fail('m4: the sandbox path carries a recognisable "ccpraxis-sweep" prefix');
+    }
+}
+{
+    SKIP: {
+        my $signals_ok = HostCaps::signals_work();
+        skip("m4: this host's signal emulation is not reliable enough "
+           . '(HostCaps::signals_work reports false) to exercise an interrupted-run cleanup', 2)
+            unless $signals_ok;
+
+        my $repo = build_fake_repo('interrupt-probe.t' => interrupt_probe_source());
+        my $outer_home = File::Temp::tempdir(HostCaps::tempdir_args(), CLEANUP => 1);
+        my $report_dir = File::Temp::tempdir(HostCaps::tempdir_args(), CLEANUP => 1);
+        my $script     = File::Spec->catfile($repo, 'scripts', 'run-tests.pl');
+
+        my $pid = fork();
+        die "fork failed: $!" unless defined $pid;
+        if ($pid == 0) {
+            $ENV{HOME} = $outer_home;
+            $ENV{FIXTURE_REPORT_DIR} = $report_dir;
+            open(STDIN,  '<', '/dev/null');
+            open(STDOUT, '>', '/dev/null');
+            open(STDERR, '>', '/dev/null');
+            exec($^X, $script) or POSIX::_exit(99);
+        }
+
+        my $deadline = time() + 20;
+        my $home_seen;
+        while (time() < $deadline) {
+            $home_seen = read_report($report_dir, 'home-seen.txt');
+            last if defined $home_seen && length $home_seen;
+            select(undef, undef, undef, 0.2);
+        }
+        ok(defined $home_seen && length $home_seen,
+            'm4: the interrupt-probe fixture reported a sandbox HOME before being interrupted')
+            or diag('no home-seen.txt appeared within 20s');
+
+        kill('TERM', $pid);
+        reap_with_grace($pid, timeout => 15);
+        kill('KILL', $pid) if pid_alive($pid);
+
+        if (defined $home_seen && length $home_seen) {
+            my $deadline2 = time() + 10;
+            while (time() < $deadline2 && -e $home_seen) { select(undef, undef, undef, 0.2) }
+            ok(!-e $home_seen,
+                'm4: an interrupted (SIGTERM) run leaves no sandbox directory behind')
+                or diag("sandbox HOME still present after interrupt: $home_seen");
+        } else {
+            fail('m4: an interrupted (SIGTERM) run leaves no sandbox directory behind');
+        }
+    }
 }
 
 done_testing();

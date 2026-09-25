@@ -79,6 +79,8 @@ use warnings;
 use File::Basename qw(basename dirname);
 use File::Spec;
 use File::Path qw(make_path remove_tree);
+use File::Copy qw(copy);
+use File::Find ();
 use Cwd qw(abs_path);
 use POSIX qw(:sys_wait_h);
 use Time::HiRes ();
@@ -120,6 +122,34 @@ my $REAL_GIT_CONFIG_GLOBAL = do {
     (defined $home && length $home) ? File::Spec->catfile($home, '.gitconfig') : undef;
 };
 
+# FIX-BATCH M4 (review, step 7): the operator's REAL butler-state and
+# continuity-active dirs, captured ONCE at load time -- before run_one() ever
+# overrides these two env vars for a per-file sandbox -- so the audit can
+# snapshot them before/after the sweep and catch a write that reached them
+# despite the sandboxing (e.g. a test that shells out without inheriting the
+# per-file override). undef when unset in the invoking environment.
+my $REAL_BUTLER_STATE_DIR = (defined $ENV{BUTLER_STATE_DIR} && length $ENV{BUTLER_STATE_DIR})
+    ? $ENV{BUTLER_STATE_DIR} : undef;
+my $REAL_CONTINUITY_ACTIVE_DIR = (defined $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR} && length $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR})
+    ? $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR} : undef;
+
+# FIX-BATCH M5 (review, step 7): the operator's real keep-awake pid, if any --
+# a pid recorded here is the operator's OWN legitimate refresher, not a leak,
+# and the wake-lock audit must never flag it.
+my $REAL_KEEPAWAKE_PID = do {
+    my $f = defined $REAL_BUTLER_STATE_DIR ? File::Spec->catfile($REAL_BUTLER_STATE_DIR, 'keepawake.pid') : undef;
+    my $pid;
+    if (defined $f && -f $f) {
+        if (open my $fh, '<', $f) {
+            local $/;
+            my $raw = <$fh>;
+            close $fh;
+            $pid = $1 if defined $raw && $raw =~ /(\d+)/;
+        }
+    }
+    $pid;
+};
+
 # Package 21-test-sandbox: the ambient, real %TEMP%/%TMP% path (a genuine
 # Windows drive-letter form, e.g. "C:\Users\<name>\AppData\Local\Temp"),
 # captured ONCE at load time, BEFORE run_sweep() ever overrides $ENV{TEMP}/
@@ -149,6 +179,133 @@ $REAL_WINDOWS_TMP = undef unless defined $REAL_WINDOWS_TMP && length $REAL_WINDO
 my $SANDBOX_SWEEP_ROOT;
 my $KEEP_SANDBOX = 0;
 
+# The recognisable prefix every per-file sandbox/win-tmp dir carries (m4).
+# Lets an operator (or a stray-orphan reaper) tell this runner's own scratch
+# apart from anything else under %TEMP%/"/tmp" at a glance. Deliberately NOT
+# the name of a wrapping directory every per-file dir nests inside -- an
+# earlier version of this fix wrapped every per-file sandbox in one shared,
+# similarly-prefixed parent directory, and that EXTRA path segment (plus the
+# 14-character prefix text itself) pushed an otherwise-ordinary fixture path
+# (guards-remake-blueprint-write.t's BW-5 cases, which build a fixed-shape
+# path under a bare `tempdir()` of their own) past
+# BpHook::Guards::Common::path_echo's 90-character display-truncation
+# threshold -- confirmed by direct measurement: 91 chars with the wrapping
+# dir at its most compact possible size, 88 chars flattened. Each per-file
+# dir instead carries the prefix ITSELF, directly under the short base --
+# one path segment shorter, and the only shape that keeps both this budget
+# and the oracle's literal "ccpraxis-sweep" substring requirement (AC m4)
+# satisfied at once.
+my $SWEEP_TEMPLATE = 'ccpraxis-sweep-XXXXXX';
+
+# _sandbox_registry_path() -> $path -- FIX-BATCH m4 (review, step 7): with no
+# single wrapping directory left to nuke on interrupt (see $SWEEP_TEMPLATE's
+# own comment above for why), the INT/TERM handler instead needs to know
+# exactly which per-file dirs are currently live. Every run_one() call
+# (in-process serial, or inside a forked parallel/container-batch child --
+# each such child still shares this lexical because it inherits the
+# PARENT's memory at fork time) appends its own sandbox/win-tmp path here
+# the moment it creates them, before running the test file itself. Lazily
+# created once per top-level process; forked children reuse the SAME path
+# (inherited at fork time), so every append lands in one file regardless of
+# which process wrote it.
+my $SANDBOX_REGISTRY_PATH;
+sub _sandbox_registry_path {
+    return $SANDBOX_REGISTRY_PATH if defined $SANDBOX_REGISTRY_PATH;
+    my $base = _short_tmp_base();
+    my ($fh, $path) = defined $base
+        ? File::Temp::tempfile('ccpraxis-sweep-registry-XXXXXX', DIR => $base, SUFFIX => '.txt', UNLINK => 0)
+        : File::Temp::tempfile(SUFFIX => '.txt', UNLINK => 0);
+    close $fh;
+    $SANDBOX_REGISTRY_PATH = $path;
+    return $SANDBOX_REGISTRY_PATH;
+}
+
+# _register_sandbox_dir($path) -- appends one line, best-effort (a failure
+# to record means only that an interrupt cannot clean this ONE dir up early;
+# run_one()'s own end-of-call removal is unaffected).
+sub _register_sandbox_dir {
+    my ($path) = @_;
+    return unless defined $path && length $path;
+    my $reg = _sandbox_registry_path();
+    if (open my $fh, '>>', $reg) {
+        print {$fh} "$path\n";
+        close $fh;
+    }
+}
+
+# The pid that INSTALLED the INT/TERM cleanup handler below (m4) -- set the
+# moment run_sweep() starts, i.e. the top-level sweep process, never a forked
+# worker. A worker inherits the SAME %SIG entries by fork semantics, and must
+# NOT act on them: removing the shared sweep root out from under sibling
+# workers still using their own per-file subdirectory would be its own bug.
+my $SWEEP_OWNER_PID;
+
+# _force_remove_tree($dir) -> 1 (fully removed) | 0 (left something behind,
+# reported to STDERR). FIX-BATCH M1 (review, step 7): the previous
+# `remove_tree(..., { safe => 1 })` silently skips any file that is not
+# writable (a git object is 0444), so a sandbox holding one leaked FOREVER
+# and the failure was swallowed by an `eval`. Clearing every read-only bit
+# first (finddepth so files are cleared before their parent dir) and dropping
+# `safe => 1` means the only thing that can still block removal is something
+# genuinely outside this process's control (e.g. a file another process still
+# has open) -- and that case is now reported by name instead of silently
+# leaked.
+sub _force_remove_tree {
+    my ($dir) = @_;
+    return 1 unless defined $dir && length $dir && -e $dir;
+    eval {
+        File::Find::finddepth(sub {
+            chmod(0777, $File::Find::name) if -e $File::Find::name;
+        }, $dir);
+    };
+    chmod(0777, $dir) if -e $dir;
+    # File::Path::remove_tree's `error` option wants a SCALAR ref (which it
+    # then points at a fresh arrayref itself) -- NOT an arrayref directly.
+    # Passing \@errors dies with "Not a SCALAR reference", which the eval
+    # below swallowed, leaving remove_tree() never actually called.
+    my $errors_ref;
+    eval { remove_tree($dir, { error => \$errors_ref }) };
+    my @errors = (ref $errors_ref eq 'ARRAY') ? @$errors_ref : ();
+    if (@errors) {
+        for my $e (@errors) {
+            my ($file, $msg) = %$e;
+            $file = $dir unless length $file;
+            print STDERR "sandbox not fully removed: $file ($msg)\n";
+        }
+        return 0;
+    }
+    return 1;
+}
+
+# _install_sweep_cleanup_handlers() -- FIX-BATCH m4 (review, step 7): a
+# `timeout N perl scripts/run-tests.pl` or an operator Ctrl-C used to leave
+# the sweep root (and every live per-file dir under it) behind with no
+# cleanup at all. Installed once, at the very start of run_sweep(); guarded
+# by $SWEEP_OWNER_PID so a forked worker (which inherits these same %SIG
+# entries) never acts on a signal meant for the parent.
+sub _install_sweep_cleanup_handlers {
+    $SWEEP_OWNER_PID = $$;
+    my $handler = sub {
+        my ($sig) = @_;
+        return unless defined $SWEEP_OWNER_PID && $$ == $SWEEP_OWNER_PID;
+        unless ($KEEP_SANDBOX) {
+            if (defined $SANDBOX_REGISTRY_PATH && -f $SANDBOX_REGISTRY_PATH) {
+                if (open my $fh, '<', $SANDBOX_REGISTRY_PATH) {
+                    while (my $line = <$fh>) {
+                        $line =~ s/\s+\z//;
+                        _force_remove_tree($line) if length $line;
+                    }
+                    close $fh;
+                }
+                unlink $SANDBOX_REGISTRY_PATH;
+            }
+        }
+        exit(1);
+    };
+    $SIG{INT}  = $handler;
+    $SIG{TERM} = $handler;
+}
+
 # _short_tmp_base() -> $dir | undef -- on this project's actual host (a
 # cygwin/msys-flavored Git-for-Windows perl), "/tmp" is a real, writable
 # mount aliasing the same physical directory $ENV{TEMP} names, but through a
@@ -174,17 +331,15 @@ sub _short_tmp_base {
     return undef;
 }
 
-# _sandbox_sweep_root() -> $dir -- lazily creates the sweep-wide root exactly
-# once per process. CLEANUP => 0: File::Temp's own END-based auto-cleanup
-# would delete --keep-sandbox'd per-file dirs out from under the operator at
-# process exit, so removal is handled explicitly (per file in run_one(), and
-# a best-effort rmdir of the empty root itself at the end of run_sweep()).
-sub _sandbox_sweep_root {
+# _sandbox_base() -> $dir -- the (static, always-exists) directory every
+# per-file sandbox is created DIRECTLY under, each carrying its own
+# $SWEEP_TEMPLATE-prefixed name (see that variable's header comment for why
+# there is deliberately no wrapping per-sweep directory any more). Memoized
+# only so every call in one process agrees, not because anything here is
+# expensive to recompute.
+sub _sandbox_base {
     return $SANDBOX_SWEEP_ROOT if defined $SANDBOX_SWEEP_ROOT;
-    my $base = _short_tmp_base();
-    $SANDBOX_SWEEP_ROOT = defined $base
-        ? File::Temp::tempdir(DIR => $base, CLEANUP => 0)
-        : File::Temp::tempdir(CLEANUP => 0);
+    $SANDBOX_SWEEP_ROOT = _short_tmp_base() // File::Spec->tmpdir();
     return $SANDBOX_SWEEP_ROOT;
 }
 
@@ -553,8 +708,22 @@ sub run_one {
     delete $ENV{CCPRAXIS_CONTAINER_LANE_ENABLED};
 
     local %ENV = %ENV;
-    my $root    = _sandbox_sweep_root();
-    my $sandbox = File::Temp::tempdir(DIR => $root, CLEANUP => 0);
+
+    # FIX-BATCH M3 (review, step 7): every ambient ccpraxis path variable a
+    # dispatched worker/agent carries (BP_LEDGER and its many siblings,
+    # CCPRAXIS_DATA_DIR, CLAUDE_PROJECT_DIR, CLAUDE_CONFIG_DIR, ALMANAC_HOME)
+    # used to pass straight through to every test unchanged -- a test that
+    # shells out to bp-ledger.pl or similar without itself scrubbing these
+    # would mutate REAL, LIVE blueprint/almanac/claude-config state. Deleted
+    # BEFORE the sandbox overrides below so nothing here can resurrect one.
+    for my $k (keys %ENV) {
+        delete $ENV{$k} if $k =~ /^BP_/;
+    }
+    delete $ENV{$_} for qw(CCPRAXIS_DATA_DIR CLAUDE_PROJECT_DIR CLAUDE_CONFIG_DIR ALMANAC_HOME);
+
+    my $base    = _sandbox_base();
+    my $sandbox = File::Temp::tempdir($SWEEP_TEMPLATE, DIR => $base, CLEANUP => 0);
+    _register_sandbox_dir($sandbox);
     # TMPDIR points at $sandbox itself now, NOT a "Temp" subdirectory of it.
     # A fixture's own File::Temp/File::Spec->tmpdir()-based tempfiles landing
     # in the same directory as its sandboxed HOME is harmless (nothing here
@@ -580,8 +749,9 @@ sub run_one {
     # missing/unusable (a non-Windows host, where "/tmp" already IS the real
     # system tmpdir and this whole distinction is moot).
     my $win_tmp = defined $REAL_WINDOWS_TMP
-        ? File::Temp::tempdir(DIR => $REAL_WINDOWS_TMP, CLEANUP => 0)
+        ? File::Temp::tempdir($SWEEP_TEMPLATE, DIR => $REAL_WINDOWS_TMP, CLEANUP => 0)
         : $sandbox;
+    _register_sandbox_dir($win_tmp) if $win_tmp ne $sandbox;
     $ENV{HOME}                              = $sandbox;
     $ENV{USERPROFILE}                       = $sandbox;
     $ENV{APPDATA}                           = File::Spec->catdir($sandbox, 'AppData', 'Roaming');
@@ -592,11 +762,29 @@ sub run_one {
     $ENV{BUTLER_STATE_DIR}                  = File::Spec->catdir($sandbox, '.claude', 'butler-state');
     $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR}    = File::Spec->catdir($sandbox, 'active');
     $ENV{CCPRAXIS_NO_WAKELOCK}              = 1;
-    if (defined $REAL_GIT_CONFIG_GLOBAL) {
-        $ENV{GIT_CONFIG_GLOBAL} = $REAL_GIT_CONFIG_GLOBAL;
-    } else {
-        delete $ENV{GIT_CONFIG_GLOBAL};
+
+    # FIX-BATCH M2 (review, step 7): GIT_CONFIG_GLOBAL used to point straight
+    # at the operator's REAL ~/.gitconfig -- git has no read-only mode for
+    # that file, so a `git config --global ...` run by a test (or a script
+    # under test) wrote the operator's real identity file. Copy it (an
+    # inbound GIT_CONFIG_GLOBAL takes precedence over the load-time-captured
+    # real ~/.gitconfig, so an outer override is respected rather than
+    # clobbered) into the sandbox instead, and point GIT_CONFIG_GLOBAL at
+    # that copy. No real source at all -> an empty file, so `git config
+    # --global` inside a test still has somewhere harmless to write.
+    my $sandboxed_gitconfig = File::Spec->catfile($sandbox, '.gitconfig-sandbox');
+    {
+        my $src = (defined $ENV{GIT_CONFIG_GLOBAL} && length $ENV{GIT_CONFIG_GLOBAL} && -f $ENV{GIT_CONFIG_GLOBAL})
+            ? $ENV{GIT_CONFIG_GLOBAL}
+            : $REAL_GIT_CONFIG_GLOBAL;
+        if (defined $src && -f $src) {
+            eval { copy($src, $sandboxed_gitconfig) };
+        }
+        unless (-f $sandboxed_gitconfig) {
+            if (open my $fh, '>', $sandboxed_gitconfig) { close $fh }
+        }
     }
+    $ENV{GIT_CONFIG_GLOBAL} = $sandboxed_gitconfig;
 
     my $out = `perl "$f" 2>&1`;
     my $rc  = $? >> 8;
@@ -605,8 +793,8 @@ sub run_one {
     my $skip_reason = _skip_all_reason($out);
 
     unless ($KEEP_SANDBOX) {
-        eval { remove_tree($sandbox, { safe => 1 }) };
-        eval { remove_tree($win_tmp, { safe => 1 }) } if $win_tmp ne $sandbox;
+        _force_remove_tree($sandbox);
+        _force_remove_tree($win_tmp) if $win_tmp ne $sandbox;
     }
 
     return { file => $f, rc => $rc, notok => $notok,
@@ -862,24 +1050,148 @@ sub _git_status_paths {
 # WINPID vs. a perl pid is a Windows landmine -- see CLAUDE.md); returns ()
 # unqualified elsewhere or if the CIM query itself is unavailable/unparsable.
 sub _wakelock_pids {
-    return () unless $^O =~ /^(MSWin32|cygwin|msys)$/;
-    my $ps = 'powershell.exe -NoProfile -NonInteractive -Command '
-           . '"Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | '
-           . 'Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress -Depth 3"';
-    my $raw = `$ps 2>/dev/null`;
+    if ($^O =~ /^(MSWin32|cygwin|msys)$/) {
+        my $ps = 'powershell.exe -NoProfile -NonInteractive -Command '
+               . '"Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | '
+               . 'Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress -Depth 3"';
+        my $raw = `$ps 2>/dev/null`;
+        return () unless defined $raw && $raw =~ /\S/;
+        my $data = eval { require JSON::PP; JSON::PP->new->utf8(0)->decode($raw) };
+        return () unless ref $data;
+        $data = [$data] if ref $data eq 'HASH';
+        my @out;
+        for my $p (@$data) {
+            next unless ref $p eq 'HASH';
+            my $cmd = $p->{CommandLine};
+            next unless defined $cmd && length $cmd;
+            next unless $cmd =~ /keep-awake\.ps1|BpContinuityLease|bp-keepawake/;
+            push @out, { pid => $p->{ProcessId}, cmd => $cmd };
+        }
+        return @out;
+    }
+
+    # FIX-BATCH M7 (review, step 7): the container lane runs the oracle (and
+    # any real in-container sweep) on Linux, where the CIM branch above
+    # returns () unconditionally -- a leftover wake-lock-style process there
+    # was never detected at all. `ps -eo pid=,args=` is the POSIX equivalent:
+    # bare pid and full argv, no header line (the trailing `=` on each field
+    # suppresses it).
+    my $raw = `ps -eo pid=,args= 2>/dev/null`;
     return () unless defined $raw && $raw =~ /\S/;
-    my $data = eval { require JSON::PP; JSON::PP->new->utf8(0)->decode($raw) };
-    return () unless ref $data;
-    $data = [$data] if ref $data eq 'HASH';
     my @out;
-    for my $p (@$data) {
-        next unless ref $p eq 'HASH';
-        my $cmd = $p->{CommandLine};
-        next unless defined $cmd && length $cmd;
+    for my $line (split /\n/, $raw) {
+        next unless $line =~ /^\s*(\d+)\s+(.*)$/;
+        my ($pid, $cmd) = ($1, $2);
         next unless $cmd =~ /keep-awake\.ps1|BpContinuityLease|bp-keepawake/;
-        push @out, { pid => $p->{ProcessId}, cmd => $cmd };
+        push @out, { pid => $pid, cmd => $cmd };
     }
     return @out;
+}
+
+# _stable_wakelock_pids() -> @{ {pid, cmd} } -- FIX-BATCH M5 (review, step
+# 7): a single wake-lock snapshot flags a transient invocation (many test
+# files themselves spawn/re-spawn a fake bp-keepawake.pl under
+# CCPRAXIS_NO_WAKELOCK, alive for well under a second) as a leak. Two
+# snapshots ~2s apart, intersected on pid, keep only what is ALIVE across the
+# whole window -- AC-4's real `sleep(60)` leftover survives that easily; a
+# one-second transient does not.
+sub _stable_wakelock_pids {
+    my @first = _wakelock_pids();
+    return () unless @first;
+    Time::HiRes::sleep(2);
+    my @second   = _wakelock_pids();
+    my %alive_at_second = map { ($_->{pid} => 1) } @second;
+    return grep { $alive_at_second{ $_->{pid} } } @first;
+}
+
+# _dir_snapshot($dir) -> \%{ relpath => "mtime:size" } -- FIX-BATCH M4
+# (review, step 7): git status never reports a gitignored path, and most of
+# the real state this package cares about (butler-state, continuity active
+# dir) lives outside the repo entirely. A plain existence/path-set diff also
+# misses a MODIFICATION of a file that was already there, so this snapshots
+# (mtime, size) per file, not just presence. Returns {} for an undef/missing
+# dir -- "nothing to audit" is not the same claim as "audited and clean".
+sub _dir_snapshot {
+    my ($dir) = @_;
+    my %snap;
+    return \%snap unless defined $dir && length $dir && -d $dir;
+    eval {
+        File::Find::find(sub {
+            return unless -f $_;
+            my $rel = File::Spec->abs2rel($File::Find::name, $dir);
+            $rel =~ s{\\}{/}g;
+            my @st = stat($_);
+            $snap{$rel} = (@st ? "$st[9]:$st[7]" : '?');
+        }, $dir);
+    };
+    return \%snap;
+}
+
+# _snapshot_diff($pre, $post) -> @relpaths -- every relpath present in $post
+# that is either new or whose (mtime,size) signature changed since $pre.
+sub _snapshot_diff {
+    my ($pre, $post) = @_;
+    my @changed;
+    for my $k (sort keys %$post) {
+        push @changed, $k unless exists $pre->{$k} && $pre->{$k} eq $post->{$k};
+    }
+    return @changed;
+}
+
+# _read_inflight_write_sets($repo_root_abs) -> @relpath_or_dir_entries --
+# FIX-BATCH M6 (review, step 7): every write_set entry declared by another
+# package currently in flight, read from .ccpraxis-local-data/.drive-solo/
+# inflight.json (a list of {blueprint,package,ledger} records) and that
+# package's own ledger frontmatter (`write_set: a:b:c`, colon-separated --
+# same shape bp-checks.pl's own _split_set already assumes). Never dies: a
+# missing/unparsable inflight file or ledger just means "nothing to
+# attribute", not a sweep-crashing condition. With no inflight file at all,
+# returns () and every new path fails the audit exactly as before this
+# package existed.
+sub _read_inflight_write_sets {
+    my ($root) = @_;
+    my $path = File::Spec->catfile($root, qw(.ccpraxis-local-data .drive-solo inflight.json));
+    return () unless -f $path;
+    my $raw = do {
+        open my $fh, '<:raw', $path or return ();
+        local $/;
+        <$fh>;
+    };
+    return () unless defined $raw && length $raw;
+    my $data = eval { require JSON::PP; JSON::PP->new->utf8(0)->decode($raw) };
+    return () unless ref $data eq 'HASH' && ref $data->{packages} eq 'ARRAY';
+
+    my @sets;
+    for my $p (@{ $data->{packages} }) {
+        next unless ref $p eq 'HASH';
+        my $ledger_rel = $p->{ledger};
+        next unless defined $ledger_rel && length $ledger_rel;
+        my $ledger_abs = File::Spec->catfile($root, split m{/}, $ledger_rel);
+        next unless -f $ledger_abs;
+        my $text = do {
+            open my $fh, '<', $ledger_abs or next;
+            local $/;
+            <$fh>;
+        };
+        next unless defined $text;
+        my ($fm) = $text =~ /\A---\s*\n(.*?)\n---\s*\n/s;
+        next unless defined $fm;
+        my ($ws) = $fm =~ /^write_set:\s*(.*?)\s*$/m;
+        next unless defined $ws && length $ws;
+        push @sets, grep { length } split /:/, $ws;
+    }
+    return @sets;
+}
+
+# _path_attributed($relpath, @write_sets) -> 1 | 0 -- true iff $relpath
+# equals a declared write_set entry, or sits inside one that names a
+# directory.
+sub _path_attributed {
+    my ($relpath, @sets) = @_;
+    for my $entry (@sets) {
+        return 1 if $relpath eq $entry || $relpath =~ m{^\Q$entry\E/};
+    }
+    return 0;
 }
 
 # run_sweep(@argv) -> $exit_code -- everything that used to be this script's
@@ -916,11 +1228,19 @@ sub run_sweep {
         exit 2;
     }
 
-    # Force the sweep-wide sandbox root into existence NOW, before any
-    # host-parallel/host-serial worker is spawned -- forked children inherit
-    # this process's memory at fork time, so every one of them sees the SAME
-    # root without any IPC (package 21-test-sandbox).
-    _sandbox_sweep_root();
+    # Force the sandbox base and the sandbox registry into existence NOW,
+    # before any host-parallel/host-serial worker is spawned -- forked
+    # children inherit this process's memory at fork time, so every one of
+    # them sees the SAME base and SAME registry path without any IPC
+    # (package 21-test-sandbox).
+    _sandbox_base();
+    _sandbox_registry_path();
+
+    # FIX-BATCH m4 (review, step 7): installed as early as possible, right
+    # after the registry above exists, so an interrupt lands with something
+    # to clean up but before any worker is forked (a forked worker inherits
+    # these same %SIG entries but is guarded off by $SWEEP_OWNER_PID).
+    _install_sweep_cleanup_handlers();
 
     # Pre-sweep audit snapshot (package 21-test-sandbox). Taken here, before
     # any test file runs, so a file that appears afterward is genuinely new
@@ -928,7 +1248,14 @@ sub run_sweep {
     # bookkeeping (that write happens later, and is filtered by path below
     # regardless).
     my @audit_pre_paths = _git_status_paths($ROOT_ABS);
-    my @audit_pre_procs = _wakelock_pids();
+    my @audit_pre_procs = grep { !(defined $REAL_KEEPAWAKE_PID && $_->{pid} eq $REAL_KEEPAWAKE_PID) } _wakelock_pids();
+    # FIX-BATCH M4 (review, step 7): the real butler-state dir and continuity
+    # active dir are never under $ROOT_ABS, so git status can never see a
+    # write into them -- snapshot them directly, by (mtime,size) per file so
+    # a modification of an already-existing file counts, not only a brand
+    # new path.
+    my $audit_pre_bs = _dir_snapshot($REAL_BUTLER_STATE_DIR);
+    my $audit_pre_ca = _dir_snapshot($REAL_CONTINUITY_ACTIVE_DIR);
 
     # --- collect ---------------------------------------------------------------
     my @files;
@@ -1206,7 +1533,12 @@ sub run_sweep {
     # Derived from each result's captured TAP output, not from run_one()'s
     # skipped/skip_reason fields: parallel children report back only
     # rc/notok/secs/file/out, so those fields never survive the fork.
-    my @skipped = grep { defined _skip_all_reason($_->{out}) } @results;
+    # FIX-BATCH m1 (review, step 7): a file that crashes with zero tests
+    # (a bare "1..0" plan line, exit != 0, no skip_all call) matched the same
+    # regex as a legitimate skip_all and was listed as BOTH red AND SKIPPED.
+    # A file that ran zero tests because it died is not a skip -- require the
+    # rc==0/notok==0 shape a genuine skip_all always has.
+    my @skipped = grep { $_->{rc} == 0 && $_->{notok} == 0 && defined _skip_all_reason($_->{out}) } @results;
     if (@skipped) {
         print "\nSKIPPED:\n";
         for my $r (sort { $a->{file} cmp $b->{file} } @skipped) {
@@ -1267,29 +1599,65 @@ sub run_sweep {
         my %pre_path = map { ($_ => 1) } @audit_pre_paths;
         my @new_paths = grep { !$pre_path{$_} } @post_paths;
 
-        my @post_procs = _wakelock_pids();
+        # FIX-BATCH M6 (review, step 7): a new path that lands squarely inside
+        # another IN-FLIGHT package's own write_set is not this sweep's own
+        # defect -- it is a concurrent worker doing legitimate, disjoint work
+        # while this sweep happened to run. Split, rather than either failing
+        # the sweep on every such path (the observed false positive) or
+        # silently dropping the check (losing the audit's value for anything
+        # else). With no inflight file, @inflight_sets is empty and every new
+        # path fails exactly as before this fix.
+        my @inflight_sets = _read_inflight_write_sets($ROOT_ABS);
+        my (@new_unattributed, @new_attributed);
+        for my $p (@new_paths) {
+            if (@inflight_sets && _path_attributed($p, @inflight_sets)) {
+                push @new_attributed, $p;
+            } else {
+                push @new_unattributed, $p;
+            }
+        }
+
+        my @post_procs = _stable_wakelock_pids();
+        @post_procs = grep { !(defined $REAL_KEEPAWAKE_PID && $_->{pid} eq $REAL_KEEPAWAKE_PID) } @post_procs;
         my %pre_pid = map { ($_->{pid} => 1) } @audit_pre_procs;
         my @new_procs = grep { !$pre_pid{$_->{pid}} } @post_procs;
 
-        if (@new_paths || @new_procs) {
+        # FIX-BATCH M4 (review, step 7): the real butler-state dir and
+        # continuity active dir are outside $ROOT_ABS, so git status never
+        # sees a write into them -- diff the (mtime,size) snapshots taken
+        # before the sweep started against a fresh one now.
+        my @bs_changed = _snapshot_diff($audit_pre_bs, _dir_snapshot($REAL_BUTLER_STATE_DIR));
+        my @ca_changed = _snapshot_diff($audit_pre_ca, _dir_snapshot($REAL_CONTINUITY_ACTIVE_DIR));
+        my @bs_paths = map { File::Spec->catfile($REAL_BUTLER_STATE_DIR, $_) } @bs_changed;
+        my @ca_paths = map { File::Spec->catfile($REAL_CONTINUITY_ACTIVE_DIR, $_) } @ca_changed;
+
+        if (@new_unattributed || @new_procs || @bs_paths || @ca_paths) {
             $audit_failed = 1;
             print "\nAUDIT FAILED:\n";
-            if (@new_paths) {
+            if (@new_unattributed) {
                 print "  new repo path(s) appeared during this sweep (git status):\n";
-                print "    $_\n" for @new_paths;
+                print "    $_\n" for @new_unattributed;
             }
             if (@new_procs) {
                 print "  wake-lock-style process(es) survived this sweep:\n";
                 printf "    pid=%s  %s\n", $_->{pid}, $_->{cmd} for @new_procs;
             }
+            if (@bs_paths || @ca_paths) {
+                print "  the real butler-state/continuity-active dir(s) changed during this sweep:\n";
+                print "    $_\n" for (@bs_paths, @ca_paths);
+            }
+        }
+        if (@new_attributed) {
+            print "\nappeared during sweep (in-flight package; not attributed):\n";
+            print "    $_\n" for @new_attributed;
         }
     }
 
-    # Best-effort: remove the sweep-wide sandbox root if it is now empty (every
-    # per-file dir already removed itself in run_one() unless --keep-sandbox).
-    # Never fatal, never reported -- this is hygiene, not a done criterion.
+    # Best-effort: drop the sandbox registry file (every per-file dir already
+    # removed itself in run_one() unless --keep-sandbox). Never fatal, never
+    # reported -- this is hygiene, not a done criterion.
     unless ($KEEP_SANDBOX) {
-        eval { rmdir $SANDBOX_SWEEP_ROOT if defined $SANDBOX_SWEEP_ROOT };
+        eval { unlink $SANDBOX_REGISTRY_PATH if defined $SANDBOX_REGISTRY_PATH };
     }
 
     my $exit_code = scalar(@red);
