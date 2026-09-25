@@ -682,6 +682,160 @@ ac6_case(label => 'f-ledger-empty-write-set',  ledger_empty_ws  => 1);
 }
 
 # ===========================================================================
+# AC-16 (M-1, review 24-interlock-scope-review.md) -- the perl -c exemption
+# must not fire when $rest carries a command substitution, backtick or
+# process substitution: the shell still executes those operands even though
+# the outer "perl -c ..." itself never runs the script. Pure-function calls,
+# exactly like AC-15's use of write_sets_overlap() -- no fixture/filesystem
+# needed, since _validation_shaped() takes only the command string.
+# Confirmed against the committed code before this addition: all three
+# below return 0 (bug); expected (fixed) value is 1.
+# ===========================================================================
+{
+    my $has_fn = defined &BpHook::Guards::GuardBash::_validation_shaped;
+    ok($has_fn, 'AC-16 setup: BpHook::Guards::GuardBash::_validation_shaped exists');
+
+    for my $c (
+        [q{perl -c $(perl plugins/fx/tests/t/alpha.t)}   => 'command substitution operand'],
+        [q{perl -c x.pl `perl plugins/fx/tests/t/alpha.t`} => 'backtick operand'],
+        [q{perl -c <(perl plugins/fx/tests/t/alpha.t)}   => 'process substitution operand'],
+    ) {
+        my ($cmd, $label) = @$c;
+        my $got = $has_fn ? BpHook::Guards::GuardBash::_validation_shaped($cmd) : undef;
+        ok($got, "AC-16 ($label): perl -c with a nested real test run is still validation-shaped (cmd: $cmd)");
+    }
+
+    # Non-vacuity controls: a plain "perl -c" with no nested substitution is
+    # still exempt, for both a .t and a .pm operand.
+    for my $c (
+        [q{perl -c plugins/fx/tests/t/alpha.t} => 'plain -c on a .t file'],
+        [q{perl -c x.pm}                       => 'plain -c on a .pm file'],
+    ) {
+        my ($cmd, $label) = @$c;
+        my $got = $has_fn ? BpHook::Guards::GuardBash::_validation_shaped($cmd) : undef;
+        is($got ? 1 : 0, 0, "AC-16 (control, $label): plain perl -c stays exempt (cmd: $cmd)");
+    }
+}
+
+# ===========================================================================
+# AC-18 (M-2, review 24-interlock-scope-review.md) -- an interpreter eval
+# (perl/node/... with -e/-E/-c) that hides a real test run inside system()/
+# exec() must be validation-shaped even though the outer command has no bare
+# "perl SOMETHING.t" text of its own once strip_noise blanks the quoted
+# body. Pure-function calls against _validation_shaped(), same style as
+# AC-16/AC-15.
+# ===========================================================================
+{
+    my $has_fn = defined &BpHook::Guards::GuardBash::_validation_shaped;
+
+    for my $c (
+        [q{perl -e 'system("perl t/x.t")'}      => q{system() inside single-quoted -e}],
+        [q{perl -e "system(q(perl t/x.t))"}     => q{system() inside double-quoted -e}],
+    ) {
+        my ($cmd, $label) = @$c;
+        my $got = $has_fn ? BpHook::Guards::GuardBash::_validation_shaped($cmd) : undef;
+        ok($got, "AC-18: $label -> validation-shaped (cmd: $cmd)");
+    }
+
+    # Non-vacuity control: a ledger note whose quoted --text merely mentions
+    # the runner, with no interpreter eval anywhere in the command, is still
+    # not validation-shaped.
+    {
+        my $cmd = q{perl plugins/butler/scripts/bp-ledger.pl append-attempt --ledger L --text "see perl scripts/run-tests.pl for details"};
+        my $got = $has_fn ? BpHook::Guards::GuardBash::_validation_shaped($cmd) : undef;
+        is($got ? 1 : 0, 0, "AC-18 (control): a quoted mention of the runner, no eval -> not validation-shaped (cmd: $cmd)");
+    }
+}
+
+# ===========================================================================
+# AC-19 (S-1, review 24-interlock-scope-review.md) -- write-set scoping is
+# an approximation of what a run READS, not what it writes. A subagent
+# whose own binding is disjoint from every live writer is still DENIED for
+# a full-sweep invocation of the runner script (no path operand, --fast,
+# or several plugins), because the sweep reads the whole tree including the
+# live writer's half-written files; the same subagent is still allowed for
+# a single test file inside its own write set. Caller bound to A, live
+# disjoint writer bound to B (same shape as AC-1).
+# ===========================================================================
+{
+    my $data_n = tempdir_n();
+    my $sid = 'ac19-sid';
+    GuardHarness::fresh_state();
+    ok(GuardHarness::arm($sid, 'driver'), 'AC-19 setup: session armed driver');
+
+    setup_pkg_ledger($data_n, 'A');
+    setup_pkg_ledger($data_n, 'B');
+
+    my $caller_tuid = 'AC19CALLER';
+    write_binding($data_n, $caller_tuid,
+        blueprint => $PKG{A}{bp}, package => $PKG{A}{pkg}, session_id => $sid);
+
+    my $worker_tuid = 'AC19WORKERB';
+    write_worker_marker($data_n, $worker_tuid, session_id => $sid, subagent_type => 'bp-implementer');
+    write_binding($data_n, $worker_tuid,
+        blueprint => $PKG{B}{bp}, package => $PKG{B}{pkg}, session_id => $sid, subagent_type => 'bp-implementer');
+
+    my $transcript = "$data_n/transcript.jsonl";
+    write_meta_json($transcript, $sid, 'AC19AID', $caller_tuid);
+
+    for my $cmd (
+        'perl scripts/run-tests.pl --fast',
+        'perl scripts/run-tests.pl',
+        'perl scripts/run-tests.pl plugins/fx plugins/other',
+    ) {
+        my $res = gb(
+            payload(cmd => $cmd, session_id => $sid, agent_id => 'AC19AID', transcript_path => $transcript),
+            CCPRAXIS_DATA_DIR => $data_n,
+        );
+        is($res->{rc}, 2, "AC-19: disjoint caller, full-sweep '$cmd' -> deny (sweep reads everything)");
+    }
+
+    # Non-vacuity control: a single test file inside the caller's own write
+    # set keeps ordinary write-set scoping (disjoint -> allow).
+    {
+        my $cmd = 'perl scripts/run-tests.pl plugins/fx/tests/t/alpha.t';
+        my $res = gb(
+            payload(cmd => $cmd, session_id => $sid, agent_id => 'AC19AID', transcript_path => $transcript),
+            CCPRAXIS_DATA_DIR => $data_n,
+        );
+        is($res->{rc}, 0, "AC-19 (control): disjoint caller, single test file in its own write set '$cmd' -> allow");
+    }
+}
+
+# ===========================================================================
+# AC-20 (S-3, review 24-interlock-scope-review.md) -- strip_noise must not
+# run unbounded on an oversize command. GB-a already caps the same walk at
+# BP_GUARD_MAX_STRIP_BYTES (_match_text_and_reason, default 8000); the
+# validation interlock's own probe (_validation_shaped) currently ignores
+# that cap and calls strip_noise regardless of length. Observable via a
+# command that is validation-shaped only when matched RAW (the pre-change,
+# conservative direction for oversize/paren-bearing text): a quoted ledger
+# note hiding "(perl scripts/run-tests.pl --fast)" is allowed (0) once
+# strip_noise blanks the quoted body, but denied (2) if the oversize command
+# instead gets matched raw because the cap kicked in.
+# ===========================================================================
+{
+    my $has_fn = defined &BpHook::Guards::GuardBash::_validation_shaped;
+    my $pad = 'x' x 100;
+    my $cmd = qq{perl plugins/butler/scripts/bp-ledger.pl append-attempt --ledger L --text "$pad validated (perl scripts/run-tests.pl --fast) exit 0"};
+    cmp_ok(length($cmd), '>', 50, 'AC-20 setup: the probe command is longer than the small cap used below');
+
+    my $got_capped = $has_fn
+        ? do { local $ENV{BP_GUARD_MAX_STRIP_BYTES} = '50'; BpHook::Guards::GuardBash::_validation_shaped($cmd) }
+        : undef;
+    ok($got_capped, 'AC-20: oversize relative to BP_GUARD_MAX_STRIP_BYTES=50 -> matched raw -> validation-shaped');
+
+    # Non-vacuity control: the identical command, under a cap comfortably
+    # larger than its own length, still gets stripped normally and stays
+    # allowed (not validation-shaped) -- pins that the cap change is scoped
+    # to oversize commands only.
+    my $got_uncapped = $has_fn
+        ? do { local $ENV{BP_GUARD_MAX_STRIP_BYTES} = '9000'; BpHook::Guards::GuardBash::_validation_shaped($cmd) }
+        : undef;
+    is($got_uncapped ? 1 : 0, 0, 'AC-20 (control): comfortably under the cap -> strip_noise runs -> not validation-shaped');
+}
+
+# ===========================================================================
 # AC-17 (checks: perl-compile) -- GuardBash.pm compiles cleanly.
 # ===========================================================================
 {

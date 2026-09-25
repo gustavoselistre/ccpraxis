@@ -75,15 +75,36 @@ sub main {
     refuse('only the main session records a fork override.')
         if defined $ticket->{agent_id};
 
-    # step 6: record the token.
+    # step 6: record the token. Save whatever token this call is about to
+    # overwrite first, so a step-7 failure can put it back rather than just
+    # unlinking -- otherwise the unwind destroys a PREVIOUS, still-valid
+    # override that has nothing to do with this call (red-team m-2).
+    my $prior_path = "$root/fork-ok/$sid.json";
+    my $prior_bytes;
+    if (defined $sid && $sid =~ /\A[A-Za-z0-9_-]{1,128}\z/ && -f $prior_path) {
+        if (open(my $fh, '<:raw', $prior_path)) {
+            local $/;
+            $prior_bytes = <$fh>;
+            close $fh;
+        }
+    }
     refuse('could not record the override; nothing was recorded.')
         unless BpHook::Guards::GuardFork::record_token($sid, $reason);
 
-    # step 7: log the reason; unwind the token on failure.
+    # step 7: log the reason; unwind THIS call's write on failure -- restore
+    # the prior token if there was one, or remove the file only when this
+    # call was the one that created it.
     my $project = defined $ticket->{cwd} && length $ticket->{cwd} ? $ticket->{cwd} : '-';
     unless (BpHook::log_reason($sid, 'agent', 'fork-ok', $reason, $project)) {
-        my $S = BpHook::state_dir();
-        unlink("$S/fork-ok/$sid.json") if defined $S;
+        if (defined $prior_bytes) {
+            if (open(my $fh, '>:raw', $prior_path)) {
+                print $fh $prior_bytes;
+                close $fh;
+            }
+        }
+        else {
+            unlink($prior_path);
+        }
         refuse('could not record the override; nothing was recorded.');
     }
 

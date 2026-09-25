@@ -29,6 +29,7 @@ use File::Glob qw(bsd_glob);
 use File::Spec ();
 use JSON::PP ();
 use Digest::SHA qw(sha1_hex);
+use Encode ();
 
 BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
 
@@ -828,6 +829,135 @@ my ($AC10_BASE, $AC10_S, $AC10_CWD, $AC10_REASON);
     my $res = run_cli_bin();
     is($res->{rc}, 1, 'AC-33: bash bin/butler-fork-ok, no args -> exit 1');
     is($res->{out}, "$STEP1\n", 'AC-33: stdout is exactly the step-1 line');
+}
+
+# ===========================================================================
+# D93-M1 -- fix round for Decision 93 / review M1 (byte-vs-decoded-character
+# mismatch in valid_reason). A reason whose UTF-8 BYTE length clears the
+# 10-non-whitespace-character floor but whose DECODED character length does
+# not must be refused by the CLI outright, and must never leave a token that
+# a later fork would silently fail to redeem. Conversely, anything the CLI
+# accepts must actually redeem: the very next fork in that session succeeds.
+# ===========================================================================
+{
+    # 'eeee eee' spelled with U+00E9: 8 characters (7 non-space, 2 words) --
+    # decoded-character-invalid (7 < 10) -- but 15 UTF-8 bytes (14 non-space)
+    # -- byte-count-valid. Exactly the M1 example.
+    local %ENV = %ENV;
+    my $base = GuardHarness::fresh_state();
+    my $S = BpHook::state_dir();
+    # Encode explicitly to real UTF-8 bytes and clear the utf8 flag: a
+    # wide-flagged Perl scalar passed straight through system() downgrades
+    # single-byte-range codepoints (U+00E9 -> the ONE byte 0xE9) on this
+    # host instead of surfacing as two UTF-8 bytes, which would hide the
+    # very byte/char mismatch this test needs on the wire.
+    my $c = "\x{e9}";
+    my $mismatch_chars = ($c x 4) . ' ' . ($c x 3);
+    my $mismatch = Encode::encode_utf8($mismatch_chars);
+
+    # a ticket for this exact argv, so the CLI reaches record_token (step 6)
+    # rather than refusing earlier at step 4 for lack of a binding. The core
+    # ticket key normalizes both forms to the same UTF-8 bytes (BpHook.pm's
+    # _utf8_bytes), so a decoded-character command string here still claims
+    # the byte-form argv the CLI is run with below.
+    gf(payload_bash(cmd => "butler-fork-ok --reason '$mismatch_chars'",
+                     session_id => 'sess-m1a', tool_use_id => 'T1', cwd => '/proj'));
+
+    my $res = run_cli('--reason', $mismatch);
+    is($res->{rc}, 1, 'D93-M1a: byte-valid/char-short reason -> CLI exit 1 (refused)');
+    is($res->{out}, "$STEP2\n", 'D93-M1a: the step-2 line, not the step-8 success line');
+    ok(!-e "$S/fork-ok", 'D93-M1a: no fork-ok directory was created')
+        or diag('a token would silently fail a later fork -- review M1');
+}
+{
+    # a fresh, ordinary reason that is valid at both byte and character
+    # counts: the CLI must accept it, and the very next fork in that session
+    # must then actually succeed -- the general invariant M1 breaks for the
+    # short non-ASCII case above.
+    local %ENV = %ENV;
+    my $base = GuardHarness::fresh_state();
+    my $S = BpHook::state_dir();
+    my $reason = 'a reason the cli truly accepts here';
+
+    gf(payload_bash(cmd => "butler-fork-ok --reason '$reason'",
+                     session_id => 'A', tool_use_id => 'T1', cwd => '/proj'));
+    my $res = run_cli('--reason', $reason);
+    is($res->{rc}, 0, 'D93-M1b: an ordinary valid reason -> CLI exit 0');
+    is($res->{out}, "$STEP8\n", 'D93-M1b: the step-8 success line');
+
+    my $fork = gf(payload_fork(tool_name => 'Agent', subagent_type => 'fork',
+                                session_id => 'A', tool_use_id => 'T2'));
+    is($fork->{rc}, 0, 'D93-M1b: a reason the CLI accepted actually redeems the next fork')
+        or diag('CLI reported success but the fork was denied -- review M1');
+}
+{
+    # a reason over 300 characters whose truncated (first-300-char) form is
+    # STILL valid: the fix (validating the cut, per review M1's suggested
+    # fix) must not reject a legitimately long reason that survives
+    # truncation intact.
+    local %ENV = %ENV;
+    my $base = GuardHarness::fresh_state();
+    my $S = BpHook::state_dir();
+    my $long = ('filler word content here, ' x 12) . 'and the real justification words land safely inside the first three hundred characters too';
+    cmp_ok(length($long), '>', 300, 'D93-M1c precondition: the reason exceeds 300 characters');
+    my $cut = substr($long, 0, 300);
+    (my $cut_nospace = $cut) =~ s/\s+//g;
+    my @cut_words = grep { length } split /\s+/, $cut;
+    ok(length($cut_nospace) >= 10 && scalar(@cut_words) >= 2,
+        'D93-M1c precondition: the first 300 characters alone are still a valid reason');
+
+    gf(payload_bash(cmd => "butler-fork-ok --reason '$long'",
+                     session_id => 'A', tool_use_id => 'T1', cwd => '/proj'));
+    my $res = run_cli('--reason', $long);
+    is($res->{rc}, 0, 'D93-M1c: a >300-char reason whose truncated form stays valid -> CLI exit 0');
+    is($res->{out}, "$STEP8\n", 'D93-M1c: the step-8 success line');
+
+    my $fork = gf(payload_fork(tool_name => 'Agent', subagent_type => 'fork',
+                                session_id => 'A', tool_use_id => 'T2'));
+    is($fork->{rc}, 0, 'D93-M1c: the next fork then succeeds');
+}
+
+# ===========================================================================
+# D93-m2 -- fix round for Decision 93 / red-team m-2 (a reasons.log write
+# failure unwinds and destroys a PREVIOUSLY recorded, still-valid token for
+# the same session, even though that earlier override has nothing to do with
+# the failing call). The earlier token must survive, and the CLI must say
+# only that nothing NEW was recorded.
+# ===========================================================================
+{
+    local %ENV = %ENV;
+    my $base = GuardHarness::fresh_state();
+    my $S = BpHook::state_dir();
+    my $reason1 = 'the first reason recorded successfully here';
+    my $reason2 = 'the second reason that fails to log here';
+
+    # record reason1 for session A -- an ordinary successful flow, leaving a
+    # valid, still-unredeemed token.
+    gf(payload_bash(cmd => "butler-fork-ok --reason '$reason1'",
+                     session_id => 'A', tool_use_id => 'T1', cwd => '/proj'));
+    my $res1 = run_cli('--reason', $reason1);
+    is($res1->{rc}, 0, 'D93-m2 setup: reason1 records successfully');
+    ok(-f "$S/fork-ok/A.json", 'D93-m2 setup: a token now exists for session A');
+
+    # now make reasons.log unwritable (a directory in its place), so the
+    # NEXT record_token succeeds but log_reason fails, forcing the unwind.
+    unlink("$S/reasons.log") if -e "$S/reasons.log";
+    make_path("$S/reasons.log");
+    ok(-d "$S/reasons.log", 'D93-m2 setup: reasons.log is now a directory (unwritable as a log)');
+
+    gf(payload_bash(cmd => "butler-fork-ok --reason '$reason2'",
+                     session_id => 'A', tool_use_id => 'T2', cwd => '/proj'));
+    my $res2 = run_cli('--reason', $reason2);
+    is($res2->{rc}, 1, 'D93-m2: the second record fails (reasons.log write failure)');
+    is($res2->{out}, "$STEP6\n", 'D93-m2: the step-6 "nothing recorded" line');
+
+    ok(-f "$S/fork-ok/A.json", 'D93-m2: the EARLIER token for session A still exists')
+        or diag('the failed second record destroyed the first, still-valid override -- red-team m-2');
+
+    my $fork = gf(payload_fork(tool_name => 'Agent', subagent_type => 'fork',
+                                session_id => 'A', tool_use_id => 'T3'));
+    is($fork->{rc}, 0, 'D93-m2: the surviving earlier token still redeems a fork')
+        or diag('the surviving token should still allow one fork -- red-team m-2');
 }
 
 $? = 0;

@@ -59,7 +59,10 @@ sub _digits_or_default {
 sub _sanitize {
     my ($s, $max) = @_;
     return '' unless defined $s;
-    (my $v = $s) =~ s/[^A-Za-z0-9_-]//g;
+    # NIT-4 (24-interlock-scope-review): keep '.', which _valid_member_name
+    # allows in a package/blueprint name -- stripping it mangled the name
+    # shown in the deny text.
+    (my $v = $s) =~ s/[^A-Za-z0-9_.-]//g;
     return substr($v, 0, $max);
 }
 
@@ -285,20 +288,39 @@ my $VALIDATION_RE = qr/
 # (unchanged), and a raw command that carries "<<" together with a backtick
 # or "$(" (an unquoted heredoc body still expands at shell level even though
 # strip_noise blanks it).
+#
+# 24-interlock-scope-review M-2: an interpreter eval (perl/node/python
+# invoked with -e, -E or -c) hides its real payload from strip_noise's own
+# quote blanking exactly like the shell -c escape above, so it forces raw
+# matching too.
+my $INTERP_EVAL_RE = qr/(^|[;&|\s])(perl|node|python3?)[[:space:]]+(-[^\s]+[[:space:]]+)*-[A-Za-z]*[eEc]\b/;
+
 sub _validation_shaped {
     my ($cmd) = @_;
     my $vtext;
-    my $stripped = BpHook::Guards::Shell::strip_noise($cmd);
-    my $probe = (defined $stripped && length $stripped) ? $stripped : $cmd;
-    if (BpHook::Guards::Common::is_shell_or_eval_invocation($cmd)
-        || BpHook::Guards::Common::line_match(qr/\x60|\$\(|\(/, $probe)
-        || (BpHook::Guards::Common::line_match(qr/<</, $cmd)
-            && BpHook::Guards::Common::line_match(qr/\x60|\$\(/, $cmd)))
-    {
+    # 24-interlock-scope-review S-3: cap the strip_noise walk the same way
+    # GB-a's own _match_text_and_reason does; over the cap, match raw (the
+    # conservative direction and the pre-24 behaviour for paren-bearing
+    # text).
+    my $max = _digits_or_default($ENV{BP_GUARD_MAX_STRIP_BYTES}, 8000);
+    $max = 8000 unless $max > 0;
+    if (length($cmd) > $max) {
         $vtext = $cmd;
     }
     else {
-        $vtext = $probe;
+        my $stripped = BpHook::Guards::Shell::strip_noise($cmd);
+        my $probe = (defined $stripped && length $stripped) ? $stripped : $cmd;
+        if (BpHook::Guards::Common::is_shell_or_eval_invocation($cmd)
+            || BpHook::Guards::Common::line_match(qr/\x60|\$\(|\(/, $probe)
+            || (BpHook::Guards::Common::line_match(qr/<</, $cmd)
+                && BpHook::Guards::Common::line_match(qr/\x60|\$\(/, $cmd))
+            || BpHook::Guards::Common::line_match($INTERP_EVAL_RE, $cmd))
+        {
+            $vtext = $cmd;
+        }
+        else {
+            $vtext = $probe;
+        }
     }
     $vtext = _neutralize_perl_syntax_checks($vtext);
     $vtext =~ s/\\\n/ /g;
@@ -325,6 +347,11 @@ sub _neutralize_perl_syntax_checks {
             last unless $tok =~ /^-/;
             if ($tok =~ /^-[wWXtT]*c[wWXtT]*$/) { $has_c = 1; last }
         }
+        # 24-interlock-scope-review M-1: a command substitution, backtick or
+        # process substitution among $rest's operands still runs a real
+        # command at shell level even though the outer "perl -c ..." itself
+        # never executes its script -- never blank those operands away.
+        $has_c = 0 if $rest =~ /\x60|\$\(|[<>]\(/;
         $has_c
             ? ($sep . (' ' x (length($ws) + length('perl') + length($rest))))
             : ($sep . $ws . 'perl' . $rest);
@@ -468,19 +495,12 @@ sub _valid_member_name {
     return 1;
 }
 
-# _resolve_binding($data_n, $tuid) -> { blueprint, package, write_set =>
-# [entries] } | undef. Spec sec 2.2. Never dies; any parse/read failure is
-# an undef (conservative fallback upstream).
-sub _resolve_binding {
-    my ($data_n, $tuid) = @_;
-    return undef unless defined $tuid && $tuid =~ $TUID_NAME_RE;
-    my $braw = _read_bytes("$data_n/.drive-solo/bindings/$tuid.json");
-    return undef unless defined $braw && length $braw;
-    my $rec = eval { JSON::PP->new->utf8->decode($braw) };
-    return undef unless ref $rec eq 'HASH';
-    my ($bp, $pkg) = ($rec->{blueprint}, $rec->{package});
-    return undef unless _valid_member_name($bp) && _valid_member_name($pkg);
-
+# _read_ledger_write_set($data_n, $bp, $pkg) -> \@entries | undef. The
+# ledger-read half of _resolve_binding, split out so the caller can memoise
+# it by "$bp/$pkg" (24-interlock-scope-review S-2) -- two workers bound to
+# the same package must not read the same ledger file twice in one run.
+sub _read_ledger_write_set {
+    my ($data_n, $bp, $pkg) = @_;
     my $lraw = _read_bytes("$data_n/blueprints/$bp/packages/$pkg.md");
     return undef unless defined $lraw && length $lraw;
     my @lines = split /\n/, $lraw;
@@ -499,7 +519,72 @@ sub _resolve_binding {
     return undef unless defined $ws_val;
     my @ws = grep { length } split /:/, $ws_val;
     return undef unless @ws;
-    return { blueprint => $bp, package => $pkg, write_set => \@ws };
+    return \@ws;
+}
+
+# _resolve_binding($data_n, $tuid) -> { blueprint, package, write_set =>
+# [entries] } | undef. Spec sec 2.2. Never dies; any parse/read failure is
+# an undef (conservative fallback upstream).
+sub _resolve_binding {
+    my ($data_n, $tuid) = @_;
+    return undef unless defined $tuid && $tuid =~ $TUID_NAME_RE;
+    my $braw = _read_bytes("$data_n/.drive-solo/bindings/$tuid.json");
+    return undef unless defined $braw && length $braw;
+    my $rec = eval { JSON::PP->new->utf8->decode($braw) };
+    return undef unless ref $rec eq 'HASH';
+    my ($bp, $pkg) = ($rec->{blueprint}, $rec->{package});
+    return undef unless _valid_member_name($bp) && _valid_member_name($pkg);
+
+    my $ws = _read_ledger_write_set($data_n, $bp, $pkg);
+    return undef unless defined $ws;
+    return { blueprint => $bp, package => $pkg, write_set => $ws };
+}
+
+# _resolve_binding_cached($data_n, $tuid, \%ledger_cache) -> same shape as
+# _resolve_binding(), but the ledger half is memoised in %ledger_cache
+# (keyed "$bp/$pkg") across the calls made within one _gb_d invocation
+# (24-interlock-scope-review S-2 -- "cached per run call ... by ledger
+# path").
+sub _resolve_binding_cached {
+    my ($data_n, $tuid, $ledger_cache) = @_;
+    return undef unless defined $tuid && $tuid =~ $TUID_NAME_RE;
+    my $braw = _read_bytes("$data_n/.drive-solo/bindings/$tuid.json");
+    return undef unless defined $braw && length $braw;
+    my $rec = eval { JSON::PP->new->utf8->decode($braw) };
+    return undef unless ref $rec eq 'HASH';
+    my ($bp, $pkg) = ($rec->{blueprint}, $rec->{package});
+    return undef unless _valid_member_name($bp) && _valid_member_name($pkg);
+
+    my $key = "$bp/$pkg";
+    my $ws;
+    if (exists $ledger_cache->{$key}) {
+        $ws = $ledger_cache->{$key};
+    }
+    else {
+        $ws = _read_ledger_write_set($data_n, $bp, $pkg);
+        $ledger_cache->{$key} = $ws;
+    }
+    return undef unless defined $ws;
+    return { blueprint => $bp, package => $pkg, write_set => $ws };
+}
+
+# _is_full_sweep_runner($cmd) -> true iff $cmd invokes scripts/run-tests.pl
+# with no path operand, with --fast, or with two-or-more path operands
+# (24-interlock-scope-review S-1). Write-set scoping approximates what a
+# run WRITES; a full or multi-plugin sweep also READS every other
+# in-flight worker's half-written files, so it is denied by presence of
+# any live writer alone, regardless of write-set overlap.
+sub _is_full_sweep_runner {
+    my ($cmd) = @_;
+    return 0 unless defined $cmd;
+    return 0 unless $cmd =~ m{(?:^|[;&|]|[\x20\t])(?:perl[\x20\t]+(?:-[^\s;&|]+[\x20\t]+)*)?(?:[^\s;&|]*\/)?run-tests\.pl\b(.*)$};
+    my $tail = defined $1 ? $1 : '';
+    $tail =~ s/[;&|].*$//s;
+    return 1 if $tail =~ /(^|\s)--fast\b/;
+    my @args = grep { length && $_ !~ /^--?/ } split /\s+/, $tail;
+    return 1 if @args == 0;
+    return 1 if @args >= 2;
+    return 0;
 }
 
 sub _gb_d {
@@ -563,20 +648,23 @@ sub _gb_d {
                 my $sid = BpHook::session_id($p);
                 my $aid = BpHook::agent_id($p);
                 my $own_binding;
-                my $caller_ws;    # defined only when the caller's own
-                                  # write set resolved -- write-set scoping
-                                  # (Decision 85) applies only then.
                 if (defined $aid) {
                     $own_binding = BpHook::Guards::Common::subagent_tool_use_id($p);
                     return undef unless defined $own_binding; # fail open: cannot tell subagent apart
-                    my $caller_resolved = _resolve_binding($data_n, $own_binding);
-                    $caller_ws = $caller_resolved->{write_set} if defined $caller_resolved;
                 }
                 opendir(my $wdh, $workers_dir);
                 if ($wdh) {
                     my @names = sort grep { $_ =~ $TUID_NAME_RE } readdir($wdh);
                     closedir $wdh;
                     my $seen = 0;
+                    my %ledger_ws_cache; # "$bp/$pkg" -> \@entries|undef, memoised for this call (S-2).
+                    my $caller_ws;        # defined only when the caller's own
+                                          # write set resolved -- write-set scoping
+                                          # (Decision 85) applies only then.
+                    my $caller_ws_tried = 0; # resolve the caller's own binding
+                                              # lazily, only once a live writer
+                                              # is actually found (S-2).
+                    my $full_sweep;
                     for my $name (@names) {
                         my $full = "$workers_dir/$name";
                         next unless -f $full;
@@ -593,9 +681,19 @@ sub _gb_d {
                         next unless defined $role_writer;
                         next unless _fresh_mtime($full, $stale_min);
 
+                        # S-2: only now, with a live writer confirmed, pay
+                        # for resolving the caller's own binding -- and only
+                        # once per call.
+                        if (defined $own_binding && !$caller_ws_tried) {
+                            $caller_ws_tried = 1;
+                            my $caller_resolved = _resolve_binding_cached($data_n, $own_binding, \%ledger_ws_cache);
+                            $caller_ws = $caller_resolved->{write_set} if defined $caller_resolved;
+                            $full_sweep = _is_full_sweep_runner($cmd) if defined $caller_ws;
+                        }
+
                         if (defined $caller_ws) {
                             # write-set-scoped subagent (B-3/B-4/B-5/B-6).
-                            my $w_resolved = _resolve_binding($data_n, $name);
+                            my $w_resolved = _resolve_binding_cached($data_n, $name, \%ledger_ws_cache);
                             if (!defined $w_resolved) {
                                 # B-5: the other worker's footprint is
                                 # unknown -- conservative fallback deny.
@@ -604,7 +702,11 @@ sub _gb_d {
                                     $cmd_line,
                                 ];
                             }
-                            if (write_sets_overlap($caller_ws, $w_resolved->{write_set})) {
+                            # S-1: a full/multi-plugin sweep reads every
+                            # in-flight worker's files regardless of write-set
+                            # overlap, so it is denied by mere presence of a
+                            # live writer.
+                            if ($full_sweep || write_sets_overlap($caller_ws, $w_resolved->{write_set})) {
                                 my $bpname  = _sanitize($w_resolved->{blueprint}, 64);
                                 my $pkgname = _sanitize($w_resolved->{package}, 64);
                                 return [

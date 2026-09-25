@@ -498,6 +498,7 @@ continuity/
   holder/<sid>.lock       flock target for become, extend and holder exit.
   tickets/<k>/            command-binding tickets for one exact command.
   stop-tokens/            gate-minted stop tokens and one <sid>.current pointer per session.
+  fork-ok/<sid>.json      package 19's one-shot fork override token, minted by butler-fork-ok.
   reasons.log             the Decision 7 reason log.
   hook-errors.log         internal errors caught by BpHook::main.
 ```
@@ -547,7 +548,9 @@ or the drive-solo and reporter first steps, deletes it.
 `transcript_path` and that file no longer exists on disk. A session whose transcript is gone can never
 stop again, so nothing is disarmed. Each removal appends one line to the reason log with actor `gc`,
 verb `gc` and the reason `transcript gone: <path>`. Records without a `transcript_path` are never
-collected. The lease daemon runs it at most once an hour.
+collected. The lease daemon runs it at most once an hour. `fork-ok/<sid>.json` is the one exception:
+a fork token is never collected, because `take_token` (not GC) is what removes it, and a token has no
+`transcript_path` to key GC off of.
 
 **Resumed sessions.** `--resume` keeps the session id and its transcript file (harness-facts (d)), so
 the arm file, an off file and the reason history all carry over untouched and GC never touches them. A
@@ -712,8 +715,8 @@ and text.
 reason-log: ~/.claude/butler-state/continuity/reasons.log
 
 This is the same root as the arm state (`$BUTLER_STATE_DIR/continuity/reasons.log` when overridden).
-One tab-separated line per event, appended with `O_APPEND` by `butler-continuity.pl`, and by
-`gc_sessions()` for its own removals:
+One tab-separated line per event, appended with `O_APPEND` by `butler-continuity.pl`, by
+`butler-fork-ok.pl` (package 19) for its own recordings, and by `gc_sessions()` for its own removals:
 
 ```
 2026-09-24T05:00:00Z	abb7e549-0e1f-4c1b-9a53-0d3b5a3c7f10	agent	off	C:/Development/ccpraxis	all packages done; nothing left to run
@@ -723,11 +726,13 @@ One tab-separated line per event, appended with `O_APPEND` by `butler-continuity
 ```
 
 Fields: ISO-8601 UTC time, session id, actor (`agent`, `operator` or `gc`), verb (`off`, `silence`,
-`gc` or `fork-ok`), project root (the ticket `cwd` resolved through `data_dir`, or `-` when the
-binding was a stop token or GC), and reason. `fork-ok` is logged by `butler-fork-ok.pl` (package 19,
-Decision 64) each time it records a fork override. Tabs and newlines in the reason become spaces. The reason is capped at 300
-characters. An agent reason must hold at least two whitespace-separated words, so it is never empty and
-never a single word. Otherwise the command prints
+`gc` or `fork-ok`), project root, and reason. For `off` and `silence` this is the ticket `cwd`
+resolved through `data_dir`, or `-` when the binding was a stop token or GC. For `fork-ok`,
+`butler-fork-ok.pl` (package 19, Decision 64) logs the raw ticket `cwd` (or `-` if unset) each time
+it records a fork override, without the `data_dir` resolution the other verbs apply. Tabs and
+newlines in the reason become spaces. The reason is capped at 300 characters. An agent reason must
+hold at least two whitespace-separated words, so it is never empty and never a single word.
+Otherwise the command prints
 `butler-continuity: --reason needs at least two words saying why.` and exits 1, and nothing is logged.
 An operator off without a reason logs `(operator)`. The log rolls to `reasons.log.1` past 1 MiB. The
 statusline badge (package 10) reads the per-session `off/` and `silence/` files, not this log.
@@ -969,9 +974,11 @@ One row per surviving hook: the most message lines it may print on any path, and
 its wrapper passes to `run-hook.sh`, under which it exits 0 in bash before perl starts (Decision 12,
 Decision 20, Decision 33). Every hook exits 0 or 2 and nothing else (exit 2 only for a deliberate
 deny). Every message line is at most 160 characters. A command echoed back is cut to 80 characters
-with `...`. No message names a retired mechanism or says how to disable the guard. Decision 3 applies
-throughout: every "armed" below is THIS session's `armed/<session_id>`, never "any session in the
-project".
+with `...`. No message names a retired mechanism or says how to disable the guard, with one named
+exception: `guard-fork.sh`'s deny text names `butler-fork-ok --reason` (Decision 64). That is not a
+disable path for the guard -- it records a one-shot, logged override that is consumed by exactly the
+next fork dispatch, and the guard denies again after it. Decision 3 applies throughout: every
+"armed" below is THIS session's `armed/<session_id>`, never "any session in the project".
 
 | stop-gate.sh | 7 | --pre ledger,armed : exits when BP_LEDGER is unset and armed/<session_id> is absent |
 | arm-on-entry.sh | 1 | --pre text:bp-drive-next : exits when the payload text does not contain bp-drive-next |
