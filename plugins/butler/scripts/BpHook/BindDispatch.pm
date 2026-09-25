@@ -45,6 +45,20 @@ my $TUID_RE = qr/\A[A-Za-z0-9_-]{1,128}\z/;
 my $TYPE_RE = qr/\A[A-Za-z0-9:._-]{1,64}\z/;
 
 # ---------------------------------------------------------------------------
+# Decision 69 A2 / package 16 spec sec 2.5: $CASE_INSENSITIVE controls
+# whether canon() folds ASCII case before comparing. undef (the default)
+# means "auto-detect from $^O" -- true on msys, MSWin32, cygwin, darwin
+# (WriteGuards' own rule, duplicated here per the spec's minimal-duplication
+# note).
+# ---------------------------------------------------------------------------
+our $CASE_INSENSITIVE;
+
+sub _is_ci {
+    return $CASE_INSENSITIVE ? 1 : 0 if defined $CASE_INSENSITIVE;
+    return ($^O =~ /\A(?:msys|MSWin32|cygwin|darwin)\z/) ? 1 : 0;
+}
+
+# ---------------------------------------------------------------------------
 # small local helpers.
 # ---------------------------------------------------------------------------
 sub _is_abs {
@@ -171,6 +185,34 @@ sub _ledger_line {
     $b =~ s{/+\z}{};
     (my $L = $b) =~ s{.*/}{};
     return "$L/blueprints/$bp/packages/$pkg.md";
+}
+
+# ---------------------------------------------------------------------------
+# _ledger_abs($data, $bp, $pkg) -- package 16 spec sec 2.5: the ABSOLUTE
+# form "$data/blueprints/$bp/packages/$pkg.md" (never shown, only compared
+# through canon()).
+# ---------------------------------------------------------------------------
+sub _ledger_abs {
+    my ($data, $bp, $pkg) = @_;
+    (my $b = $data) =~ tr{\\}{/};
+    $b =~ s{/+\z}{};
+    return "$b/blueprints/$bp/packages/$pkg.md";
+}
+
+# ---------------------------------------------------------------------------
+# canon($s) -- package 16 spec sec 2.5: '\' -> '/'; a leading "/<letter>/"
+# form ("/c/x") becomes "<letter>:/x"; ASCII case folded when _is_ci() is
+# true. Both sides of an absolute-Ledger-line comparison are canon()-ed as
+# UTF-8 byte strings (BpHook::_to_bytes). Nothing else is normalised.
+# ---------------------------------------------------------------------------
+sub canon {
+    my ($s) = @_;
+    return undef unless defined $s;
+    my $v = BpHook::_to_bytes($s);
+    $v =~ tr{\\}{/};
+    $v =~ s{^/([A-Za-z])/}{$1:/};
+    $v =~ tr/A-Z/a-z/ if _is_ci();
+    return $v;
 }
 
 # ---------------------------------------------------------------------------
@@ -489,7 +531,8 @@ sub _handle_driver {
         my @valid;
         for my $decl (@decls) {
             for my $m (@members) {
-                if ($decl eq _ledger_line($data, $m->{bp}, $m->{pkg})) {
+                if ($decl eq _ledger_line($data, $m->{bp}, $m->{pkg})
+                    || canon($decl) eq canon(_ledger_abs($data, $m->{bp}, $m->{pkg}))) {
                     push @valid, $m;
                     last;
                 }
@@ -563,5 +606,14 @@ sub _run {
 
     return _handle_driver($p);
 }
+
+# ---------------------------------------------------------------------------
+# Public accessors (package 16 spec sec 2.5) -- same behaviour as the
+# private subs they wrap; the private names stay, so WriteGuards.pm calls
+# only these.
+# ---------------------------------------------------------------------------
+sub member_ok        { return _member_ok(@_) }
+sub resolve_data_dir { return _resolve_data_dir(@_) }
+sub inflight_members { return _inflight_members(@_) }
 
 1;

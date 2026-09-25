@@ -324,7 +324,7 @@ sub _is_temp {
 # fully qualified (dispatch-binding.t already does the same for
 # _append_history).
 # ---------------------------------------------------------------------------
-sub _member_ok { return BpHook::BindDispatch::_member_ok(@_) }
+sub _member_ok { return BpHook::BindDispatch::member_ok(@_) }
 
 # ---------------------------------------------------------------------------
 # _read_frontmatter($path) -- sec 2.3 point 3: line 1 must be exactly '---'
@@ -514,7 +514,7 @@ sub resolve {
     my $role = eval { BpHook::role($p) };
     return undef unless defined $role && $role eq 'driver';
 
-    my $data = BpHook::BindDispatch::_resolve_data_dir($p);
+    my $data = BpHook::BindDispatch::resolve_data_dir($p);
     return undef unless defined $data && length $data;
     # Decision 69 A9 (red-team M2): strip a trailing '/' before deriving
     # anything from $data -- otherwise the root-derivation regex below strips
@@ -523,7 +523,7 @@ sub resolve {
     $data =~ s{/+\z}{};
     (my $droot = $data) =~ s{/[^/]*\z}{};
 
-    my @members = BpHook::BindDispatch::_inflight_members($data);
+    my @members = BpHook::BindDispatch::inflight_members($data);
     my @U;
     for my $m (@members) {
         my $u = _usable($data, $m->{bp}, $m->{pkg});
