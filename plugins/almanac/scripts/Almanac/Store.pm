@@ -411,7 +411,22 @@ sub writer_id {
     return $WRITER_ID;
 }
 
-sub _record_path { return "$_[0]->{dir}/$_[1].md" }
+# _byte_id($id) -> byte-string id -- an id is ASCII by grammar (S2.6), so a
+# utf8-flagged id (e.g. a caller passing a decoded record field back in, per
+# S1 of the 07-tasklist review) downgrades losslessly. Downgrading a COPY,
+# never the caller's own scalar, so this has no visible effect on a caller
+# that kept a reference to the same value. A value that fails to downgrade
+# is not pure ASCII and therefore not grammatical anyway -- the id grammar
+# check that follows (or already ran) rejects it on its own terms.
+sub _byte_id {
+    my ($id) = @_;
+    return $id unless defined $id;
+    my $copy = "$id";
+    utf8::downgrade($copy, 1);
+    return $copy;
+}
+
+sub _record_path { return "$_[0]->{dir}/" . _byte_id($_[1]) . ".md" }
 
 # Id grammar (S2.6): \A[A-Za-z0-9][A-Za-z0-9._-]*\z, max 128 chars, no / or \
 # (already excluded by the character class) and no ".." sequence. Checked
@@ -459,7 +474,7 @@ sub exists {
     $self->_require_readable('exists');
     return 0 unless defined $id && $id =~ /\A[A-Za-z0-9][A-Za-z0-9._-]*\z/
                  && length($id) <= 128 && $id !~ /\.\./;
-    return -f $self->_record_path($id) ? 1 : 0;
+    return -f $self->_record_path(_byte_id($id)) ? 1 : 0;
 }
 
 # _load_record($id, $path) -> \%record   -- shared by read/create/update/list
