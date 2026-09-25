@@ -660,6 +660,16 @@ sub write_ticket {
     return _write_json_atomic("$root/tickets/$k/$sid.$tuid.json", $rec);
 }
 
+sub _rmdir_ticket_key_if_empty {
+    my ($dir) = @_;
+    if (opendir(my $dh2, $dir)) {
+        my @remaining = grep { $_ ne '.' && $_ ne '..' } readdir($dh2);
+        closedir $dh2;
+        rmdir($dir) if @remaining == 0;
+    }
+    return;
+}
+
 sub take_ticket {
     my ($name, $argv) = @_;
     my $norm = _normalize_ticket_name($name);
@@ -686,21 +696,91 @@ sub take_ticket {
             unlink $full;
             next;
         }
-        push @live, $full;
+        push @live, { file => $full, data => $data };
     }
     return undef if @live == 0;
-    return 'ambiguous' if @live > 1;
-    my $file = $live[0];
-    my $claimed = "$file.claimed.$$";
-    return undef unless rename($file, $claimed);
-    my $data = _read_json($claimed);
-    unlink($claimed);
-    if (opendir(my $dh2, $dir)) {
-        my @remaining = grep { $_ ne '.' && $_ ne '..' } readdir($dh2);
-        closedir $dh2;
-        rmdir($dir) if @remaining == 0;
+
+    if (@live == 1) {
+        my $file = $live[0]{file};
+        my $claimed = "$file.claimed.$$";
+        return undef unless rename($file, $claimed);
+        my $data = _read_json($claimed);
+        unlink($claimed);
+        _rmdir_ticket_key_if_empty($dir);
+        return ref $data eq 'HASH' ? $data : undef;
     }
-    return ref $data eq 'HASH' ? $data : undef;
+
+    # 2+ live entries. Ambiguity is only ever across sessions (task 50, spec
+    # 2.5): same-session duplicates (a guard-blocked attempt plus its retry)
+    # bind instead of refusing. agent_id differing (undef counts as its own
+    # value) also stays ambiguous -- a main-thread call and a subagent call
+    # must never merge.
+    my %sids = map { (defined $_->{data}{session_id} ? $_->{data}{session_id} : "\0undef") => 1 } @live;
+    return 'ambiguous' if scalar(keys %sids) > 1;
+
+    my %aids = map { (defined $_->{data}{agent_id} ? $_->{data}{agent_id} : "\0undef") => 1 } @live;
+    return 'ambiguous' if scalar(keys %aids) > 1;
+
+    # One session, one agent: claim every entry. An entry another process
+    # claimed first (rename failed) is skipped, not fatal.
+    my @claimed;
+    for my $ent (@live) {
+        my $c = "$ent->{file}.claimed.$$";
+        next unless rename($ent->{file}, $c);
+        my $d = _read_json($c);
+        unlink($c);
+        next unless ref $d eq 'HASH';
+        push @claimed, { file => $ent->{file}, data => $d };
+    }
+    _rmdir_ticket_key_if_empty($dir);
+    return undef unless @claimed;
+
+    # Base record: the claimed entry with the greatest `at`; ties broken by
+    # file name, lexically last.
+    my @sorted = sort {
+        (($b->{data}{at} // 0) <=> ($a->{data}{at} // 0))
+            || ($b->{file} cmp $a->{file})
+    } @claimed;
+    my $base      = $sorted[0]{data};
+    my $base_file = $sorted[0]{file};
+    my $base_at   = $base->{at};
+
+    # operator: true only if EVERY claimed entry has operator true -- a
+    # stale ticket can never upgrade a call to operator.
+    my $operator_all = 1;
+    for my $e (@claimed) {
+        $operator_all = 0 unless $e->{data}{operator};
+    }
+
+    # background: the base record's value, except that if another claimed
+    # entry shares the SAME greatest `at` with a different background, the
+    # conservative answer (false) wins.
+    my $background = $base->{background} ? 1 : 0;
+    for my $e (@claimed) {
+        next if $e->{file} eq $base_file;
+        next unless ($e->{data}{at} // 0) == $base_at;
+        my $eb = $e->{data}{background} ? 1 : 0;
+        $background = 0 if $eb != $background;
+    }
+
+    my %result = %$base;
+    $result{operator}   = $operator_all ? JSON::PP::true()  : JSON::PP::false();
+    $result{background} = $background   ? JSON::PP::true() : JSON::PP::false();
+    return \%result;
+}
+
+# local_utc_hhmm($epoch) -> "HH:MM (HH:MMZ)" -- local half from localtime,
+# UTC half from gmtime, both from the SAME integer epoch, both truncated to
+# the minute. `localtime` is evaluated at the call: no zone is hard-coded,
+# $ENV{TZ} is never assigned here, and no zone NAME/abbreviation (%Z) is
+# ever printed (Git for Windows derives abbreviations from the Windows zone
+# name, which is how "W. Europe Standard Time" became "WEST").
+sub local_utc_hhmm {
+    my ($epoch) = @_;
+    return undef unless defined $epoch && !ref($epoch) && $epoch =~ /^-?\d+$/;
+    my @l = localtime($epoch);
+    my @g = gmtime($epoch);
+    return sprintf('%02d:%02d (%02d:%02dZ)', $l[2], $l[1], $g[2], $g[1]);
 }
 
 # ------------------------------------------------------------- stop tokens --

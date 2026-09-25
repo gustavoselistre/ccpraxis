@@ -908,11 +908,7 @@ sub _cmd_next {
                               . join(',', @malformed));
         print STDERR "bp-drive-next: blueprints/ holds directories with no blueprint.md:\n";
         print STDERR "  - $_\n" for @malformed;
-        print STDERR "Each is skipped by candidate discovery, so the scope resolves empty --\n"
-                   . "but 'empty' and 'malformed' are not the same thing, and reporting the run\n"
-                   . "settled over a half-created blueprint would disarm the watchdog on top of\n"
-                   . "a package that may still be running. Finish creating it (blueprint.md), or\n"
-                   . "move it aside, then retry.\n";
+        print STDERR "Each is skipped by candidate discovery, so the scope resolves empty -- but 'empty' and 'malformed' are not the same thing, and reporting the run settled over a half-created blueprint would disarm the watchdog on top of a package that may still be running. Finish creating it (blueprint.md), or move it aside, then retry.\n";
         return 2;
     }
 
@@ -1338,10 +1334,7 @@ sub _cmd_record_order {
         if (@unknown) {
             print STDERR "bp-drive-next record-order: not a blueprint:\n";
             print STDERR "  - $_\n" for @unknown;
-            print STDERR "Each argument must be a blueprint directory name under\n"
-                       . "  $bpbase/\n"
-                       . "(record-order takes bare names, no flags -- a flag recorded as a\n"
-                       . "blueprint name reports itself settled and is never driven).\n";
+            print STDERR "Each argument must be a blueprint directory name under $bpbase/ (record-order takes bare names, no flags -- a flag recorded as a blueprint name reports itself settled and is never driven).\n";
             return 2;
         }
     }
@@ -1377,10 +1370,7 @@ sub _cmd_record_order {
             }
         }
         if (@dropped) {
-            print STDERR "bp-drive-next record-order: refusing an order that omits blueprint(s)\n"
-                       . "still holding non-terminal packages -- the `next` walk iterates the\n"
-                       . "recorded order, so an omitted blueprint is never driven and the run\n"
-                       . "reports 'done' over work it never looked at:\n";
+            print STDERR "bp-drive-next record-order: refusing an order that omits blueprint(s) still holding non-terminal packages -- the `next` walk iterates the recorded order, so an omitted blueprint is never driven and the run reports 'done' over work it never looked at:\n";
             print STDERR "  - $_\n" for @dropped;
             print STDERR "Include them in the order, or exclude them deliberately with:\n"
                        . "  bp-drive-next.pl park <blueprint> <reason...>\n";
@@ -1448,44 +1438,28 @@ USAGE
 SUBCOMMANDS
   next --scope <spec>
       Print exactly ONE next-action JSON (below) to stdout, single line.
-      <spec> = one blueprint name | comma/space list of names | "all" (or empty)
-      = all audited blueprints. <spec> resolves mechanically to the candidate SET
-      and is used ONLY for need-order candidates; once order.json exists it is the
-      authoritative scope+order and --scope is ignored.
+      <spec> = one blueprint name | comma/space list of names | "all" (or empty) = all audited blueprints. <spec> resolves mechanically to the candidate SET and is used ONLY for need-order candidates; once order.json exists it is the authoritative scope+order and --scope is ignored.
   record-order <bp> [<bp> …]
-      Persist the SESSION-judged blueprint order to order.json. The director never
-      invents order — it only persists and serves it.
+      Persist the SESSION-judged blueprint order to order.json. The director never invents order — it only persists and serves it.
   park <blueprint> <reason…>
-      Record a blueprint-level park (idempotent) to parks.json and log it. A parked
-      blueprint is settled: never driven, excluded from every pending list.
+      Record a blueprint-level park (idempotent) to parks.json and log it. A parked blueprint is settled: never driven, excluded from every pending list.
 
 NEXT-ACTION JSON  (exactly one per `next`)
   {"action":"need-order","candidates":[…]}          no order yet; session must judge+record
   {"action":"run-package","blueprint":B,"package":P} drive this package next
   {"action":"pause","until_epoch":E,"reason":"usage"} timed auto-resume at epoch E
-  {"action":"stop","reason":"token-refresh-failed","detail":…} token could not be
-                                                     refreshed; the wake-lock is released and the
-                                                     run ends. NOT a pause: a pause promises a
-                                                     resume, and there is none until a human
-                                                     re-authenticates.
+  {"action":"stop","reason":"token-refresh-failed","detail":…} token could not be refreshed; the wake-lock is released and the run ends. NOT a pause: a pause promises a resume, and there is none until a human re-authenticates.
   {"action":"blueprint-done","blueprint":B,"pending":[…]} B settled; pending = remaining bps to re-eval
-  {"action":"in-flight","blueprint":B,"packages":[…],"running":[…]}
-                                                     nothing dispatchable right now, but B still
-                                                     holds non-terminal packages (typically owned by
-                                                     a concurrent worker). NOT completion: stopping
-                                                     here kills the run mid-package.
+  {"action":"in-flight","blueprint":B,"packages":[…],"running":[…]} nothing dispatchable right now, but B still holds non-terminal packages (typically owned by a concurrent worker). NOT completion: stopping here kills the run mid-package.
   {"action":"done"}                                  every in-scope blueprint is done-or-parked
 
-  Keep-awake is a director-managed SIDE EFFECT (started when work is runnable or a
-  timed auto-resume is pending; stopped when settled) — never an action.
+  Keep-awake is a director-managed SIDE EFFECT (started when work is runnable or a timed auto-resume is pending; stopped when settled) — never an action.
 
 GOVERNOR VERDICT CONSUMED  (from bp-usage-gate.pl verdict — pkg-02)
   {"action":"ok"|"pause-usage"|"pause-token"|"unavailable","until_epoch":E|null,"reason":…}
   ok           → proceed
   pause-usage  → pause reason=usage, until_epoch=E
-  pause-token  → attempt a refresh (bp-token-keeper). Recovered → proceed;
-                 failed → action=stop, wake-lock released, error logged.
-                 Solo NEVER pauses for token expiry — see _token_recover.
+  pause-token  → attempt a refresh (bp-token-keeper). Recovered → proceed; failed → action=stop, wake-lock released, error logged. Solo NEVER pauses for token expiry — see _token_recover.
   unavailable  → retry a few times, then degrade-and-proceed (log "governance degraded")
 
 STATE  (<data>/.drive-solo/, all director-owned)
@@ -1493,10 +1467,7 @@ STATE  (<data>/.drive-solo/, all director-owned)
   parks.json      [{"blueprint":…,"reason":…,"at":<epoch>}, …]
   announced.json  {"announced":[…]}   blueprints whose blueprint-done already fired
   inflight.json   {"packages":[{"blueprint":…,"package":…,"ledger":…,"since":<epoch>}],
-                  "updated_at":<epoch>}   the project-level in-flight set:
-                  added on run-package, pruned once its ledger turns terminal.
-                  Concurrent hand-out (a further ready package disjoint from
-                  every in-flight write set) is unconditional.
+                  "updated_at":<epoch>}   the project-level in-flight set: added on run-package, pruned once its ledger turns terminal. Concurrent hand-out (a further ready package disjoint from every in-flight write set) is unconditional.
   keepawake.pid   PID of the wake-lock process (host only; sandbox = no file)
   run.md          append-only structured run log
 END_HELP

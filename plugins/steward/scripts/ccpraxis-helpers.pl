@@ -745,34 +745,17 @@ sub cmd_help {
 ccpraxis-helpers.pl
 
 Subcommands:
-  sync-skills            Mirror ccpraxis/skills/ to ~/.claude/skills/.
-                         Symlinks on Unix, copies on Windows. Idempotent.
+  sync-skills            Mirror ccpraxis/skills/ to ~/.claude/skills/. Symlinks on Unix, copies on Windows. Idempotent.
 
-  check-claude-md        Report status of live CLAUDE.md vs the repo version.
-                         Possible statuses: linked, equal_content, differs,
-                         symlinked_elsewhere, missing_live, missing_repo.
+  check-claude-md        Report status of live CLAUDE.md vs the repo version. Possible statuses: linked, equal_content, differs, symlinked_elsewhere, missing_live, missing_repo.
 
-  marketplace-diff       Diff live known_marketplaces.json vs repo's
-                         global-config/known_marketplaces.json. Strips
-                         installLocation from each entry before comparing.
+  marketplace-diff       Diff live known_marketplaces.json vs repo's global-config/known_marketplaces.json. Strips installLocation from each entry before comparing.
 
-  settings-export-merge  Merge live settings.json into repo's
-                         global-config/settings.json. Live wins on shared
-                         keys; keys only in repo are preserved. Saved backup
-                         preferences (.backup-preferences.json, live_vs_repo
-                         scope) override that: "keep different" (skip-always)
-                         and "keep repo-only" (right-only) keep the repo's
-                         value; "keep live-only" (left-only) stays out of the
-                         repo entirely.
+  settings-export-merge  Merge live settings.json into repo's global-config/settings.json. Live wins on shared keys; keys only in repo are preserved. Saved backup preferences (.backup-preferences.json, live_vs_repo scope) override that: "keep different" (skip-always) and "keep repo-only" (right-only) keep the repo's value; "keep live-only" (left-only) stays out of the repo entirely.
                          Options:
-                           --skip-key KEY  Leave the repo side of KEY alone for
-                                           this run only (repeatable). Use for
-                                           the user's per-run "Skip" answers.
-                                           Dotted names (env.FOO) address one
-                                           sub-key, matching json-diff.pl.
+                           --skip-key KEY  Leave the repo side of KEY alone for this run only (repeatable). Use for the user's per-run "Skip" answers. Dotted names (env.FOO) address one sub-key, matching json-diff.pl.
 
-All output is JSON on stdout. Exit codes: 0=ok, 1=soft fail, 2=hard fail,
-3=usage error.
+All output is JSON on stdout. Exit codes: 0=ok, 1=soft fail, 2=hard fail, 3=usage error.
 EOF
     exit 0;
 }

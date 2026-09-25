@@ -277,8 +277,9 @@ row is `03-scorer-rich`, and the pid-file row is `02-rich-extraction`.
 You are armed by construction. You stop only on a terminal, fresh ledger with a concrete
 `## Next action` when blocked or parked, or while a hold covers a running background subagent.
 To wait: dispatch the worker in the background, run `butler-hold <agent id>` with
-`run_in_background: true`, and end the turn; its completion wakes you. A hold on anything that
-is not a running background subagent counts for nothing.
+`run_in_background: true` only when `butler-continuity status` shows `holder: none` (otherwise
+run it in the foreground, which extends the holder), and end the turn; its completion wakes you.
+A hold on anything that is not a running background subagent counts for nothing.
 `butler-continuity off` and `silence` refuse in a coordinator.
 A denied stop prints a stop token for the holder line above; use it as printed.
 <!-- continuity:end -->

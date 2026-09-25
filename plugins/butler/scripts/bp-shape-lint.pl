@@ -169,10 +169,7 @@ for my $file (@files) {
 my %seen; @hits = grep { !$seen{"$$_[0]|$$_[3]"}++ } @hits;
 if (!@hits) { print "bp-shape-lint: no shared-shape candidates found.\n"; exit 0 }
 
-print "bp-shape-lint: " . scalar(@hits) . " candidate(s). Each is a SUGGESTION —\n";
-print "a count over a fixture this test built is fine; a count over a shared\n";
-print "artifact forbids later packages from extending it. Retarget those to the\n";
-print "package's own contribution, or to a floor (see t/64 AC-36).\n\n";
+print "bp-shape-lint: " . scalar(@hits) . " candidate(s). Each is a SUGGESTION — a count over a fixture this test built is fine; a count over a shared artifact forbids later packages from extending it. Retarget those to the package's own contribution, or to a floor (see t/64 AC-36).\n\n";
 for my $h (@hits) {
     my ($file, $line, $what, $desc) = @$h;
     $desc =~ s/\s+/ /g;

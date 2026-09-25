@@ -87,6 +87,29 @@ sub _member_ok {
     return ($v =~ /\A[A-Za-z0-9]/) ? 1 : 0;
 }
 
+# ---------------------------------------------------------------------------
+# Decision 98: a fixed, exact-match allowlist of authoring/reviewing agent
+# types that are never subject to the one-ledger rule -- allowed with no
+# Ledger line, and no binding written, regardless of how many packages are
+# in flight or what the prompt contains. Case-sensitive, exact string match
+# only (no near-miss widening -- see the oracle's "pinned" assertions).
+# ---------------------------------------------------------------------------
+my %EXEMPT_TYPE = map { ($_ => 1) }
+    ('blueprint:bp-auditor', 'butler:bp-feedback-verifier', 'Explore', 'claude-code-guide');
+
+sub _subagent_type_of {
+    my ($p) = @_;
+    my $ti = (ref $p->{tool_input} eq 'HASH') ? $p->{tool_input} : {};
+    my $t = $ti->{subagent_type};
+    return (defined $t && !ref($t)) ? $t : undef;
+}
+
+sub _is_exempt_type {
+    my ($v) = @_;
+    return 0 unless defined $v;
+    return $EXEMPT_TYPE{$v} ? 1 : 0;
+}
+
 sub _tuid_of {
     my ($p) = @_;
     return undef unless ref $p eq 'HASH';
@@ -508,6 +531,11 @@ sub _handle_ledger {
 # ---------------------------------------------------------------------------
 sub _decide_driver {
     my ($p) = @_;
+
+    # Decision 98: an exempt subagent_type is allowed outright -- no bind,
+    # no ledger check, before any of the data-dir/inflight machinery below.
+    return { verdict => 'allow' } if _is_exempt_type(_subagent_type_of($p));
+
     my $data = _resolve_data_dir($p); # LOW: same resolution as the director
 
     return { verdict => 'allow' } unless defined $data && length $data;
@@ -652,6 +680,11 @@ sub _run {
 # only these.
 # ---------------------------------------------------------------------------
 sub member_ok        { return _member_ok(@_) }
+sub is_exempt_type    { return _is_exempt_type(@_) }
+# exempt_types() -- Decision 101 M1: the WHOLE allowlist, enumerable, so a
+# new entry added to %EXEMPT_TYPE breaks a test on purpose instead of
+# staying invisible behind is_exempt_type()'s one-string-at-a-time answer.
+sub exempt_types      { return sort keys %EXEMPT_TYPE }
 sub resolve_data_dir { return _resolve_data_dir(@_) }
 sub inflight_members { return _inflight_members(@_) }
 # would_deny is defined above, next to _decide_driver, so it shares the

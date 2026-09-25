@@ -51,32 +51,18 @@ sub _usage {
     return <<'EOF';
 bp-feedback.pl [options] [--] [text ...]
 
-  --source <token>     override the source token (default "chat", or
-                       "transcript" when --from-session supplied the body)
-  --from-session <id>  take the body from that session's transcript instead of
-                       argv/stdin, so the operator's bytes are never retyped by
-                       an agent. Pair with --command to lift the exact
-                       <command-args> payload of a slash-command invocation.
-  --command <name>     with --from-session: the slash command whose arguments
-                       are the feedback (e.g. butler:feedback). Without it, the
-                       last plainly-typed user message is used.
+  --source <token>     override the source token (default "chat", or "transcript" when --from-session supplied the body)
+  --from-session <id>  take the body from that session's transcript instead of argv/stdin, so the operator's bytes are never retyped by an agent. Pair with --command to lift the exact <command-args> payload of a slash-command invocation.
+  --command <name>     with --from-session: the slash command whose arguments are the feedback (e.g. butler:feedback). Without it, the last plainly-typed user message is used.
   --blueprint <name>   record this blueprint name; overrides detection
   --batch <name>       target batch directory name
-                       (default: the newest OPEN batch, i.e. one with no
-                        DECOMPOSED.md; if the newest batch is closed, or
-                        there are none, a new batch-<max+1> is created and
-                        used)
+                       (default: the newest OPEN batch, i.e. one with no DECOMPOSED.md; if the newest batch is closed, or there are none, a new batch-<max+1> is created and used)
   --data-dir <path>    override <data> resolution
   -h, --help           print usage to STDOUT and exit 0
 
-Reads the feedback body from the positional arguments if any are given,
-otherwise from stdin (read to EOF, in binary). Captures verbatim, byte for
-byte; interprets nothing.
+Reads the feedback body from the positional arguments if any are given, otherwise from stdin (read to EOF, in binary). Captures verbatim, byte for byte; interprets nothing.
 
-When piping into this tool, prefer `set -o pipefail` in the calling shell: a
-producer that dies mid-pipe closes stdin early, which this tool cannot
-distinguish from a short, complete message, and pipefail is what surfaces
-the producer's own exit code to the caller.
+When piping into this tool, prefer `set -o pipefail` in the calling shell: a producer that dies mid-pipe closes stdin early, which this tool cannot distinguish from a short, complete message, and pipefail is what surfaces the producer's own exit code to the caller.
 EOF
 }
 

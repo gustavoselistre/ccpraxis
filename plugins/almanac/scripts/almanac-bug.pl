@@ -1027,28 +1027,18 @@ almanac-bug.pl — ccpraxis bug reports, one file per report.
   file --title T (--body - | --body-file F) [--severity S] [--area A] [--project ROOT]
         Create a report in the current project. Prints its path.
   append <id> (--body - | --body-file F)
-        Add to the end of a report's body. Allowed ONLY while status is `open`.
-        Use this to record progress — it cannot lose what is already there.
+        Add to the end of a report's body. Allowed ONLY while status is `open`. Use this to record progress — it cannot lose what is already there.
   update <id> (--body - | --body-file F) [--title T] [--severity S] [--replace]
-        REPLACE a report's body. Allowed ONLY while status is `open`.
-        Refuses when the existing body would be discarded unless --replace is
-        given; there is no undo, as reports are gitignored.
+        REPLACE a report's body. Allowed ONLY while status is `open`. Refuses when the existing body would be discarded unless --replace is given; there is no undo, as reports are gitignored.
   set-status <id> --to <state> [--note N] [--repair]
         open -> reviewing -> taken -> resolved|declined  (reviewing -> open to hand back)
-        --repair: ONLY for a report whose current status is not a known state
-        (hand-written, or from before this machine existed). It cannot skip a
-        legal transition between valid states. Put it last on the line.
+        --repair: ONLY for a report whose current status is not a known state (hand-written, or from before this machine existed). It cannot skip a legal transition between valid states. Put it last on the line.
         Leaving `open` FREEZES the body and records its sha256.
   list [--status S] [--json]        reports in THIS PROJECT only
-  collect [--status S] [--json]     reports across every project REGISTERED in
-                                     steward's backup registry -- filing a bug
-                                     and registering for backup are unrelated
-                                     decisions, so an unregistered project is
-                                     excluded, not scanned for
+  collect [--status S] [--json]     reports across every project REGISTERED in steward's backup registry -- filing a bug and registering for backup are unrelated decisions, so an unregistered project is excluded, not scanned for
   verify                            re-check every frozen body against its digest
 
-One report per file. Write only through this script — a PreToolUse hook denies
-direct edits to the reports directory.
+One report per file. Write only through this script — a PreToolUse hook denies direct edits to the reports directory.
 USAGE
     exit 3;
 }

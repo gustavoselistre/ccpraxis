@@ -371,11 +371,12 @@ if ($verb eq 'status') {
 
     my $h = BpHook::holder($SID);
     if (defined $h && BpHook::holder_live($SID, {})) {
-        my (undef, $mm, $hh) = gmtime($h->{deadline});
         my $items = (ref $h->{items} eq 'ARRAY')
             ? sanitize_text(join(', ', @{ $h->{items} }))
             : '';
-        push @lines, sprintf('holder: running until %02d:%02dZ: %s', $hh, $mm, $items);
+        my $ddl = BpHook::local_utc_hhmm($h->{deadline});
+        $ddl = 'unknown' unless defined $ddl;
+        push @lines, sprintf('holder: running until %s; still running: %s', $ddl, $items);
     }
     else {
         push @lines, 'holder: none';

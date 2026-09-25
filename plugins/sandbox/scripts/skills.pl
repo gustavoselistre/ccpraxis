@@ -3000,14 +3000,10 @@ Commands:
   load-selection      --selection-file FILE         Print current state (migrates v1->v3).
   prune               --selection-file FILE         Drop dead entries; write state.
   diff                --selection-file FILE         Compare discovery to mounted baseline.
-  select-interactive  --selection-file FILE         TUI selector for skills/plugins/MCP;
-                                                    writes selection + settings.local.json.
-  select-model        --selection-file FILE         Print the selector's item model as one
-                                                    JSON object; writes nothing, no terminal.
+  select-interactive  --selection-file FILE         TUI selector for skills/plugins/MCP; writes selection + settings.local.json.
+  select-model        --selection-file FILE         Print the selector's item model as one JSON object; writes nothing, no terminal.
   select-apply        --decision-file D --selection-file FILE
-                                                    Apply a decision produced by the launch
-                                                    screen through the same persist path.
-                                                    Exit 2 when the decision was not confirmed.
+                                                    Apply a decision produced by the launch screen through the same persist path. Exit 2 when the decision was not confirmed.
   mounts              --selection-file FILE         Emit host_path<TAB>name per line.
   record-mount        --selection-file FILE         Set mounted_at_create = selected.
   manifest            --selection-file FILE [--output FILE]
@@ -3015,21 +3011,11 @@ Commands:
   materialize-plugins --selection-file FILE --output FILE
                                                     Emit container-shaped installed_plugins.json.
   clone-to-project    --project-path P (--plugin-key K | --mcp-name N)
-                                                    Promote a Suggestion to Project: append
-                                                    scope=project install (plugins) or add to
-                                                    enabledMcpjsonServers (MCP) in settings.json.
-                                                    Idempotent; only ADDS, never edits existing.
-  materialize-credentials --output FILE             Emit sandbox-isolated .credentials.json:
-                                                    claudeAiOauth + mcpOAuth from previous
-                                                    container state only (host token never
-                                                    injected; one-time reset marker gates it).
+                                                    Promote a Suggestion to Project: append scope=project install (plugins) or add to enabledMcpjsonServers (MCP) in settings.json. Idempotent; only ADDS, never edits existing.
+  materialize-credentials --output FILE             Emit sandbox-isolated .credentials.json: claudeAiOauth + mcpOAuth from previous container state only (host token never injected; one-time reset marker gates it).
   host-only-masks     --selection-file F --output FILE
-                                      Container paths of host-only skills in selected
-                                      live-bound plugins; the launcher masks each.
-  materialize-known-marketplaces --output FILE      Emit container-shaped known_marketplaces.json:
-                                                    rewrites Windows installLocation paths to the
-                                                    container mount target; drops directory-source
-                                                    marketplaces whose source.path isn't mounted.
+                                      Container paths of host-only skills in selected live-bound plugins; the launcher masks each.
+  materialize-known-marketplaces --output FILE      Emit container-shaped known_marketplaces.json: rewrites Windows installLocation paths to the container mount target; drops directory-source marketplaces whose source.path isn't mounted.
   help                                              Show this help.
 
 Common options:

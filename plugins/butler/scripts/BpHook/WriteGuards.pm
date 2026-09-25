@@ -223,6 +223,23 @@ sub _in {
 }
 
 # ---------------------------------------------------------------------------
+# _under_any_reports($abs_c, $data) -- Decision 100: true iff $abs_c lies
+# under "<data>/blueprints/<any bp>/reports/", for ANY blueprint name
+# (including one with no in-flight package at all). $abs_c is already
+# lexically collapsed and canon()-ed by the caller (_abs_of), so a literal
+# ".." segment can never reach this far -- no separate traversal check is
+# needed here.
+# ---------------------------------------------------------------------------
+sub _under_any_reports {
+    my ($abs_c, $data) = @_;
+    return 0 unless defined $abs_c && defined $data && length $data;
+    my $dc = _ccanon($data);
+    return 0 unless defined $dc && length $dc;
+    my ($a, $d) = _is_ci() ? (_foldc($abs_c), _foldc($dc)) : ($abs_c, $dc);
+    return ($a =~ m{\A\Q$d\E/blueprints/[^/]+/reports/}) ? 1 : 0;
+}
+
+# ---------------------------------------------------------------------------
 # _target_path($p) -- tool_input.file_path, else tool_input.notebook_path,
 # when a non-empty plain string; else undef.
 # ---------------------------------------------------------------------------
@@ -437,6 +454,32 @@ sub _binding {
     return { blueprint => $bp, package => $pkg };
 }
 
+# ---------------------------------------------------------------------------
+# _worker_subagent_type($data, $tuid) -- Decision 100: the subagent_type
+# named by BpHook::Guards::TrackDispatch's own worker record at
+# "<data>/.drive-solo/workers/<tuid>" (no ".json" suffix, unlike bindings/).
+# undef on any read/shape failure -- never used to widen anything by itself.
+# ---------------------------------------------------------------------------
+sub _worker_subagent_type {
+    my ($data, $tuid, $caller_sid) = @_;
+    return undef unless defined $tuid && $tuid =~ /^[A-Za-z0-9_-]{1,128}$/;
+    my $path = "$data/.drive-solo/workers/$tuid";
+    open(my $fh, '<:raw', $path) or return undef;
+    local $/;
+    my $raw = <$fh>;
+    close $fh;
+    return undef unless defined $raw;
+    my $rec = eval { JSON::PP->new->utf8->decode($raw) };
+    return undef unless ref $rec eq 'HASH';
+    # Decision 101 minor: a record for a DIFFERENT session grants nothing --
+    # without this, a forged/stale record naming another session's tuid
+    # could be read back as this caller's own.
+    return undef unless defined $caller_sid && defined $rec->{session_id}
+        && !ref($rec->{session_id}) && $rec->{session_id} eq $caller_sid;
+    my $t = $rec->{subagent_type};
+    return (defined $t && !ref($t) && length $t) ? $t : undef;
+}
+
 sub _agent_type_of {
     my ($p) = @_;
     my $v = (ref $p eq 'HASH') ? $p->{agent_type} : undef;
@@ -536,6 +579,7 @@ sub resolve {
         my $tuid = _meta_tool_use_id($p);
         my $b = defined($tuid) ? _binding($data, $tuid) : undef;
         my $P = defined($b) ? _usable($data, $b->{blueprint}, $b->{package}) : undef;
+        my $sid = BpHook::session_id($p);
         my ($kind, @packages);
         if (defined $P) {
             $kind = 'bound';
@@ -552,19 +596,35 @@ sub resolve {
             $kind = 'refused_bound';
             @packages = ();
         }
-        elsif ($n_inflight == 0) {
-            return undef;
-        }
-        elsif ($n_inflight == 1) {
-            $kind = 'sole';
-            @packages = @U;
-        }
         else {
-            $kind = 'refused';
-            @packages = @U;
+            # Decision 100/101 M2: an unbound subagent whose OWN worker
+            # record (session_id-matched) names a subagent_type BindDispatch
+            # exempts from the one-ledger rule (Decision 98) is ALWAYS
+            # reports-only -- checked here, before n_inflight, so it can
+            # never fall into 'sole' and inherit a package's full write_set
+            # (the review's M2 finding).
+            my $stype = defined($tuid) ? _worker_subagent_type($data, $tuid, $sid) : undef;
+            my $exempt = (defined $stype
+                && eval { BpHook::BindDispatch::is_exempt_type($stype) }) ? 1 : 0;
+            if ($exempt) {
+                $kind = 'exempt_reports';
+                @packages = ();
+            }
+            elsif ($n_inflight == 0) {
+                return undef;
+            }
+            elsif ($n_inflight == 1) {
+                $kind = 'sole';
+                @packages = @U;
+            }
+            else {
+                $kind = 'refused';
+                @packages = @U;
+            }
         }
-        my @allow_dirs = ($kind eq 'refused' || $kind eq 'refused_bound')
+        my @allow_dirs = ($kind eq 'refused' || $kind eq 'refused_bound' || $kind eq 'exempt_reports')
             ? () : (map { $_->{bpdir} } @packages);
+
         my $agent_type = _agent_type_of($p);
         my $w = _ciswriter($agent_type);
         return {
@@ -868,6 +928,17 @@ sub _writes {
         }
     }
 
+    if ($R->{kind} eq 'exempt_reports') {
+        # Decision 100/101 M2: an exempt-but-unbound subagent (its own,
+        # session_id-matched worker record names a BindDispatch-allowlisted
+        # subagent_type) may write ONLY under
+        # <data>/blueprints/<any bp>/reports/ -- regardless of how many
+        # packages are in flight, and never any package's write_set/
+        # test_paths, even when it is the sole package in flight.
+        return 0 if _under_any_reports($ABS_c, $R->{data});
+        return BpHook::deny(_cfit(
+            'BLOCKED: this subagent is exempt from package binding and may write only under blueprints/<bp>/reports/.'));
+    }
     if ($R->{kind} eq 'refused') {
         my $n = defined($R->{inflight}) ? $R->{inflight} : 0;
         return BpHook::deny(_cfit(sprintf(

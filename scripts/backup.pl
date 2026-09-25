@@ -48,22 +48,16 @@ usage: backup.pl run [--json] [--restart]
        backup.pl --help
 
   run                     execute (or continue) a backup run
-    --json                  accepted for the wrapper's calling convention;
-                             output is always JSON, with or without this flag
-    --restart               discard any existing run state and start a fresh
-                             run (also the escape hatch past a corrupt state
-                             file)
-    --resume <token>         continue a paused run using the given resume
-                             token (mutually exclusive with --restart)
-    --answer <id>=<choice>  answer one pending decision; repeat once per
-                             pending decision
+    --json                  accepted for the wrapper's calling convention; output is always JSON, with or without this flag
+    --restart               discard any existing run state and start a fresh run (also the escape hatch past a corrupt state file)
+    --resume <token>         continue a paused run using the given resume token (mutually exclusive with --restart)
+    --answer <id>=<choice>  answer one pending decision; repeat once per pending decision
 
   --help                  print this usage text and exit 0 (touches no state)
 
 Exactly one JSON object is written to stdout per invocation.
 
-Exit codes: 0 complete, 10 needs a decision, 20 complete with failures,
-2 usage, 3 resume token refused, 4 answer refused, 1 internal error.
+Exit codes: 0 complete, 10 needs a decision, 20 complete with failures, 2 usage, 3 resume token refused, 4 answer refused, 1 internal error.
 TXT
 
 sub _print_json_result {

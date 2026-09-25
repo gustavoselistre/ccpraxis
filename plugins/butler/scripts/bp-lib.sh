@@ -178,10 +178,8 @@ bp_require_sandbox() {
   [ "${BP_ALLOW_HOST:-}" = "1" ] && return 0
   if [ "${IS_SANDBOX:-}" != "1" ]; then
     echo "butler: refusing to launch outside the sandbox." >&2
-    echo "  Butler runs detached headless coordinators (setsid/nohup/flock + 'claude -p')," >&2
-    echo "  which only work inside the rootless-Podman sandbox container." >&2
-    echo "  Author blueprints on the host with the 'blueprint' plugin (/blueprint:create)," >&2
-    echo "  then run them from inside 'claude-sandbox'. (Set BP_ALLOW_HOST=1 to override.)" >&2
+    echo "  Butler runs detached headless coordinators (setsid/nohup/flock + 'claude -p'), which only work inside the rootless-Podman sandbox container." >&2
+    echo "  Author blueprints on the host with the 'blueprint' plugin (/blueprint:create), then run them from inside 'claude-sandbox'. (Set BP_ALLOW_HOST=1 to override.)" >&2
     exit 4
   fi
 }

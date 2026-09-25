@@ -63,16 +63,19 @@ Run these as plain Bash tool calls, arguments in single quotes.
   holder while work is running.
 - **A reason** is at least two words and says what is done (off) or why this stop (silence). Quote
   it in single quotes; it is logged for the operator.
-- **Holder:** `butler-hold <id> [<id> ...]` as a Bash call with `run_in_background: true`. Ids are
-  the agent id a background dispatch returns, or a background Bash task id. The hold is fixed at
-  50 minutes, or sooner once every id has finished. A dispatch alone does not let an armed session
-  stop; a running holder does. There is one holder per session: running it again while it runs adds
-  ids and restarts its 50 minutes, and never starts a second holder. Call it once, when a turn ends
-  with work running — not after every dispatch and not for ids already held, and its stop token
-  runs its three commands with `--token <token>` as printed. It counts only while one of its ids is
-  still running. On exit it wakes the session and prints each id as `<id> finished`, `<id> still
-  running (last activity <time>)` or `<id> unknown`. Act on that, then hold again only for ids
-  still running.
+- **Holder:** `butler-hold <id> [<id> ...]` with `run_in_background: true`, but only when
+  `butler-continuity status` shows `holder: none`. Ids are the agent id a background dispatch
+  returns, or a background Bash task id. The hold is fixed at 50 minutes, or sooner once every
+  id has finished. A dispatch alone does not let an armed session stop; a running holder does.
+  There is one holder per session: while one is running, call `butler-hold <new id>` in the
+  foreground instead, which extends the holder and returns at once -- it never starts a second holder.
+  Call it once, when a turn ends with work running -- not after every dispatch and not for ids
+  already held. The running holder prints its own line at each extension, each id finishing, and
+  on release; the extending call's own foreground line only says it extended and exits. Its stop
+  token runs its three commands with `--token <token>` as printed. It counts only while one of its
+  ids is still running. On release it wakes the session and prints each id as `<id> finished`,
+  `<id> still running (last activity <time>)` or `<id> unknown`. Act on that, then hold again
+  only for ids still running.
 - **New session id:** after `/clear` or a carry-over, the session is unarmed — run
   `butler-continuity on` again. `--resume` keeps the arm.
 - **Questions:** queue one with `butler-continuity ask --text '<question>'` and keep working.

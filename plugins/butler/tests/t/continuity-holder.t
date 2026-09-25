@@ -388,9 +388,9 @@ my $H1_SID = 'hold-h1-sid';
             'H1: deadline - started_at is (about) the 30s test-seam duration');
     }
 
-    my $out = wait_for_stdout_line($outfile, qr/^holding session \Q@{[sid8($H1_SID)]}\E until/m, 10);
-    like($out, qr/^holding session \Q@{[sid8($H1_SID)]}\E until/m,
-        "H1: stdout's first line starts 'holding session <sid8> until'");
+    my $out = wait_for_stdout_line($outfile, qr/^\d\d:\d\d \(\d\d:\d\dZ\) holding session \Q@{[sid8($H1_SID)]}\E until/m, 10);
+    like($out, qr/^\d\d:\d\d \(\d\d:\d\dZ\) holding session \Q@{[sid8($H1_SID)]}\E until/m,
+        "H1: stdout's first line starts '<T> holding session <sid8> until'");
 
     is(BpHook::holder_live($H1_SID, { background_tasks => [{ id => 'S', type => 'subagent', status => 'running' }] }), 1,
         'H1: holder_live is 1 when p lists a held id as running');
@@ -474,8 +474,8 @@ my $H1_SID = 'hold-h1-sid';
     is($rc2, 0, 'H2: the second (extending) process exits 0');
     my @out2_lines = lines_of($out2);
     is(scalar(@out2_lines), 1, 'H2: the second process prints exactly one stdout line');
-    like($out2_lines[0] // '', qr/^extended holder of session \Q@{[sid8($H1_SID)]}\E/,
-        "H2: that line starts 'extended holder of session <sid8>'");
+    like($out2_lines[0] // '', qr/^extended the running holder \(pid \d+\) until/,
+        "H2: that line starts 'extended the running holder (pid N) until'");
     is($err2, '', 'H2: the extending process stderr is empty');
 
     my $h = BpHook::holder($H1_SID);
@@ -541,7 +541,7 @@ my $H1_SID = 'hold-h1-sid';
         my ($exited_out, $exited_out_file) = ($exited_pid == $pid_x) ? (undef, $outx) : (undef, $outy);
         $exited_out_file = ($exited_pid == $pid_x) ? $outx : $outy;
         my $out = slurp($exited_out_file);
-        like($out, qr/^extended holder of session \Q@{[sid8($sid)]}\E/m, 'H3: with the extended line');
+        like($out, qr/^extended the running holder \(pid \d+\) until/m, 'H3: with the extended line');
 
         ok(kill(0, $other_pid), 'H3: exactly one is alive -- the other');
         my $h = BpHook::holder($sid);
@@ -596,8 +596,8 @@ my $H1_SID = 'hold-h1-sid';
         isnt($h2->{pid}, $pid, 'H4a: the new record has a new pid, distinct from the killed one');
         is_deeply($h2->{items}, ['Z'], 'H4a: BECOME replaced the item set, it did not extend the dead ones');
     }
-    my $out2 = wait_for_stdout_line($out2f, qr/^holding session \Q@{[sid8($sid)]}\E until/m, 10);
-    like($out2, qr/^holding session \Q@{[sid8($sid)]}\E until/m, 'H4a: a fresh holding line');
+    my $out2 = wait_for_stdout_line($out2f, qr/^\d\d:\d\d \(\d\d:\d\dZ\) holding session \Q@{[sid8($sid)]}\E until/m, 10);
+    like($out2, qr/^\d\d:\d\d \(\d\d:\d\dZ\) holding session \Q@{[sid8($sid)]}\E until/m, 'H4a: a fresh holding line');
     reap_and_log('H4a-new-holder', $pid2, $out2f, $err2f);
 }
 
@@ -724,14 +724,17 @@ SKIP: {
     }
 
     my @l = lines_of($out);
-    is(scalar(@l), 6, 'H5: exactly six stdout lines') or diag("stdout was:\n$out");
-    like($l[0] // '', qr/^holding session \Q@{[sid8($sid)]}\E until/, 'H5: line 1 -- the holding line');
-    is($l[1] // '', "hold ended at the deadline for session @{[sid8($sid)]}.",
-        'H5: line 2 -- the deadline header');
-    is($l[2] // '', "S still running (last activity @{[iso_of($e1)]})", 'H5: line 3 -- S still running with E1');
-    is($l[3] // '', "B still running (last activity @{[iso_of($e2)]})", 'H5: line 4 -- B still running with E2');
-    is($l[4] // '', 'F finished', 'H5: line 5 -- F finished');
-    is($l[5] // '', 'U unknown', 'H5: line 6 -- U unknown');
+    is(scalar(@l), 7, 'H5: exactly seven stdout lines') or diag("stdout was:\n$out");
+    like($l[0] // '', qr/^\d\d:\d\d \(\d\d:\d\dZ\) holding session \Q@{[sid8($sid)]}\E until/,
+        'H5: line 1 -- the holding line');
+    like($l[1] // '', qr/^\d\d:\d\d \(\d\d:\d\dZ\) finished: F; still waiting on: S, B, U$/,
+        'H5: line 2 -- finished: F; still waiting on: S, B, U');
+    like($l[2] // '', qr/^\d\d:\d\d \(\d\d:\d\dZ\) released: deadline reached$/,
+        'H5: line 3 -- released: deadline reached');
+    is($l[3] // '', "S still running (last activity @{[iso_of($e1)]})", 'H5: line 4 -- S still running with E1');
+    is($l[4] // '', "B still running (last activity @{[iso_of($e2)]})", 'H5: line 5 -- B still running with E2');
+    is($l[5] // '', 'F finished', 'H5: line 6 -- F finished');
+    is($l[6] // '', 'U unknown', 'H5: line 7 -- U unknown');
     is($err, '', 'H5: stderr is empty');
     ok(!-f "$CONT_ROOT/holder/$sid.json", 'H5: the record is gone');
 }
@@ -756,11 +759,15 @@ SKIP: {
 
     is($rc, 0, 'H6: all-finished exits 0');
     my @l = lines_of($out);
-    is(scalar(@l), 4, 'H6: holding line + all-finished header + two item lines') or diag("stdout:\n$out");
-    is($l[1] // '', "hold ended: every held item finished (session @{[sid8($sid)]}).",
-        'H6: the all-finished header');
-    is($l[2] // '', 'F1 finished', 'H6: F1 finished');
-    is($l[3] // '', 'F2 finished', 'H6: F2 finished');
+    is(scalar(@l), 6, 'H6: holding line + two finished lines + released + two item lines') or diag("stdout:\n$out");
+    like($l[1] // '', qr/^\d\d:\d\d \(\d\d:\d\dZ\) finished: F1; still waiting on: nothing$/,
+        'H6: finished: F1; still waiting on: nothing');
+    like($l[2] // '', qr/^\d\d:\d\d \(\d\d:\d\dZ\) finished: F2; still waiting on: nothing$/,
+        'H6: finished: F2; still waiting on: nothing');
+    like($l[3] // '', qr/^\d\d:\d\d \(\d\d:\d\dZ\) released: every held item finished$/,
+        'H6: the all-finished released line');
+    is($l[4] // '', 'F1 finished', 'H6: F1 finished');
+    is($l[5] // '', 'F2 finished', 'H6: F2 finished');
     is($err, '', 'H6: stderr empty');
 }
 
@@ -964,8 +971,8 @@ SKIP: {
         push @KILL_PIDS, $pid;
         my $h = wait_for_holder($sid, 10);
         ok(defined $h, 'H10b: a --token from the stop message binds sid on first use (BECOME record appears)');
-        my $out = wait_for_stdout_line($outf, qr/^holding session \Q@{[sid8($sid)]}\E until/, 10);
-        like($out, qr/^holding session \Q@{[sid8($sid)]}\E until/, 'H10b: holding line for the token-bound sid');
+        my $out = wait_for_stdout_line($outf, qr/^\d\d:\d\d \(\d\d:\d\dZ\) holding session \Q@{[sid8($sid)]}\E until/, 10);
+        like($out, qr/^\d\d:\d\d \(\d\d:\d\dZ\) holding session \Q@{[sid8($sid)]}\E until/, 'H10b: holding line for the token-bound sid');
         reap_and_log('H10b-cleanup', $pid, $outf, $errf);
 
         my ($out2, $err2, $rc2) = run_hold('H10b-second', ['--token', $tok, 'B2'], {});
@@ -1008,7 +1015,7 @@ SKIP: {
         write_ticket_for($sid, ['D2ext'], transcript_path => $tp, background => 0);
         my ($out2, $err2, $rc2) = run_hold('H10d-extend', ['D2ext'], {});
         is($rc2, 0, 'H10d: a foreground ticket EXTENDS when a live holder already exists');
-        like($out2, qr/^extended holder of session/, 'H10d: extended line');
+        like($out2, qr/^extended the running holder \(pid \d+\) until/, 'H10d: extended line');
     }
     reap_and_log('H10d-cleanup', $pid, $outf, $errf);
 }
@@ -1136,7 +1143,7 @@ SKIP: {
     my $out = slurp($outfile);
     unlink $outfile, $errfile;
     is($rc, 0, 'H12: the holder exits 0 within tick + a few seconds of being disarmed');
-    like($out, qr/continuity is off; holder ended\./, 'H12: the off header');
+    like($out, qr/released: continuity is off$/m, 'H12: the off header');
     like($out, qr/^OFF1 (?:finished|still running|unknown)/m, 'H12: the item line for OFF1 is present');
 }
 
@@ -1161,7 +1168,7 @@ SKIP: {
     unlink $outfile, $errfile;
 
     is($rc, 143, 'H13: SIGTERM gives exit 143');
-    like($out, qr/^hold ended: killed\./m, 'H13: the killed header');
+    like($out, qr/^\d\d:\d\d \(\d\d:\d\dZ\) released: killed by a signal$/m, 'H13: the killed header');
     like($out, qr/^SIG1 (?:finished|still running|unknown)/m, 'H13: item line present');
     ok(-f "$CONT_ROOT/holder/$sid.json", 'H13: the record is left in place (coordinator rule)');
     is(BpHook::holder_live($sid, {}), 0, 'H13: holder_live is 0 once the process is gone');
@@ -1344,7 +1351,7 @@ SKIP: {
     unlink "$self_output.err";
 
     is($rc, 1, 'R5-H1: a become naming the holders own background task id is refused, exit 1');
-    unlike($out, qr/^holding session/m,
+    unlike($out, qr/holding session/m,
         'R5-H1: no holding line -- the record is never written for a self-held id');
     ok(!-f "$CONT_ROOT/holder/$sid.json", 'R5-H1: no record written for a self-held id');
 }

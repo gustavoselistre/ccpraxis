@@ -50,8 +50,7 @@ sub _detect_container_cli {
 my $PODMAN = _detect_container_cli();
 unless (defined $PODMAN) {
     print STDERR "ERROR: no container CLI on PATH (looked for docker, podman).\n";
-    print STDERR "       Install Docker Desktop (https://docker.com) or Podman Desktop\n";
-    print STDERR "       (https://podman-desktop.io/) and re-run.\n";
+    print STDERR "       Install Docker Desktop (https://docker.com) or Podman Desktop (https://podman-desktop.io/) and re-run.\n";
     exit 1;
 }
 my $RUNTIME_NAME = ($PODMAN =~ /docker/) ? 'docker' : 'podman';
@@ -357,13 +356,9 @@ log_step("Step 2/6: ensure $RUNTIME_NAME is reachable and the container image ex
             print STDERR "           podman machine init --provider wsl   # first time only — USE WSL2, NOT HYPER-V\n";
             print STDERR "           podman machine start\n";
             print STDERR "\n";
-            print STDERR "       ⚠  HYPER-V BACKEND IS NOT SUPPORTED. Microsoft's 9p host-share silently\n";
-            print STDERR "          breaks O_APPEND (claude session resume fails with EIO) and utimensat\n";
-            print STDERR "          (Bun's lock manager wedges → TUI freezes every ~60s). WSL2 is the\n";
-            print STDERR "          only reliable Windows backend for both docker and podman.\n";
+            print STDERR "       ⚠  HYPER-V BACKEND IS NOT SUPPORTED. Microsoft's 9p host-share silently breaks O_APPEND (claude session resume fails with EIO) and utimensat (Bun's lock manager wedges → TUI freezes every ~60s). WSL2 is the only reliable Windows backend for both docker and podman.\n";
         } else {
-            print STDERR "       Start the podman backend (`podman machine start` on macOS,\n";
-            print STDERR "       or check the rootless socket on Linux).\n";
+            print STDERR "       Start the podman backend (`podman machine start` on macOS, or check the rootless socket on Linux).\n";
         }
         print STDERR "\n";
         die_bootstrap("$RUNTIME_NAME backend not reachable — see above");
@@ -392,9 +387,7 @@ log_step("Step 2/6: ensure $RUNTIME_NAME is reachable and the container image ex
                 print STDERR "         $line\n";
             }
             print STDERR "\n";
-            print STDERR "       ⚠  HYPER-V BACKEND IS NOT SUPPORTED. Microsoft's `Plan9FileServer`\n";
-            print STDERR "          (the 9p host-share used by Hyper-V) silently breaks two syscalls\n";
-            print STDERR "          claude/Bun depend on:\n";
+            print STDERR "       ⚠  HYPER-V BACKEND IS NOT SUPPORTED. Microsoft's `Plan9FileServer` (the 9p host-share used by Hyper-V) silently breaks two syscalls claude/Bun depend on:\n";
             print STDERR "            - O_APPEND writes return EIO   → `claude --resume` fails\n";
             print STDERR "            - utimensat silently no-ops    → Bun lock manager wedges, TUI freezes\n";
             print STDERR "          Symptom: 'claude seems to work but stops responding after ~60s'.\n";

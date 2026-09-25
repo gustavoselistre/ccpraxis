@@ -343,20 +343,8 @@ sub sweep_orphan_containers {
 sub _usage {
     return <<'USAGE';
 usage: perl scripts/run-tests-container.pl [--ref REF] FILE.t [FILE2.t ...]
-  --ref REF   git ref to materialize (default: HEAD). Uncommitted/untracked
-              changes are NOT reflected -- this lane archives a git ref.
-              Must not start with '-' (refused, exit 2) -- git would parse
-              it as an option, not a revision.
-  FILE.t ...  one or more paths, given relative to the repo root with
-              forward slashes (e.g. plugins/butler/tests/t/foo.t). An
-              absolute path (POSIX, Windows drive-letter, or UNC) is
-              refused (exit 2) -- a host path has no meaning inside the
-              container's own tree. Every other path must match
-              [A-Za-z0-9_][A-Za-z0-9_./-]*.t with no '..' segment, refused
-              (exit 2) otherwise -- nothing legitimate needs a quote, a
-              leading dash, or a shell metacharacter here, and this
-              allow-list is what keeps a filename from reaching the inner
-              container shell unsafely.
+  --ref REF   git ref to materialize (default: HEAD). Uncommitted/untracked changes are NOT reflected -- this lane archives a git ref. Must not start with '-' (refused, exit 2) -- git would parse it as an option, not a revision.
+  FILE.t ...  one or more paths, given relative to the repo root with forward slashes (e.g. plugins/butler/tests/t/foo.t). An absolute path (POSIX, Windows drive-letter, or UNC) is refused (exit 2) -- a host path has no meaning inside the container's own tree. Every other path must match [A-Za-z0-9_][A-Za-z0-9_./-]*.t with no '..' segment, refused (exit 2) otherwise -- nothing legitimate needs a quote, a leading dash, or a shell metacharacter here, and this allow-list is what keeps a filename from reaching the inner container shell unsafely.
 USAGE
 }
 
