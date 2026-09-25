@@ -4,9 +4,11 @@
 # Derived from
 # .ccpraxis-local-data/blueprints/butler-gate-ergonomics/specs/04-bp-on-path-spec.md
 #
-# AC1 four new shims exist under plugins/butler/bin/, executable, and
-#     structurally match bp-continuity.sh's shape (BASH_SOURCE resolution,
-#     missing-script diagnostic, `exec perl ... "$@"` tail).
+# AC1 shims exist under plugins/butler/bin/ for bp-drive-next, bp-ledger and
+#     bp-dispatch-log, executable, and structurally match bp-drive-next.sh's
+#     shape (BASH_SOURCE resolution, missing-script diagnostic, `exec perl
+#     ... "$@"` tail). The bp-watch and bp-continuity shims (and their .pl
+#     targets) were deleted by package 16 batch E1.
 # AC2 each shim's stdout+exit code byte-match the direct
 #     `perl plugins/butler/scripts/<name>.pl` invocation, for one cheap
 #     read-only verb per script.
@@ -36,9 +38,6 @@
 # isolated tempdir -- never touching this host's real PATH by any path. See
 # the AC4 block below for the full reasoning.
 #
-# THIS IS A HEAD-run: every assertion below is expected to be RED right now.
-# None of plugins/butler/bin/bp-drive-next.sh, bp-ledger.sh, bp-watch.sh,
-# bp-dispatch-log.sh exist yet.
 use strict;
 use warnings;
 
@@ -56,12 +55,17 @@ my $SCRIPTS = "$PLUGIN/scripts";
 my $REPO    = "$Bin/../../../..";                # repo root
 my $HELPER  = "$REPO/scripts/_install-bin-helper.pl";
 
-ok(-f "$BIN_DIR/bp-continuity.sh", 'sanity: the template shim this oracle is derived from exists')
-    or BAIL_OUT('bp-continuity.sh is missing -- nothing below can be judged against it');
+# The template shim used to be bp-continuity.sh; package 16 batch E1 deleted
+# it (and bin/bp-watch.sh, and scripts/bp-watch.pl) along with the rest of the
+# old continuity path. bp-drive-next.sh is structurally identical (same
+# BASH_SOURCE resolution, same missing-script diagnostic, same exec tail) and
+# survives the cutover, so it is the template now.
+ok(-f "$BIN_DIR/bp-drive-next.sh", 'sanity: the template shim this oracle is derived from exists')
+    or BAIL_OUT('bp-drive-next.sh is missing -- nothing below can be judged against it');
 ok(-f $HELPER, 'sanity: the shared PATH helper this package must delegate to exists')
     or BAIL_OUT('_install-bin-helper.pl is missing');
 
-my @NAMES = qw(bp-drive-next bp-ledger bp-watch bp-dispatch-log);
+my @NAMES = qw(bp-drive-next bp-ledger bp-dispatch-log);
 
 sub slurp {
     my ($p) = @_;
@@ -125,8 +129,8 @@ sub run_out_err_rc {
 # AC1 -- existence, executable bit, structural match to bp-continuity.sh.
 # ===========================================================================
 {
-    my $template = slurp("$BIN_DIR/bp-continuity.sh");
-    ok(defined $template, 'AC1 template bp-continuity.sh is readable')
+    my $template = slurp("$BIN_DIR/bp-drive-next.sh");
+    ok(defined $template, 'AC1 template bp-drive-next.sh is readable')
         or BAIL_OUT('cannot read the template shim');
 
     for my $name (@NAMES) {
@@ -182,13 +186,13 @@ sub run_out_err_rc {
 
         # Negative-space: guards against a shim that was copy-pasted without
         # updating BOTH the exec target and the diagnostic -- a shim that still
-        # names bp-continuity.pl anywhere is wrong even if the mechanical shape
-        # above matches.
+        # names bp-drive-next.pl anywhere (its own name aside) is wrong even
+        # if the mechanical shape above matches.
         unlike(
             $content,
-            qr/bp-continuity\.pl/,
-            "AC1 $name.sh: does not still reference bp-continuity.pl anywhere (fully substituted, not partially)"
-        ) unless $name eq 'bp-continuity';
+            qr/bp-drive-next\.pl/,
+            "AC1 $name.sh: does not still reference bp-drive-next.pl anywhere (fully substituted, not partially)"
+        ) unless $name eq 'bp-drive-next';
     }
 }
 
@@ -206,18 +210,13 @@ SKIP: {
     # bp-ledger: `validate --stdin` IS the real read-only verb; fed empty
     #   stdin it deterministically reports "no parseable frontmatter" and
     #   exits 2 -- a real read-only path, not a fabricated invalid one.
-    # bp-watch: probe against an empty, freshly-made data dir is read-only
-    #   (per the script's own --help text) and deterministically reports
-    #   NONE / exit 1.
     # bp-dispatch-log: `list --root <empty dir>` is read-only and
     #   deterministically empty / exit 0.
     my %verbs = (
         'bp-drive-next'  => { args => ['--help'],                         stdin => undef },
         'bp-ledger'      => { args => ['validate', '--stdin'],            stdin => '' },
-        'bp-watch'       => { args => ['probe', '--data', "$tmp/watch"],  stdin => undef },
         'bp-dispatch-log'=> { args => ['list', '--root', "$tmp/dispatch"],stdin => undef },
     );
-    mkdir "$tmp/watch";
     mkdir "$tmp/dispatch";
 
     for my $name (@NAMES) {
@@ -369,7 +368,7 @@ SKIP: {
     # bindir, so `apply`'s glob("$bindir/*.sh") + chmod + symlink logic has
     # real files to act on, and the subsequently-sourced PATH genuinely
     # fronts a directory containing bp-drive-next.sh et al.
-    for my $name (@NAMES, 'bp-continuity') {
+    for my $name (@NAMES) {
         my $src = "$BIN_DIR/$name.sh";
         next unless -f $src;
         copy($src, "$bindir/$name.sh") or die "copy $src -> $bindir: $!";
@@ -398,7 +397,7 @@ SKIP: {
     # installed) bp-continuity, making the assertion pass for the wrong
     # reason. A plain, scrubbed, non-login shell that only sources the
     # fixture's own .bashrc is the actually-isolated check.
-    for my $name (@NAMES, 'bp-continuity') {
+    for my $name (@NAMES) {
         my $probe = "env -i HOME=" . quotemeta($fake_home)
             . " PATH=/usr/bin:/bin bash -c 'source \$HOME/.bashrc >/dev/null 2>&1; command -v $name.sh'";
         my $resolved = `$probe`;
@@ -451,8 +450,8 @@ SKIP: {
     my @pl_files = glob("$SCRIPTS/*.pl");
     my @pm_files = glob("$SCRIPTS/*.pm");
 
-    unless (@sh_files >= 4) {
-        fail('AC7: skipped -- fewer than 4 shims exist under plugins/butler/bin/ to copy into the fixture');
+    unless (@sh_files >= 3) {
+        fail('AC7: skipped -- fewer than 3 shims exist under plugins/butler/bin/ to copy into the fixture');
         last;
     }
 

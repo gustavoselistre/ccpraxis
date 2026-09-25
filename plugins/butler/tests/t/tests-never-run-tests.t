@@ -44,12 +44,10 @@ use FindBin qw($Bin);
 my $ROOT = "$Bin/../../../..";
 
 # ---------------------------------------------------------------------------
-# The allowlist. Package 16 deletes both seeded entries; until it lands they
-# still exist on disk and this lint does not police their contents.
+# The allowlist. Package 16 deleted its two seeded entries
+# (reporter-gate-regression.t, arming-binds-or-reports.t) in batch B.
 # ---------------------------------------------------------------------------
 my %ALLOWLIST = (
-    'reporter-gate-regression.t' => 'deleted by package 16',
-    'arming-binds-or-reports.t'  => 'deleted by package 16',
     'sweep-coverage-honesty.t'   => "exercises scripts/run-tests.pl's own skip reporting against real "
         . 'files; the targets are the subject under test, not a stays-green floor '
         . '(follow-up: generated fixtures)',
@@ -1182,10 +1180,8 @@ for my $case (@NEGATIVE_CASES) {
 }
 
 # --- the allowlist mechanism itself ----------------------------------------
-ok(exists $ALLOWLIST{'reporter-gate-regression.t'}, 'allowlist seeded: reporter-gate-regression.t (deleted by package 16)');
-ok(exists $ALLOWLIST{'arming-binds-or-reports.t'}, 'allowlist seeded: arming-binds-or-reports.t (deleted by package 16)');
-is($ALLOWLIST{'reporter-gate-regression.t'}, 'deleted by package 16', 'allowlist entry carries its reason');
-is($ALLOWLIST{'arming-binds-or-reports.t'}, 'deleted by package 16', 'allowlist entry carries its reason');
+ok(!exists $ALLOWLIST{'reporter-gate-regression.t'}, 'allowlist no longer names reporter-gate-regression.t (deleted by package 16 batch B)');
+ok(!exists $ALLOWLIST{'arming-binds-or-reports.t'}, 'allowlist no longer names arming-binds-or-reports.t (deleted by package 16 batch B)');
 
 ok(exists $ALLOWLIST{'sweep-coverage-honesty.t'}, 'allowlist seeded: sweep-coverage-honesty.t (own skip-reporting subject, not a stays-green floor)');
 like($ALLOWLIST{'sweep-coverage-honesty.t'}, qr/not a stays-green floor/, 'allowlist entry carries its reason');

@@ -48,7 +48,10 @@ use JSON::PP ();
 use Cwd qw(getcwd abs_path);
 
 my $GUARD = "$Bin/../../hooks/guard-ask-operator.sh";
-my $CONT  = "$Bin/../../scripts/bp-continuity.pl";
+# bp-continuity.pl was the CLI here; it is on the deletion list and gone
+# (package 16 batch E1). butler-continuity.pl is the one continuity CLI
+# left, and shares the same BpProjectRoot::resolve() ladder (reason DEL).
+my $CONT  = "$Bin/../../scripts/butler-continuity.pl";
 
 ok(-f $GUARD, 'guard-ask-operator.sh exists') or BAIL_OUT('guard missing');
 # The old ok(-f $RUNSTATE...) or BAIL_OUT is RETIRED along with $RUNSTATE
@@ -215,23 +218,27 @@ PAYLOAD_EOF`;
 }
 
 # ── AC6 — the halting verb is gone ────────────────────────────────────────
+#
+# MIGRATED (reason DEL, package 16 batch E1): bp-continuity.pl is on the
+# deletion list and gone. butler-continuity.pl is the one continuity CLI
+# left, and it never grew an await-operator verb either -- the arm/session
+# dance the old fixture needed (bp-continuity.pl's own registry-based arm) is
+# dropped: butler-continuity.pl's ask never required an armed session to
+# begin with, so nothing here needed it in the first place.
 {
     my $root = new_project();
-    my $reg  = "$root/reg";
-    my $cont = "$Bin/../../scripts/bp-continuity.pl";
-    system("CLAUDE_PROJECT_DIR='$root' CCPRAXIS_CONTINUITY_ACTIVE_DIR='$reg' "
-         . "$^X '$cont' arm --session s1 >/dev/null 2>&1");
-    my $out = `CLAUDE_PROJECT_DIR='$root' CCPRAXIS_CONTINUITY_ACTIVE_DIR='$reg' $^X '$cont' await-operator --reason 'x' 2>&1`;
+    my $cont = "$Bin/../../scripts/butler-continuity.pl";
+    my $out = `CLAUDE_PROJECT_DIR='$root' $^X '$cont' await-operator --reason 'x' 2>&1`;
     isnt($? >> 8, 0,
          'AC6 CANONICAL: await-operator is REMOVED. A retired escape hatch that still works '
        . 'is not retired, and this one ended turns for questions -- the exact halt being '
        . 'designed out');
 
     # ...and `ask` is what replaced it: it records and returns, never permitting a stop.
-    my $q = `CLAUDE_PROJECT_DIR='$root' CCPRAXIS_CONTINUITY_ACTIVE_DIR='$reg' $^X '$cont' ask --text 'A or B?' 2>&1`;
+    my $q = `CLAUDE_PROJECT_DIR='$root' $^X '$cont' ask --text 'A or B?' 2>&1`;
     is($? >> 8, 0, 'AC6 ask succeeds');
-    like($q, qr/STATUS:\s*queued/, 'AC6 and reports the question queued');
-    like($q, qr/QUEUED:\s*\d+/,    'AC6 with a count the statusline also shows');
+    like($q, qr/queued/i, 'AC6 and reports the question queued');
+    like($q, qr/\(\d+\s+waiting\)/, 'AC6 with a count the statusline also shows');
 }
 
 # ── AC7 — the queue accumulates ───────────────────────────────────────────
@@ -340,7 +347,7 @@ PAYLOAD_EOF`;
         # writer: bp-continuity.pl, BP_PROJECT_ROOT set, no CLAUDE_PROJECT_DIR
         my $wout4 = _cont_ask($ORIG2, { %CLEAR2, BP_PROJECT_ROOT => $proj4 },
                                'ROOT-D writer question');
-        like($wout4, qr/STATUS:\s*queued/, 'ROOT-D setup: the writer\'s ask call queues');
+        like($wout4, qr/queued/i, 'ROOT-D setup: the writer\'s ask call queues');
 
         # reader: the HOOK itself, BP_PROJECT_ROOT set, no CLAUDE_PROJECT_DIR --
         # run_guard always sets CLAUDE_PROJECT_DIR, so invoke the guard
@@ -376,7 +383,7 @@ PAYLOAD_EOF`;
         # BP_PROJECT_ROOT, cwd inside the project -- exactly AC6's own
         # documented invocation, just run from inside $proj3 this time.
         my $wout = _cont_ask($proj3, \%CLEAR2, 'the writer\'s own question');
-        like($wout, qr/STATUS:\s*queued/, 'ROOT-B setup: the writer\'s ask call queues');
+        like($wout, qr/queued/i, 'ROOT-B setup: the writer\'s ask call queues');
 
         # The reader's call, verbatim in shape: CLAUDE_PROJECT_DIR set, an
         # ARMED session, exactly what a real hook invocation looks like.

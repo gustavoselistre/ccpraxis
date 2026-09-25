@@ -26,7 +26,10 @@
 # AC4  an unbounded marker is refused however fresh
 # AC5  a passed deadline is refused however alive
 # AC6  a marker with no pid, or no identity, is refused as UNVERIFIABLE
-# AC7  the CLI and the module agree, since the gate only sees the CLI
+# AC7  REMOVED (reason DEL, package 16 batch E1): bp-resumption.pl, the CLI
+#      this compared the module against, is on the deletion list. The module
+#      behaviour AC7 exercised through the CLI is still pinned directly, via
+#      AC1-AC6 against BpResumption.pm itself.
 # AC8  bp-runstate and the continuity gate use the SAME implementation
 use strict;
 use warnings;
@@ -39,38 +42,18 @@ use warnings;
 BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
 use Test::More;
 use FindBin qw($Bin);
-use File::Temp qw(tempdir);
 
 my $SCRIPTS = "$Bin/../../scripts";
 my $MOD     = "$SCRIPTS/BpResumption.pm";
-my $CLI     = "$SCRIPTS/bp-resumption.pl";
 ok(-f $MOD, 'BpResumption.pm exists') or BAIL_OUT('module missing');
-ok(-f $CLI, 'bp-resumption.pl exists') or BAIL_OUT('cli missing');
 require $MOD;
-
-my $dir = tempdir(CLEANUP => 1);
-my $n = 0;
-sub write_marker {
-    my ($line) = @_;
-    my $p = "$dir/m" . ++$n;
-    open my $fh, '>', $p or die $!;
-    print {$fh} $line;
-    close $fh;
-    return $p;
-}
-
-sub cli_verify {
-    my ($file) = @_;
-    my $out = `perl "$CLI" verify --file "$file" 2>&1`;
-    return ($? >> 8, $out // '');
-}
 
 # A process that is alive for the duration of this test, to stand in for a live
 # hold. Its identity is real, so AC1/AC2 differ ONLY in the recorded fingerprint.
 my $live = fork();
 if (defined $live && $live == 0) { sleep 60; exit 0 }
 SKIP: {
-    skip 'fork unavailable', 20 unless defined $live && $live > 0;
+    skip 'fork unavailable', 16 unless defined $live && $live > 0;
     ok(BpResumption::pid_alive($live), 'fixture: the stand-in process is alive');
     my $fp = BpResumption::pid_fingerprint($live);
     ok(defined $fp, 'fixture: and it can be fingerprinted');
@@ -81,10 +64,6 @@ SKIP: {
         my ($ok, $why) = BpResumption::verify_line($line);
         ok($ok, 'AC1 a marker for a live, fingerprinted process with a future deadline verifies')
             or diag("refused: " . ($why // ''));
-
-        my ($rc, $out) = cli_verify(write_marker($line));
-        is($rc, 0, 'AC7 and the CLI agrees (exit 0)');
-        like($out, qr/REASON: ok/, 'AC7 reporting ok');
     }
 
     # ── AC2 — THE ONE THAT MATTERS: a recycled pid ────────────────────────
@@ -98,9 +77,6 @@ SKIP: {
         my ($ok, $why) = BpResumption::verify_line($line);
         ok(!$ok, 'AC2 CANONICAL: a LIVE pid whose identity does not match is REFUSED');
         like($why // '', qr/recycled/i, 'AC2 and the refusal names the reason');
-
-        my ($rc, $out) = cli_verify(write_marker($line));
-        is($rc, 1, 'AC7 the CLI refuses it too');
     }
 
     # ── AC4/AC5 — bounded, and still ahead ────────────────────────────────
@@ -164,8 +140,11 @@ SKIP: {
 # that cost a fix batch was that knowledge living in one file cannot be
 # reached from the other.
 {
-    for my $f (['bp-watch.pl', "$SCRIPTS/bp-watch.pl"],
-               ['bp-worker.pl', "$SCRIPTS/bp-worker.pl"]) {
+    # bp-watch.pl -- REMOVED (reason DEL, package 16 batch E1): it is on the
+    # deletion list and gone. Trimmed to what bp-worker.pl uses, per the
+    # spec's own forward note. The behavior this protected -- nothing
+    # growing its own pid_alive/pid_fingerprint copy -- is unweakened below.
+    for my $f (['bp-worker.pl', "$SCRIPTS/bp-worker.pl"]) {
         my ($name, $path) = @$f;
         open my $fh, '<', $path or die "$path: $!";
         local $/;
@@ -184,12 +163,7 @@ SKIP: {
     # deletion list (Decision 5 collapses the Stop gate to the single
     # stop-gate.sh) and has no successor that re-verifies resumption
     # through bp-resumption.pl's CLI; that role is not carried forward as a
-    # shell-side check any more. Spec's own forward note (batch E1) already
-    # anticipated trimming this file "to what bp-worker.pl uses"; this is
-    # that trim landing early because gate-continuity.sh disappeared in B,
-    # ahead of E1. The behavior this protected -- bp-watch.pl and
-    # bp-worker.pl sharing ONE resumption implementation, never growing
-    # their own pid_alive/pid_fingerprint -- is unweakened above.
+    # shell-side check any more.
 }
 
 done_testing();

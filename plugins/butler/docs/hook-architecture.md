@@ -1092,27 +1092,7 @@ test deletions); this list is trimmed after each batch to name only what is stil
 pending a later batch (C-E1), so it stays the coverage test's exact to-do list rather than a permanent
 historical record.
 
-Scripts and shims whose only callers are retired, pending batch E1:
-
-- `plugins/butler/scripts/bp-continuity.pl` (replaced by butler-continuity.pl)
-- `plugins/butler/scripts/bp-watch.pl` (replaced by the holder and the gate)
-- `plugins/butler/scripts/bp-resumption.pl` (only gate-continuity.sh called it)
-- `plugins/butler/scripts/bp-session.pl` (nonce claim for the old arm path; tickets and stop tokens replace it)
-- `plugins/butler/bin/bp-continuity.sh`
-- `plugins/butler/bin/bp-watch.sh`
-
-Tests whose whole subject is deleted, pending batch C or E1. Their live assertions are re-expressed by
-stop-gate-single.t, stop-gate-coordinator-ledger.t, continuity-command-verbs.t, continuity-holder.t,
-continuity-arm-on-entry.t, continuity-lease-follows-arm.t, dispatch-binding.t, guards-per-subagent.t
-and guards-remake-suite.t.
-
-- `plugins/butler/tests/t/bp-watch-decision-core.t`
-- `plugins/butler/tests/t/watcher-probe-liveness.t`
-- `plugins/butler/tests/t/continuity-toggle.t`
-- `plugins/butler/tests/t/continuity-bounded-hold.t`
-- `plugins/butler/tests/t/continuity-output-stays-parseable.t`
-- `plugins/butler/tests/t/disarm-nonce-guard.t`
-- `plugins/butler/tests/t/session-identity-binding.t`
+All scripts, shims and tests on this list have been deleted (batches A through E1).
 
 Runtime state is not in git and is not deleted by 16. Once the files above are gone nothing reads it:
 the three machine registries, the `.subagent-guard/<session>` stall state, the `.watchers/`
