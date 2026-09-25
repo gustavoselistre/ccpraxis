@@ -1092,17 +1092,11 @@ sub _observe_cache {
     return;
 }
 
-# 08-fleet-on-holder (Decision 19): the fleet's holder switch. Pure, per-call,
-# never cached -- off (unset/empty/anything but exactly "1") means byte-for-
-# byte today's behavior everywhere it is consulted below.
-sub fleet_holder_on {
-    return (defined $ENV{BUTLER_CONCURRENCY} && $ENV{BUTLER_CONCURRENCY} eq '1') ? 1 : 0;
-}
-
 # 08-fleet-on-holder: does $sid have a live, unexpired holder record right
-# now? Checked FIRST is the switch itself -- off means no require, no I/O, no
-# BpHook.pm in %INC. Never dies, never writes. There is deliberately no pid
-# check and no background_tasks check (the orchestrator has no payload); the
+# now? Batch C (spec 16-cutover 2.8): fleet_holder_on is deleted -- the
+# holder path is unconditional now, so this call site behaves as if it always
+# returned 1. Never dies, never writes. There is deliberately no pid check
+# and no background_tasks check (the orchestrator has no payload); the
 # deadline alone bounds the exemption to at most 1h past the last hold/extend.
 #
 # $launched_epoch (optional): the current incarnation's own registry
@@ -1116,7 +1110,6 @@ sub fleet_holder_on {
 # caller can remember it after the hold ends (spec/red-team MEDIUM-1).
 sub coordinator_holding {
     my ($sid, $now, $launched_epoch) = @_;
-    return 0 unless fleet_holder_on();
     return 0 unless defined $sid && $sid =~ /\A[A-Za-z0-9_-]{1,128}\z/;
     my $ok = eval {
         require Cwd;

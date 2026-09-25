@@ -266,22 +266,29 @@ sub coordinator_pid {
     return marker_pid("$runs/$pkg.pid");
 }
 
-# 1 if a solo driver's current-package pointer names this (blueprint, package).
-# $data_root is the reconciler's own resolved data dir.
+# 1 if a solo driver's in-flight set names this (blueprint, package). Batch C
+# (spec 16-cutover 2.8, 1.3 departure #9): re-pointed from current.json to
+# inflight.json -- current.json is gone, and without this the reconciler's
+# solo-driver protection would silently go off. $data_root is the
+# reconciler's own resolved data dir.
 sub solo_claimed {
     my ($data_root, $bp_name, $pkg) = @_;
     return 0 unless defined $data_root && length $data_root;
-    my $path = "$data_root/.drive-solo/current.json";
+    my $path = "$data_root/.drive-solo/inflight.json";
     return 0 unless -f $path;
     my $c = slurp_capped($path, 65536);
     return 0 unless defined $c && length $c && length($c) <= 65536;
     require JSON::PP;
     my $rec = eval { JSON::PP->new->decode($c) };
     return 0 if $@ || ref $rec ne 'HASH';
-    return 0 unless defined $rec->{package} && !ref($rec->{package}) && $rec->{package} eq $pkg;
-    my $rec_bp = $rec->{blueprint};
-    return 1 if !defined $rec_bp || (!ref($rec_bp) && $rec_bp eq '');
-    return 1 if !ref($rec_bp) && $rec_bp eq $bp_name;
+    return 0 unless ref $rec->{packages} eq 'ARRAY';
+    for my $e (@{ $rec->{packages} }) {
+        next unless ref $e eq 'HASH';
+        next unless defined $e->{package} && !ref($e->{package}) && $e->{package} eq $pkg;
+        my $rec_bp = $e->{blueprint};
+        return 1 if !defined $rec_bp || (!ref($rec_bp) && $rec_bp eq '');
+        return 1 if !ref($rec_bp) && $rec_bp eq $bp_name;
+    }
     return 0;
 }
 

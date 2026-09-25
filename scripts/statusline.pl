@@ -419,51 +419,26 @@ my %WORD_COLOR = ( sandbox => $MUTED, host => $PRIMARY );
 my $env  = $SANDBOX_ON ? 'sandbox' : 'host';
 my $word = $MARKER{$env};
 
-# ── Continuity badge (g01-explicit-continuity-arming) ────────
+# ── Continuity badge ─────────────────────────────────────────
 # Per-session, keyed by the documented top-level `session_id` field of the
 # stdin JSON (spec SS2.6/AC-7).
 #
-# IT TRACKED THE ARMING COMMAND, NOT CONTINUITY (operator, 2026-08-25: "it
-# only appears when I manually toggle it on with the command, doesn't appear
-# when other sources have also turned it on"). It read ONE registry --
-# .continuity-active, written only by bp-continuity.pl's arm -- while butler
-# runs THREE per-session registries, each backing a Stop gate that will refuse
-# to let this session's turn end:
+# Batch C (spec 16-cutover, criterion C-8, 1.3 departure #8): the three old
+# per-session registries (.continuity-active, .drive-solo-active,
+# .reporter-active) are gone. The badge now reads the ONE new-store arm file,
+# <state>/armed/<sid>, the same file BpHook's arm-on-entry hook and
+# BpContinuityLease::new_store_active both read. "Why can't this turn end" is
+# answered by whether that one file exists for this session, full stop.
 #
-#   .continuity-active   gate-continuity.sh    explicit arm / /butler:continuity
-#   .drive-solo-active   gate-drive-loop.sh    a /butler:drive-solo DRIVER session
-#   .reporter-active     gate-drive-loop.sh    a registered reporter session
-#
-# So a session driving a blueprint was gated exactly as hard as an armed one
-# and the badge said nothing. A status indicator that is silent while the
-# state it reports is live does not merely omit -- it tells you the gate is
-# off. All three are now read, and the badge names WHICH, because "why can't
-# this turn end" is the question it exists to answer.
-#
-# Path resolution is duplicated from lib.sh's bp_continuity_active_dir /
-# bp_drive_active_dir / bp_reporter_active_dir, ON PURPOSE -- this file stays a
-# standalone installed payload (no require of anything under plugins/). They
-# must resolve identically for a given environment; AC-13 pins that parity for
-# the continuity one, and the other two are the same rule with a different leaf
-# and a different override variable.
-#
-# PATH RESOLUTION (fix-batch F1) -- override, else $HOME, else $USERPROFILE,
-# else UNRESOLVABLE. This file is a READ path only (it never writes a marker),
-# so unlike bp-continuity.pl it must never hard-fail the statusline over this --
-# "unresolvable" degrades to "badge renders unarmed", which is truthful rather
-# than a fourth guess: if the directory can never be resolved here, the writer
-# could never have resolved it either (same rule), so it could never have
-# written a live marker for this badge to miss.
+# PATH RESOLUTION duplicates BpHook::state_dir()'s rule ON PURPOSE -- this
+# file stays a standalone installed payload (no require of anything under
+# plugins/). BUTLER_STATE_DIR if absolute (a relative value is UNRESOLVABLE,
+# never guessed at), else $HOME then $USERPROFILE, each plus
+# /.claude/butler-state/continuity.
 #
 # NO TTL IS APPLIED HERE, deliberately and as before. Reaping a stale marker is
-# the hooks' job (bp_continuity_any_active and its siblings sweep the whole
-# registry on every Stop event, owner-independently). A read path that
-# second-guessed the reaper would disagree with the gate, which is the one thing
-# this badge must never do.
-# ABSOLUTE, OR UNRESOLVED -- the same rule lib.sh's bp_is_absolute_path applies.
-# This copy used to accept any non-empty value, so a relative override lit the
-# badge off a marker the gate would never read: the badge would claim a watch
-# that was not happening, which is the one thing it must never do.
+# the hooks' job. A read path that second-guessed the reaper would disagree
+# with the gate, which is the one thing this badge must never do.
 sub _bp_is_absolute_path {
     my ($v) = @_;
     return 0 unless defined $v && length $v;
@@ -478,14 +453,20 @@ sub _bp_is_absolute_path {
     return 0;
 }
 
-sub _registry_dir {
-    my ($override, $leaf) = @_;
-    my $v = $ENV{$override};
-    return $v if _bp_is_absolute_path($v);
-    return undef if defined $v && length $v;   # set but relative
+# _state_dir() -- BpHook::state_dir()'s rule, duplicated (see header above).
+sub _state_dir {
+    my $bsd = $ENV{BUTLER_STATE_DIR};
+    if (defined $bsd && length $bsd) {
+        return undef unless _bp_is_absolute_path($bsd);
+        (my $v = $bsd) =~ s{/+$}{};
+        $v =~ tr{\\}{/};
+        return "$v/continuity";
+    }
     for my $home ($ENV{HOME}, $ENV{USERPROFILE}) {
         next unless _bp_is_absolute_path($home);
-        return "$home/.claude/ccpraxis/$leaf";
+        (my $v = $home) =~ s{/+$}{};
+        $v =~ tr{\\}{/};
+        return "$v/.claude/butler-state/continuity";
     }
     return undef;
 }
@@ -493,22 +474,11 @@ sub _registry_dir {
 my $sid = $data->{session_id};
 $sid = '' unless defined $sid && !ref($sid) && $sid =~ m{\A[^/\\\0]+\z} && $sid !~ /\.\./;
 
-# Order is PRECEDENCE, most explicit first: an operator who armed continuity by
-# hand is told that, even if this session also happens to be driving.
-my @WATCHERS = (
-    [ 'CCPRAXIS_CONTINUITY_ACTIVE_DIR', '.continuity-active',  'watched'   ],
-    [ 'CCPRAXIS_DRIVE_ACTIVE_DIR',      '.drive-solo-active',  'driving'   ],
-    [ 'CCPRAXIS_REPORTER_ACTIVE_DIR',   '.reporter-active',    'reporting' ],
-);
 my $badge_word = '';
 if (length $sid) {
-    for my $w (@WATCHERS) {
-        my ($override, $leaf, $word) = @$w;
-        my $dir = _registry_dir($override, $leaf);
-        next unless defined $dir;
-        next unless -f "$dir/$sid";
-        $badge_word = $word;
-        last;
+    my $state = _state_dir();
+    if (defined $state && -f "$state/armed/$sid") {
+        $badge_word = 'watched';
     }
 }
 

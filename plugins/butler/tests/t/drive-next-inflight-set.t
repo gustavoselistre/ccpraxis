@@ -198,8 +198,9 @@ my ($data1, $dsdir1);
     is_deeply([map { $_->{package} } @{ arrf($set2) }], ['p1-a', 'p2-b'],
         'AC-1 (done criterion 1): both disjoint packages appear in the set, in order');
 
-    my $cur = read_json("$dsdir1/current.json");
-    is($cur->{package}, 'p2-b', 'AC-1: current.json names the just-handed p2-b');
+    # AC-1 (DEL, C-2): current.json no longer exists; the director never
+    # creates it, so there is nothing to read here any more.
+    ok(!-e "$dsdir1/current.json", 'AC-1 (-> C-2): current.json is never created');
 
     # ── AC-6: schema ─────────────────────────────────────────────────────────
     is_deeply([sort keys %$set2], [qw(packages updated_at)],
@@ -235,8 +236,7 @@ my ($data1, $dsdir1);
     my $set3 = read_json("$dsdir1/inflight.json");
     is_deeply([map { $_->{package} } @{ arrf($set3) }], ['p1-a', 'p2-b'],
         'AC-2: the set is unchanged by an in-flight call');
-    my $cur3 = read_json("$dsdir1/current.json");
-    is($cur3->{package}, 'p2-b', 'AC-2: current.json is unchanged by an in-flight call');
+    ok(!-e "$dsdir1/current.json", 'AC-2 (DEL, C-2): current.json is still never created');
 
     my ($rc4, $out4) = run_next($data1, ['next', '--scope', 'all'], { now => sub { $NOW3 } });
     is($rc4, 0, 'AC-2: repeated call 4 exits 0');
@@ -368,11 +368,13 @@ ac3_case('parked');
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# AC-5: switch off — one package at a time, exactly as today, for every
-# off-spelling (unset, '0', 'true', '').
+# AC-5 (batch C, spec 16-cutover C-1, reason SW): the switch is gone --
+# BUTLER_CONCURRENCY unset, '0', 'true', '' or '1' all give the SAME
+# concurrent-hand-out result. Two disjoint ready packages are both handed out
+# and both land in the set, regardless of the variable's value.
 # ═══════════════════════════════════════════════════════════════════════════
-for my $off_value (undef, '0', 'true', '') {
-    my $label = defined $off_value ? "'$off_value'" : 'unset';
+for my $conc_value (undef, '0', 'true', '', '1') {
+    my $label = defined $conc_value ? "'$conc_value'" : 'unset';
     my $data = tempdir(CLEANUP => 1);
     make_bp_dir($data, 'bpx', [
         { key => 'p1-a', status => 'pending', write_set => 'a/' },
@@ -384,92 +386,26 @@ for my $off_value (undef, '0', 'true', '') {
     write_json("$dsdir/order.json", { order => ['bpx'], recorded_at => $NOW });
 
     local $ENV{BUTLER_CONCURRENCY};
-    if (defined $off_value) { $ENV{BUTLER_CONCURRENCY} = $off_value; }
-    else                    { delete $ENV{BUTLER_CONCURRENCY}; }
-
-    my $expected_line = $J->encode({ action => 'run-package', blueprint => 'bpx', package => 'p1-a' }) . "\n";
+    if (defined $conc_value) { $ENV{BUTLER_CONCURRENCY} = $conc_value; }
+    else                     { delete $ENV{BUTLER_CONCURRENCY}; }
 
     my ($rc1, $out1) = run_next($data, ['next', '--scope', 'all'], { now => sub { $NOW } });
-    is($rc1, 0, "AC-5(off=$label): call 1 exits 0");
-    is($out1, $expected_line, "AC-5(off=$label) B7: call 1 stdout is byte-identical to today's run-package p1-a");
+    is($rc1, 0, "SW(conc=$label): call 1 exits 0");
+    my $a1 = decode_line($out1);
+    is($a1->{action}, 'run-package', "SW(conc=$label): call 1 hands out p1-a");
+    is($a1->{package}, 'p1-a', "SW(conc=$label): call 1 package is p1-a");
 
     my ($rc2, $out2) = run_next($data, ['next', '--scope', 'all'], { now => sub { $NOW + 37 } });
-    is($rc2, 0, "AC-5(off=$label): call 2 exits 0");
-    is($out2, $expected_line, "AC-5(off=$label) B7: call 2 re-issues run-package p1-a again (today's behaviour)");
+    is($rc2, 0, "SW(conc=$label): call 2 exits 0");
+    my $a2 = decode_line($out2);
+    is($a2->{action}, 'run-package', "SW(conc=$label) (-> C-1): a SECOND disjoint ready package is handed "
+        . 'regardless of BUTLER_CONCURRENCY\'s value');
+    is($a2->{package}, 'p2-b', "SW(conc=$label): call 2 hands the disjoint p2-b, not a re-issue of p1-a");
 
     my $set = read_json("$dsdir/inflight.json");
-    is(scalar(@{ arrf($set) }), 1, "AC-5(off=$label) (done criterion 1): switch off leaves exactly one entry");
-    is($set->{packages}[0]{package}, 'p1-a', "AC-5(off=$label): the one entry is p1-a");
-    is($set->{packages}[0]{since}, $NOW, "AC-5(off=$label): since is unchanged across the repeated call");
-}
-
-{   # B8: switch off, p1-a running -> hands p2-b; set replaced to one entry
-    my $data = tempdir(CLEANUP => 1);
-    make_bp_dir($data, 'bpx', [
-        { key => 'p1-a', status => 'running', write_set => 'a/' },
-        { key => 'p2-b', status => 'pending', write_set => 'b/' },
-        { key => 'p3-c', status => 'pending', write_set => 'a/sub/' },
-    ]);
-    my $dsdir = "$data/.drive-solo";
-    make_path($dsdir);
-    write_json("$dsdir/order.json", { order => ['bpx'], recorded_at => $NOW });
-
-    local $ENV{BUTLER_CONCURRENCY} = '0';
-    my ($rc, $out) = run_next($data, ['next', '--scope', 'all'], { now => sub { $NOW } });
-    is($rc, 0, 'AC-5(B8): exits 0');
-    my $act = decode_line($out);
-    is($act->{action}, 'run-package', 'AC-5(B8): today: p2-b handed (running set [] under the switch)');
-    is($act->{package}, 'p2-b', 'AC-5(B8): p2-b is the handed package');
-
-    my $set = read_json("$dsdir/inflight.json");
-    is(scalar(@{ arrf($set) }), 1, 'AC-5(B8): set replaced to exactly one entry');
-    is($set->{packages}[0]{package}, 'p2-b', 'AC-5(B8): that entry is p2-b');
-}
-
-{   # B9: switch off, inflight.json pre-seeded with two pending entries ->
-    # hand-out ignores the set; the written set is exactly [p1-a]
-    my $data = tempdir(CLEANUP => 1);
-    make_bp_dir($data, 'bpx', [
-        { key => 'p1-a', status => 'pending', write_set => 'a/' },
-        { key => 'p2-b', status => 'pending', write_set => 'b/' },
-    ]);
-    my $dsdir = "$data/.drive-solo";
-    make_path($dsdir);
-    write_json("$dsdir/order.json", { order => ['bpx'], recorded_at => $NOW });
-    write_json("$dsdir/inflight.json", { packages => [
-        { blueprint => 'bpx', package => 'p1-a', ledger => ledger_prefix($data, 'bpx', 'p1-a'), since => $NOW - 100 },
-        { blueprint => 'bpx', package => 'p2-b', ledger => ledger_prefix($data, 'bpx', 'p2-b'), since => $NOW - 100 },
-    ], updated_at => $NOW - 100 });
-
-    local $ENV{BUTLER_CONCURRENCY} = '';
-    my ($rc, $out) = run_next($data, ['next', '--scope', 'all'], { now => sub { $NOW } });
-    is($rc, 0, 'AC-5(B9): exits 0');
-    my $act = decode_line($out);
-    is($act->{action}, 'run-package', 'AC-5(B9): the set is ignored for hand-out under the switch');
-    is($act->{package}, 'p1-a', 'AC-5(B9): today: p1-a (sorted first) is handed regardless of the seeded set');
-
-    my $set = read_json("$dsdir/inflight.json");
-    is_deeply([map { $_->{package} } @{ arrf($set) }], ['p1-a'],
-        'AC-5(B9): the written set is exactly [p1-a]');
-}
-
-{   # B10: switch off, single-package blueprint at running -> exact in-flight bytes
-    my $data = tempdir(CLEANUP => 1);
-    make_bp_dir($data, 'bpx', [
-        { key => 'p1-a', status => 'running', write_set => 'a/' },
-    ]);
-    my $dsdir = "$data/.drive-solo";
-    make_path($dsdir);
-    write_json("$dsdir/order.json", { order => ['bpx'], recorded_at => $NOW });
-
-    local $ENV{BUTLER_CONCURRENCY};
-    delete $ENV{BUTLER_CONCURRENCY};
-    my ($rc, $out) = run_next($data, ['next', '--scope', 'all'], { now => sub { $NOW } });
-    is($rc, 0, 'AC-5(B10): exits 0');
-    my $expected = $J->encode({ action => 'in-flight', blueprint => 'bpx', packages => ['p1-a'], running => ['p1-a'] }) . "\n";
-    is($out, $expected, 'AC-5(B10): exact bytes, no inflight key with the switch off');
-    my $act = decode_line($out);
-    ok(!exists $act->{inflight}, 'AC-5(B10): no inflight key with the switch off');
+    is(scalar(@{ arrf($set) }), 2, "SW(conc=$label): both disjoint packages land in the set");
+    is_deeply([sort map { $_->{package} } @{ arrf($set) }], ['p1-a', 'p2-b'],
+        "SW(conc=$label): the set holds exactly p1-a and p2-b");
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -505,10 +441,13 @@ for my $off_value (undef, '0', 'true', '') {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# AC-8: load & repair — a corrupt file (B12) and a missing file (B13) are
-# both rebuilt trustworthily from current.json.
+# AC-8 (batch C, spec 16-cutover 1.3 departure #10, reason DEL): a corrupt
+# file (B12) and a missing file (B13) are rebuilt from SCRATCH -- the
+# current.json seeding path is removed outright (not kept as a migration
+# path), so a pre-existing current.json is simply ignored and the first
+# ready package (sorted) is handed instead of whatever current.json named.
 # ═══════════════════════════════════════════════════════════════════════════
-{   # B12: corrupt inflight.json
+{   # B12: corrupt inflight.json, current.json present but IGNORED
     my $data = tempdir(CLEANUP => 1);
     make_bp_dir($data, 'bpx', [
         { key => 'p1-a', status => 'pending', write_set => 'a/' },
@@ -521,12 +460,11 @@ for my $off_value (undef, '0', 'true', '') {
     write_json("$dsdir/current.json", { blueprint => 'bpx', package => 'p1-a', recorded_at => $R });
     write_raw("$dsdir/inflight.json", "{not json");
 
-    local $ENV{BUTLER_CONCURRENCY} = '1';
     my ($rc, $out) = run_next($data, ['next', '--scope', 'all'], { now => sub { $NOW } });
     is($rc, 0, 'AC-8(B12): exits 0 despite a corrupt inflight.json');
     my $act = decode_line($out);
-    is($act->{action}, 'run-package', 'AC-8(B12): p1-a is seeded, not re-handed; p2-b is handed instead');
-    is($act->{package}, 'p2-b', 'AC-8(B12): p2-b handed');
+    is($act->{action}, 'run-package', 'AC-8(B12) (DEL, C-9): a fresh ready package is handed -- current.json is never consulted');
+    is($act->{package}, 'p1-a', 'AC-8(B12) (DEL): p1-a is handed as the first ready package, not "seeded"');
 
     my $run_md = read_file("$dsdir/run.md");
     like($run_md, qr/WARN malformed JSON in .*inflight\.json/, 'AC-8(B12): run.md gains the existing malformed-JSON WARN line');
@@ -534,11 +472,11 @@ for my $off_value (undef, '0', 'true', '') {
     my $set = read_json("$dsdir/inflight.json");
     ok(defined $set, 'AC-8(B12): inflight.json is rewritten as valid JSON');
     my ($p1e) = grep { $_->{package} eq 'p1-a' } @{ arrf($set) };
-    ok(defined $p1e, 'AC-8(B12): p1-a is present as the seeded entry');
-    is($p1e->{since}, $R, 'AC-8(B12): the seeded entry keeps recorded_at as since');
+    ok(defined $p1e, 'AC-8(B12): p1-a is present as the freshly-handed entry');
+    is($p1e->{since}, $NOW, 'AC-8(B12) (DEL): since is the CURRENT call\'s clock, not current.json\'s stale recorded_at');
 }
 
-{   # B13a: missing inflight.json, current.json names a non-terminal package
+{   # B13a: missing inflight.json, current.json present but IGNORED
     my $data = tempdir(CLEANUP => 1);
     make_bp_dir($data, 'bpx', [
         { key => 'p1-a', status => 'pending', write_set => 'a/' },
@@ -550,17 +488,16 @@ for my $off_value (undef, '0', 'true', '') {
     my $R = $NOW - 300;
     write_json("$dsdir/current.json", { blueprint => 'bpx', package => 'p1-a', recorded_at => $R });
 
-    local $ENV{BUTLER_CONCURRENCY} = '1';
     my ($rc, $out) = run_next($data, ['next', '--scope', 'all'], { now => sub { $NOW } });
     is($rc, 0, 'AC-8(B13a): exits 0 with no prior inflight.json');
     my $act = decode_line($out);
-    is($act->{action}, 'run-package', 'AC-8(B13a): p1-a seeded and not re-handed; p2-b handed');
-    is($act->{package}, 'p2-b', 'AC-8(B13a): p2-b handed');
+    is($act->{action}, 'run-package', 'AC-8(B13a) (DEL): p1-a handed as the first ready package');
+    is($act->{package}, 'p1-a', 'AC-8(B13a) (DEL): p1-a handed');
 
     my $set = read_json("$dsdir/inflight.json");
     my ($p1e) = grep { $_->{package} eq 'p1-a' } @{ arrf($set) };
-    ok(defined $p1e, 'AC-8(B13a): p1-a present, seeded from current.json');
-    is($p1e->{since}, $R, 'AC-8(B13a): since = current.json recorded_at');
+    ok(defined $p1e, 'AC-8(B13a): p1-a present');
+    is($p1e->{since}, $NOW, 'AC-8(B13a) (DEL, C-9): since = this call\'s clock, current.json\'s recorded_at is never consulted');
 }
 
 {   # B13b: missing inflight.json, no current.json, no hand-out this call
@@ -572,7 +509,6 @@ for my $off_value (undef, '0', 'true', '') {
     make_path($dsdir);
     # deliberately no order.json -> need-order, no run-package
 
-    local $ENV{BUTLER_CONCURRENCY} = '1';
     my ($rc, $out) = run_next($data, ['next', '--scope', 'bpx'], { now => sub { $NOW } });
     is($rc, 0, 'AC-8(B13b): exits 0');
     my $act = decode_line($out);
@@ -602,7 +538,7 @@ for my $off_value (undef, '0', 'true', '') {
     is($act->{action}, 'run-package', 'AC-9(B14): the action is unaffected by the write failure');
     is($act->{package}, 'p1-a', 'AC-9(B14): p1-a still handed');
 
-    ok(-e "$dsdir/current.json", 'AC-9(B14): current.json is still written');
+    ok(!-e "$dsdir/current.json", 'AC-9(B14) (DEL, C-2): current.json is never written');
     my $run_md = read_file("$dsdir/run.md");
     like($run_md, qr/WARN inflight\.json write failed/, 'AC-9(B14): run.md gains the write-failure WARN line');
 }
@@ -702,8 +638,10 @@ for my $off_value (undef, '0', 'true', '') {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# AC-11 (B18): current.json is removed on `stop`, but inflight.json entries
-# are left exactly as they were (entries leave only via prune).
+# AC-11 (B18) (batch C, spec 16-cutover C-2, reason DEL): a pre-existing
+# current.json is left byte-identical by `stop` -- the director never reads
+# or removes it any more -- and inflight.json entries are left exactly as
+# they were (entries leave only via prune).
 # ═══════════════════════════════════════════════════════════════════════════
 {
     my $data = tempdir(CLEANUP => 1);
@@ -718,8 +656,8 @@ for my $off_value (undef, '0', 'true', '') {
         { blueprint => 'bpx', package => 'p1-a', ledger => ledger_prefix($data, 'bpx', 'p1-a'), since => $NOW - 10 },
     ], updated_at => $NOW - 10 });
     my $before = read_file("$dsdir/inflight.json");
+    my $current_before = read_file("$dsdir/current.json");
 
-    local $ENV{BUTLER_CONCURRENCY} = '1';
     my ($rc, $out) = run_next($data, ['next', '--scope', 'all'], {
         now      => sub { $NOW },
         verdict  => sub { { action => 'pause-token', until_epoch => undef, reason => 'token' } },
@@ -729,9 +667,10 @@ for my $off_value (undef, '0', 'true', '') {
     my $act = decode_line($out);
     is($act->{action}, 'stop', 'AC-11(B18): a failed token refresh stops the run');
 
-    ok(!-e "$dsdir/current.json", 'AC-11(B18): current.json is removed exactly as today');
+    is(read_file("$dsdir/current.json"), $current_before,
+        'AC-11(B18) (DEL, C-2): a pre-existing current.json is left byte-identical -- the director never removes it');
     my $after = read_file("$dsdir/inflight.json");
-    is($after, $before, 'AC-11 (done criterion: current.json kept exactly as today until 16): inflight.json entries are untouched by stop');
+    is($after, $before, 'AC-11: inflight.json entries are untouched by stop');
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -743,7 +682,10 @@ for my $off_value (undef, '0', 'true', '') {
     is($rc, 0, 'AC-12: --help exits 0');
 
     like($out, qr/inflight\.json/, 'AC-12: --help documents inflight.json');
-    like($out, qr/BUTLER_CONCURRENCY/, 'AC-12: --help documents the BUTLER_CONCURRENCY switch');
+    unlike($out, qr/BUTLER_CONCURRENCY/,
+        'AC-12 (DEL, batch C): --help no longer documents BUTLER_CONCURRENCY -- concurrent hand-out is unconditional');
+    unlike($out, qr/current\.json/,
+        'AC-12 (DEL, batch C): --help no longer documents current.json -- it is gone');
 
     like($out, qr/next\s+--scope/, 'AC-12: --help still contains "next --scope" subcommand');
     like($out, qr/record-order/,   'AC-12: --help still contains "record-order" subcommand');

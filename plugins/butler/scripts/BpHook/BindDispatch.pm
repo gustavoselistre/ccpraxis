@@ -163,14 +163,9 @@ sub _inflight_members {
         return @members;
     }
 
-    my $current = _read_json_file("$d/.drive-solo/current.json");
-    if (ref $current eq 'HASH') {
-        my $bp  = $current->{blueprint};
-        my $pkg = $current->{package};
-        if (_member_ok($bp) && _member_ok($pkg)) {
-            return ({ bp => $bp, pkg => $pkg });
-        }
-    }
+    # Batch C (spec 16-cutover, sec 2.5): the current.json fallback is
+    # deleted -- no inflight.json (or one that does not parse) means zero
+    # members, never a seed from the retired pointer file.
     return ();
 }
 
@@ -512,14 +507,9 @@ sub _handle_driver {
         return 0;
     }
 
-    # Decision 19: the switch is ON only when BUTLER_CONCURRENCY is exactly
-    # "1". With it off (unset, empty, "0" or anything else), the one-ledger
-    # deny never fires -- but the members rule (which member a prompt names)
-    # is unchanged: an unambiguous match still binds to that member; only an
-    # ambiguous/no-match result, which would otherwise deny, degrades to
-    # binding the first member in set order instead.
-    my $switch_on = (defined $ENV{BUTLER_CONCURRENCY} && $ENV{BUTLER_CONCURRENCY} eq '1') ? 1 : 0;
-
+    # Batch C (spec 16-cutover, sec 2.5): the switch is gone. With two or
+    # more members, an ambiguous or no-match prompt is always denied -- the
+    # "bind the first member instead of denying" fallback no longer exists.
     my $prompt = _prompt_of($p);
 
     # Decision 67: once the prompt tries to declare a ledger at all, ONLY a
@@ -544,12 +534,6 @@ sub _handle_driver {
             _bind($data, $valid[0]{bp}, $valid[0]{pkg}, $p, $tuid);
             return 0;
         }
-        if (!$switch_on) {
-            my $tuid = _tuid_of($p);
-            return 0 unless defined $tuid;
-            _bind($data, $members[0]{bp}, $members[0]{pkg}, $p, $tuid);
-            return 0;
-        }
         return _deny_labelled($data, \@members, (@valid == 0) ? 'none' : 'many');
     }
 
@@ -558,13 +542,6 @@ sub _handle_driver {
         my $tuid = _tuid_of($p);
         return 0 unless defined $tuid;
         _bind($data, $named[0]{bp}, $named[0]{pkg}, $p, $tuid);
-        return 0;
-    }
-
-    if (!$switch_on) {
-        my $tuid = _tuid_of($p);
-        return 0 unless defined $tuid;
-        _bind($data, $members[0]{bp}, $members[0]{pkg}, $p, $tuid);
         return 0;
     }
 

@@ -215,43 +215,13 @@ sub payload {
 }
 
 # ===========================================================================
-# AC-5 -- fleet_holder_on() follows the exact-"1" rule on every call, and
-# flips per-call as %ENV changes mid-process. Calls wrapped in eval: the sub
-# does not exist yet, and one missing sub must not take down this whole file.
+# AC-5 (batch C, spec 16-cutover 2.8, reason SW): fleet_holder_on() is
+# deleted -- the holder path is unconditional now, so there is no switch left
+# to exercise. Proves the sub itself is gone rather than merely inert.
 # ===========================================================================
 {
-    my @cases = (
-        ['unset',   undef],
-        ['empty',   ''],
-        ['zero',    '0'],
-        ['true',    'true'],
-        ['space-1', ' 1'],
-        ['one',     '1'],
-    );
-    for my $c (@cases) {
-        my ($label, $val) = @$c;
-        local %ENV = %ENV;
-        if (defined $val) { $ENV{BUTLER_CONCURRENCY} = $val } else { delete $ENV{BUTLER_CONCURRENCY} }
-        my $r = eval { BpOrch::fleet_holder_on() };
-        my $err = $@;
-        my $expect = ($label eq 'one') ? 1 : 0;
-        diag("died: $err") if $err;
-        is($r, $expect, "AC-5 [$label]: fleet_holder_on() is " . ($expect ? '1' : '0'));
-    }
-    # per-call read: flipping %ENV between two calls flips the result.
-    {
-        local %ENV = %ENV;
-        delete $ENV{BUTLER_CONCURRENCY};
-        my $r1 = eval { BpOrch::fleet_holder_on() };
-        my $e1 = $@;
-        $ENV{BUTLER_CONCURRENCY} = 1;
-        my $r2 = eval { BpOrch::fleet_holder_on() };
-        my $e2 = $@;
-        diag("died: $e1") if $e1;
-        is($r1, 0, 'AC-5: first call (unset) is 0');
-        diag("died: $e2") if $e2;
-        is($r2, 1, 'AC-5: second call, same process, after setting %ENV, is 1');
-    }
+    ok(!defined(&BpOrch::fleet_holder_on),
+        'SW (2.8): BpOrch::fleet_holder_on no longer exists -- the holder path is unconditional');
 }
 
 # ===========================================================================
@@ -313,29 +283,9 @@ sub payload {
     diag("died: $@") if $@;
     is($r_corrupt, 0, 'R9-C1: a corrupt, unparseable JSON record gives 0');
 
-    # switch off, in a fresh CHILD perl -- proves no I/O, no BpHook.pm load.
-    my $sid_off = next_sid();
-    write_holder($root, $sid_off, deadline => $now + 1800);
-    my $code = <<'PERL';
-require $ENV{FLEET08_ORCH};
-my $r = eval { BpOrch::coordinator_holding($ENV{FLEET08_SID}, $ENV{FLEET08_NOW} + 0) };
-my $died = $@ ? 1 : 0;
-my $has_bphook = (grep { /BpHook\.pm$/ } keys %INC) ? 1 : 0;
-print "RESULT=" . (defined $r ? $r : 'undef') . "\n";
-print "DIED=$died\n";
-print "INC_BPHOOK=$has_bphook\n";
-PERL
-    local %ENV = (%ENV, BUTLER_CONCURRENCY => undef, BUTLER_STATE_DIR => $root,
-                  FLEET08_ORCH => $ORCH, FLEET08_SID => $sid_off, FLEET08_NOW => $now);
-    delete $ENV{BUTLER_CONCURRENCY};
-    open(my $fh, '-|', $^X, '-e', $code) or die "spawn child perl: $!";
-    my $out = do { local $/; <$fh> }; close $fh;
-    my ($result) = $out =~ /^RESULT=(\S*)/m;
-    my ($inc)     = $out =~ /^INC_BPHOOK=(\d)/m;
-    is($result, '0', 'AC-6: switch off, in a fresh child perl, coordinator_holding returns 0 even for a valid record')
-        or diag("child stdout: $out");
-    is($inc, '0', 'AC-6: switch off -- BpHook.pm never entered %INC in that child')
-        or diag("child stdout: $out");
+    # Batch C (spec 16-cutover 2.8, reason SW): the switch-off child-perl
+    # case above is retired -- there is no more "switch off" state to prove
+    # a fresh child never loads BpHook.pm for.
 }
 
 # ===========================================================================
@@ -531,16 +481,9 @@ sub run_wedge_sim {
 }
 
 {
-    # AC-8: same wedge fixture, switch OFF -- watchdog_kill_wedged fires on
-    # the first flat tick, and watchdog_flat_held never appears at all.
-    local %ENV = %ENV;
-    delete $ENV{BUTLER_CONCURRENCY};
-    my $r = run_wedge_sim(with_holder => 1, deadline_offset => 1800);
-    like($r->{log}, qr/watchdog_kill_wedged/,
-        'AC-8: switch off -- watchdog_kill_wedged fires on the first flat tick (today\'s behavior, holder present or not)')
-        or diag("err=" . ($r->{err} // '(none)') . "\nlog:\n" . $r->{log});
-    unlike($r->{log}, qr/watchdog_flat_held/,
-        'AC-8: switch off -- watchdog_flat_held never appears in the log');
+    # AC-8 (batch C, spec 16-cutover 2.8, reason SW): the switch-off wedge
+    # fixture is retired -- there is no more "switch off" state in which a
+    # holder is ignored and the coordinator is killed immediately.
 }
 
 # ===========================================================================
@@ -763,7 +706,8 @@ sub run_wedge_sim {
 
 # ===========================================================================
 # AC-11 -- terminal fresh ledger, no holder at all -> 0. A non-terminal
-# ledger without a holder is still refused in BOTH switch states.
+# ledger without a holder is still refused (batch C, spec 16-cutover, reason
+# SW: the "switch off" half is retired -- there is only one behaviour now).
 # ===========================================================================
 {
     my $root = fresh_state_root();
@@ -774,52 +718,46 @@ sub run_wedge_sim {
     my $res = gate_run(payload(next_sid(), background_tasks => []), %env);
     is($res->{rc}, 0, 'AC-11: a terminal, fresh ledger with no holder at all gives 0');
 
-    for my $sw ([undef, 'off'], [1, 'on']) {
-        my ($val, $label) = @$sw;
-        my ($dir2, $led2) = mk_bp('running', 'keep going');
-        my $res2 = gate_run(payload(next_sid()), env_for($dir2, $led2, fresh_state_root()), BUTLER_CONCURRENCY => $val);
-        is($res2->{rc}, 2, "AC-11: a non-terminal ledger with no holder is still refused, switch $label");
-    }
+    my ($dir2, $led2) = mk_bp('running', 'keep going');
+    my $res2 = gate_run(payload(next_sid()), env_for($dir2, $led2, fresh_state_root()));
+    is($res2->{rc}, 2, 'AC-11: a non-terminal ledger with no holder is still refused');
 }
 
 # ===========================================================================
 # AC-12 -- Behavior 11's gate part: force-stop, pause+terminal, pause+shutdown
-# each give an identical verdict and identical file effects with the switch
-# unset and with it 1.
+# (batch C, spec 16-cutover, reason SW: the "switch off"/"switch on" pairing
+# is retired -- there is only one behaviour now, with no BUTLER_CONCURRENCY
+# in the environment at all).
 # ===========================================================================
 {
-    for my $sw ([undef, 'off'], [1, 'on']) {
-        my ($val, $label) = @$sw;
-
+    {
         my ($dir, $led) = mk_bp('running', 'keep going', forcestop => 1);
         my $before = slurp($led);
-        my $res = gate_run(payload(next_sid()), env_for($dir, $led, fresh_state_root()), BUTLER_CONCURRENCY => $val);
-        is($res->{rc}, 0, "AC-12 [force-stop, switch $label]: exit 0");
-        ok(!-e "$dir/runs/p.force-stop", "AC-12 [force-stop, switch $label]: the force-stop file is removed");
-        is(slurp($led), $before, "AC-12 [force-stop, switch $label]: ledger bytes unchanged");
+        my $res = gate_run(payload(next_sid()), env_for($dir, $led, fresh_state_root()));
+        is($res->{rc}, 0, 'AC-12 [force-stop]: exit 0');
+        ok(!-e "$dir/runs/p.force-stop", 'AC-12 [force-stop]: the force-stop file is removed');
+        is(slurp($led), $before, 'AC-12 [force-stop]: ledger bytes unchanged');
     }
 
-    for my $sw ([undef, 'off'], [1, 'on']) {
-        my ($val, $label) = @$sw;
+    {
         my ($dir, $led) = mk_bp('done', 'Reviewed and closed.', paused => 1);
         my $root = fresh_state_root();
         my $sid = next_sid();
         write_holder($root, $sid, deadline => epoch_now() + 1800);
         my $res = gate_run(payload($sid, background_tasks => [{ id => 'A', type => 'subagent', status => 'running' }]),
-            env_for($dir, $led, $root), BUTLER_CONCURRENCY => $val);
-        is($res->{rc}, 2, "AC-12 [pause+terminal, switch $label]: exit 2 even with a live holder");
+            env_for($dir, $led, $root));
+        is($res->{rc}, 2, 'AC-12 [pause+terminal]: exit 2 even with a live holder');
         like((lines_of($res->{err}))[0] // '', qr/a fleet pause is active and status 'done' is terminal/,
-            "AC-12 [pause+terminal, switch $label]: reason names the pause+terminal rule");
-        ok(-e "$dir/runs/.paused", "AC-12 [pause+terminal, switch $label]: .paused left in place");
+            'AC-12 [pause+terminal]: reason names the pause+terminal rule');
+        ok(-e "$dir/runs/.paused", 'AC-12 [pause+terminal]: .paused left in place');
     }
 
-    for my $sw ([undef, 'off'], [1, 'on']) {
-        my ($val, $label) = @$sw;
+    {
         my ($dir, $led) = mk_bp('running', 'keep going', paused => 1, shutdown => 1);
-        my $res = gate_run(payload(next_sid()), env_for($dir, $led, fresh_state_root()), BUTLER_CONCURRENCY => $val);
-        is($res->{rc}, 2, "AC-12 [pause+shutdown, switch $label]: falls through to the ledger rule, exit 2");
+        my $res = gate_run(payload(next_sid()), env_for($dir, $led, fresh_state_root()));
+        is($res->{rc}, 2, 'AC-12 [pause+shutdown]: falls through to the ledger rule, exit 2');
         like((lines_of($res->{err}))[0] // '', qr/status 'running' is not terminal/,
-            "AC-12 [pause+shutdown, switch $label]: the ledger reason");
+            'AC-12 [pause+shutdown]: the ledger reason');
     }
 }
 

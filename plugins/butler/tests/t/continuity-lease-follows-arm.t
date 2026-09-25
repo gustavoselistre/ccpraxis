@@ -233,7 +233,11 @@ sub slurp {
 }
 
 # ===========================================================================
-# L4 -- new store empty, legacy marker present -> still active via legacy
+# L4 (batch C, spec 16-cutover C-6, reason SW): the legacy registry is
+# retired from any_active outright -- a fresh legacy-registry marker ALONE,
+# with the new store empty, no longer holds the lease. A live new-store arm
+# (with a live transcript) is what holds it now, exactly as L1 already
+# proved; this block adds the negative half the old L4 never covered.
 # ===========================================================================
 {
     my $home = fresh_home();
@@ -244,15 +248,25 @@ sub slurp {
     local $BpContinuityLease::PLATFORM         = 'windows';
 
     mk_marker("$legacy/legacysess");
-    is(BpContinuityLease::any_active($legacy), 1,
-       'L4: any_active is 1 with the new store empty and a legacy marker present');
+    is(BpContinuityLease::any_active($legacy), 0,
+       'L4 (-> C-6, SW): any_active is 0 with the new store empty and ONLY a legacy marker present');
     my ($v, $h) = BpContinuityLease::converge($legacy,
-        spawn => sub { open my $w, '>', $_[0] or die $!; print {$w} "1\n"; close $w; 1 },
+        spawn => sub { die "must not spawn -- nothing is armed in the new store\n" },
         powershell_available => sub { 1 });
-    is($v, 'held', 'L4: and converge holds');
+    is($v, 'released', 'L4 (-> C-6, SW): and converge releases -- the legacy marker grants nothing');
+
+    # Positive case: arm the NEW store for the same dir and see the lease
+    # follow it, exactly as C-6 requires.
+    my $sid = 'l4newstore';
+    ok(BpHook::arm($sid, role => 'manual', by => 'on'), 'L4 setup: BpHook::arm succeeds');
+    is(BpContinuityLease::any_active($legacy), 1,
+       'L4 (-> C-6): any_active is 1 once the NEW store has a live armed session');
 
     unlink "$legacy/legacysess";
-    is(BpContinuityLease::any_active($legacy), 0, 'L4: removing the marker releases (any_active is 0)');
+    is(BpContinuityLease::any_active($legacy), 1,
+       'L4: removing the (already-inert) legacy marker changes nothing -- the new store still holds');
+    BpHook::disarm($sid, actor => 'agent', reason => 'a b');
+    is(BpContinuityLease::any_active($legacy), 0, 'L4: disarming the new-store session releases (any_active is 0)');
 }
 
 # ===========================================================================
@@ -511,23 +525,12 @@ sub slurp {
 }
 
 # ===========================================================================
-# R4-L-unreadable (redteam LOW-4) -- when the new store cannot positively
-# confirm an active arm, the wake-lock must not be released just because of
-# that read problem: with no legacy marker, any_active must fall back to
-# whatever it CAN determine, and must never flip a real hold to "released"
-# on account of the new store alone failing to read.
-#
-# This host cannot reproduce a genuine EACCES opendir() failure to order --
-# verified empirically: chmod 0000 on a directory does not block opendir()
-# under Git-for-Windows perl, and pushing the path past Windows's ~260-char
-# MAX_PATH does not either (long-path support is evidently active here).
-# So the strict "-d true, opendir fails" shape LOW-4 names cannot be forced
-# from a test on this machine, and that half of the criterion is UNPINNABLE
-# here (noted in the report, not silently dropped). What IS tested, and
-# fully within reach, is the outer contract the fix exists to protect: the
-# legacy-OR-new-store composition in any_active() must still answer "held"
-# when the legacy registry says so, regardless of what the new store's own
-# read returns.
+# R4-L-unreadable (batch C, spec 16-cutover C-6, reason SW): the
+# legacy-OR-new-store composition this case pinned is deleted along with the
+# legacy registry itself. any_active is single-source now, so a new store
+# that cannot be read (armed/ is a file, not a directory -- a real,
+# ENOTDIR-class opendir() failure) answers 0, exactly as an empty store
+# would, REGARDLESS of a legacy marker (which is no longer consulted at all).
 # ===========================================================================
 {
     my $home = fresh_home();
@@ -538,17 +541,14 @@ sub slurp {
 
     my $root = BpHook::state_dir();
     make_path($root);
-    # armed/ is a FILE, not a directory: new_store_active's own directory
-    # scan cannot succeed against it (a real, portable opendir()-class
-    # failure -- ENOTDIR rather than LOW-4's EACCES, but observably the same
-    # "cannot read armed/" outcome from new_store_active's point of view).
     open my $fh, '>', "$root/armed" or die $!;
     close $fh;
 
-    mk_marker("$legacy/legacysess");   # the legacy registry says armed
+    mk_marker("$legacy/legacysess");   # the legacy registry says armed -- irrelevant now
 
-    is(BpContinuityLease::any_active($legacy), 1,
-       'R4-L-unreadable: any_active still holds via the legacy registry despite a broken new store');
+    is(BpContinuityLease::any_active($legacy), 0,
+       'R4-L-unreadable (-> C-6, SW): any_active is 0 when the new store cannot be read, regardless '
+     . 'of a legacy marker -- the legacy fallback is gone');
 }
 
 done_testing();
