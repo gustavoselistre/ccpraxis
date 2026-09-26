@@ -433,26 +433,26 @@ sub any_active {
 }
 
 # ---------------------------------------------------------------------------
-# active_reason($dir) -> undef | { sid, basis, age, arms }     (package 04)
+# live_arms($root) -> \@list of {sid, basis, age, role, workers}       (05)
 #
-# Same store resolution and liveness rules as any_active/new_store_active,
-# but reports WHICH arm kept the lease active rather than a bare boolean, so
-# the refresher's per-tick log line can name it. Invariant:
-# any_active($dir) == (defined active_reason($dir) ? 1 : 0) for every fixture.
-sub active_reason {
-    my ($dir) = @_;
-    my $root = store_root_for($dir);
-    return undef unless defined $root && length $root;
+# The loop body active_reason used to run inline, made reusable so package
+# 05's journal can list every live session (not just the first) plus its
+# role and its holder's worker ids. $root is the STATE ROOT directly (the
+# same value store_root_for/new_store_active operate on), not the legacy
+# continuity-active dir -- callers that hold a legacy dir resolve it via
+# store_root_for first, exactly as active_reason does below.
+sub live_arms {
+    my ($root) = @_;
+    my @out;
+    return \@out unless defined $root && length $root;
     my $adir = "$root/armed";
-    return undef unless -d $adir;
+    return \@out unless -d $adir;
 
     my $cutoff = time() - ttl_hours() * 3600;
-    opendir(my $dh, $adir) or return undef;
+    opendir(my $dh, $adir) or return \@out;
     my @entries = sort grep { /^[A-Za-z0-9_-]{1,128}$/ } readdir($dh);
     closedir $dh;
 
-    my $count = 0;
-    my $first;
     for my $e (@entries) {
         my $f = "$adir/$e";
         next unless -f $f;
@@ -484,11 +484,38 @@ sub active_reason {
             }
         }
         next unless $live;
-        $count++;
-        $first //= { sid => $e, basis => $basis, age => $age };
+
+        my $role = 'unknown';
+        my $raw = _slurp_small($f);
+        if (defined $raw && length $raw) {
+            my $data = eval { JSON::PP->new->utf8->decode($raw) };
+            $role = $data->{role} if ref $data eq 'HASH' && defined $data->{role} && length $data->{role};
+        }
+        my $workers = [];
+        my $hraw = _slurp_small("$root/holder/$e.json");
+        if (defined $hraw && length $hraw) {
+            my $hdata = eval { JSON::PP->new->utf8->decode($hraw) };
+            $workers = $hdata->{items} if ref $hdata eq 'HASH' && ref $hdata->{items} eq 'ARRAY';
+        }
+        push @out, { sid => $e, basis => $basis, age => $age, role => $role, workers => $workers };
     }
-    return undef unless $first;
-    $first->{arms} = $count;
+    return \@out;
+}
+
+# active_reason($dir) -> undef | { sid, basis, age, arms }     (package 04)
+#
+# Re-expressed (package 05) as "first of live_arms plus arms => scalar
+# @list", exactly as spec 2.5 requires -- its own observable output
+# (sid/basis/age/arms only, no role/workers) is unchanged. Invariant:
+# any_active($dir) == (defined active_reason($dir) ? 1 : 0) for every fixture.
+sub active_reason {
+    my ($dir) = @_;
+    my $root = store_root_for($dir);
+    return undef unless defined $root && length $root;
+    my $list = live_arms($root);
+    return undef unless @$list;
+    my $first = { sid => $list->[0]{sid}, basis => $list->[0]{basis}, age => $list->[0]{age} };
+    $first->{arms} = scalar @$list;
     return $first;
 }
 
@@ -1173,6 +1200,15 @@ sub daemon_loop {
     my $last_gc = 0;
     my $next_handover_try = 0;
     my $did_replace = 0;
+
+    # Package 05: the power journal's per-process probe cache/seq counter,
+    # and the JOURNAL-ERROR repeat-suppression state (spec 2.8: after two
+    # consecutive identical JOURNAL-ERRORs, the same text logs no more than
+    # once per hour, so a persistently-failing journal never fills lease.log).
+    my %journal_cache;
+    my $journal_err_text;
+    my $journal_err_repeats = 0;
+    my $journal_err_logged_at = 0;
     my $snap = code_snapshot();
 
     while (1) {
@@ -1233,6 +1269,40 @@ sub daemon_loop {
         sync($dir, %opts, active => 1, log => $ka_log, owner_winpid => $owner_winpid, owner_desc => $desc);
         $log->('TICK', sprintf('active=1 reason=arm sid=%s basis=%s age=%ss arms=%d',
             $reason_data->{sid}, $reason_data->{basis}, $reason_data->{age}, $reason_data->{arms}));
+
+        # Package 05: the power journal. Windows-platform-only, inside an
+        # eval, so a journal failure (including a failed require) can never
+        # take the refresher down with it -- sync() already ran and the
+        # heartbeat pid file is touched below regardless of what happens here.
+        if (platform() eq 'windows' && (!exists $opts{journal} || $opts{journal})) {
+            my $jopts = (ref $opts{journal_opts} eq 'HASH') ? $opts{journal_opts} : {};
+            my $ok = eval {
+                require "$DIR/BpPowerJournal.pm" unless grep { m{(?:^|/)BpPowerJournal\.pm$} } keys %INC;
+                BpPowerJournal::tick($dir, tick_s => $tick, cache => \%journal_cache, %$jopts);
+                1;
+            };
+            unless ($ok) {
+                my $err = defined $@ && length $@ ? $@ : 'unknown error';
+                $err =~ s/\n.*//s;
+                $err =~ s/[^\x20-\x7e]/?/g;
+                $err = substr($err, 0, 200);
+                my $now_e = time();
+                if (defined $journal_err_text && $journal_err_text eq $err) {
+                    $journal_err_repeats++;
+                    if ($journal_err_repeats >= 2 && ($now_e - $journal_err_logged_at) < 3600) {
+                        # suppressed: same text logged less than an hour ago
+                    } else {
+                        $log->('JOURNAL-ERROR', $err);
+                        $journal_err_logged_at = $now_e;
+                    }
+                } else {
+                    $journal_err_repeats = 0;
+                    $log->('JOURNAL-ERROR', $err);
+                    $journal_err_logged_at = $now_e;
+                }
+                $journal_err_text = $err;
+            }
+        }
 
         my $now = time;
         if (($now - $last_gc) >= $GC_SESSIONS_INTERVAL) {
