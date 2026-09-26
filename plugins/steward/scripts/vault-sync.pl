@@ -37,6 +37,7 @@ use JSON::PP;
 use Sys::Hostname qw(hostname);
 use Encode qw(decode encode);
 use Fcntl qw(:flock O_CREAT O_RDWR);
+use Time::HiRes ();
 use B ();
 
 # STDOUT stays in raw byte mode. JSON::PP->utf8 below emits UTF-8 bytes directly.
@@ -105,6 +106,12 @@ my @DEFAULT_TRACKABLE = (
     # same false alarm was raised three times in one session before somebody
     # wrote it down.
     '.ccpraxis-local-data/guidance',
+    # Almanac stores (Decision 41 / almanac-records package 16). Project stores
+    # are gitignored, so the vault is their only copy off this machine. Note
+    # targets share the reasoning (Decision 8): unversioned, and an internal
+    # note's target exists nowhere else.
+    '.ccpraxis-local-data/almanac',
+    '.ccpraxis-local-data/notes',
     $HOST_MEMORY_REL,                          # host-side memory (synthetic; see local_abs)
 );
 
@@ -194,6 +201,7 @@ elsif ($cmd eq 'status')            { cmd_status() }
 elsif ($cmd eq 'sync-project')      { cmd_sync_project() }
 elsif ($cmd eq 'resolve-conflict')  { cmd_resolve_conflict() }
 elsif ($cmd eq 'commit-and-push')   { cmd_commit_and_push() }
+elsif ($cmd eq 'sync-global-almanac') { cmd_sync_global_almanac() }
 else                                { cmd_help() }
 
 exit 0;
@@ -319,6 +327,27 @@ sub cmd_init {
 sub git_ok_raw {
     # Like vault_git_ok but doesn't pass -C (used for clone/ls-remote where there's no repo yet).
     return _run_silent('git', @_) == 0;
+}
+
+# vault_reset_almanac_notes_index($context) -- Decision 43 / MUST-FIX B
+# (16-mutation-r2): the checked reset shared by EVERY command that is about to
+# commit the real (non-private) index. sync-global-almanac's own commit runs
+# in a private GIT_INDEX_FILE and ends by re-syncing the real index with this
+# same reset (review M2) -- but a crash between that private commit and its
+# own reset, or a stale almanac/notes stage left by any other means, leaves
+# the real index still holding those blobs. Any subsequent whole-index (or
+# unscoped) commit on the real index would then silently carry them along,
+# which is exactly how MF-B's probe deleted almanac/todo/g1.md's record on
+# the remote while leaving only its seal. Called unconditionally at the start
+# of every such command; when the vault isn't initialized yet ($VAULT_DIR/.git
+# absent) it's a no-op, and when there's nothing staged under almanac/notes
+# the reset itself is a no-op too.
+sub vault_reset_almanac_notes_index {
+    my ($context) = @_;
+    return unless -d "$VAULT_DIR/.git";
+    unless (vault_git_ok('reset', '-q', '--', 'almanac', 'notes')) {
+        emit_error("vault: failed to reset almanac/notes on the real index before $context");
+    }
 }
 
 sub write_file_text {
@@ -582,6 +611,11 @@ sub register_fresh {
 
     acquire_lock($VAULT_LOCK) or emit_error("Vault lock held by another session." . lock_refusal_detail());
 
+    # MF-B (16-mutation-r2): reset any stale almanac/notes stage on the real
+    # index BEFORE this command's own whole-index-shaped commit below. See
+    # vault_reset_almanac_notes_index.
+    vault_reset_almanac_notes_index('register --fresh');
+
     # Pull latest before adding our new project entry (avoid push conflict)
     vault_git_ok('fetch', 'origin');
     vault_git_ok('pull', '--rebase', 'origin', $BRANCH);
@@ -651,7 +685,11 @@ sub register_fresh {
     # projects/<slug>/metadata.json → source_notes[].machine, which can be sanitized
     # separately if the user wants.
     my $msg = "Register $slug";
-    unless (vault_git_ok('commit', '-m', $msg)) {
+    # MF-B (16-mutation-r2): scope the commit itself to this command's own
+    # pathspec (--only mode), not just the preceding add. Defense-in-depth on
+    # top of the reset above -- this commit can never carry anything staged
+    # outside projects/$slug/, whatever else is sitting in the real index.
+    unless (vault_git_ok('commit', '-m', $msg, '--', "projects/$slug/")) {
         $rollback->("git commit failed during register (vault may have unrelated dirt)");
     }
     unless (vault_git_ok('push', 'origin', $BRANCH)) {
@@ -673,6 +711,11 @@ sub register_link {
     my ($cwd, $slug) = @_;
 
     acquire_lock($VAULT_LOCK) or emit_error("Vault lock held by another session." . lock_refusal_detail());
+
+    # MF-B (16-mutation-r2): reset any stale almanac/notes stage on the real
+    # index BEFORE this command's own whole-index-shaped commit below. See
+    # vault_reset_almanac_notes_index.
+    vault_reset_almanac_notes_index('register --link');
 
     # Pull latest before mutating vault metadata
     vault_git_ok('fetch', 'origin');
@@ -731,7 +774,9 @@ sub register_link {
         or $rollback->("git add failed for projects/$slug/metadata.json");
     # Fix M1 (red-team): omit hostname from commit message (see register_fresh).
     my $msg = "Link $slug";
-    vault_git_ok('commit', '-m', $msg)
+    # MF-B (16-mutation-r2): scope the commit to its own pathspec (--only
+    # mode), same reasoning as register_fresh.
+    vault_git_ok('commit', '-m', $msg, '--', "projects/$slug/metadata.json")
         or $rollback->("git commit failed during link");
     unless (vault_git_ok('push', 'origin', $BRANCH)) {
         vault_git_ok('reset', '--hard', 'HEAD~1');
@@ -852,8 +897,8 @@ sub cmd_status {
         $vault{remote} = vault_git_output('remote', 'get-url', 'origin') || undef;
         $vault{clean}  = (vault_git_output('status', '--porcelain') eq '') ? JSON::PP::true : JSON::PP::false;
         my ($ahead, $behind) = vault_ahead_behind();
-        $vault{ahead}  = $ahead + 0;
-        $vault{behind} = $behind + 0;
+        $vault{ahead}  = defined $ahead  ? $ahead + 0  : undef;
+        $vault{behind} = defined $behind ? $behind + 0 : undef;
     }
 
     for my $slug (sort keys %{$reg->{projects}}) {
@@ -992,6 +1037,12 @@ sub cmd_sync_project {
     acquire_lock($VAULT_LOCK)            or emit_error("Vault lock held by another session." . lock_refusal_detail());
     acquire_lock("$vproj/.lock")          or emit_error("Project lock for '$slug' held by another session.");
 
+    # SF6 / Decision 43 (see vault_reset_almanac_notes_index): every sync
+    # starts with an unconditional reset of almanac/notes on the REAL index,
+    # so a stale stage left by a crashed sync-global-almanac can never ride
+    # into finalize_commit's project commit.
+    vault_reset_almanac_notes_index('sync-project');
+
     # BEFORE anything judges the vault's cleanliness. An existing vault's
     # .gitignore predates the journal split, so its ops log would read as
     # uncommitted project content and every sync would report drift.
@@ -1019,8 +1070,22 @@ sub cmd_sync_project {
     unless (vault_git_ok('fetch', 'origin')) {
         emit_error("vault fetch failed");
     }
-    unless (vault_git_ok('pull', '--rebase', 'origin', $BRANCH)) {
-        emit_error("vault pull --rebase failed (manual resolution required at $VAULT_DIR)");
+    # `git pull --rebase` refuses on ANY uncommitted index change -- even one
+    # wholly unrelated to this project (an almanac store lock held by an
+    # agent is exactly when a caller is most likely to already have
+    # something else staged) -- and even when there is nothing to rebase
+    # onto. Only actually rebase when this branch is behind origin, same
+    # guard as sync-global-almanac's (spec 2.8) and for the same reason.
+    my (undef, $behind_before) = vault_ahead_behind();
+    # SF1 (16-rereview): fail closed rather than silently skip the pull --
+    # undef means rev-list could not answer (e.g. a missing origin/$BRANCH),
+    # not "not behind".
+    emit_error("vault: could not determine ahead/behind vs. origin/$BRANCH -- refusing to sync")
+        unless defined $behind_before;
+    if ($behind_before > 0) {
+        unless (vault_git_ok('pull', '--rebase', 'origin', $BRANCH)) {
+            emit_error("vault pull --rebase failed (manual resolution required at $VAULT_DIR)");
+        }
     }
 
     my $pmeta = read_json($pmeta_path);
@@ -1032,74 +1097,45 @@ sub cmd_sync_project {
     my %inventory;   # rel_path => { local_exists, vault_exists, cache_exists, is_dir }
     my @skipped_symlinks;
     my @skipped_bad_paths;
+    my @skipped_stores;   # spec 16, 2.4/2.5 -- almanac store dirs skipped this run.
 
-    for my $tp (@{$pmeta->{tracked_paths}}) {
-        unless (validate_relative_path($tp)) {
-            push @skipped_bad_paths, $tp;
-            next;
-        }
-        my $abs_local = local_abs($cwd, $tp);
-        my $abs_vault = vault_file_path($slug, $tp);
-        my $abs_cache = cache_path($cwd, $tp);
-
-        # Collect from local (skip symlinks at top before -d/-f which auto-follow)
-        if (-l $abs_local) {
-            push @skipped_symlinks, $tp;
-        } elsif (-d $abs_local) {
-            walk_dir_into_inventory(\%inventory, $abs_local, $tp, 'local', \@skipped_symlinks, \@skipped_bad_paths);
-        } elsif (-f $abs_local) {
-            add_to_inventory(\%inventory, $tp, 'local') unless is_hard_excluded($tp);
-        }
-
-        # Collect from vault — H14 (red-team): check -l BEFORE -d/-f (which
-        # auto-follow symlinks). Without this, a vault symlink pointing at
-        # /etc/passwd would be hashed and pulled into local on next sync.
-        if (-l $abs_vault) {
-            push @skipped_symlinks, "vault:$tp";
-        } elsif (-d $abs_vault) {
-            walk_dir_into_inventory(\%inventory, $abs_vault, $tp, 'vault', \@skipped_symlinks, \@skipped_bad_paths);
-        } elsif (-f $abs_vault) {
-            add_to_inventory(\%inventory, $tp, 'vault') unless is_hard_excluded($tp);
-        }
-
-        # Cache files
-        if (-l $abs_cache) {
-            push @skipped_symlinks, "cache:$tp";
-        } elsif (-d $abs_cache) {
-            walk_dir_into_inventory(\%inventory, $abs_cache, $tp, 'cache', \@skipped_symlinks, \@skipped_bad_paths);
-        } elsif (-f $abs_cache) {
-            add_to_inventory(\%inventory, $tp, 'cache') unless is_hard_excluded($tp);
-        }
-    }
-
-    # Classify each file
+    # Classify each file. Declared here (ahead of the tracked-paths walk,
+    # rather than after it) so that an almanac store directory found LOCALLY
+    # can be hashed, classified AND staged from inside its own
+    # almanac_store_window callback (spec 16, 2.4/2.5; review M1). Doing this
+    # after the walk, unlocked, is exactly the gap M1 found: a record could be
+    # hashed and staged, then deleted by a concurrent agent before the group
+    # check at commit time noticed, leaving the vault with a record and no
+    # seal. %almanac_handled marks every rel a store window already fully
+    # classified and applied, so the generic per-rel loop and the
+    # group-consistency loop below (which still cover almanac types found only
+    # in the vault or the cache, never locally, since those carry no local
+    # concurrency risk) never touch it again.
     my @auto_applied;
     my @cache_repaired;
     my @conflicts;
     my @file_mod_skipped;
     my $applied = 0;
+    my %computed;   # rel => { action, base_hash, local_hash, vault_hash, abs_local, abs_vault, abs_cache }
+    my %almanac_handled;   # rel => 1 once classified+applied inside a store window
 
-    for my $rel (sort keys %inventory) {
-        next if is_hard_excluded($rel);
-
-        my $abs_local = local_abs($cwd, $rel);
-        my $abs_vault = vault_file_path($slug, $rel);
-        my $abs_cache = cache_path($cwd, $rel);
-
-        my $base_hash  = -f $abs_cache ? hash_file($abs_cache) : '';
-        my $local_hash = -f $abs_local ? hash_file($abs_local) : '';
-        my $vault_hash = -f $abs_vault ? hash_file($abs_vault) : '';
-
-        my $action = classify($base_hash, $local_hash, $vault_hash);
+    # apply_action -- everything the per-file classify used to do inline,
+    # now reusable so an almanac record GROUP (spec 16, 2.5) can defer its
+    # members and apply them together, or emit one conflict for the whole
+    # group instead of one per member.
+    my $apply_action = sub {
+        my ($rel, $c) = @_;
+        my ($action, $base_hash, $local_hash, $vault_hash, $abs_local, $abs_vault, $abs_cache)
+            = @{$c}{qw(action base_hash local_hash vault_hash abs_local abs_vault abs_cache)};
 
         if ($action eq 'skip') {
-            next;
+            return;
         } elsif ($action eq 'push') {
             stage_push($slug, $cwd, $rel, $local_hash);
             $applied++;
             push @auto_applied, { path => $rel, action => 'push' };
         } elsif ($action eq 'pull') {
-            stage_pull($slug, $cwd, $rel, $vault_hash);
+            stage_pull($slug, $cwd, $rel, $vault_hash, $local_hash);
             $applied++;
             push @auto_applied, { path => $rel, action => 'pull' };
         } elsif ($action eq 'cache_only') {
@@ -1133,7 +1169,7 @@ sub cmd_sync_project {
                 push @cache_repaired, $rel;
             }
             else {
-                stage_delete_local($slug, $cwd, $rel);
+                stage_delete_local($slug, $cwd, $rel, $local_hash);
                 $applied++;
                 push @auto_applied, { path => $rel, action => 'delete_local' };
             }
@@ -1160,6 +1196,297 @@ sub cmd_sync_project {
                 merge_result => $merge_result,
             };
         }
+    };
+
+    # classify_and_apply_almanac_store_dir($local_dir) -- called INSIDE an
+    # almanac_store_window callback, so it runs with D/.store and every
+    # present record lock held (spec 16, 2.4). It hashes the local side (the
+    # only side that can race with a concurrent agent), reads the vault and
+    # cache sides directly (no lock needed there -- $VAULT_LOCK already owns
+    # them), groups by record id, and classifies + applies (or emits one group
+    # conflict) before releasing anything. Every rel it touches is marked in
+    # %almanac_handled so it is never reprocessed, unlocked, later.
+    my $classify_and_apply_almanac_store_dir = sub {
+        my ($local_dir, $abs_vault_store, $abs_cache_store, $rel_store) = @_;
+
+        my %local_have = map { ($_, 1) } almanac_local_store_files($local_dir);
+        my %all_names;
+        $all_names{$_} = 1 for keys %local_have;
+        $all_names{$_} = 1 for almanac_store_dir_entries($abs_vault_store);
+        $all_names{$_} = 1 for almanac_store_dir_entries($abs_cache_store);
+
+        my %groups;   # group key => [ basename, ... ]
+        for my $name (sort keys %all_names) {
+            if ($name =~ /^([A-Za-z0-9][A-Za-z0-9._-]*)\.md(?:\.seal)?$/) {
+                push @{$groups{"R:$1"}}, $name;
+            } elsif ($name eq '.reorder-journal.json') {
+                push @{$groups{'J'}}, $name;
+            }
+        }
+
+        # Phase 1 -- HASH EVERY GROUP FIRST, stage nothing yet. This is the
+        # "local hashes taken" half of the lock window: every member's
+        # base/local/vault hash is read while the store lock is held, so the
+        # classification below reflects one consistent instant.
+        my %group_computed;   # group key => { rel => computed-hash }
+        for my $key (sort keys %groups) {
+            my %member_computed;
+            for my $name (@{$groups{$key}}) {
+                my $rel        = "$rel_store/$name";
+                my $abs_local  = "$local_dir/$name";
+                my $abs_vault  = "$abs_vault_store/$name";
+                my $abs_cache  = "$abs_cache_store/$name";
+                my $base_hash  = -f $abs_cache ? hash_file($abs_cache) : '';
+                my $local_hash = $local_have{$name} ? hash_file($abs_local) : '';
+                my $vault_hash = -f $abs_vault ? hash_file($abs_vault) : '';
+
+                my $action = classify($base_hash, $local_hash, $vault_hash);
+                $member_computed{$rel} = $computed{$rel} = {
+                    action => $action, base_hash => $base_hash, local_hash => $local_hash,
+                    vault_hash => $vault_hash, abs_local => $abs_local, abs_vault => $abs_vault,
+                    abs_cache => $abs_cache,
+                };
+                $almanac_handled{$rel} = 1;
+                add_to_inventory(\%inventory, $rel, 'local') if $local_have{$name};
+                add_to_inventory(\%inventory, $rel, 'vault') if -f $abs_vault;
+                add_to_inventory(\%inventory, $rel, 'cache') if -f $abs_cache;
+            }
+            $group_computed{$key} = \%member_computed;
+        }
+
+        # TEST-ONLY seam (Decision 43): every local hash for this store is
+        # now taken; staging (below) has not started. See
+        # _vault_sync_test_pause. Inert unless CCPRAXIS_VAULT_SYNC_TEST_PAUSE
+        # is set.
+        _vault_sync_test_pause();
+
+        # Phase 2 -- classify (conflict vs. apply) and stage, using ONLY the
+        # hashes phase 1 already took under this same lock window.
+        for my $key (sort keys %groups) {
+            my %member_computed = %{ $group_computed{$key} };
+
+            my @actions = map { $_->{action} } values %member_computed;
+            next unless grep { $_ ne 'skip' } @actions;
+
+            my $has_conflict = grep { $_ eq 'conflict' } @actions;
+            my $has_push_dir = grep { $_ eq 'push' || $_ eq 'delete_vault' } @actions;
+            my $has_pull_dir = grep { $_ eq 'pull' || $_ eq 'delete_local' } @actions;
+
+            if ($has_conflict || ($has_push_dir && $has_pull_dir)) {
+                my ($record_rel) = grep { /\.md$/ } keys %member_computed;
+                $record_rel //= (sort keys %member_computed)[0];
+                my $rc = $member_computed{$record_rel};
+                push @conflicts, {
+                    path         => $record_rel,
+                    base         => file_summary($rc->{abs_cache}, $rc->{base_hash}),
+                    local        => file_summary($rc->{abs_local}, $rc->{local_hash}),
+                    vault        => file_summary($rc->{abs_vault}, $rc->{vault_hash}),
+                    is_text      => JSON::PP::true,
+                    merge_result => undef,
+                };
+                next;
+            }
+
+            $apply_action->($_, $member_computed{$_}) for keys %member_computed;
+        }
+
+        # TEST-ONLY seam (Decision 45): staging for this store is now
+        # complete; the store lock window is still open. See
+        # _vault_sync_test_pause_staged. Inert unless
+        # CCPRAXIS_VAULT_SYNC_TEST_PAUSE is set.
+        _vault_sync_test_pause_staged();
+
+        return 1;
+    };
+
+    for my $tp (@{$pmeta->{tracked_paths}}) {
+        unless (validate_relative_path($tp)) {
+            push @skipped_bad_paths, $tp;
+            next;
+        }
+        my $abs_local = local_abs($cwd, $tp);
+        my $abs_vault = vault_file_path($slug, $tp);
+        my $abs_cache = cache_path($cwd, $tp);
+
+        # The almanac root gets its own LOCAL enumeration, per store-type
+        # directory, under the almanac lock protocol (spec 16, 2.4/2.5).
+        # Vault and cache sides need no almanac locks -- vault-sync already
+        # owns them under $VAULT_LOCK -- so they fall through to the normal
+        # walk below, which is eligibility-filtered via is_hard_excluded.
+        if ($tp eq '.ccpraxis-local-data/almanac') {
+            if (-l $abs_local) {
+                push @skipped_symlinks, $tp;
+            } elsif (-d $abs_local) {
+                if (opendir(my $dh, $abs_local)) {
+                    my @type_dirs = sort grep { $_ ne '.' && $_ ne '..' } readdir($dh);
+                    closedir $dh;
+                    for my $type (@type_dirs) {
+                        my $type_dir = "$abs_local/$type";
+                        next unless -d $type_dir || -l $type_dir;
+                        my $rel_store = "$tp/$type";
+                        my $abs_vault_store = vault_file_path($slug, $rel_store);
+                        my $abs_cache_store = cache_path($cwd, $rel_store);
+                        my ($ok, undef, $skip) = almanac_store_window(
+                            $type_dir, $rel_store, 'vault-sync sync-project',
+                            sub {
+                                my ($dir) = @_;
+                                return $classify_and_apply_almanac_store_dir->(
+                                    $dir, $abs_vault_store, $abs_cache_store, $rel_store);
+                            });
+                        push @skipped_stores, $skip unless $ok;
+                    }
+                }
+            }
+
+            if (-l $abs_vault) {
+                push @skipped_symlinks, "vault:$tp";
+            } elsif (-d $abs_vault) {
+                walk_dir_into_inventory(\%inventory, $abs_vault, $tp, 'vault', \@skipped_symlinks, \@skipped_bad_paths);
+            } elsif (-f $abs_vault) {
+                add_to_inventory(\%inventory, $tp, 'vault') unless is_hard_excluded($tp);
+            }
+
+            if (-l $abs_cache) {
+                push @skipped_symlinks, "cache:$tp";
+            } elsif (-d $abs_cache) {
+                walk_dir_into_inventory(\%inventory, $abs_cache, $tp, 'cache', \@skipped_symlinks, \@skipped_bad_paths);
+            } elsif (-f $abs_cache) {
+                add_to_inventory(\%inventory, $tp, 'cache') unless is_hard_excluded($tp);
+            }
+
+            next;
+        }
+
+        # Collect from local (skip symlinks at top before -d/-f which auto-follow)
+        if (-l $abs_local) {
+            push @skipped_symlinks, $tp;
+        } elsif (-d $abs_local) {
+            walk_dir_into_inventory(\%inventory, $abs_local, $tp, 'local', \@skipped_symlinks, \@skipped_bad_paths);
+        } elsif (-f $abs_local) {
+            add_to_inventory(\%inventory, $tp, 'local') unless is_hard_excluded($tp);
+        }
+
+        # Collect from vault — H14 (red-team): check -l BEFORE -d/-f (which
+        # auto-follow symlinks). Without this, a vault symlink pointing at
+        # /etc/passwd would be hashed and pulled into local on next sync.
+        if (-l $abs_vault) {
+            push @skipped_symlinks, "vault:$tp";
+        } elsif (-d $abs_vault) {
+            walk_dir_into_inventory(\%inventory, $abs_vault, $tp, 'vault', \@skipped_symlinks, \@skipped_bad_paths);
+        } elsif (-f $abs_vault) {
+            add_to_inventory(\%inventory, $tp, 'vault') unless is_hard_excluded($tp);
+        }
+
+        # Cache files
+        if (-l $abs_cache) {
+            push @skipped_symlinks, "cache:$tp";
+        } elsif (-d $abs_cache) {
+            walk_dir_into_inventory(\%inventory, $abs_cache, $tp, 'cache', \@skipped_symlinks, \@skipped_bad_paths);
+        } elsif (-f $abs_cache) {
+            add_to_inventory(\%inventory, $tp, 'cache') unless is_hard_excluded($tp);
+        }
+    }
+
+    # A rel under a SKIPPED store must never be touched, on any side (spec
+    # 16, 2.4's Failure clause: "no file under D is hashed, staged, pulled,
+    # deleted, cached or git-added, on any side"). %almanac_handled alone
+    # does not cover this -- it only marks what a store window actually
+    # classified, and a skipped store's callback never ran, so its rels
+    # would otherwise fall through to the generic loops below, which read
+    # $abs_local straight off the filesystem with NO regard for the lock
+    # that was never acquired. That is precisely the gap that let a
+    # concurrently-modified record inside a SKIPPED store still get hashed,
+    # classified as a push and staged, unlocked, by the very code path this
+    # skip exists to keep out.
+    my %almanac_skipped_rel;   # rel => 1 for every rel under a skipped store
+    if (@skipped_stores) {
+        my @prefixes = map { $_->{path} } @skipped_stores;
+        for my $rel (keys %inventory) {
+            for my $p (@prefixes) {
+                if (index($rel, "$p/") == 0) {
+                    $almanac_skipped_rel{$rel} = 1;
+                    last;
+                }
+            }
+        }
+    }
+
+    # Almanac record groups (spec 16, 2.5) for anything NOT already handled
+    # inside a store window above -- i.e. an almanac type directory that
+    # exists only in the vault or only in the cache, never locally, which
+    # carries no local-concurrency risk (there is nothing on this machine an
+    # agent could be racing against). Everything a store window already
+    # classified and applied is in %almanac_handled and is skipped here, both
+    # in the per-rel loop and in the group build, so it is never touched
+    # twice with two different (locked vs. unlocked) hash readings.
+    my %almanac_group_of;    # rel => group key
+    my %almanac_groups;      # group key => [ rel, ... ]
+    for my $rel (keys %inventory) {
+        next if $almanac_handled{$rel} || $almanac_skipped_rel{$rel};
+        if ($rel =~ m{^(\.ccpraxis-local-data/almanac/[^/]+)/([A-Za-z0-9][A-Za-z0-9._-]*)\.md(?:\.seal)?$}) {
+            my $key = "$1/$2";
+            push @{$almanac_groups{$key}}, $rel;
+            $almanac_group_of{$rel} = $key;
+        } elsif ($rel =~ m{^(\.ccpraxis-local-data/almanac/[^/]+)/\.reorder-journal\.json$}) {
+            my $key = "J:$1";
+            push @{$almanac_groups{$key}}, $rel;
+            $almanac_group_of{$rel} = $key;
+        }
+    }
+
+    for my $rel (sort keys %inventory) {
+        next if $almanac_handled{$rel} || $almanac_skipped_rel{$rel};
+        next if is_hard_excluded($rel);
+
+        my $abs_local = local_abs($cwd, $rel);
+        my $abs_vault = vault_file_path($slug, $rel);
+        my $abs_cache = cache_path($cwd, $rel);
+
+        my $base_hash  = -f $abs_cache ? hash_file($abs_cache) : '';
+        my $local_hash = -f $abs_local ? hash_file($abs_local) : '';
+        my $vault_hash = -f $abs_vault ? hash_file($abs_vault) : '';
+
+        my $action = classify($base_hash, $local_hash, $vault_hash);
+        $computed{$rel} = {
+            action => $action, base_hash => $base_hash, local_hash => $local_hash, vault_hash => $vault_hash,
+            abs_local => $abs_local, abs_vault => $abs_vault, abs_cache => $abs_cache,
+        };
+
+        next if $almanac_group_of{$rel};   # deferred to group handling below
+        $apply_action->($rel, $computed{$rel});
+    }
+
+    # Group consistency at classify time (spec 16, 2.5): a group conflict is
+    # any member classifying as 'conflict', or the members' actions spanning
+    # both a local->vault action (push, delete_vault) and a vault->local
+    # action (pull, delete_local). A group conflict emits EXACTLY ONE
+    # conflicts[] entry, for the record path -- never for the seal, never a
+    # git_merge_attempt -- and no member of the group is staged.
+    for my $key (sort keys %almanac_groups) {
+        my @members = @{$almanac_groups{$key}};
+        my @actions = map { $computed{$_}{action} } @members;
+        next unless grep { $_ ne 'skip' } @actions;
+
+        my $has_conflict = grep { $_ eq 'conflict' } @actions;
+        my $has_push_dir  = grep { $_ eq 'push' || $_ eq 'delete_vault' } @actions;
+        my $has_pull_dir  = grep { $_ eq 'pull' || $_ eq 'delete_local' } @actions;
+
+        if ($has_conflict || ($has_push_dir && $has_pull_dir)) {
+            my ($record_rel) = grep { /\.md$/ } @members;
+            $record_rel //= $members[0];
+            my $rc = $computed{$record_rel};
+            push @conflicts, {
+                path         => $record_rel,
+                base         => file_summary($rc->{abs_cache}, $rc->{base_hash}),
+                local        => file_summary($rc->{abs_local}, $rc->{local_hash}),
+                vault        => file_summary($rc->{abs_vault}, $rc->{vault_hash}),
+                is_text      => JSON::PP::true,
+                merge_result => undef,
+            };
+            next;
+        }
+
+        $apply_action->($_, $computed{$_}) for @members;
     }
 
     journal_set_phase($slug, 'awaiting_resolution');
@@ -1185,6 +1512,7 @@ sub cmd_sync_project {
         conflicts            => \@conflicts,
         skipped_symlinks     => \@skipped_symlinks,
         skipped_bad_paths    => \@skipped_bad_paths,
+        skipped_stores       => \@skipped_stores,
         session_id           => $SESSION_ID,
     });
 }
@@ -1231,6 +1559,58 @@ sub cmd_resolve_conflict {
     my $abs_local = local_abs($cwd, $path);
     my $abs_vault = vault_file_path($slug, $path);
 
+    # Almanac record groups (spec 16, 2.6): use-local/use-vault apply to BOTH
+    # members of {<id>.md, <id>.md.seal}; use-merged has no valid seal to
+    # offer and is refused, for a record or for the reorder journal alike.
+    my $almanac_record_type_dir;
+    if ($path =~ m{^\.ccpraxis-local-data/almanac/([^/]+)/[A-Za-z0-9][A-Za-z0-9._-]*\.md$}) {
+        $almanac_record_type_dir = $1;
+    }
+    my $is_almanac_journal = ($path =~ m{^\.ccpraxis-local-data/almanac/[^/]+/\.reorder-journal\.json$}) ? 1 : 0;
+
+    if (($almanac_record_type_dir || $is_almanac_journal) && $action eq 'use-merged') {
+        emit_error("use-merged is not available for almanac store files: a merged record has no valid seal. Choose use-local or use-vault.");
+    }
+
+    if ($almanac_record_type_dir) {
+        my $seal_path      = "$path.seal";
+        my $abs_local_seal = local_abs($cwd, $seal_path);
+        my $abs_vault_seal = vault_file_path($slug, $seal_path);
+
+        if ($action eq 'use-local') {
+            unless (-f $abs_local) {
+                emit_error("Cannot use-local: '$path' does not exist locally.");
+            }
+            my $h = hash_file($abs_local);
+            stage_push($slug, $cwd, $path, $h);
+            stage_cache_only_from_path($slug, $cwd, $path, $abs_local, $h);
+            if (-f $abs_local_seal) {
+                my $hs = hash_file($abs_local_seal);
+                stage_push($slug, $cwd, $seal_path, $hs);
+                stage_cache_only_from_path($slug, $cwd, $seal_path, $abs_local_seal, $hs);
+            } elsif (-f $abs_vault_seal) {
+                stage_delete_vault($slug, $cwd, $seal_path);
+            }
+        } elsif ($action eq 'use-vault') {
+            unless (-f $abs_vault) {
+                emit_error("Cannot use-vault: '$path' does not exist in vault.");
+            }
+            my $h = hash_file($abs_vault);
+            stage_pull($slug, $cwd, $path, $h, (-f $abs_local ? hash_file($abs_local) : ''));
+            stage_cache_only_from_path($slug, $cwd, $path, $abs_vault, $h);
+            if (-f $abs_vault_seal) {
+                my $hs = hash_file($abs_vault_seal);
+                stage_pull($slug, $cwd, $seal_path, $hs, (-f $abs_local_seal ? hash_file($abs_local_seal) : ''));
+                stage_cache_only_from_path($slug, $cwd, $seal_path, $abs_vault_seal, $hs);
+            } elsif (-f $abs_local_seal) {
+                stage_delete_local($slug, $cwd, $seal_path, hash_file($abs_local_seal));
+            }
+        }
+
+        emit_json({ status => 'staged', slug => $slug, path => $path, action => $action });
+        return;
+    }
+
     if ($action eq 'use-local') {
         unless (-f $abs_local) {
             emit_error("Cannot use-local: '$path' does not exist locally.");
@@ -1243,7 +1623,7 @@ sub cmd_resolve_conflict {
             emit_error("Cannot use-vault: '$path' does not exist in vault.");
         }
         my $h = hash_file($abs_vault);
-        stage_pull($slug, $cwd, $path, $h);
+        stage_pull($slug, $cwd, $path, $h, (-f $abs_local ? hash_file($abs_local) : ''));
         stage_cache_only_from_path($slug, $cwd, $path, $abs_vault, $h);
     } elsif ($action eq 'use-merged') {
         my $merged = $opts{'merged-file'};
@@ -1343,6 +1723,17 @@ sub cmd_commit_and_push {
 # clears journal, emits committed_and_pushed status (with optional rollback notes).
 sub finalize_commit {
     my ($slug, $cwd, $vproj, %opts) = @_;
+
+    # SF-a (16-mutation-r2): commit-and-push reaches here without ever having
+    # run cmd_sync_project's almanac/notes reset -- it only relies on that
+    # PRECEDING call having already cleaned the real index. If a
+    # sync-global-almanac crashed in between (or ran after, e.g. via
+    # Vault.pm's ordering) and left residue staged, this command's own commit
+    # below would otherwise carry it. Reset unconditionally, same as every
+    # other command that commits the real index. See
+    # vault_reset_almanac_notes_index.
+    vault_reset_almanac_notes_index('finalize_commit');
+
     my $j = journal_read($slug);
 
     # Step 1 — Renaming phase (do or finish)
@@ -1392,13 +1783,20 @@ sub finalize_commit {
     my $status = vault_git_output('status', '--porcelain', '--', "projects/$slug/");
     if (length $status) {
         my $msg = "Sync $slug: " . iso_now();
-        unless (vault_git_ok('commit', '-m', $msg)) {
+        # SF-a (16-mutation-r2): scope the commit itself to this project's
+        # pathspec (--only mode), defense-in-depth on top of the reset above.
+        unless (vault_git_ok('commit', '-m', $msg, '--', "projects/$slug/")) {
             emit_error("git commit failed");
         }
     }
 
     # Push (only if ahead)
     my ($ahead, $behind) = vault_ahead_behind();
+    # SF1 (16-rereview): never let an unanswerable ahead/behind read as
+    # "nothing to push" -- that is exactly how a stranded local commit gets
+    # reported as committed_and_pushed.
+    emit_error("vault: could not determine ahead/behind vs. origin/$BRANCH -- refusing to report a push result")
+        unless defined $ahead;
     if ($ahead > 0) {
         unless (vault_git_ok('push', 'origin', $BRANCH)) {
             emit_error("git push failed");
@@ -1449,6 +1847,326 @@ sub finalize_commit {
         }
     }
     emit_json($out);
+}
+
+# ── sync-global-almanac ──────────────────────────────────────────────
+# Commits and pushes <vault>/almanac and <vault>/notes under the almanac lock
+# protocol (spec 16, 2.8). Vault.pm runs this once per backup, BEFORE the
+# project loop, because git pull --rebase refuses a worktree with modified
+# tracked files once almanac/ is itself tracked.
+sub cmd_sync_global_almanac {
+    acquire_lock($VAULT_LOCK) or emit_error("Vault lock held by another session." . lock_refusal_detail());
+
+    emit_error("vault not initialized at $VAULT_DIR") unless -d "$VAULT_DIR/.git";
+
+    # SF6 / Decision 43: see vault_reset_almanac_notes_index -- a prior crash
+    # in THIS SAME command, between its private-index commit and its own
+    # reset (below), is exactly the window this guards.
+    vault_reset_almanac_notes_index('sync-global-almanac');
+
+    ensure_almanac_ignored();
+    ensure_almanac_no_text_conversion();
+
+    # A PRIVATE index (review M2). `git commit -- <pathspec>` runs in
+    # "--only" mode: it commits the WORKING TREE content of the given paths,
+    # disregarding whatever was staged -- so the `git add -f` / `git rm
+    # --cached` done inside each store's lock window would be thrown away
+    # and replaced by an unlocked re-read of the working tree at commit time.
+    # That erases the lock's whole purpose (a skipped store's tracked files
+    # get committed anyway if an agent touched them; a tracked sidecar that
+    # is still on disk gets re-added even after `rm --cached`). Building the
+    # commit from a private GIT_INDEX_FILE -- seeded from HEAD, then edited
+    # ONLY by the locked add/rm below -- commits exactly what the locks
+    # protected, nothing else.
+    my $priv_index = "$VAULT_DIR/.git/vault-sync-global-almanac.index.$$";
+    unlink $priv_index if -e $priv_index;
+    {
+        local $ENV{GIT_INDEX_FILE} = git_path($priv_index);
+        unless (vault_git_ok('read-tree', 'HEAD')) {
+            unlink $priv_index if -e $priv_index;
+            emit_error("vault: git read-tree HEAD failed while preparing the global almanac commit");
+        }
+    }
+
+    my @skipped_stores;
+    my $almanac_root = "$VAULT_DIR/almanac";
+    if (opendir(my $dh, $almanac_root)) {
+        my @type_dirs = sort grep { $_ ne '.' && $_ ne '..' } readdir($dh);
+        closedir $dh;
+        for my $type (@type_dirs) {
+            my $type_dir = "$almanac_root/$type";
+            next unless -d $type_dir || -l $type_dir;
+            my $rel_store = "almanac/$type";
+            my ($ok, undef, $skip) = almanac_store_window(
+                $type_dir, $rel_store, 'vault-sync sync-global-almanac',
+                sub {
+                    my ($dir) = @_;
+                    local $ENV{GIT_INDEX_FILE} = git_path($priv_index);
+                    my @eligible = almanac_local_store_files($dir);
+                    my %eligible_set = map { ("$rel_store/$_" => 1) } @eligible;
+                    # -z / NUL-split (review S2): a non-ASCII tracked name comes
+                    # back C-quoted under core.quotepath without -z, and the
+                    # rm --cached below would then miss it.
+                    my ($ls_out, undef) = _run_capture('git', '-C', git_path($VAULT_DIR),
+                        'ls-files', '-z', '--', "$rel_store/");
+                    my @tracked = grep { length } split /\0/, $ls_out;
+
+                    # TEST-ONLY seam (Decision 43): local state for this store
+                    # is enumerated; staging (rm --cached / add -f below) has
+                    # not started. See _vault_sync_test_pause.
+                    _vault_sync_test_pause();
+
+                    for my $t (@tracked) {
+                        next if $eligible_set{$t};
+                        unless (vault_git_ok('rm', '--cached', '--ignore-unmatch', '-q', '--', $t)) {
+                            emit_error("vault: git rm --cached failed for '$t' in the global almanac sync");
+                        }
+                    }
+                    for my $b (@eligible) {
+                        unless (vault_git_ok('add', '-f', '--', "$rel_store/$b")) {
+                            emit_error("vault: git add failed for '$rel_store/$b' in the global almanac sync");
+                        }
+                    }
+
+                    # TEST-ONLY seam (Decision 45): staging for this store is
+                    # now complete; the store lock window is still open. See
+                    # _vault_sync_test_pause_staged. Inert unless
+                    # CCPRAXIS_VAULT_SYNC_TEST_PAUSE is set.
+                    _vault_sync_test_pause_staged();
+
+                    return 1;
+                });
+            push @skipped_stores, $skip unless $ok;
+        }
+    }
+
+    # MF1 (16-rereview): mirror deletions of a WHOLE almanac/<type>/
+    # directory, or of almanac/ entirely. The per-type loop above only
+    # visits type directories that still exist on disk, so a type directory
+    # removed as a whole never runs its callback, and the HEAD-seeded
+    # entries `read-tree` put in the private index for it are never dropped
+    # -- they get committed again on every run and never leave the remote.
+    # This check runs unconditionally (not gated on almanac_root existing)
+    # so a whole-almanac deletion is covered too: every ls-files'd path's
+    # type directory is re-checked against the CURRENT filesystem here.
+    {
+        local $ENV{GIT_INDEX_FILE} = git_path($priv_index);
+        my ($ls_out, undef) = _run_capture('git', '-C', git_path($VAULT_DIR),
+            'ls-files', '-z', '--', 'almanac/');
+        my @tracked = grep { length } split /\0/, $ls_out;
+        for my $t (@tracked) {
+            next unless $t =~ m{^almanac/([^/]+)/};
+            my $type_dir = "$almanac_root/$1";
+            next if -d $type_dir || -l $type_dir;   # still present -- handled above
+            unless (vault_git_ok('rm', '--cached', '--ignore-unmatch', '-q', '--', $t)) {
+                emit_error("vault: git rm --cached failed for '$t' while removing a deleted almanac type directory");
+            }
+        }
+    }
+
+    if (-d "$VAULT_DIR/notes") {
+        local $ENV{GIT_INDEX_FILE} = git_path($priv_index);
+        unless (vault_git_ok('add', '-A', '--', 'notes')) {
+            emit_error("vault: git add failed for notes/ in the global almanac sync");
+        }
+    } else {
+        # MF1: notes/ was deleted as a whole locally -- drop its HEAD-seeded
+        # entries from the private index too, or they are committed again
+        # forever.
+        local $ENV{GIT_INDEX_FILE} = git_path($priv_index);
+        unless (vault_git_ok('rm', '-r', '--cached', '--ignore-unmatch', '-q', '--', 'notes')) {
+            emit_error("vault: git rm --cached failed while removing notes/ after local deletion");
+        }
+    }
+
+    my $diff;
+    {
+        local $ENV{GIT_INDEX_FILE} = git_path($priv_index);
+        $diff = vault_git_output('diff', '--cached', '--name-only', '--', 'almanac', 'notes');
+    }
+    my $committed = 0;
+    my $commit_sha;
+    if (length $diff) {
+        my $msg = "Sync global almanac: " . iso_now();
+        {
+            local $ENV{GIT_INDEX_FILE} = git_path($priv_index);
+            # No pathspec: this commits EXACTLY the private index's tree,
+            # which read-tree seeded from HEAD and which only almanac/notes
+            # edits above ever touched.
+            unless (vault_git_ok('commit', '-m', $msg)) {
+                unlink $priv_index if -e $priv_index;
+                emit_error("git commit failed for global almanac sync");
+            }
+        }
+        $committed = 1;
+        $commit_sha = vault_git_output('rev-parse', 'HEAD');
+        $commit_sha =~ s/\s+\z//;
+
+        # Align the REAL index for only these paths (review M2). `git reset`
+        # re-reads the given pathspecs from HEAD (now the new commit) into
+        # whatever index is live -- no GIT_INDEX_FILE override here -- so an
+        # unrelated file already staged outside almanac/notes (AC5's
+        # reports/r.md) is untouched and stays staged.
+        unless (vault_git_ok('reset', '-q', '--', 'almanac', 'notes')) {
+            emit_error("vault: failed to align the working index after the global almanac commit");
+        }
+    }
+    unlink $priv_index if -e $priv_index;
+
+    unless (vault_git_ok('fetch', 'origin')) {
+        emit_error("vault fetch failed for global almanac sync");
+    }
+    # `git pull --rebase` refuses on ANY uncommitted index change, even one
+    # wholly unrelated to almanac/notes (AC5: a pre-staged reports/r.md must
+    # survive this call untouched) and even when there is nothing to rebase
+    # onto. Only actually rebase when this branch is behind origin.
+    my (undef, $behind_before) = vault_ahead_behind();
+    # SF1: fail closed on an unanswerable ahead/behind (the global almanac
+    # commit is kept locally -- nothing is lost -- but proceeding could skip
+    # a needed pull or under-report the push below).
+    emit_error("vault: could not determine ahead/behind vs. origin/$BRANCH for global almanac sync")
+        unless defined $behind_before;
+    if ($behind_before > 0) {
+        unless (vault_git_ok('pull', '--rebase', 'origin', $BRANCH)) {
+            if (-d "$VAULT_DIR/.git/rebase-merge" || -d "$VAULT_DIR/.git/rebase-apply") {
+                vault_git_ok('rebase', '--abort');
+            }
+            emit_error("vault pull --rebase failed for global almanac sync -- the global almanac commit "
+                     . "is kept locally and will be pushed by a later run");
+        }
+    }
+
+    my $pushed = 0;
+    my ($ahead, undef) = vault_ahead_behind();
+    emit_error("vault: could not determine ahead/behind vs. origin/$BRANCH for global almanac sync")
+        unless defined $ahead;
+    if ($ahead > 0) {
+        unless (vault_git_ok('push', 'origin', $BRANCH)) {
+            emit_error("vault push failed for global almanac sync");
+        }
+        $pushed = 1;
+    }
+
+    # Invariant (spec 2.8): on exit 0, HEAD must equal origin/main -- nothing
+    # left unpushed. vault_ahead_behind returning (0,0) on a git FAILURE
+    # (review S3) would otherwise read as "nothing to push" and exit 0 with a
+    # local-only commit silently stranded.
+    my $head_sha   = vault_git_output('rev-parse', 'HEAD');
+    my $origin_sha = vault_git_output('rev-parse', "origin/$BRANCH");
+    $head_sha =~ s/\s+\z//; $origin_sha =~ s/\s+\z//;
+    # SF2 (16-rereview): an EMPTY sha (a missing origin/$BRANCH, or a failed
+    # rev-parse) is exactly the trigger this invariant exists for, and the
+    # old length-gated check skipped the comparison in that case -- reporting
+    # exit 0 with committed:true, pushed:false and a stranded local commit.
+    if (!length($head_sha) || !length($origin_sha) || $head_sha ne $origin_sha) {
+        emit_error("vault: HEAD ('$head_sha') does not match origin/$BRANCH ('$origin_sha') after global almanac sync");
+    }
+
+    emit_json({
+        status         => 'synced',
+        committed      => ($committed ? JSON::PP::true : JSON::PP::false),
+        pushed         => ($pushed ? JSON::PP::true : JSON::PP::false),
+        commit         => $commit_sha,
+        skipped_stores => \@skipped_stores,
+    });
+}
+
+# ensure_almanac_ignored() -- spec 16, 2.9. Idempotent: writes and commits
+# only the rules that are missing (whole-line match, since '*.lock' is a
+# literal prefix of '*.lock.holder' and a substring check would falsely
+# treat the shorter rule as already present).
+sub ensure_almanac_ignored {
+    my $path = "$VAULT_DIR/.gitignore";
+    my $text = '';
+    if (-f $path) {
+        open my $fh, '<:raw', $path or return;
+        local $/;
+        $text = <$fh> // '';
+        close $fh;
+    }
+    # Spec 2.9 names the literal rule "almanac/**/*.lock". A whole-LINE
+    # membership check (below) is already safe against the fact that
+    # "almanac/**/*.lock" is a literal text PREFIX of "almanac/**/*.lock.holder"
+    # -- a substring count would double-count it, but split-on-line-then-
+    # exact-match never does, so the literal rule needs no bracket-class
+    # workaround (review S7).
+    my @rules = ('almanac/**/*.lock', 'almanac/**/*.lock.holder', 'almanac/**/*.tmp.*');
+    # CRLF-safe (review S1): a vault .gitignore edited on Windows has \r\n
+    # line endings. split /\n/ alone leaves a trailing \r on every line, so
+    # "$rule\r" never equals $rule and every rule looks "missing" on every
+    # run, appending duplicates and committing on every single sync.
+    my %have = map { $_ => 1 } split /\r?\n/, $text;
+    my @missing = grep { !$have{$_} } @rules;
+    return unless @missing;
+
+    $text .= "\n" unless $text eq '' || $text =~ /\n\z/;
+    $text .= "# Almanac lock/holder/temp sidecars never travel (almanac-records package 16).\n"
+           . join("\n", @missing) . "\n";
+    open my $out, '>:raw', $path or return;
+    print {$out} $text;
+    close $out;
+
+    # Pathspec-limited (spec 16, 2.9's own commit AND the invariant in 2.8
+    # that this commit never touches a path outside almanac/notes/.gitignore
+    # even when something else is already staged in the index -- exactly
+    # AC5's scenario). Both results are checked (review S1): a failed add or
+    # commit must not leave .gitignore dirty and silent, because a dirty
+    # .gitignore makes every later `pull --rebase` in this vault refuse.
+    unless (vault_git_ok('add', '.gitignore')) {
+        emit_error("vault: failed to stage .gitignore for the almanac ignore rules");
+    }
+    unless (vault_git_ok('commit', '-m', 'vault: ignore almanac lock and temp sidecars', '--', '.gitignore')) {
+        emit_error("vault: failed to commit the almanac .gitignore rules");
+    }
+}
+
+# ensure_almanac_no_text_conversion() -- review S6. Seal byte-identity
+# depends on the checked-out bytes of a record matching what Store wrote,
+# exactly. `cmd_init` writes "* -text" into .gitattributes when it scaffolds
+# a brand-new empty remote (:308), but a vault whose remote predates that
+# scaffold has no such file. Cloned on a machine with
+# core.autocrlf=true -- the Git-for-Windows default -- checkout would
+# silently convert every LF record to CRLF, and every restored seal would
+# then read "tampered". This is additive only: it never overwrites an
+# existing .gitattributes, it only ensures almanac/** and notes/** are
+# covered when nothing already disables conversion for them.
+sub ensure_almanac_no_text_conversion {
+    my $path = "$VAULT_DIR/.gitattributes";
+    my $text = '';
+    if (-f $path) {
+        open my $fh, '<:raw', $path or return;
+        local $/;
+        $text = <$fh> // '';
+        close $fh;
+    }
+    my @lines = split /\r?\n/, $text;
+    # Already covered, either by the init-time blanket rule or by a prior
+    # run of this same function.
+    return if grep { $_ eq '* -text' } @lines;
+    my %have = map { ($_ => 1) } @lines;
+    # SF5 (16-rereview): a pattern containing '/' is anchored to the vault
+    # ROOT, so the global-only rules above never matched project-scope
+    # records at projects/<slug>/files/.ccpraxis-local-data/almanac/**. On a
+    # pre-scaffold vault with core.autocrlf=true, checkout still converted
+    # those to CRLF, and every restored project seal read "tampered".
+    my @rules = ('almanac/** -text', 'notes/** -text',
+                 'projects/*/files/.ccpraxis-local-data/almanac/** -text');
+    my @missing = grep { !$have{$_} } @rules;
+    return unless @missing;
+
+    $text .= "\n" unless $text eq '' || $text =~ /\n\z/;
+    $text .= "# Byte-identity for almanac records and seals (almanac-records package 16).\n"
+           . join("\n", @missing) . "\n";
+    open my $out, '>:raw', $path or return;
+    print {$out} $text;
+    close $out;
+
+    unless (vault_git_ok('add', '.gitattributes')) {
+        emit_error("vault: failed to stage .gitattributes for almanac byte-identity");
+    }
+    unless (vault_git_ok('commit', '-m', 'vault: disable text conversion for almanac and notes', '--', '.gitattributes')) {
+        emit_error("vault: failed to commit .gitattributes for almanac byte-identity");
+    }
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1673,7 +2391,294 @@ sub is_hard_excluded {
     for my $re (@HARD_EXCLUDE_REGEX) {
         return 1 if $rel_lc =~ $re;
     }
+    # Almanac eligibility (spec 16 2.2) is evaluated on the path AS-IS and is
+    # case-sensitive -- unlike every rule above, so $rel (not $rel_lc).
+    return 1 if is_almanac_ineligible($rel);
     return 0;
+}
+
+# ── Almanac eligibility (spec 16, 2.2) ───────────────────────────────────
+# A file directly inside a store directory (project: .ccpraxis-local-data/
+# almanac/<type>/; global: almanac/<type>/ relative to the vault root) is a
+# record, a seal, or the reorder journal -- anything else (including every
+# *.lock, *.lock.holder, .store.lock*, *.tmp.* and .vault-sync.tmp shape)
+# never travels. A file directly under the almanac root, or nested more than
+# one level under a store directory, is likewise ineligible.
+sub almanac_eligible_basename {
+    my ($basename) = @_;
+    return 'journal' if $basename eq '.reorder-journal.json';
+    return 'record'  if $basename =~ /^[A-Za-z0-9][A-Za-z0-9._-]*\.md$/;
+    return 'seal'    if $basename =~ /^[A-Za-z0-9][A-Za-z0-9._-]*\.md\.seal$/;
+    return undef;
+}
+
+sub is_almanac_ineligible {
+    my ($rel) = @_;
+    return 0 unless defined $rel;
+    my $sub;
+    if    ($rel =~ m{^\.ccpraxis-local-data/almanac/(.+)$}) { $sub = $1; }
+    elsif ($rel =~ m{^almanac/(.+)$})                       { $sub = $1; }
+    else  { return 0; }
+    my @parts = split m{/}, $sub, -1;
+    return 1 if @parts != 2;   # directly under the root, or nested too deep
+    my ($type, $basename) = @parts;
+    return 0 if length($type) && defined almanac_eligible_basename($basename);
+    return 1;
+}
+
+# almanac_local_store_files($abs_dir) -> list of eligible basenames present in
+# $abs_dir (a store directory), applying the orphan-seal rule (2.2): a seal
+# whose record file is absent in the SAME listing is treated as absent.
+# Caller is expected to already hold the store window's locks (2.4).
+# almanac_store_dir_entries($abs_dir) -> list of eligible basenames present in
+# $abs_dir (a store directory on the VAULT or CACHE side). Unlike
+# almanac_local_store_files, this applies no orphan-seal rule -- that rule is
+# local-side only (spec 16, 2.2) -- and takes no lock, because $VAULT_LOCK
+# already owns the vault and the cache is this machine's own sync state.
+sub almanac_store_dir_entries {
+    my ($abs_dir) = @_;
+    my @out;
+    return @out unless -d $abs_dir && !-l $abs_dir;
+    opendir(my $dh, $abs_dir) or return @out;
+    for my $ent (readdir $dh) {
+        next if $ent eq '.' || $ent eq '..';
+        push @out, $ent if defined almanac_eligible_basename($ent);
+    }
+    closedir $dh;
+    return @out;
+}
+
+sub almanac_local_store_files {
+    my ($abs_dir) = @_;
+    my @out;
+    return @out unless -d $abs_dir && !-l $abs_dir;
+    opendir(my $dh, $abs_dir) or return @out;
+    my @entries = readdir($dh);
+    closedir $dh;
+    my %record_present;
+    for my $ent (@entries) {
+        $record_present{$1} = 1 if $ent =~ /^([A-Za-z0-9][A-Za-z0-9._-]*)\.md$/;
+    }
+    for my $ent (@entries) {
+        next if $ent eq '.' || $ent eq '..';
+        if ($ent =~ /^([A-Za-z0-9][A-Za-z0-9._-]*)\.md$/) {
+            push @out, $ent;
+        } elsif ($ent =~ /^([A-Za-z0-9][A-Za-z0-9._-]*)\.md\.seal$/) {
+            push @out, $ent if $record_present{$1};
+        } elsif ($ent eq '.reorder-journal.json') {
+            push @out, $ent;
+        }
+        # anything else (lock/holder/tmp sidecars, subdirectories) never travels.
+    }
+    return @out;
+}
+
+# ── The almanac lock protocol (spec 16, 2.4). Deliberately NOT
+#    Almanac::Lock -- no steward script imports across plugins -- but the same
+#    kernel-level flock semantics and holder-JSON shape, so
+#    Almanac::Lock::read_holder interops with what this writes. ──
+sub almanac_lock_timeout_ms {
+    my $v = $ENV{VAULT_SYNC_ALMANAC_LOCK_TIMEOUT_MS};
+    return $v + 0 if defined $v && $v =~ /^\d+$/;
+    return 10000;
+}
+
+sub almanac_iso_now {
+    my ($epoch) = @_;
+    my @t = gmtime(defined $epoch ? $epoch : time);
+    return sprintf('%04d-%02d-%02dT%02d:%02d:%02dZ',
+                   $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
+}
+
+# almanac_acquire($target, $deadline_epoch, $verb) -> ($ok, $fh, $lock_path, $ioerr)
+# $target is the absolute path WITHOUT the .lock suffix (a record path or a
+# store's ".store" marker). No alarm, no signal-based timer -- an absolute deadline,
+# polled, exactly like Almanac::Lock.
+sub almanac_acquire {
+    my ($target, $deadline, $verb) = @_;
+    my $lock_path   = "$target.lock";
+    my $holder_path = "$target.lock.holder";
+    my $fh;
+    unless (open($fh, '>', $lock_path)) {
+        return (0, undef, $lock_path, "$!");
+    }
+    while (1) {
+        if (flock($fh, LOCK_EX | LOCK_NB)) {
+            my $now  = time;
+            my $host = eval { hostname() };
+            $host = 'unknown' unless defined $host && length $host;
+            my %rec = (
+                pid => $$, host => $host, script => $0, verb => $verb,
+                target => $target, acquired_at => almanac_iso_now($now),
+                acquired_at_epoch => $now,
+            );
+            if (open(my $h, '>', $holder_path)) {
+                print {$h} JSON::PP->new->canonical->encode(\%rec);
+                close $h;
+            }
+            return (1, $fh, $lock_path, undef);
+        }
+        my $now_t = Time::HiRes::time();
+        last if $now_t >= $deadline;
+        my $remain = $deadline - $now_t;
+        Time::HiRes::sleep($remain < 0.05 ? $remain : 0.05);
+    }
+    close $fh;
+    return (0, undef, $lock_path, undef);   # timeout -- never unlinked, per rule 3.
+}
+
+sub almanac_release {
+    my ($fh) = @_;
+    return unless $fh;
+    flock($fh, LOCK_UN);
+    close $fh;
+}
+
+# almanac_read_holder($target) -> \%holder | undef. Never takes a lock.
+sub almanac_read_holder {
+    my ($target) = @_;
+    open(my $fh, '<:raw', "$target.lock.holder") or return undef;
+    local $/;
+    my $raw = <$fh>;
+    close $fh;
+    return undef unless defined $raw && length $raw;
+    my $rec = eval { JSON::PP->new->decode($raw) };
+    return (ref($rec) eq 'HASH') ? $rec : undef;
+}
+
+# almanac_skip_entry(%args) -> the 2.4 skip-entry hash.
+sub almanac_skip_entry {
+    my (%a) = @_;
+    my ($skip_label, $lock_path, $target, $timeout_ms, $ioerr) =
+        @a{qw(skip_label lock_path target timeout_ms ioerr)};
+    my $lock_base = defined $lock_path ? basename($lock_path) : (basename($target) . '.lock');
+    my $holder = defined $ioerr ? undef : almanac_read_holder($target);
+    my $holder_part;
+    if (defined $ioerr) {
+        $holder_part = "(could not open lock file: $ioerr)";
+    } elsif (defined $holder) {
+        $holder_part = "(holder pid $holder->{pid} on host $holder->{host}, $holder->{script}, "
+                     . "$holder->{verb}, since $holder->{acquired_at})";
+    } else {
+        $holder_part = "(holder unknown)";
+    }
+    my $message = "almanac store $skip_label skipped: $lock_base is held $holder_part"
+                . " -- nothing from this store was copied in either direction; the next backup"
+                . " will carry it once the lock is free.";
+    my $holder_out = defined $holder
+        ? { pid => $holder->{pid}, host => $holder->{host}, script => $holder->{script},
+            verb => $holder->{verb}, acquired_at => $holder->{acquired_at} }
+        : undef;
+    return {
+        path      => $skip_label,
+        lock      => $lock_base,
+        waited_ms => $timeout_ms,
+        holder    => $holder_out,
+        message   => $message,
+    };
+}
+
+# almanac_store_window($store_abs, $skip_label, $verb, $callback)
+#   -> ($ok, $callback_result, $skip_entry)
+# Acquires D/.store, enumerates D, then every present record lock in
+# ascending byte order of id, calls $callback->($store_abs) while all are
+# held, then releases everything. On any acquisition miss, releases whatever
+# was acquired for D and returns a skip entry -- no file under D is touched.
+# TEST-ONLY seam (Decision 43, almanac-records package 16 re-review). Inert
+# unless CCPRAXIS_VAULT_SYNC_TEST_PAUSE is set. When set, called from inside
+# an almanac store lock window, AFTER the local hashes/enumeration for that
+# window have been taken and BEFORE its staging completes: it drops
+# <dir>/in-window so a concurrent test process can observe the window is
+# open, then polls (bounded to 30s, fine-grained) for <dir>/release before
+# letting the window's staging proceed. This is how a test proves a writer
+# stays blocked by the store lock for the window's whole duration, rather
+# than for some vacuous sliver of it.
+sub _vault_sync_test_pause {
+    my $pause_dir = $ENV{CCPRAXIS_VAULT_SYNC_TEST_PAUSE};
+    return unless defined $pause_dir && length $pause_dir;
+    return unless -d $pause_dir;
+    open(my $fh, '>', "$pause_dir/in-window") or return;
+    close $fh;
+    my $deadline = Time::HiRes::time() + 30;
+    while (!-e "$pause_dir/release") {
+        return if Time::HiRes::time() >= $deadline;
+        Time::HiRes::sleep(0.05);
+    }
+}
+
+# _vault_sync_test_pause_staged() -- TEST-ONLY seam (Decision 45, package 16
+# round-4 rulings). A SECOND pause point, still inside the same store lock
+# window as _vault_sync_test_pause above, but placed AFTER this window's
+# staging has completed (git add -f / rm --cached / stage_* already run) so
+# a test can assert the lock is still held at staging time rather than
+# winning a race against it. Inert unless CCPRAXIS_VAULT_SYNC_TEST_PAUSE is
+# set. When set, drops <dir>/staged, then polls (fine-grained) for
+# <dir>/release-staged before letting the callback return (and the window's
+# locks release). Bound: 30s if <dir>/hold-staged exists (matching the first
+# point's bound, for a test that deliberately holds this point open),
+# otherwise a short 0.5s default -- so a test that only exercises the FIRST
+# point (and never creates release-staged) sees this second wait return
+# quickly instead of adding 30s of dead time to every such test.
+sub _vault_sync_test_pause_staged {
+    my $pause_dir = $ENV{CCPRAXIS_VAULT_SYNC_TEST_PAUSE};
+    return unless defined $pause_dir && length $pause_dir;
+    return unless -d $pause_dir;
+    open(my $fh, '>', "$pause_dir/staged") or return;
+    close $fh;
+    my $bound = (-e "$pause_dir/hold-staged") ? 30 : 0.5;
+    my $deadline = Time::HiRes::time() + $bound;
+    while (!-e "$pause_dir/release-staged") {
+        return if Time::HiRes::time() >= $deadline;
+        Time::HiRes::sleep(0.05);
+    }
+}
+
+sub almanac_store_window {
+    my ($store_abs, $skip_label, $verb, $callback) = @_;
+
+    # Symlinked store directories are skipped by the existing symlink rule,
+    # with no locks attempted (spec 5, edge cases).
+    return (1, undef, undef) if -l $store_abs;
+    return (1, undef, undef) unless -d $store_abs;
+
+    my $timeout_ms = almanac_lock_timeout_ms();
+    my $deadline   = Time::HiRes::time() + $timeout_ms / 1000;
+
+    my $store_target = "$store_abs/.store";
+    my ($ok, $fh, $lock_path, $ioerr) = almanac_acquire($store_target, $deadline, $verb);
+    unless ($ok) {
+        return (0, undef, almanac_skip_entry(
+            skip_label => $skip_label, lock_path => $lock_path, target => $store_target,
+            timeout_ms => $timeout_ms, ioerr => $ioerr));
+    }
+    my @held = ($fh);
+
+    my @ids;
+    if (opendir(my $dh, $store_abs)) {
+        for my $ent (readdir $dh) {
+            push @ids, $1 if $ent =~ /^([A-Za-z0-9][A-Za-z0-9._-]*)\.md$/;
+        }
+        closedir $dh;
+    }
+    @ids = sort @ids;
+
+    for my $id (@ids) {
+        my $rec_target = "$store_abs/$id.md";
+        my ($rok, $rfh, $rlock_path, $rioerr) = almanac_acquire($rec_target, $deadline, $verb);
+        unless ($rok) {
+            almanac_release($_) for @held;
+            return (0, undef, almanac_skip_entry(
+                skip_label => $skip_label, lock_path => $rlock_path, target => $rec_target,
+                timeout_ms => $timeout_ms, ioerr => $rioerr));
+        }
+        push @held, $rfh;
+    }
+
+    my $result = eval { $callback->($store_abs) };
+    my $err = $@;
+    almanac_release($_) for @held;
+    die $err if $err;
+    return (1, $result, undef);
 }
 
 sub dir_size {
@@ -1911,21 +2916,26 @@ sub stage_push {
 }
 
 sub stage_pull {
-    my ($slug, $cwd, $rel, $hash_before) = @_;
+    # $local_hash_before is the LOCAL side's hash at classify time (review M3):
+    # commit-and-push re-checks it, under the record's lock, before applying
+    # the rename, so a local write that lands during the gap between classify
+    # and apply is never silently overwritten.
+    my ($slug, $cwd, $rel, $hash_before, $local_hash_before) = @_;
     my $src = vault_file_path($slug, $rel);
     my $final = local_abs($cwd, $rel);
     my $tmp = "$final$TMP_SUFFIX";
     make_path(dirname($tmp));
     copy_file($src, $tmp);
     journal_record_op($slug, {
-        id          => next_op_id($slug),
-        path        => $rel,
-        action      => 'pull',
-        source      => $src,
-        tmp_path    => $tmp,
-        final_path  => $final,
-        hash_before => $hash_before,
-        status      => 'staged',
+        id                => next_op_id($slug),
+        path              => $rel,
+        action            => 'pull',
+        source            => $src,
+        tmp_path          => $tmp,
+        final_path        => $final,
+        hash_before       => $hash_before,
+        local_hash_before => $local_hash_before,
+        status            => 'staged',
     });
     # Also cache from vault source
     stage_cache_only_from_path($slug, $cwd, $rel, $src, $hash_before);
@@ -1990,15 +3000,18 @@ sub stage_delete_vault {
 }
 
 sub stage_delete_local {
-    my ($slug, $cwd, $rel) = @_;
+    # $local_hash_before -- see stage_pull: re-checked under lock before the
+    # unlink, so a local write during the classify/apply gap is never lost.
+    my ($slug, $cwd, $rel, $local_hash_before) = @_;
     my $local_final = local_abs($cwd, $rel);
     my $cache_final = cache_path($cwd, $rel);
     journal_record_op($slug, {
-        path        => $rel,
-        action      => 'delete_local',
-        final_path  => $local_final,
-        cache_path  => $cache_final,
-        status      => 'staged',
+        path              => $rel,
+        action            => 'delete_local',
+        final_path        => $local_final,
+        cache_path        => $cache_final,
+        local_hash_before => $local_hash_before,
+        status            => 'staged',
     });
 }
 
@@ -2022,6 +3035,163 @@ sub batch_rename_all {
     # with it. stage_push records the push before its cache op and the journal
     # preserves that order, so the push is always seen first.
     my %rolled_back_paths;
+
+    # Almanac record groups (spec 16, 2.7): group rollback on push (any
+    # member's source changed mid-sync rolls the whole group back), and a
+    # locked apply on pull (every rename/unlink whose final path is inside a
+    # project store directory is applied while holding that record's lock --
+    # the journal takes D/.store -- with one deadline per group).
+    my %almanac_rename_groups;   # key => { dir_rel, id|undef, ops => [...] }
+    for my $op (@{$j->{ops}}) {
+        next if $op->{status} eq 'complete' || $op->{status} eq 'rolled_back';
+        my $p = $op->{path} // '';
+        if ($p =~ m{^(\.ccpraxis-local-data/almanac/[^/]+)/([A-Za-z0-9][A-Za-z0-9._-]*)\.md(?:\.seal)?$}) {
+            my ($dir_rel, $id) = ($1, $2);
+            my $key = "R:$dir_rel/$id";
+            $almanac_rename_groups{$key} //= { dir_rel => $dir_rel, id => $id, ops => [] };
+            push @{$almanac_rename_groups{$key}{ops}}, $op;
+        } elsif ($p =~ m{^(\.ccpraxis-local-data/almanac/[^/]+)/\.reorder-journal\.json$}) {
+            my $dir_rel = $1;
+            my $key = "J:$dir_rel";
+            $almanac_rename_groups{$key} //= { dir_rel => $dir_rel, id => undef, ops => [] };
+            push @{$almanac_rename_groups{$key}{ops}}, $op;
+        }
+    }
+
+    for my $key (sort keys %almanac_rename_groups) {
+        my $g = $almanac_rename_groups{$key};
+        my @gops = @{$g->{ops}};
+
+        my $group_rolled_back = 0;
+        my $rollback_reason;
+
+        # Group rollback on push: re-hash every push member's source; if any
+        # member changed mid-sync, the whole group rolls back. A source that
+        # VANISHED entirely also counts as changed (review M1): the window
+        # between classify and this check is exactly where a concurrent
+        # delete can leave the vault holding one member of a group (say the
+        # record) with no corresponding change to the other (the seal),
+        # which is a torn pair even though neither op individually "failed".
+        for my $op (@gops) {
+            next unless ($op->{action} // '') eq 'push';
+            if (!-f $op->{source}) {
+                $group_rolled_back = 1;
+                $rollback_reason = 'almanac_group_rolled_back';
+                next;
+            }
+            my $now_hash = hash_file($op->{source});
+            if ($op->{hash_before} && $now_hash ne $op->{hash_before}) {
+                $group_rolled_back = 1;
+                $rollback_reason = 'almanac_group_rolled_back';
+            }
+        }
+
+        # Locked apply on pull: acquire the record's lock (or D/.store for the
+        # journal) before applying any pull/delete_local member of this group.
+        my $has_pull_like = grep { ($_->{action} // '') =~ /^(pull|delete_local)$/ } @gops;
+        my $lock_fh;
+        if (!$group_rolled_back && $has_pull_like) {
+            my $lock_target = defined($g->{id})
+                ? local_abs($cwd, "$g->{dir_rel}/$g->{id}.md")
+                : (local_abs($cwd, $g->{dir_rel}) . '/.store');
+            my $timeout_ms = almanac_lock_timeout_ms();
+            my $deadline   = Time::HiRes::time() + $timeout_ms / 1000;
+            my ($ok, $fh, undef, undef) = almanac_acquire($lock_target, $deadline, 'vault-sync commit-and-push');
+            if ($ok) {
+                $lock_fh = $fh;
+            } else {
+                $group_rolled_back = 1;
+                $rollback_reason = 'almanac_lock_timeout';
+            }
+        }
+
+        # Lost-update guard (review M3): now that the lock is held, re-check
+        # every pull/delete_local member's LOCAL bytes against what classify
+        # saw. An agent writing the record through Store during the pause
+        # between classify and this apply must never be silently overwritten
+        # or unlinked -- the lock only proves nobody is writing RIGHT NOW, not
+        # that nobody wrote in between.
+        if (!$group_rolled_back && $has_pull_like) {
+            for my $op (@gops) {
+                next unless ($op->{action} // '') =~ /^(pull|delete_local)$/;
+                my $expected = $op->{local_hash_before};
+                next unless defined $expected;   # nothing recorded -- no basis to compare
+
+                # SF4 (16-rereview / Decision 43): roll a group FORWARD, not
+                # back, once a member has already landed. A crash between
+                # this op's rename and its sibling's leaves recovery
+                # re-running with the op still 'staged' even though its
+                # rename already completed. Comparing final bytes against
+                # local_hash_before (the PRE-sync content) then reads as a
+                # concurrent local edit and rolls the WHOLE group back --
+                # tearing the pair the other way, discarding a landed
+                # member's sibling. A member already applied (its tmp is
+                # gone for pull, or its final file is already gone for
+                # delete_local) is roll-forward residue, not a lost update:
+                # skip the comparison for it.
+                if (($op->{action} // '') eq 'delete_local') {
+                    next unless -f $op->{final_path};   # already deleted -- applied
+                } elsif ($op->{tmp_path} && !-f $op->{tmp_path}
+                        && -f $op->{final_path} && length($op->{hash_before} // '')
+                        && hash_file($op->{final_path}) eq $op->{hash_before}) {
+                    next;   # already applied -- roll forward, not a lost update
+                }
+
+                my $now_local_hash = -f $op->{final_path} ? hash_file($op->{final_path}) : '';
+                if ($now_local_hash ne $expected) {
+                    $group_rolled_back = 1;
+                    $rollback_reason = 'almanac_local_modified_during_sync';
+                    last;
+                }
+            }
+        }
+
+        if ($group_rolled_back) {
+            for my $op (@gops) {
+                unlink $op->{tmp_path} if $op->{tmp_path} && -f $op->{tmp_path};
+                $op->{status} = 'rolled_back';
+                $op->{reason} = $rollback_reason;
+                push @rolled_back, { path => $op->{path}, reason => $rollback_reason };
+            }
+        } else {
+            for my $op (@gops) {
+                if ($op->{action} eq 'delete_vault' || $op->{action} eq 'delete_local') {
+                    unlink $op->{final_path} if -f $op->{final_path};
+                    unlink $op->{cache_path} if $op->{cache_path} && -f $op->{cache_path};
+                    $op->{status} = 'complete';
+                    push @renamed, $op->{path};
+                } elsif ($op->{action} eq 'clear_cache') {
+                    unlink $op->{final_path} if -f $op->{final_path};
+                    $op->{status} = 'complete';
+                    push @renamed, $op->{path};
+                } else {
+                    # push, pull, cache -- rename tmp to final.
+                    unless (-f $op->{tmp_path}) {
+                        if (-f $op->{final_path}) {
+                            $op->{status} = 'complete';
+                            push @renamed, $op->{path};
+                        } else {
+                            $op->{status} = 'rolled_back';
+                            $op->{reason} = 'tmp_missing_and_final_missing';
+                            push @rolled_back, { path => $op->{path}, reason => 'tmp_missing' };
+                        }
+                        next;
+                    }
+                    make_path(dirname($op->{final_path}));
+                    unlink $op->{final_path} if -e $op->{final_path};
+                    unless (rename $op->{tmp_path}, $op->{final_path}) {
+                        unless (copy($op->{tmp_path}, $op->{final_path})) {
+                            emit_error("Rename and copy both failed for $op->{tmp_path} -> $op->{final_path}: $!");
+                        }
+                        unlink $op->{tmp_path};
+                    }
+                    $op->{status} = 'complete';
+                    push @renamed, $op->{path};
+                }
+            }
+        }
+        almanac_release($lock_fh) if $lock_fh;
+    }
 
     for my $op (@{$j->{ops}}) {
         next if $op->{status} eq 'complete' || $op->{status} eq 'rolled_back';
@@ -2920,8 +4090,15 @@ sub ensure_journal_ignored {
     print {$out} $text;
     close $out;
 
-    vault_git_ok('add', '.gitignore');
-    vault_git_ok('commit', '-m', 'vault: ignore the append-only sync journal ops log');
+    # Pathspec-limited (same reasoning as ensure_almanac_ignored) and both
+    # results checked -- an unchecked failure here previously left
+    # .gitignore silently dirty for the caller's unscoped commit to pick up.
+    unless (vault_git_ok('add', '.gitignore')) {
+        emit_error("vault: failed to stage .gitignore for the sync journal ignore rule");
+    }
+    unless (vault_git_ok('commit', '-m', 'vault: ignore the append-only sync journal ops log', '--', '.gitignore')) {
+        emit_error("vault: failed to commit the sync journal .gitignore rule");
+    }
 }
 
 sub vault_dirty_files {
@@ -2936,9 +4113,18 @@ sub vault_dirty_files {
     return @files;
 }
 
+# SF1/SF2 (16-rereview): returns (undef, undef) -- never (0, 0) -- when
+# `rev-list` cannot compute an answer (a failed exit, e.g. a missing
+# origin/$BRANCH). Before this, a failure read exactly like "nothing to
+# push/pull", so a caller would skip a needed pull --rebase, or skip a
+# push and still report committed_and_pushed with the commit stranded
+# locally (the false-success class report d667 exists to prevent). Every
+# caller below must treat undef as a hard failure, never as zero.
 sub vault_ahead_behind {
-    my $ab = vault_git_output('rev-list', '--left-right', '--count', "HEAD...origin/$BRANCH");
-    return ($ab =~ /^(\d+)\s+(\d+)$/) ? ($1, $2) : (0, 0);
+    my ($ab, $exit) = _run_capture('git', '-C', git_path($VAULT_DIR),
+        'rev-list', '--left-right', '--count', "HEAD...origin/$BRANCH");
+    return (undef, undef) unless $exit == 0;
+    return ($ab =~ /^(\d+)\s+(\d+)$/) ? ($1, $2) : (undef, undef);
 }
 
 # ═══════════════════════════════════════════════════════════════════════

@@ -1,6 +1,6 @@
 ---
 name: backup
-description: Syncs everything personal between the live host and your private repos — ccpraxis config (global + container) AND every project registered for vault backup (CLAUDE.md, skills, plans, memory). Scans for secrets before pushing. Resolves vault sync conflicts interactively. If you're in a project that has trackable Claude files but isn't registered for backup, offers to register it. Also surfaces Claude Code binary snapshots taken by /update and supports manual revert. Use when the user wants to sync config, back up settings, push config changes, sync vault projects, list/revert Claude Code snapshots, or says "backup", "sync config", "push config", "sync everything", "back up my work", "revert claude code", "list claude snapshots", "rollback claude".
+description: Syncs everything personal between the live host and your private repos — ccpraxis config (global + container) AND every project registered for vault backup (CLAUDE.md, skills, plans, memory, almanac records — global and project). Scans for secrets before pushing. Resolves vault sync conflicts interactively. If you're in a project that has trackable Claude files but isn't registered for backup, offers to register it. Also surfaces Claude Code binary snapshots taken by /update and supports manual revert. Use when the user wants to sync config, back up settings, push config changes, sync vault projects, list/revert Claude Code snapshots, or says "backup", "sync config", "push config", "sync everything", "back up my work", "revert claude code", "list claude snapshots", "rollback claude".
 user-invocable: true
 host-only: true
 allowed-tools: Bash, AskUserQuestion, Skill
@@ -163,6 +163,8 @@ Surface, from the report's fields:
   sync. The revert mode is entered by intent (see **Modes**), never from a report.
 - `sources` — a phase that never ran is reported as "never ran", never as "found
   nothing".
+- `almanac_store_skipped` notes (relay each `message` verbatim) and `global_almanac_failed`
+  (treat the run as problematic); mention `global_almanac.committed` / `.pushed` too.
 
 ## Follow-up actions
 
