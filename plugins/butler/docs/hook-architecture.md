@@ -56,8 +56,8 @@ and `runs/<pkg>.force-stop`.
 | hooks.json | PreToolUse | Bash | guard-bash.sh, guard-git-mutations.sh --only-during-butler-run, arm-on-entry.sh, continuity-off-check.sh |
 | hooks.json | PreToolUse | Edit\|Write\|MultiEdit\|NotebookEdit | guard-writes.sh, ledger-guard.sh, guard-blueprint-write.sh |
 | hooks.json | PreToolUse | Edit\|Write\|MultiEdit\|NotebookEdit\|Task\|Agent | gate-shutdown.sh |
-| hooks.json | PreToolUse | Task\|Agent | bind-dispatch.sh, track-dispatch.sh |
-| hooks.json | PreToolUse | Task\|Agent\|Bash | context-ceiling.sh, guard-fork.sh |
+| hooks.json | PreToolUse | Task\|Agent | bind-dispatch.sh, track-dispatch.sh, guard-fork.sh |
+| hooks.json | PreToolUse | Task\|Agent\|Bash | context-ceiling.sh |
 | hooks.json | PreToolUse | (none) | wait-shape-guard.sh |
 | hooks.json | PreToolUse | AskUserQuestion | guard-ask-operator.sh |
 | hooks.json | PostToolUse | Task\|Agent | track-dispatch.sh |
@@ -95,7 +95,7 @@ reason: Package 16 flattened this file from the pre-cutover staging tree's guard
 
 ### file: guard-ask-operator.sh
 verdict: keep
-reason: Package 16 flattened this file from the pre-cutover staging tree's guards sub-batch; it still refuses AskUserQuestion while unattended work runs and queues the question in the legacy store.
+reason: Package 16 flattened this file from the pre-cutover staging tree's guards sub-batch; it still refuses AskUserQuestion while unattended work runs and files the question as an almanac pending decision.
 
 ### file: guard-bash.sh
 verdict: keep
@@ -107,7 +107,7 @@ reason: Package 16 flattened this file from the pre-cutover staging tree's guard
 
 ### file: guard-fork.sh
 verdict: keep
-reason: Package 19 adds this file (Decision 64/90): a PreToolUse guard on Task/Agent/Bash that denies every dispatch whose subagent_type is the literal string fork, overridable once per session by butler-fork-ok.
+reason: Package 19 adds this file (Decision 64/90): a PreToolUse guard on Task/Agent that denies every dispatch whose subagent_type is the literal string fork, overridable once per session by butler-fork-ok.
 
 ### file: guard-git-mutations.sh
 verdict: keep
@@ -155,7 +155,7 @@ reason: The arming check's own Bash registration in the guarded 2.2 form, replac
 
 ### registration: hooks.json PreToolUse [Bash] continuity-off-check.sh
 verdict: keep
-reason: The ticket-writing check's own Bash registration in the guarded 2.2 form, replacing the old guard-run-finish.sh entry on the same matcher.
+reason: The ticket-writing check's own Bash registration in the guarded 2.2 form, replacing the old guard-run-finish.sh entry on the same matcher, and (package 28, Decision 105) the one writer of butler-continuity, butler-hold and butler-fork-ok tickets.
 
 ### registration: hooks.json PreToolUse [Edit|Write|MultiEdit|NotebookEdit] guard-writes.sh
 verdict: keep
@@ -181,13 +181,13 @@ reason: The dispatch-binding check's own Task and Agent registration in the guar
 verdict: keep
 reason: Becomes the PreToolUse Task|Agent registration of the merged tracker, in the guarded 2.2 form, absorbing the drive-solo tracker's old registration on the same tools.
 
+### registration: hooks.json PreToolUse [Task|Agent] guard-fork.sh
+verdict: keep
+reason: Package 28 (Decision 105) re-registered this off Bash: it moved into the Task|Agent group because its Bash half only wrote butler-fork-ok tickets, and that write now lives in continuity-off-check.sh.
+
 ### registration: hooks.json PreToolUse [Task|Agent|Bash] context-ceiling.sh
 verdict: keep
 reason: Becomes the PreToolUse Task|Agent|Bash registration of the merged context-ceiling guard, in the guarded 2.2 form, denying a dispatch or a Bash call past the hard ceiling.
-
-### registration: hooks.json PreToolUse [Task|Agent|Bash] guard-fork.sh
-verdict: keep
-reason: Package 19's own registration (Decision 64/90), in the guarded 2.2 command form, on the same Task|Agent|Bash matcher as context-ceiling.sh so it sees every dispatch and every Bash ticket-writing call.
 
 ### registration: hooks.json PreToolUse [] wait-shape-guard.sh
 verdict: keep
@@ -380,10 +380,10 @@ A Bash command is never told its session, and `$CLAUDE_CODE_SESSION_ID` is unver
 the second.
 
 **Tickets** (any time, for example arming when no stop is pending). The PreToolUse hook
-`continuity-off-check.sh` writes one ticket per real invocation of `butler-continuity` or `butler-hold`
-whose argv it can predict; `guard-fork.sh` is the one and only writer of the third name,
-`butler-fork-ok` (Decision 91) -- `continuity-off-check.sh` is never edited to know about it, so a
-second writer never produces two tickets for one call:
+`continuity-off-check.sh` writes one ticket per real, predictable invocation of `butler-continuity`,
+`butler-hold` or `butler-fork-ok` (package 28, Decision 105) -- it is the one and only writer of all
+three names. `guard-fork.sh` writes none: its Bash-branch ticket write moved into
+`continuity-off-check.sh` so a second writer never produces two tickets for one call:
 
 - Key: `k` = lowercase hex SHA-1 (core `Digest::SHA`) of `join("\0", $name, @argv)`, where `$name` is
   normalised to `butler-continuity`, `butler-hold` or `butler-fork-ok`. The command computes the same
@@ -847,7 +847,9 @@ which is a re-scope request for package 04 (see Re-scope requests), in line with
 module per hook package.
 
 **Mechanism.** `continuity-off-check.sh` is a PreToolUse Bash hook with the prefilter
-`--pre text:butler-continuity,text:butler-hold`. It writes the tickets described under Command binding.
+`--pre text:butler-continuity,text:butler-hold,text:butler-fork-ok` (package 28, Decision 105): it
+exits when the payload text contains none of the three names. It writes the tickets described under
+Command binding.
 For each real invocation of `butler-continuity off`, with or without `--reason`, from a payload
 without `agent_id`, it reads the tail (at most 1 MiB) of the payload's `transcript_path` and finds the
 latest genuine operator record, walking back past everything that is not one:
@@ -907,8 +909,9 @@ agent has turned continuity off or silenced it.
 Other verbs, each printing one line unless noted: `on [--role driver|reporter]`,
 `silence --reason '<2+ words>' [--token <token>]`, `status` (at most 4 lines: arm state and role, the
 holder and its items and deadline, any pending silence; holder read through `BpHook::holder`),
-`ask '<question>'` (appends to the legacy `.subagent-guard/questions.md` exactly as `bp-continuity.pl
-ask` does, Decision 22), and the internal `lease --daemon`. `silence` on an unarmed session prints
+`ask --text '<question>'` (files a pending decision in the almanac decision store via
+`Almanac::Decision::file`), `questions`, `answer --id <id> --answer '<text>'`, and the internal
+`lease --daemon`. `silence` on an unarmed session prints
 `continuity is off for this session; nothing to silence.`, exits 0 and records nothing. The command
 honours `CCPRAXIS_NO_WAKELOCK` exactly as `bp-continuity.pl` does, so tests never take the real lock.
 
@@ -1014,7 +1017,7 @@ next fork dispatch, and the guard denies again after it. Decision 3 applies thro
 
 | stop-gate.sh | 7 | --pre ledger,armed : exits when BP_LEDGER is unset and armed/<session_id> is absent |
 | arm-on-entry.sh | 1 | --pre text:bp-drive-next : exits when the payload text does not contain bp-drive-next |
-| continuity-off-check.sh | 0 | --pre text:butler-continuity,text:butler-hold : exits when the payload text contains neither name |
+| continuity-off-check.sh | 0 | --pre text:butler-continuity,text:butler-hold,text:butler-fork-ok : exits when the payload text contains none of the three names |
 | bind-dispatch.sh | 6 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
 | guard-writes.sh | 3 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
 | ledger-guard.sh | 1 | --pre text:/packages/ --pre ledger,driver : exits when the payload text lacks /packages/, or when BP_LEDGER is unset and the session is not an armed driver |

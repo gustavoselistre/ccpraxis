@@ -7,10 +7,9 @@
 #
 # Denies every Agent/Task dispatch whose tool_input.subagent_type is the
 # literal string "fork", everywhere but for the next fork dispatch of a
-# session holding a one-shot token minted by butler-fork-ok. On a Bash
-# dispatch it writes the core ticket that binds a real butler-fork-ok
-# invocation to its session -- it is the ONLY writer of that ticket name
-# (Decision 91; ContinuityOffCheck.pm is not touched).
+# session holding a one-shot token minted by butler-fork-ok. Ticket writing
+# for a real butler-fork-ok invocation moved to ContinuityOffCheck.pm
+# (package 28, Decision 105); this module writes no ticket for any payload.
 #
 # run($p, @args) never calls exit, never dies on purpose, never spawns a
 # process, and never re-parses the payload (BpHook::parse_count() is
@@ -136,21 +135,6 @@ sub run {
         return 0 unless defined $sid;
         return 0 if take_token($sid);
         return BpHook::deny(deny_lines());
-    }
-
-    if ($t eq 'Bash') {
-        my $ti = $p->{tool_input};
-        return 0 unless ref $ti eq 'HASH';
-        my $cmd = $ti->{command};
-        return 0 unless _is_plain_string($cmd);
-        my $background = $ti->{run_in_background} ? 1 : 0;
-        for my $argv (BpHook::invocations($cmd, 'butler-fork-ok')) {
-            next unless ref $argv eq 'ARRAY';
-            next if grep { !defined $_ } @$argv;
-            BpHook::write_ticket($p, 'butler-fork-ok', $argv,
-                operator => 0, background => $background);
-        }
-        return 0;
     }
 
     return 0;

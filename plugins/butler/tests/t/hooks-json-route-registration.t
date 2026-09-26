@@ -82,7 +82,7 @@ my @EXPECT = (
     { event => 'PreToolUse',  matcher => 'Task|Agent',                                  file => 'bind-dispatch.sh',            args => '' },
     { event => 'PreToolUse',  matcher => 'Task|Agent',                                  file => 'track-dispatch.sh',           args => '' },
     { event => 'PreToolUse',  matcher => 'Task|Agent|Bash',                             file => 'context-ceiling.sh',          args => '' },
-    { event => 'PreToolUse',  matcher => 'Task|Agent|Bash',                             file => 'guard-fork.sh',               args => '' },
+    { event => 'PreToolUse',  matcher => 'Task|Agent',                                  file => 'guard-fork.sh',               args => '' },
     { event => 'PreToolUse',  matcher => '',                                            file => 'wait-shape-guard.sh',         args => '' },
     { event => 'PreToolUse',  matcher => 'AskUserQuestion',                             file => 'guard-ask-operator.sh',       args => '' },
     { event => 'PostToolUse', matcher => 'Task|Agent',                                  file => 'track-dispatch.sh',           args => '' },
