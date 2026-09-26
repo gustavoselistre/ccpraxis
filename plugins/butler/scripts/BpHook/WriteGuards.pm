@@ -325,6 +325,77 @@ sub _temp_candidates {
     return @valid;
 }
 
+# ---------------------------------------------------------------------------
+# spec 31 sec 2.2: _seg_eq_base -- segment equality for the temp-base prefix
+# only, tolerant of one side being a Windows 8.3 short name.
+# ---------------------------------------------------------------------------
+sub _seg_eq_base {
+    my ($a, $b) = @_;
+    $a = '' unless defined $a;
+    $b = '' unless defined $b;
+    return 1 if (_is_ci() ? _foldc($a) eq _foldc($b) : $a eq $b);
+    return 0 unless _is_ci();
+    my $re = _8dot3_re();
+    my $sa = ($a =~ $re) ? 1 : 0;
+    my $sb = ($b =~ $re) ? 1 : 0;
+    return 0 unless $sa xor $sb;
+    my ($short, $long) = $sa ? ($a, $b) : ($b, $a);
+    (my $stem = $short) =~ s/~.*\z//s;
+    my $stem_f = _foldc($stem);
+    $stem_f =~ s/[^a-z0-9]//g;
+    my $basis_f = _foldc($long);
+    $basis_f =~ s/[^a-z0-9]//g;
+    my $want = (length($basis_f) >= 6) ? substr($basis_f, 0, 6) : $basis_f;
+    return (length($stem_f) > 0 && $stem_f eq $want) ? 1 : 0;
+}
+
+# ---------------------------------------------------------------------------
+# spec 31 sec 2.1: _own_scratchpad -- driver-only allowance for a write
+# strictly below THIS session's scratchpad dir. No filesystem access.
+# ---------------------------------------------------------------------------
+sub _own_scratchpad {
+    my ($p, $ABS_c, $R) = @_;
+    return 0 unless defined($R->{mode}) && $R->{mode} eq 'driver';
+
+    my $sid = BpHook::session_id($p);
+    return 0 unless defined $sid;
+
+    my $tp = (ref $p eq 'HASH') ? $p->{transcript_path} : undef;
+    return 0 unless defined $tp && !ref($tp) && length $tp;
+    my $T = _collapse_lexical(BpHook::_to_bytes($tp));
+    return 0 unless $T =~ m{/([^/]+)/([^/]+)\z};
+    my ($slug, $base) = ($1, $2);
+    my $ci = _is_ci();
+    my $base_ok = $ci ? (_foldc($base) eq _foldc("$sid.jsonl")) : ($base eq "$sid.jsonl");
+    return 0 unless $base_ok;
+    return 0 unless $slug =~ /\A[A-Za-z0-9-]{1,255}\z/;
+
+    return 0 if _in($ABS_c, $R->{root});
+    return 0 if defined($R->{data}) && length($R->{data}) && _in($ABS_c, $R->{data});
+
+    for my $B (_temp_candidates()) {
+        my $Bc = _ccanon($B);
+        next unless defined $Bc && length $Bc;
+        my @b = split m{/}, $Bc;
+        my @a = split m{/}, $ABS_c;
+        next unless @a >= @b + 5;
+        my $ok = 1;
+        for my $i (0 .. $#b) {
+            unless (_seg_eq_base($a[$i], $b[$i])) { $ok = 0; last }
+        }
+        next unless $ok;
+        my @tail = @a[scalar(@b) .. scalar(@b) + 3];
+        my @want = ('claude', $slug, $sid, 'scratchpad');
+        my $tail_ok = 1;
+        for my $i (0 .. 3) {
+            my ($x, $y) = ($tail[$i], $want[$i]);
+            unless ($ci ? (_foldc($x) eq _foldc($y)) : ($x eq $y)) { $tail_ok = 0; last }
+        }
+        return 1 if $tail_ok;
+    }
+    return 0;
+}
+
 sub _is_temp {
     my ($abs_c, $root, $data) = @_;
     return 0 if defined($root) && length($root) && _in($abs_c, $root);
@@ -916,6 +987,7 @@ sub _writes {
     if (my $d = _maybe_deny_8dot3($ABS, $ABS_c, $R)) { return $d }
     if (my $d = _maybe_deny_sibling_ledger($ABS, $ABS_c, $R, 'writes')) { return $d }
 
+    return 0 if _own_scratchpad($p, $ABS_c, $R);
     return 0 if _is_temp($ABS_c, $R->{root}, $R->{data});
 
     my $in_deny = 0;
