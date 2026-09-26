@@ -15,7 +15,7 @@ use strict;
 use warnings;
 use FindBin qw($Bin);
 use Test::More;
-use File::Temp qw(tempdir);
+use File::Temp qw(tempdir tempfile);
 use JSON::PP;
 
 (my $H = "$Bin/../../hooks") =~ s{\\}{/}g;
@@ -53,6 +53,23 @@ for my $tool (qw(Edit Write MultiEdit NotebookEdit)) {
     like($se, qr/almanac-bug\.pl update/, 'the denial gives the update verb for an open report');
     like($se, qr/almanac-bug\.pl file/,   'the denial gives the follow-up route for a frozen one');
     like($se, qr/20260813-010203-abcd/,   'the denial names the report id');
+}
+
+# --- Review defect M1 -- tab-IFS field collapse: byte-exact deny text -------
+# A run of tabs is one IFS delimiter and empty fields vanish, so the id/path
+# fields can shift into each other's slots. Pin the exact lines, not just
+# "the id appears somewhere in stderr".
+{
+    my $bug_id = '20260813-010203-abcd';
+    my (undef, $se) = fire(ev('Edit', $R));
+    my @lines = split /\n/, $se;
+    ok((grep { $_ eq "  $R" } @lines),
+        'M1/bug: a stderr line is exactly "  <path>" -- the path field lands in the path slot, not blank/shifted')
+        or diag("stderr:\n$se");
+    ok((grep { /^\s*perl <ccpraxis>\/plugins\/almanac\/scripts\/almanac-bug\.pl update \Q$bug_id\E --body -\s*$/ } @lines),
+        'M1/bug: the update line reads "...almanac-bug.pl update <id> --body -" exactly -- the id field '
+      . 'lands in the id slot, never the path')
+        or diag("stderr:\n$se");
 }
 
 # Everything else is untouched. A guard that leaked into ordinary edits would be
@@ -112,6 +129,191 @@ for my $p (
     my ($blk) = @{ $cfg->{hooks}{PreToolUse} || [] };
     like($blk->{matcher} // '', qr/Edit/,  'its matcher covers Edit');
     like($blk->{matcher} // '', qr/Write/, 'and Write');
+}
+
+# =============================================================================
+# Package 09-write-guard, spec section 4: DC7's three parts on the CLI/script
+# under test, AlmanacBug -- (a) new_id collision-freedom, (b) claim_report_path
+# never overwriting an existing report, (c) the two-generator decision recorded
+# in a comment. Loaded once via the `do $A` convention (see
+# almanac-lock-rename-retry.t:39-45): `unless (caller)` is false when a file
+# runs under `do`, so the CLI's own main dispatch never fires here.
+# =============================================================================
+(my $S = "$Bin/../../scripts") =~ s{\\}{/}g;
+my $A = "$S/almanac-bug.pl";
+ok(-f $A, 'almanac-bug.pl exists (DC7 fixture)') or BAIL_OUT('script missing');
+
+sub slurp_text_wg {
+    my ($p) = @_;
+    open my $fh, '<:encoding(UTF-8)', $p or return undef;
+    local $/;
+    my $c = <$fh>;
+    close $fh;
+    return $c;
+}
+
+sub read_all_lines_wg {
+    my ($path) = @_;
+    open(my $fh, '<', $path) or return ();
+    my @l = <$fh>;
+    close $fh;
+    return @l;
+}
+
+sub field_of_wg {
+    my ($p, $k) = @_;
+    open my $f, '<:raw', $p or return undef;
+    local $/;
+    my $t = <$f>;
+    close $f;
+    return $t =~ /^\Q$k\E:\s*(.*)$/m ? $1 : undef;
+}
+
+do $A;
+die "could not load almanac-bug.pl in-process: $@" if $@;
+
+# --- AC19 / DC7a -- 10000 distinct ids in one process-second ---------------
+{
+    my $FIXED = 1_700_000_000;
+    my %seen;
+    for (1 .. 10_000) {
+        my $id = AlmanacBug::new_id($FIXED);
+        $seen{$id}++;
+    }
+    my @dupes = grep { $seen{$_} > 1 } keys %seen;
+    is(scalar(@dupes), 0, 'AC19/DC7a: 10000 calls to new_id($fixed_epoch) in one process-second are all distinct')
+        or diag('duplicate count: ' . scalar(@dupes));
+    my @bad_shape = grep { $_ !~ /^\d{8}-\d{6}-[0-9a-f]{4}\z/ } keys %seen;
+    is(scalar(@bad_shape), 0, 'AC19/DC7a: every generated id matches ^\d{8}-\d{6}-[0-9a-f]{4}$')
+        or diag(join(', ', @bad_shape[0 .. (@bad_shape > 4 ? 4 : $#bad_shape)]));
+}
+
+# --- AC20 / DC7a -- claim_report_path never overwrites an existing report ---
+{
+    my $dir20 = tempdir(CLEANUP => 1);
+    $dir20 =~ s{\\}{/}g;
+    my $FIXED20 = 1_700_000_001;
+
+    local $AlmanacBug::ID_BASE = 0x1234;
+    local $AlmanacBug::ID_SEQ  = 0;
+    my $predicted = AlmanacBug::new_id($FIXED20);
+    $AlmanacBug::ID_SEQ = 0;   # rewind so claim_report_path mints the SAME id first
+
+    require File::Path;
+    File::Path::make_path($dir20);
+    my $sentinel_bytes = "SENTINEL-DO-NOT-TOUCH\n";
+    open(my $sfh, '>:raw', "$dir20/$predicted.md") or die "fixture: cannot write sentinel: $!";
+    print {$sfh} $sentinel_bytes;
+    close $sfh;
+
+    my ($path, $lock) = eval { AlmanacBug::claim_report_path($dir20, $FIXED20) };
+    my $claim_err = $@;
+    ok(defined $path, 'AC20/DC7a: claim_report_path succeeds despite the predicted id already existing')
+        or diag('err: ' . (length($claim_err) ? $claim_err : (ref($lock) ? ($lock->{message} // '(no message)') : ($lock // '(undef)'))));
+    if (defined $path) {
+        isnt($path, "$dir20/$predicted.md",
+            'AC20: claim_report_path returns a path DIFFERENT from the pre-existing predicted id');
+        $lock->release if ref($lock) && $lock->can('release');
+    } else {
+        fail('AC20: claim_report_path returns a path DIFFERENT from the pre-existing predicted id');
+    }
+    my $after = do {
+        open(my $f, '<:raw', "$dir20/$predicted.md") or die "fixture: cannot reread sentinel: $!";
+        local $/;
+        <$f>;
+    };
+    is($after, $sentinel_bytes, 'AC20: the pre-existing sentinel file bytes are unchanged');
+}
+
+# --- AC21 / DC7a -- 20 back-to-back `file` CLI calls, 20 distinct reports ---
+{
+    my $home21 = tempdir(CLEANUP => 1);
+    my $proj21 = tempdir(CLEANUP => 1);
+    my @ids21;
+    for my $i (1 .. 20) {
+        my $cmd = qq{ALMANAC_HOME="$home21" perl "$A" file --project "$proj21" }
+                . qq{--title "AC21 report $i" --body "b" 2>&1};
+        my $out = `$cmd`;
+        my $rc  = $? >> 8;
+        is($rc, 0, "AC21/DC7a: file() call $i exits 0") or diag($out);
+        chomp(my $path = $out);
+        my ($id) = $path =~ m{/([^/]+)\.md$};
+        push @ids21, $id if defined $id;
+    }
+    my %uniq21 = map { $_ => 1 } @ids21;
+    is(scalar(@ids21), 20, 'AC21: 20 file() calls each produced an id we could extract');
+    is(scalar(keys %uniq21), 20, 'AC21: 20 back-to-back file() calls yield 20 distinct report files');
+
+    my $list_cmd = qq{ALMANAC_HOME="$home21" perl "$A" list --project "$proj21" 2>&1};
+    my $list_out = `$list_cmd`;
+    for my $id (@ids21) {
+        like($list_out, qr/\Q$id\E/, "AC21: list finds report $id");
+    }
+}
+
+# --- AC22 / DC7b -- a legacy-shaped id keeps working end-to-end -------------
+{
+    my $home22 = tempdir(CLEANUP => 1);
+    my $proj22 = tempdir(CLEANUP => 1);
+    my $file_cmd = qq{ALMANAC_HOME="$home22" perl "$A" file --project "$proj22" }
+                 . qq{--title "AC22 legacy source" --body "b" 2>&1};
+    my $out22 = `$file_cmd`;
+    my $rc22  = $? >> 8;
+    is($rc22, 0, 'AC22 fixture: a report was filed to relabel with a legacy id') or diag($out22);
+    chomp(my $path22 = $out22);
+    (my $dir22 = $path22) =~ s{/[^/]+$}{};
+    my $legacy_id   = '20260813-010203-abcd';
+    my $legacy_path = "$dir22/$legacy_id.md";
+
+    {
+        my $bytes = slurp_text_wg($path22);
+        $bytes =~ s/^id:\s*\S+$/id: $legacy_id/m;
+        open(my $wf, '>:encoding(UTF-8)', $legacy_path) or die "fixture: cannot write $legacy_path: $!";
+        print {$wf} $bytes;
+        close $wf;
+    }
+    unlink $path22;
+
+    sub run22 {
+        my (@a) = @_;
+        my $c = qq{ALMANAC_HOME="$home22" perl "$A" } . join(' ', @a) . ' 2>&1';
+        my $o = `$c`;
+        return ($? >> 8, $o // '');
+    }
+
+    my ($rc_l22, $lout22) = run22('list', '--project', qq{"$proj22"});
+    is($rc_l22, 0, 'AC22: list exits 0 for a legacy-id report');
+    like($lout22, qr/\Q$legacy_id\E/, 'AC22: list finds it by the legacy id');
+
+    my ($rc_a22) = run22('append', $legacy_id, '--project', qq{"$proj22"}, '--body', qq{"more detail"});
+    is($rc_a22, 0, 'AC22: append exits 0 addressed by the legacy id');
+
+    my ($rc_s22) = run22('set-status', $legacy_id, '--project', qq{"$proj22"}, '--to', 'reviewing');
+    is($rc_s22, 0, 'AC22: set-status --to reviewing exits 0 addressed by the legacy id');
+
+    my ($rc_v22) = run22('verify', '--project', qq{"$proj22"});
+    is($rc_v22, 0, 'AC22: verify exits 0');
+
+    ok(-f $legacy_path, 'AC22: the report is still filed at its original legacy-id file name');
+    is(field_of_wg($legacy_path, 'id'), $legacy_id, 'AC22: its frontmatter id: field is unchanged');
+}
+
+# --- AC23 / DC7c -- the two-generator parity decision is recorded in a comment
+{
+    my @lines23 = read_all_lines_wg($A);
+    my ($idx23) = grep { $lines23[$_] =~ /^\s*sub\s+new_id\b/ } 0 .. $#lines23;
+    ok(defined $idx23, 'AC23 fixture: sub new_id is found in almanac-bug.pl') or diag('sub new_id not found');
+    if (defined $idx23) {
+        my $start23  = $idx23 > 15 ? $idx23 - 15 : 0;
+        my $window23 = join('', @lines23[$start23 .. $idx23]);
+        like($window23, qr/Almanac::Record/,
+            'AC23/DC7c: a comment within 15 lines of sub new_id mentions Almanac::Record');
+        like($window23, qr/tooling-bug-filing/,
+            'AC23/DC7c: ...and mentions tooling-bug-filing');
+    } else {
+        fail('AC23/DC7c: a comment within 15 lines of sub new_id mentions Almanac::Record');
+        fail('AC23/DC7c: ...and mentions tooling-bug-filing');
+    }
 }
 
 done_testing();

@@ -565,14 +565,44 @@ HOLDER14
         push @acquire_lines, $i if $lines[$i] =~ /Almanac::Lock->acquire\s*\(/;
         push @load_lines,    $i if $lines[$i] =~ /AlmanacBug::load\s*\(/;
     }
-    is(scalar(@acquire_lines), 3, 'AC-19: Almanac::Lock->acquire appears exactly three times');
-    my $all_above = (@acquire_lines == 3 && @load_lines == 3) ? 1 : 0;
-    if ($all_above) {
-        for my $i (0 .. 2) {
-            $all_above = 0 unless $acquire_lines[$i] < $load_lines[$i];
+
+    # Decision 36 / package 09: claim_report_path (verb => 'file') and
+    # verify's tampered/unreadable re-check (verb => 'verify') both take a
+    # real Almanac::Lock->acquire with no corresponding AlmanacBug::load --
+    # neither verb reads a report through load(). Classify every acquire
+    # site by its own verb=>'...' argument: the three mutating verbs
+    # (update/append/set-status) stay pinned above their load() exactly as
+    # before; 'file' and 'verify' are the two allowed extras; anything else
+    # is not permitted.
+    my (@mutating_acquire, @extra_acquire, @other_acquire);
+    for my $i (@acquire_lines) {
+        if ($lines[$i] =~ /verb\s*=>\s*['"](?:update|append|set-status)['"]/) {
+            push @mutating_acquire, $i;
+        } elsif ($lines[$i] =~ /verb\s*=>\s*['"](?:file|verify)['"]/) {
+            push @extra_acquire, $i;
+        } else {
+            push @other_acquire, $i;
         }
     }
-    ok($all_above, "AC-19: each acquire() occurs ABOVE its verb's load() call");
+    unless (ok(scalar(@other_acquire) == 0, 'AC-19: no acquire() site outside the five named verbs')) {
+        diag("line " . ($_ + 1) . ": $lines[$_]") for @other_acquire;
+    }
+    is(scalar(@mutating_acquire), 3,
+        'AC-19: Almanac::Lock->acquire appears exactly three times for the mutating verbs (update/append/set-status)');
+    is(scalar(@extra_acquire), 2,
+        "AC-19: exactly two extra acquire sites, verb => 'file' (claim_report_path) and verb => 'verify' (verify's re-check)");
+    ok((grep { $lines[$_] =~ /verb\s*=>\s*['"]file['"]/ } @extra_acquire),
+        "AC-19: one extra acquire site names verb => 'file'");
+    ok((grep { $lines[$_] =~ /verb\s*=>\s*['"]verify['"]/ } @extra_acquire),
+        "AC-19: one extra acquire site names verb => 'verify'");
+
+    my $all_above = (@mutating_acquire == 3 && @load_lines == 3) ? 1 : 0;
+    if ($all_above) {
+        for my $i (0 .. 2) {
+            $all_above = 0 unless $mutating_acquire[$i] < $load_lines[$i];
+        }
+    }
+    ok($all_above, "AC-19: each mutating-verb acquire() occurs ABOVE its verb's load() call");
 
     my ($susp, $res) = (0, 0);
     for my $line (@lines) {
