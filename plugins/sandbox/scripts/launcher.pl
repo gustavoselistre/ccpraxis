@@ -1607,19 +1607,9 @@ sub _pick_session_via_screen {
     my @rows = (ref $data->{sessions} eq 'ARRAY') ? @{ $data->{sessions} } : ();
     return ('new', undef) unless @rows || $data->{error};
 
-    my @items = ( { kind => 'row', id => 'NEW', group => 'sessions',
-                    display => '+ Start a new session', disabled => 0, selected => 0 } );
-    for my $s (@rows) {
-        next unless ref $s eq 'HASH' && defined $s->{uuid};
-        push @items, { kind => 'row', id => $s->{uuid}, group => 'sessions',
-                       display => (defined $s->{label} && length $s->{label}
-                                   ? $s->{label} : $s->{uuid}),
-                       disabled => 0, selected => 0 };
-    }
-    my $res = _launch_run_list({ mode  => 'single',
-                                 label => "resume a session - $PROJECT_NAME",
-                                 error => $data->{error},
-                                 items => \@items });
+    my $model = tui::LaunchScreens::session_pick_model(
+        \@rows, "resume a session - $PROJECT_NAME", $data->{error});
+    my $res = _launch_run_list($model);
     my $d = $res->{decision};
     return ('cancel', undef) unless $d->{confirmed};
     my $id = $d->{cursor_id};

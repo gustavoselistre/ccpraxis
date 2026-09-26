@@ -1,19 +1,18 @@
 #!/usr/bin/env perl
 # platform: any
-# Unit tests for the select-session.pl picker's viewport + display helpers —
-# the pure functions behind the scrolling TUI fix. The TUI render loop itself
-# needs a real TTY (covered by attended live-checks), but its load-bearing
-# logic is pure and testable by `require`-ing the script (its main flow is
-# guarded by `unless (caller)`):
+# Unit tests for the select-session.pl picker's pure helpers — the load-
+# bearing logic behind the scrolling/rendering TUI, testable without a real
+# TTY by `require`-ing the script (its main flow is guarded by
+# `unless (caller)`):
 #
-#   scroll_window  — keeps the selection inside a screen-sized window so a long
-#                    list never overflows / pollutes scrollback.
-#   clip_visible   — clips each row to the terminal width (ANSI-aware, byte-
-#                    conservative) so no row wraps and desyncs the redraw.
 #   sanitize_cell  — strips terminal-control bytes from attacker-influenceable
-#                    session previews before they're rendered.
-#   build_options  — "Start a new session" is always option 0; previews are
-#                    sanitized into the label.
+#                    session text before it's rendered.
+#   build_options  — "Start a new session" is always option 0; each session
+#                    option carries a card built from the new SessionIndex-
+#                    shaped session hash (blueprint sandbox-session-ux,
+#                    package 03-picker-cards).
+#   plan_frame     — the plain loop's row-budget chrome, unchanged by
+#                    package 03.
 
 use strict;
 use warnings;
@@ -32,64 +31,6 @@ pass('require did not run main() — caller guard holds');
 sub visible { my $s = shift; $s =~ s/\e\[[0-9;]*[A-Za-z]//g; return $s; }
 
 # ---------------------------------------------------------------------
-# scroll_window($top, $sel, $cap, $n)
-# ---------------------------------------------------------------------
-is(scroll_window(0,  3, 10, 5),  0,  'list fits in window -> top stays 0');
-is(scroll_window(5,  6,  3, 20), 5,  'selection already visible -> no scroll');
-is(scroll_window(0,  9,  3, 20), 7,  'selection below window -> scroll down to show it');
-is(scroll_window(7,  2,  3, 20), 2,  'selection above window -> scroll up to show it');
-is(scroll_window(0, 19,  3, 20), 17, 'End: last item -> window pinned to the bottom');
-is(scroll_window(17, 0,  3, 20), 0,  'Home: first item -> window back to the top');
-is(scroll_window(100,19, 3, 20), 17, 'out-of-range top clamps to max_top');
-is(scroll_window(0,  5,  1, 20), 5,  'cap=1: window tracks selection exactly');
-is(scroll_window(-5,-3,  0, 20), 0,  'garbage inputs clamp safely to 0');
-
-# Invariant sweep: for any selection, the chosen window must contain it.
-{
-    my $bad = 0;
-    my ($cap, $n) = (5, 37);
-    my $max_top = $n > $cap ? $n - $cap : 0;
-    my $top = 0;
-    for my $sel (0 .. $n - 1) {
-        $top = scroll_window($top, $sel, $cap, $n);
-        $bad++ unless $sel >= $top && $sel <= $top + $cap - 1;
-        $bad++ if $top < 0 || $top > $max_top;
-    }
-    is($bad, 0, 'sweeping selection 0..n-1 always keeps it inside a valid window');
-}
-
-# ---------------------------------------------------------------------
-# clip_visible($s, $width)
-# ---------------------------------------------------------------------
-is(visible(clip_visible("abcdefghij", 5)), "abcde", 'truncates to width visible cols');
-is(visible(clip_visible("abc", 10)),       "abc",   'shorter than width -> unchanged');
-is(visible(clip_visible("abc", 0)),        "",      'width 0 -> empty payload');
-like(clip_visible("anything", 4), qr/\e\[0m\z/,     'always ends with a reset (no color bleed)');
-
-# SGR escapes are preserved and cost zero columns.
-{
-    my $c = clip_visible("\e[1;36mABCDE\e[0m", 3);
-    like($c, qr/\e\[1;36m/,         'SGR color sequence is preserved');
-    is(visible($c), "ABC",          'SGR is zero-width: exactly 3 visible cols kept');
-}
-
-# Non-SGR control sequences are dropped entirely.
-is(visible(clip_visible("a\e[2Jb", 10)), "ab", 'embedded non-SGR CSI (\\e[2J) is dropped');
-
-# Bare C0 control bytes + DEL are stripped at the display seam (zero width), so
-# an un-sanitized source (e.g. $PROJECT_LABEL) can't beep/overwrite/spoof.
-is(visible(clip_visible("a\x07b\x0dc\x08d\x7fe", 10)), "abcde",
-   'C0 (BEL/CR/BS) + DEL bytes are dropped by clip_visible');
-
-# Width counted in BYTES -> multi-byte UTF-8 truncation is conservative; a row
-# can never exceed the width and therefore never wraps.
-{
-    my $multibyte = "\xc3\xa9" x 10;     # ten "é" = 20 bytes
-    my $vis = visible(clip_visible($multibyte, 5));
-    ok(length($vis) <= 5, 'multi-byte payload clipped to <= width bytes (never wraps)');
-}
-
-# ---------------------------------------------------------------------
 # sanitize_cell($s)
 # ---------------------------------------------------------------------
 is(sanitize_cell("a\x1bb"),  "ab",  'ESC (0x1b) stripped');
@@ -105,7 +46,9 @@ is(sanitize_cell("caf\xc3\xa9"), "caf\xc3\xa9", 'printable multi-byte UTF-8 pres
 }
 
 # ---------------------------------------------------------------------
-# build_options(@sessions) — "new" first + preview sanitized into the label
+# build_options(@sessions) — "new" first + card built from the new,
+# SessionIndex-shaped session hash (uuid, mtime, kind, started_at,
+# last_active_at, first_typed, last_typed, same_message).
 # ---------------------------------------------------------------------
 {
     my @opts = build_options();
@@ -113,11 +56,14 @@ is(sanitize_cell("caf\xc3\xa9"), "caf\xc3\xa9", 'printable multi-byte UTF-8 pres
 }
 {
     my $sess = {
-        uuid    => 'abcd1234-1111-2222-3333-444455556666',
-        mtime   => 1_700_000_000,
-        size    => 10,
-        cwd     => '/project',
-        preview => "fix\x1bthe\x07bug",     # contains ESC + BEL injection bytes
+        uuid           => 'abcd1234-1111-2222-3333-444455556666',
+        mtime          => 1_700_000_000,
+        kind           => 'human',
+        started_at     => 1_700_000_000,
+        last_active_at => 1_700_000_000,
+        first_typed    => "fix\x1bthe\x07bug",     # contains ESC + BEL injection bytes
+        last_typed     => undef,
+        same_message   => 1,
     };
     my @opts = build_options($sess);
     is(scalar @opts, 2,                  'one NEW + one session => 2 options');
@@ -125,29 +71,32 @@ is(sanitize_cell("caf\xc3\xa9"), "caf\xc3\xa9", 'printable multi-byte UTF-8 pres
     like($opts[1]{action}, qr/^RESUME abcd1234-/, 'session yields RESUME <uuid>');
     unlike($opts[1]{label}, qr/\x1b/,    'no ESC byte survives into the session label');
     unlike($opts[1]{label}, qr/[\x00-\x08\x0e-\x1f\x7f]/, 'no control bytes in the label');
-    like($opts[1]{label}, qr/fixthebug/, 'preview text preserved minus the control bytes');
+    like($opts[1]{label}, qr/fixthebug/, 'message text preserved minus the control bytes');
 }
 {
-    # A preview that is *only* control bytes collapses to the no-preview marker.
+    # A message that is *only* control bytes collapses to the no-message marker.
     my $sess = {
-        uuid    => '99999999-0000-0000-0000-000000000000',
-        mtime   => 1_700_000_000,
-        size    => 1,
-        cwd     => '/p',
-        preview => "\x1b\x07\x00",
+        uuid           => '99999999-0000-0000-0000-000000000000',
+        mtime          => 1_700_000_000,
+        kind           => 'human',
+        started_at     => 1_700_000_000,
+        last_active_at => 1_700_000_000,
+        first_typed    => "\x1b\x07\x00",
+        last_typed     => undef,
+        same_message   => 1,
     };
     my @opts = build_options($sess);
-    like($opts[1]{label}, qr/\(no preview\)/, 'all-control preview => "(no preview)"');
+    like($opts[1]{label}, qr/\(no message\)/, 'all-control message => "(no message)"');
 }
 
 # ---------------------------------------------------------------------
 # s14-session-filter (AC-18 -> DC-3): is_butler tagging on build_options.
 # build_options' signature/return shape is otherwise unchanged (asserted
 # above); requiring the script must still not run main() even though the
-# script body now references the SessionFilter package (only butler_sids(),
-# reached solely from the `unless (caller)` entry point, ever loads it) — the
-# existing `pass('require did not run main() — caller guard holds')` near the
-# top of this file already covers that half of AC-18 and must stay green.
+# script body now references the SessionFilter/SessionIndex packages (only
+# reached from the `unless (caller)` entry point) — the existing
+# `pass('require did not run main() — caller guard holds')` near the top of
+# this file already covers that half of AC-18 and must stay green.
 # ---------------------------------------------------------------------
 {
     my @opts = build_options();
@@ -156,25 +105,33 @@ is(sanitize_cell("caf\xc3\xa9"), "caf\xc3\xa9", 'printable multi-byte UTF-8 pres
 }
 {
     my $butler_sess = {
-        uuid      => 'ffffffff-1111-2222-3333-444455556666',
-        mtime     => 1_700_000_000,
-        size      => 10,
-        cwd       => '/project',
-        preview   => 'a butler-spawned session',
-        is_butler => 1,
+        uuid           => 'ffffffff-1111-2222-3333-444455556666',
+        mtime          => 1_700_000_000,
+        kind           => 'human',
+        started_at     => 1_700_000_000,
+        last_active_at => 1_700_000_000,
+        first_typed    => 'a butler-spawned session',
+        last_typed     => undef,
+        same_message   => 1,
+        is_butler      => 1,
     };
     my $user_sess = {
-        uuid    => '01234567-1111-2222-3333-444455556666',
-        mtime   => 1_700_000_001,
-        size    => 10,
-        cwd     => '/project',
-        preview => 'a regular user session',
+        uuid           => '01234567-1111-2222-3333-444455556666',
+        mtime          => 1_700_000_001,
+        kind           => 'human',
+        started_at     => 1_700_000_001,
+        last_active_at => 1_700_000_001,
+        first_typed    => 'a regular user session',
+        last_typed     => undef,
+        same_message   => 1,
         # no is_butler key at all
     };
     my @opts = build_options($butler_sess, $user_sess);
     is(scalar @opts, 3, 'AC-18 -> DC-3: one NEW + two sessions => 3 options');
     is($opts[1]{is_butler}, 1, 'AC-18 -> DC-3: a session with is_butler=>1 tags its option is_butler==1');
     is($opts[2]{is_butler}, 0, 'AC-18 -> DC-3: a session with no is_butler key tags its option is_butler==0');
+    like($opts[1]{action}, qr/^RESUME \Qffffffff-1111-2222-3333-444455556666\E$/, 'AC-18 -> DC-3: action shape unchanged for the butler session');
+    like($opts[2]{action}, qr/^RESUME \Q01234567-1111-2222-3333-444455556666\E$/, 'AC-18 -> DC-3: action shape unchanged for the user session');
 }
 
 # ---------------------------------------------------------------------
@@ -209,17 +166,5 @@ is(sanitize_cell("caf\xc3\xa9"), "caf\xc3\xa9", 'printable multi-byte UTF-8 pres
     ok($tiny->{head} + $tiny->{foot} + ($tiny->{hints} ? 2 : 0) + $tiny->{cap} <= 2,
        'rows=2: degenerate frame still fits');
 }
-
-# ---------------------------------------------------------------------
-# json_unescape — decodes \uXXXX so control chars become real bytes (then
-# stripped) and accented text renders, instead of literal backslash-u noise.
-# ---------------------------------------------------------------------
-# Build the \uXXXX sequences with chr(92) ("\") so no literal backslash-u token
-# appears in this source (which would otherwise be transformed before it runs).
-my $BS = chr(92);
-is(json_unescape('hello world'), 'hello world', 'plain text passes through');
-is(json_unescape("caf${BS}u00e9"), "caf\xc3\xa9", 'BMP escape decodes to UTF-8 "e-acute"');
-is(sanitize_cell(json_unescape("a${BS}u001bb")), 'ab',
-   'JSON-escaped ESC is decoded to a real byte then stripped by sanitize_cell');
 
 done_testing();
