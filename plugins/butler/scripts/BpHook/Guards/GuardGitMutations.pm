@@ -272,7 +272,219 @@ sub run {
         );
     }
 
+    # Package 35 / Decision 117: a subagent payload (agent_id present) is
+    # denied every git verb that mutates the index, refs or history, or
+    # talks to a remote -- the driver's own verdicts (above) are unchanged
+    # for everyone, including the driver, which never reaches this block.
+    if (defined BpHook::agent_id($p)) {
+        if (_subagent_git_index_mutation($scan, $anchor, $gitopt)) {
+            return BpHook::deny(
+                BpHook::Guards::Common::fit(
+                    'BLOCKED: a subagent cannot change the git index, refs or history, or talk to a remote; the driver owns git.'
+                ),
+                BpHook::Guards::Common::fit($cmd_line),
+            );
+        }
+    }
+
     return 0;
+}
+
+# ---------------------------------------------------------------------------
+# _subagent_git_index_mutation($scan, $anchor, $gitopt) -> true iff some
+# line of $scan invokes a Decision-117/118 mutating git verb. $scan is the
+# already-masked command (quotes/heredoc/backtick-handled by
+# _git_scan_target). Operates per-line, grep -E semantics, mirroring the
+# rest of this module. Every occurrence on a line is inspected (package
+# 35 fix-batch M1), not just the first, so a chained good-faith sequence
+# such as "git apply --check p && git apply --index p" is still denied on
+# its second invocation even though its first is read-only.
+# ---------------------------------------------------------------------------
+sub _subagent_git_index_mutation {
+    my ($scan, $anchor, $gitopt) = @_;
+
+    # Verbs denied unconditionally, in any form: straightforward
+    # index/ref/history mutators with no read-only sense. The boundary is
+    # (?![-\w]), not \b, so a hyphenated plumbing verb that never touches
+    # the index/refs/history is not swept in: merge-file, merge-tree,
+    # merge-base, commit-tree, commit-graph (fix-batch S1).
+    my $bare_re = qr/${anchor}git[\s]+${gitopt}(add|rm|mv|commit|update-index|update-ref|read-tree|merge|rebase|cherry-pick|revert|am|push|pull|fetch|stage|bisect|gc|prune|repack|filter-branch|replace)(?![-\w])/;
+    return 1 if BpHook::Guards::Common::line_match($bare_re, $scan);
+
+    # Verbs whose own arguments decide the verdict (Decision 118). Every
+    # occurrence on the line is walked (while (...) =~ /$re/g), not just
+    # the leftmost -- fix-batch M1. $anchor carries its own capture group
+    # (group 1), so each verb's "rest of the invocation" capture is group 2.
+    my @qualified = (
+        [qr/${anchor}git[\s]+${gitopt}apply(?![-\w])([^;&|)\n]*)/,         \&_apply_rest_is_mutating],
+        [qr/${anchor}git[\s]+${gitopt}branch(?![-\w])([^;&|)\n]*)/,        \&_branch_rest_is_mutating],
+        [qr/${anchor}git[\s]+${gitopt}tag(?![-\w])([^;&|)\n]*)/,           \&_tag_rest_is_mutating],
+        [qr/${anchor}git[\s]+${gitopt}notes(?![-\w])([^;&|)\n]*)/,         \&_notes_rest_is_mutating],
+        [qr/${anchor}git[\s]+${gitopt}worktree(?![-\w])([^;&|)\n]*)/,      \&_worktree_rest_is_mutating],
+        [qr/${anchor}git[\s]+${gitopt}submodule(?![-\w])([^;&|)\n]*)/,     \&_submodule_rest_is_mutating],
+        [qr/${anchor}git[\s]+${gitopt}remote(?![-\w])([^;&|)\n]*)/,        \&_remote_rest_is_mutating],
+        [qr/${anchor}git[\s]+${gitopt}config(?![-\w])([^;&|)\n]*)/,        \&_config_rest_is_mutating],
+        [qr/${anchor}git[\s]+${gitopt}symbolic-ref(?![-\w])([^;&|)\n]*)/,  \&_symbolic_ref_rest_is_mutating],
+        [qr/${anchor}git[\s]+${gitopt}reflog(?![-\w])([^;&|)\n]*)/,        \&_reflog_rest_is_mutating],
+    );
+    for my $line (split /\n/, $scan) {
+        for my $q (@qualified) {
+            my ($re, $classifier) = @$q;
+            while ($line =~ /$re/g) {
+                my $rest = defined $2 ? $2 : '';
+                return 1 if $classifier->($rest);
+            }
+        }
+    }
+
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# _strip_redirects($rest) -> $rest with shell redirection tokens (and their
+# targets, whether attached or space-separated) removed, so a redirect is
+# never mistaken for a positional argument (fix-batch M2 point 1). Order
+# matters: the fd-duplication and &> forms are stripped before the plain
+# ">"/">>" form, which would otherwise eat into them.
+# ---------------------------------------------------------------------------
+sub _strip_redirects {
+    my ($rest) = @_;
+    return '' unless defined $rest;
+    $rest =~ s/\d*>&\d+//g;       # 2>&1, >&2 -- no filename target
+    $rest =~ s/&>\s*\S*//g;       # &>file, &> file
+    $rest =~ s/\d*>>?\s*\S*//g;   # >file, >>file, 2>/dev/null, > out.txt
+    $rest =~ s/<\s*\S*//g;        # <file
+    return $rest;
+}
+
+# ---------------------------------------------------------------------------
+# Per-verb qualifier classifiers. Each takes the raw text following the
+# verb (up to the next shell separator) and returns true iff that
+# invocation mutates the index, refs, history or a remote per Decision 118.
+# ---------------------------------------------------------------------------
+
+sub _apply_rest_is_mutating {
+    my ($rest) = @_;
+    return 0 unless defined $rest && length $rest;
+    return 1 if $rest =~ /(?:^|\s)(?:--cached|--index)(?:\s|=|$)/;
+    return 1 if $rest =~ /(?:^|\s)(?:-3|--3way)(?:\s|$)/;
+    return 0;
+}
+
+sub _branch_rest_is_mutating {
+    my ($rest) = @_;
+    $rest = _strip_redirects($rest);
+    return 0 unless defined $rest && length $rest;
+
+    my $mutating_re    = qr/^(?:-d|-D|--delete|-m|-M|--move|-c|-C|--copy|-f|--force|-u|--set-upstream-to(?:=.*)?|--unset-upstream|--edit-description|-t|--track|--no-track|--create-reflog)$/;
+    my $list_flag_re   = qr/^(?:-a|--all|-r|--remotes|-l|--list|-v|-vv|--verbose|--show-current)$/;
+    my $list_eq_re     = qr/^(?:--sort=.*|--format=.*)$/;
+    my $ref_arg_flag_re = qr/^(?:--contains|--no-contains|--merged|--no-merged|--points-at)$/; # takes a ref argument
+
+    my @tokens = grep { length } split /\s+/, $rest;
+    my $list_mode = 0;
+    while (@tokens) {
+        my $tok = shift @tokens;
+        return 1 if $tok =~ $mutating_re;
+        if ($tok =~ $list_flag_re || $tok =~ $list_eq_re) {
+            $list_mode = 1;
+            next;
+        }
+        if ($tok =~ $ref_arg_flag_re) {
+            $list_mode = 1;
+            shift @tokens if @tokens && $tokens[0] !~ /^-/;
+            next;
+        }
+        if ($tok =~ /^-/) {
+            # An unrecognised flag: fail open on the flag itself (fix-batch
+            # M2 point 3) -- but it does not, by itself, license a
+            # positional branch-name argument that follows.
+            next;
+        }
+        # A positional token: a glob pattern once a listing flag has put us
+        # in list mode (e.g. "branch --list 'feat*'"), otherwise a branch
+        # name to create/rename onto.
+        return 1 unless $list_mode;
+    }
+    return 0;
+}
+
+sub _tag_rest_is_mutating {
+    my ($rest) = @_;
+    my @tokens = grep { length } split /\s+/, (defined $rest ? $rest : '');
+    return 0 unless @tokens; # bare "git tag" -- listing form, allow
+    return 0 if $tokens[0] =~ /^(?:-l|--list)$/;
+    return 1;
+}
+
+sub _notes_rest_is_mutating {
+    my ($rest) = @_;
+    my @tokens = grep { length } split /\s+/, (defined $rest ? $rest : '');
+    return 1 unless @tokens; # no subcommand -- not one of the two allowed forms
+    return 0 if $tokens[0] =~ /^(?:list|show)$/;
+    return 1;
+}
+
+sub _worktree_rest_is_mutating {
+    my ($rest) = @_;
+    my @tokens = grep { length } split /\s+/, (defined $rest ? $rest : '');
+    return 0 unless @tokens; # bare "git worktree" lists worktrees
+    return 0 if $tokens[0] eq 'list';
+    return 1;
+}
+
+sub _submodule_rest_is_mutating {
+    my ($rest) = @_;
+    my @tokens = grep { length } split /\s+/, (defined $rest ? $rest : '');
+    return 0 unless @tokens; # bare "git submodule" -- status-like listing
+    return 0 if $tokens[0] eq 'status';
+    return 1;
+}
+
+sub _remote_rest_is_mutating {
+    my ($rest) = @_;
+    my @tokens = grep { length } split /\s+/, (defined $rest ? $rest : '');
+    return 0 unless @tokens; # bare "git remote" -- allow
+    my $i = 0;
+    $i++ if $tokens[0] eq '-v'; # "git remote -v" stays a listing form
+    return 0 unless exists $tokens[$i]; # nothing after -v -- allow
+    return 0 if $tokens[$i] =~ /^(?:show|get-url)$/;
+    return 1;
+}
+
+sub _config_rest_is_mutating {
+    my ($rest) = @_;
+    my @tokens = grep { length } split /\s+/, (defined $rest ? $rest : '');
+    return 0 unless @tokens; # bare "git config" -- allow (not a write)
+    my $deny_flag_re = qr/^(?:--unset(?:-all)?|--add|--replace-all|--rename-section|--remove-section|-e|--edit)$/;
+    my $positional_count = 0;
+    for my $tok (@tokens) {
+        return 1 if $tok =~ $deny_flag_re;
+        $positional_count++ unless $tok =~ /^-/;
+    }
+    return 1 if $positional_count >= 2; # "config <key> <value>" write form
+    return 0;
+}
+
+sub _symbolic_ref_rest_is_mutating {
+    my ($rest) = @_;
+    my @tokens = grep { length } split /\s+/, (defined $rest ? $rest : '');
+    return 0 unless @tokens; # bare invocation -- read attempt, allow
+    my $positional_count = 0;
+    for my $tok (@tokens) {
+        return 1 if $tok =~ /^(?:-d|--delete)$/;
+        $positional_count++ unless $tok =~ /^-/;
+    }
+    return 1 if $positional_count >= 2; # a write (ref + new target)
+    return 0;
+}
+
+sub _reflog_rest_is_mutating {
+    my ($rest) = @_;
+    my @tokens = grep { length } split /\s+/, (defined $rest ? $rest : '');
+    return 0 unless @tokens; # bare "git reflog" -- allow
+    return 0 if $tokens[0] eq 'show';
+    return 1;
 }
 
 1;
