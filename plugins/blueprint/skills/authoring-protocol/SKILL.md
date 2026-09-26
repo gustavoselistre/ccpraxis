@@ -59,6 +59,8 @@ A cap is a **runaway backstop, not a budget** — it only binds when the coordin
 
 `list` / `view` read files only. `audit` re-runs `blueprint:bp-auditor`. `archive` / `delete` are lifecycle ops on the files. This plugin never touches running coordinator processes — those live in the sandbox and are butler's to stop. A user decision that implies substantial new work becomes a **new blueprint**, not scope creep on an existing one.
 
+**Work that moved to another blueprint is dropped, not parked.** Mark that package's ledger dropped and put a pointer to where the work went (<blueprint>/<package>) in its Next action; parked means waiting on a decision, and a finished blueprint holding a parked package is never archived.
+
 ## Soft ordering vs a hard dependency edge
 
 `depends_on` is not the only ordering tool. Two different needs get confused if you reach for the DAG

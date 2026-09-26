@@ -31,7 +31,12 @@
 #                                                      run ends. NOT a pause: a pause promises a
 #                                                      resume, and there is none until a human
 #                                                      re-authenticates.
-#   {"action":"blueprint-done","blueprint":B,"pending":[…]} B settled; pending = remaining bps to re-eval
+#   {"action":"blueprint-done","blueprint":B,"pending":[…],"archived":true|false,
+#    "archive_detail":"…"}                             B settled; pending = remaining bps to re-eval;
+#                                                      archived reports whether the director's own
+#                                                      single-blueprint archive attempt (reusing
+#                                                      bp-lifecycle.pl reconcile --archive) landed —
+#                                                      archive_detail names the outcome either way
 #   {"action":"in-flight","blueprint":B,"packages":[…],"running":[…]}
 #                                                      nothing dispatchable right now, but B still
 #                                                      holds non-terminal packages (typically owned by
@@ -502,6 +507,26 @@ sub _acquire_inflight_lock {
     }
 }
 
+# _acquire_archive_lock($dsdir) -> $filehandle | undef (review 01, M1).
+# Exclusive, non-blocking, single attempt -- no retry, no timeout. Busy or
+# any failure to acquire both return undef so the caller can defer
+# immediately rather than stall `next`. Released implicitly when the
+# returned filehandle goes out of scope (held for the caller's critical
+# section only).
+sub _acquire_archive_lock {
+    my ($dsdir) = @_;
+    make_path($dsdir) unless -d $dsdir;
+    my $lockfile = "$dsdir/archive.lock";
+    my $fh;
+    return undef unless open $fh, '>>', $lockfile;
+    my $got = eval { flock($fh, LOCK_EX | LOCK_NB) };
+    unless ($got) {
+        close $fh;
+        return undef;
+    }
+    return $fh;
+}
+
 sub _append_run_log {
     my ($dsdir, $line) = @_;
     return unless defined $dsdir;
@@ -715,6 +740,284 @@ sub mark_announced {
 }
 
 # ===========================================================================
+# SINGLE-BLUEPRINT ARCHIVE AT blueprint-done (director-archives-finished,
+# package 01, spec §2.3-2.6). Reuses bp-lifecycle.pl's own archive gate
+# (BpState::blueprint_lifecycle) and its `reconcile --archive` action as a
+# list-form subprocess -- never a second archive implementation. A failed or
+# deferred attempt never blocks the run; the caller retries on a later `next`
+# (the retry sweep in _cmd_next) or via the run-done `--all` backstop.
+# ===========================================================================
+
+# _archive_detail_clean($s): one line (every \r/\n run collapsed to a single
+# space), at most 400 characters, never empty (spec §2.1).
+sub _archive_detail_clean {
+    my ($s) = @_;
+    $s = defined $s ? $s : '';
+    $s =~ s/[\r\n]+/ /g;
+    $s = substr($s, 0, 400) if length($s) > 400;
+    return length($s) ? $s : 'archive failed: unknown';
+}
+
+# _archive_gate($data, $bp) -> ($ok, $detail) — pure read (spec §2.3).
+# Precedence: no ledgers -> not archivable; any non-done/dropped status ->
+# not all delivered; lifecycle ne 'done' -> not archivable; else (1, undef).
+sub _archive_gate {
+    my ($data, $bp) = @_;
+    require "$DIR/BpState.pm" unless defined &BpState::all_package_statuses;
+    my $bpdir = "$data/blueprints/$bp";
+    my $statuses = BpState::all_package_statuses($bpdir);
+    unless (%$statuses) {
+        return (0, 'not archivable: no package ledgers');
+    }
+    my @bad = grep { $statuses->{$_} ne 'done' && $statuses->{$_} ne 'dropped' } sort keys %$statuses;
+    if (@bad) {
+        return (0, 'not all delivered: ' . join(', ', map { "$_=$statuses->{$_}" } @bad));
+    }
+    my $lc = BpState::blueprint_lifecycle($bpdir, sub { kill(0, $_[0]) ? 1 : 0 });
+    if ($lc ne 'done') {
+        return (0, "not archivable: lifecycle is '$lc'");
+    }
+    return (1, undef);
+}
+
+# _archive_blockers($data, $dsdir, $bp, $now) -> \@parts (spec §2.4). Three
+# read-only deferral checks; empty list = not deferred. $now is the
+# director's own now seam for the dispatch-log staleness check ONLY -- the
+# worker-marker staleness check below uses the REAL clock deliberately
+# (mtime is real; see spec §2.4/2).
+sub _archive_blockers {
+    my ($data, $dsdir, $bp, $now) = @_;
+    my @parts;
+
+    # 1. in-flight set: NOT pruned (spec rationale — pruning would drop the
+    # very entry this check exists to see).
+    my ($entries) = load_inflight($data, $dsdir, $now);
+    my @inflight_pkgs = sort map { $_->{package} }
+                        grep { $_->{blueprint} eq $bp } @$entries;
+    push @parts, 'in-flight ' . join(',', @inflight_pkgs) if @inflight_pkgs;
+
+    # 2. live worker marker bound to one of this blueprint's ledgers.
+    my @live_tuids;
+    my $wdir = "$dsdir/workers";
+    my $bdir = "$dsdir/bindings";
+    if (-d $wdir) {
+        my $stale_min = 180;
+        if (defined $ENV{CCPRAXIS_VALIDATION_STALE_MIN}
+            && $ENV{CCPRAXIS_VALIDATION_STALE_MIN} =~ /^[0-9]+\z/
+            && $ENV{CCPRAXIS_VALIDATION_STALE_MIN} > 0) {
+            $stale_min = $ENV{CCPRAXIS_VALIDATION_STALE_MIN} + 0;
+        }
+        if (opendir(my $dh, $wdir)) {
+            for my $f (readdir $dh) {
+                next unless $f =~ /^[A-Za-z0-9_-]{1,128}\z/;
+                my $path = "$wdir/$f";
+                next unless -f $path;
+                my @st = stat($path);
+                next unless @st;
+                next unless (CORE::time() - $st[9]) < ($stale_min * 60);
+                my $binding = _read_json_file("$bdir/$f.json");
+                next unless ref $binding eq 'HASH' && (($binding->{blueprint} // '') eq $bp);
+                push @live_tuids, $f;
+            }
+            closedir $dh;
+        }
+    }
+    push @parts, 'live worker ' . join(',', sort @live_tuids) if @live_tuids;
+
+    # 3. open dispatch-log entry attributed to this blueprint.
+    my $dispatch_dir = "$data/.dispatch-log";
+    my @open_ids;
+    my $lib_ok = eval {
+        require "$DIR/bp-dispatch-log.pl" unless defined &BpDispatchLog::is_live;
+        1;
+    };
+    if (!$lib_ok) {
+        push @parts, 'dispatch-log unreadable';
+    } elsif (-d $dispatch_dir && opendir(my $dh, $dispatch_dir)) {
+        for my $f (readdir $dh) {
+            next unless $f =~ /^(.+)\.json\z/;
+            my $id  = $1;
+            my $rec = _read_json_file("$dispatch_dir/$f");
+            next unless ref $rec eq 'HASH';
+            next unless BpDispatchLog::is_live($rec, $now);
+            my $attr = BpDispatchLog::attribution($rec);
+            next unless (($attr->{blueprint} // '') eq $bp);
+            push @open_ids, $id;
+        }
+        closedir $dh;
+    }
+    push @parts, 'open dispatch ' . join(',', sort @open_ids) if @open_ids;
+
+    return \@parts;
+}
+
+# _run_archive($data, $dsdir, $bp, $opts) -> ($archived_bool_plain, $detail)
+# (spec §2.5). List-form subprocess, never a shell string; STDOUT/STDERR
+# captured through real temp files (never an in-memory scalar — Landmine #2).
+# Review 01 M1: takes a non-blocking $dsdir/archive.lock around the whole
+# attempt (busy -> deferred immediately, no retry) and, under that lock,
+# re-checks immediately before running bp-lifecycle.pl that the source still
+# exists and the destination does not -- closing the window a concurrent
+# `next` could have used to already file this same archive. Lock is released
+# on every return path via $lock_fh going out of scope.
+sub _run_archive {
+    my ($data, $dsdir, $bp, $opts) = @_;
+    my $script = $opts->{lifecycle_script} // "$DIR/bp-lifecycle.pl";
+
+    my $lock_fh = _acquire_archive_lock($dsdir);
+    return (0, 'deferred: archive in progress') unless $lock_fh;
+
+    my $bp_dir      = "$data/blueprints/$bp";
+    my $archive_dir = "$data/blueprints/_archive/$bp";
+    unless (-e $bp_dir) {
+        return (1, "already archived to _archive/$bp") if -d $archive_dir;
+        return (0, 'deferred: archive in progress');
+    }
+    # Decision 6: source and destination both present is a failure needing a
+    # human, never a deferral -- it does not clear by itself. Never runs
+    # bp-lifecycle.pl or touches _archive/<b> in this case.
+    return (0, "archive failed: _archive/$bp already exists (reconcile not run)") if -e $archive_dir;
+
+    require File::Temp;
+    my ($otfh, $opath) = File::Temp::tempfile(); close $otfh;
+    my ($etfh, $epath) = File::Temp::tempfile(); close $etfh;
+
+    open(my $saved_out, '>&', \*STDOUT) or return (0, "archive failed: could not run bp-lifecycle.pl (cannot dup STDOUT: $!)");
+    open(my $saved_err, '>&', \*STDERR) or do {
+        open(STDOUT, '>&', $saved_out); close $saved_out;
+        return (0, "archive failed: could not run bp-lifecycle.pl (cannot dup STDERR: $!)");
+    };
+    my $rc = -1;
+    my $fail_detail;
+    if (open(STDOUT, '>', $opath)) {
+        if (open(STDERR, '>', $epath)) {
+            $rc = system($^X, $script, 'reconcile', '--blueprint', $bp,
+                         '--data-dir', $data, '--archive', '--json');
+            $fail_detail = "could not run bp-lifecycle.pl ($!)" if $rc == -1;
+        } else {
+            $fail_detail = "cannot capture output: $!";
+        }
+    } else {
+        $fail_detail = "cannot capture output: $!";
+    }
+    open(STDOUT, '>&', $saved_out); close $saved_out;
+    open(STDERR, '>&', $saved_err); close $saved_err;
+
+    my $out = _read_file($opath) // '';
+    my $err = _read_file($epath) // '';
+    unlink $opath, $epath;
+
+    if ($rc == -1) {
+        return (0, "archive failed: $fail_detail");
+    }
+    my $exit = $rc >> 8;
+
+    my $parsed = eval { JSON::PP->new->decode($out) };
+    my $rec;
+    if (ref $parsed eq 'ARRAY') {
+        ($rec) = grep { ref $_ eq 'HASH' && (($_->{blueprint} // '') eq $bp) } @$parsed;
+    }
+
+    if ($exit != 0) {
+        my $detail;
+        if ($rec && ref $rec->{errors} eq 'ARRAY' && @{ $rec->{errors} }) {
+            $detail = $rec->{errors}[0];
+        }
+        unless (defined $detail) {
+            my @lines = grep { length } split /\r?\n/, $err;
+            $detail = $lines[0] if @lines;
+        }
+        $detail //= 'no output';
+        return (0, "archive failed: reconcile exit $exit: $detail");
+    }
+
+    # exit 0: disk state decides `archived`, never the JSON (spec §2.5).
+    if (-d "$data/blueprints/_archive/$bp" && !-e "$data/blueprints/$bp") {
+        my $detail;
+        if ($rec && ref $rec->{actions} eq 'ARRAY') {
+            my ($act) = grep { ref $_ eq 'HASH' && (($_->{kind} // '') eq 'archive') && $_->{applied} }
+                        @{ $rec->{actions} };
+            $detail = $act->{detail} if $act;
+        }
+        $detail //= "archived to _archive/$bp";
+        return (1, $detail);
+    }
+
+    # exit 0 but not archived: a reported `skipped` action names why and is
+    # NOT a failure (a live orchestrator raced the gate); anything else is.
+    if ($rec && ref $rec->{actions} eq 'ARRAY') {
+        my ($skip) = grep { ref $_ eq 'HASH' && (($_->{kind} // '') eq 'skipped') } @{ $rec->{actions} };
+        if ($skip) {
+            return (0, "not archivable: $skip->{detail}");
+        }
+    }
+    my $lc = $rec ? ($rec->{lifecycle} // '?') : '?';
+    return (0, "archive failed: reconcile exited 0 but did not archive (lifecycle '$lc')");
+}
+
+# _attempt_archive($data, $dsdir, $bp, $now, $opts) -> ($archived_bool_json,
+# $detail, $outcome) (spec §2.3). Gate -> blockers -> subprocess, first stop
+# wins. Never dies: the whole body is guarded so any exception becomes
+# (false, "archive failed: <msg>", 'failed'). Drops $bp from order.json on
+# 'archived' only.
+sub _attempt_archive {
+    my ($data, $dsdir, $bp, $now, $opts) = @_;
+    my ($archived, $detail, $outcome) = (0, undef, undef);
+    my $ok = eval {
+        my $inner = sub {
+            my ($gate_ok, $gate_detail) = _archive_gate($data, $bp);
+            return (0, $gate_detail, 'not-archivable') unless $gate_ok;
+
+            my $blockers = _archive_blockers($data, $dsdir, $bp, $now);
+            return (0, 'deferred: ' . join('; ', @$blockers), 'deferred') if @$blockers;
+
+            my ($ab, $rd) = _run_archive($data, $dsdir, $bp, $opts);
+            return (1, $rd, 'archived') if $ab;
+            return (0, $rd, 'not-archivable') if $rd =~ /^not archivable:/;
+            return (0, $rd, 'deferred') if $rd =~ /^deferred:/;
+            return (0, $rd, 'failed');
+        };
+        ($archived, $detail, $outcome) = $inner->();
+        1;
+    };
+    unless ($ok) {
+        (my $msg = $@) =~ s/\s+\z//;
+        ($archived, $detail, $outcome) = (0, "archive failed: $msg", 'failed');
+    }
+    if ($outcome eq 'archived') {
+        _drop_from_order($dsdir, $bp);
+    }
+    my $archived_json = $archived ? JSON::PP::true : JSON::PP::false;
+    return ($archived_json, _archive_detail_clean($detail), $outcome);
+}
+
+# _drop_from_order($dsdir, @names): re-reads order.json from disk and, if it
+# is a HASH whose `order` is an ARRAY containing any of @names, rewrites it
+# atomically with those names removed, preserving every other key. Never
+# writes when nothing is removed. A write failure logs one WARN line and is
+# otherwise ignored (spec §2.3).
+sub _drop_from_order {
+    my ($dsdir, @names) = @_;
+    return unless @names;
+    my $path = "$dsdir/order.json";
+    my $order_data = _read_json_file($path, $dsdir);
+    return unless ref $order_data eq 'HASH' && ref $order_data->{order} eq 'ARRAY';
+    my %drop = map { $_ => 1 } @names;
+    my @removed = grep { $drop{$_} } @{ $order_data->{order} };
+    return unless @removed;
+    my @kept = grep { !$drop{$_} } @{ $order_data->{order} };
+    my %new_data = %$order_data;
+    $new_data{order} = \@kept;
+    eval { _write_json_atomic($path, \%new_data); };
+    if ($@) {
+        (my $msg = $@) =~ s/\s+\z//;
+        _append_run_log($dsdir, "WARN order.json update failed: $msg");
+        return;
+    }
+    _append_run_log($dsdir, "ORDER-DROP-ARCHIVED $_") for @removed;
+}
+
+# ===========================================================================
 # KEEP-AWAKE ACTUATION (side effect; seam-injectable; never affects action/exit)
 # ===========================================================================
 
@@ -916,6 +1219,13 @@ sub _cmd_next {
     my %bp_meta   = %{ $state->{bp_meta} };
     my %bp_status = %{ $state->{bp_status} };
 
+    # director-archives-finished / package 01, spec §2.6#3: whether order.json
+    # held an ARRAY that was EMPTY on disk, captured BEFORE the ORDER-PRUNE
+    # step below (which cannot change an already-empty array). Distinct from
+    # "no order.json at all" (undef) and from "pruned to empty in memory"
+    # (order-json-prune-stale-blueprint.t AC4/C, unaffected by this flag).
+    my $order_was_empty_array = (defined $order && ref $order eq 'ARRAY' && !@$order) ? 1 : 0;
+
     # package 30 (spec §2.3): report every unresolvable cross token in scope,
     # for every `next` call, regardless of which action this call ends up
     # returning.
@@ -1011,12 +1321,23 @@ sub _cmd_next {
         return 0;
     }
 
-    # B2: no order recorded → need-order
+    # B2: no order recorded → need-order.
+    #
+    # director-archives-finished / package 01, spec §2.6#3: an order.json that
+    # held an ARRAY EMPTY ON DISK (captured above, before ORDER-PRUNE) is not
+    # "no order recorded" when every in-scope candidate is parked — every
+    # blueprint the archive removed from the order is exactly the case this
+    # exempts. Falling through here lets B2a (which already excludes parked
+    # names from `missing`) and the B3 walk (which iterates an empty @$order
+    # and finds nothing to do) settle it as `done`, never as a fresh
+    # need-order prompt for work that is either archived or parked.
     unless (defined $order && @$order) {
-        my $action = { action => 'need-order', candidates => \@candidates };
-        print _encode_action($action), "\n";
-        keepawake_apply('active', $dsdir, $opts);
-        return 0;
+        unless ($order_was_empty_array && !(grep { !$parked{$_} } @candidates)) {
+            my $action = { action => 'need-order', candidates => \@candidates };
+            print _encode_action($action), "\n";
+            keepawake_apply('active', $dsdir, $opts);
+            return 0;
+        }
     }
 
     # B2a: an order EXISTS but does not cover every in-scope candidate.
@@ -1054,6 +1375,38 @@ sub _cmd_next {
             }), "\n";
             keepawake_apply('active', $dsdir, $opts);
             return 0;
+        }
+    }
+
+    # director-archives-finished / package 01, spec §2.6#2: the archive retry
+    # sweep. Every `next` (not only the call that first emits blueprint-done)
+    # retries the single-blueprint archive for any blueprint already
+    # announced, settled, unparked and drivable — so a deferral (in-flight /
+    # live worker / open dispatch) or a failure clears on a later call
+    # without a fresh blueprint-done. Silent when the gate itself still
+    # fails (the steady state for every fixture with no audited status);
+    # logged only for archived/deferred/failed, matching the emission-time
+    # ARCHIVE line's own vocabulary. This sweep changes which action THIS
+    # call returns only through an archived name's removal from `$order`.
+    for my $b (@$order) {
+        next if $undrivable{$b};
+        next if $parked{$b};
+        next unless $announced{$b};
+        my $b_meta   = $bp_meta{$b}   // {};
+        my $b_status = $bp_status{$b} // {};
+        next unless blueprint_settled($b_meta, $b_status, 0);
+
+        # S1 (review 01): no unguarded pre-check here -- _attempt_archive
+        # already runs _archive_gate inside its own eval (never dies) and
+        # the log filter below already suppresses its 'not-archivable'
+        # outcome, so calling it directly avoids a duplicate ledger read
+        # that could itself die outside any eval.
+        my ($archived_bool, $archive_detail, $outcome) = _attempt_archive($data, $dsdir, $b, $now, $opts);
+        if ($outcome eq 'archived' || $outcome eq 'deferred' || $outcome eq 'failed') {
+            _append_run_log($dsdir, "ARCHIVE $b $outcome -- $archive_detail");
+        }
+        if ($outcome eq 'archived') {
+            $order = [ grep { $_ ne $b } @$order ];
         }
     }
 
@@ -1115,9 +1468,21 @@ sub _cmd_next {
 
                 # Write to announced.json before returning (fire-once idempotence, B4)
                 mark_announced($dsdir, $bp);
-                _append_run_log($dsdir, "BLUEPRINT-DONE $bp pending=" . join(',', @pending_list));
 
-                my $action = { action => 'blueprint-done', blueprint => $bp, pending => \@pending_list };
+                # director-archives-finished / package 01, spec §2.6#1: the
+                # director's own single-blueprint archive attempt, reusing
+                # bp-lifecycle.pl's reconcile --archive. Never blocks the run
+                # -- archived/archive_detail report the outcome either way,
+                # and blueprint-done still fires exactly once via
+                # announced.json above regardless of it.
+                my ($archived_bool, $archive_detail, $archive_outcome) =
+                    _attempt_archive($data, $dsdir, $bp, $now, $opts);
+
+                _append_run_log($dsdir, "BLUEPRINT-DONE $bp pending=" . join(',', @pending_list));
+                _append_run_log($dsdir, "ARCHIVE $bp $archive_outcome -- $archive_detail");
+
+                my $action = { action => 'blueprint-done', blueprint => $bp, pending => \@pending_list,
+                               archived => $archived_bool, archive_detail => $archive_detail };
                 print _encode_action($action), "\n";
                 my $phase = @pending_list ? 'active' : 'settled';
                 keepawake_apply($phase, $dsdir, $opts);
@@ -1368,12 +1733,17 @@ sub _cmd_next {
     #   * a blueprint whose packages are ALL delivered is advanced to `done` and
     #     filed into blueprints/_archive/.
     #
-    # Archiving is enabled HERE and nowhere else in the automatic path. It is a
-    # directory move, so it must only run where nothing holds the directory —
-    # true at this point and not true inside the orchestrator (which lives in it)
-    # or during a status read (which may be observing a run about to relaunch).
-    # The director's own state lives in <data>/.drive-solo/, outside every
-    # blueprint, so moving one cannot disturb it.
+    # This --all sweep is the BACKSTOP for the director's own single-blueprint
+    # archive at blueprint-done (emission) and its retry sweep (B2a-B3):
+    # unlike those, it ignores the deferral records entirely (Decision 3(1))
+    # -- deliberately, since reaching B6 at all means nothing in scope can
+    # progress without a human, so nothing can still be writing into any
+    # blueprint's directory. It is a directory move, so it must only run
+    # where nothing holds the directory — true at this point and not true
+    # inside the orchestrator (which lives in it) or during a status read
+    # (which may be observing a run about to relaunch). The director's own
+    # state lives in <data>/.drive-solo/, outside every blueprint, so moving
+    # one cannot disturb it.
     #
     # A blueprint that is merely settled — parked or blocked awaiting a human —
     # is NOT all-delivered and is therefore left exactly where it is. bp-lifecycle
@@ -1382,15 +1752,41 @@ sub _cmd_next {
     # Best-effort: the run is over and reported done either way. A reconciliation
     # failure must not manufacture a failed drive.
     {
-        my $lifecycle = "$DIR/bp-lifecycle.pl";
-        if (-f $lifecycle) {
-            my $rc = eval {
-                system($^X, $lifecycle, 'reconcile', '--all',
-                       '--data-dir', $data, '--archive', '--quiet');
-            };
-            _append_run_log($dsdir, 'LIFECYCLE-RECONCILE '
-                . ((!$@ && defined $rc && $rc == 0) ? 'ok' : 'failed (non-fatal)'));
+        # director-archives-finished / package 01, spec §2.6#4: snapshot the
+        # order BEFORE the sweep (its own archives happen inside the
+        # subprocess below, invisible to this process until it returns), so
+        # that "newly archived by THIS sweep" can be told apart from
+        # "already archived earlier this run".
+        my @snapshot_names = @$order
+            ? grep { -f "$data/blueprints/$_/blueprint.md" } @$order
+            : ();
+
+        # M1 (review 01): the same non-blocking archive.lock as the
+        # single-blueprint path, so this --all sweep can never race a
+        # concurrent `next`'s archive of the same blueprint. Busy -> skip
+        # the sweep this call, non-fatal, retried next time.
+        my $lock_fh = _acquire_archive_lock($dsdir);
+        if ($lock_fh) {
+            my $lifecycle = "$DIR/bp-lifecycle.pl";
+            if (-f $lifecycle) {
+                my $rc = eval {
+                    system($^X, $lifecycle, 'reconcile', '--all',
+                           '--data-dir', $data, '--archive', '--quiet');
+                };
+                _append_run_log($dsdir, 'LIFECYCLE-RECONCILE '
+                    . ((!$@ && defined $rc && $rc == 0) ? 'ok' : 'failed (non-fatal)'));
+            }
+        } else {
+            _append_run_log($dsdir, 'LIFECYCLE-RECONCILE deferred -- archive in progress');
         }
+
+        my @newly_archived = grep {
+            !-e "$data/blueprints/$_" && -d "$data/blueprints/_archive/$_"
+        } @snapshot_names;
+        for my $n (@newly_archived) {
+            _append_run_log($dsdir, "ARCHIVE $n archived -- by the run-done sweep");
+        }
+        _drop_from_order($dsdir, @newly_archived) if @newly_archived;
     }
 
     print _encode_action({ action => 'done' }), "\n";
@@ -1551,7 +1947,7 @@ NEXT-ACTION JSON  (exactly one per `next`)
   {"action":"run-package","blueprint":B,"package":P} drive this package next
   {"action":"pause","until_epoch":E,"reason":"usage"} timed auto-resume at epoch E
   {"action":"stop","reason":"token-refresh-failed","detail":…} token could not be refreshed; the wake-lock is released and the run ends. NOT a pause: a pause promises a resume, and there is none until a human re-authenticates.
-  {"action":"blueprint-done","blueprint":B,"pending":[…]} B settled; pending = remaining bps to re-eval
+  {"action":"blueprint-done","blueprint":B,"pending":[…],"archived":true|false,"archive_detail":"…"} B settled; pending = remaining bps to re-eval; archived/archive_detail report the director's own single-blueprint archive attempt (reuses bp-lifecycle.pl reconcile --archive)
   {"action":"in-flight","blueprint":B,"packages":[…],"running":[…]} nothing dispatchable right now, but B still holds non-terminal packages (typically owned by a concurrent worker). NOT completion: stopping here kills the run mid-package.
   {"action":"done"}                                  every in-scope blueprint is done-or-parked
 
