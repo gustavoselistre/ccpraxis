@@ -1,0 +1,53 @@
+{
+  "schema": 1,
+  "entries": [
+    {
+      "id": "ticklish-whisper-timed-fallback",
+      "description": "Auto mode's main-session consecutive-denial prompt auto-denies after a timeout (default 120000 ms) instead of waiting forever.",
+      "relied_by": "global-config/settings.json env.CLAUDE_CODE_TICKLISH_WHISPER=1",
+      "found_in": { "version": "2.1.282", "date": "2026-09-26" },
+      "signatures": [
+        { "type": "regex", "value": "CLAUDE_CODE_TICKLISH_WHISPER(?!_)", "example": "Dn.CLAUDE_CODE_TICKLISH_WHISPER;" },
+        { "type": "literal", "value": "CLAUDE_CODE_TICKLISH_WHISPER_TIMEOUT_MS" },
+        { "type": "literal", "value": "tengu_ticklish_whisper" },
+        { "type": "literal", "value": "autoDenyAfterMs" }
+      ]
+    },
+    {
+      "id": "auto-mode-denial-limits",
+      "description": "Auto mode escalates to a blocking prompt after 3 consecutive or 20 total classifier denials.",
+      "relied_by": "never-halt hooks (Decision 10): the 3-consecutive / 20-total escalation limits",
+      "found_in": { "version": "2.1.282", "date": "2026-09-26" },
+      "signatures": [
+        { "type": "regex", "value": "maxConsecutive\\s*:\\s*3\\s*,\\s*maxTotal\\s*:\\s*20\\b", "example": "maxConsecutive:3,maxTotal:20" }
+      ]
+    },
+    {
+      "id": "subagent-classifier-abort",
+      "description": "A subagent at its denial limit aborts with \"too many classifier denials\".",
+      "relied_by": "never-halt hooks (Decision 10): subagent abort at the denial limit",
+      "found_in": { "version": "2.1.282", "date": "2026-09-26" },
+      "signatures": [
+        { "type": "literal", "value": "too many classifier denials" }
+      ]
+    },
+    {
+      "id": "disable-agent-view-gate",
+      "description": "The disableAgentView setting gates the agent view off.",
+      "relied_by": "global-config/settings.json disableAgentView: true",
+      "found_in": { "version": "2.1.282", "date": "2026-09-26" },
+      "signatures": [
+        { "type": "literal", "value": "is disabled by the 'disableAgentView' setting" }
+      ]
+    },
+    {
+      "id": "disable-workflows-gate",
+      "description": "The disableWorkflows setting gates the Workflows feature off.",
+      "relied_by": "global-config/settings.json disableWorkflows: true",
+      "found_in": { "version": "2.1.282", "date": "2026-09-26" },
+      "signatures": [
+        { "type": "regex", "value": "settings\\.disableWorkflows\\s*===\\s*!0", "example": "settings.disableWorkflows===!0" }
+      ]
+    }
+  ]
+}

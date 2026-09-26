@@ -21,6 +21,10 @@
 #                           where the user's saved backup preferences, or a
 #                           --skip-key flag, say to leave the repo side alone.
 #                           Writes result to repo path atomically.
+#   claude-internals       — Read-only check that the installed claude binary
+#                           still contains the undocumented internals our
+#                           settings rely on. Dispatches to the sibling
+#                           claude-internals-check.pl and mirrors its exit code.
 #   help
 #
 # All output is JSON on stdout. Exit codes:
@@ -738,6 +742,25 @@ sub cmd_settings_export_merge {
     exit 0;
 }
 
+# ─── Subcommand: claude-internals ─────────────────────────────────────────
+# Runs the sibling claude-internals-check.pl as a child process ($^X, never
+# the claude binary). Everything after the subcommand is passed through
+# unchanged. Exits with the child's exit code; the child's stdout/stderr pass
+# through untouched. Adds no JSON of its own.
+sub cmd_claude_internals {
+    my $sibling = File::Spec->catfile(dirname(__FILE__), 'claude-internals-check.pl');
+    my $rc = system($^X, $sibling, @ARGV);
+    if ($rc == -1) {
+        print STDERR "ccpraxis-helpers.pl: failed to run claude-internals-check.pl: $!\n";
+        exit 2;
+    }
+    if ($rc & 127) {
+        print STDERR "ccpraxis-helpers.pl: claude-internals-check.pl died with signal " . ($rc & 127) . "\n";
+        exit 2;
+    }
+    exit($rc >> 8);
+}
+
 # ─── Help ─────────────────────────────────────────────────────────────────
 
 sub cmd_help {
@@ -755,6 +778,8 @@ Subcommands:
                          Options:
                            --skip-key KEY  Leave the repo side of KEY alone for this run only (repeatable). Use for the user's per-run "Skip" answers. Dotted names (env.FOO) address one sub-key, matching json-diff.pl.
 
+  claude-internals  Read-only check that the installed claude binary still contains the undocumented internals our settings rely on. Options: --binary PATH, --data PATH. Exit 0 all present, 1 changed, 2 could not check.
+
 All output is JSON on stdout. Exit codes: 0=ok, 1=soft fail, 2=hard fail, 3=usage error.
 EOF
     exit 0;
@@ -769,5 +794,6 @@ if    ($sub eq 'sync-skills')           { cmd_sync_skills(); }
 elsif ($sub eq 'check-claude-md')       { cmd_check_claude_md(); }
 elsif ($sub eq 'marketplace-diff')      { cmd_marketplace_diff(); }
 elsif ($sub eq 'settings-export-merge') { cmd_settings_export_merge(); }
+elsif ($sub eq 'claude-internals')      { cmd_claude_internals(); }
 elsif ($sub eq 'help' || $sub eq '--help' || $sub eq '-h') { cmd_help(); }
 else { die_json(3, "Unknown subcommand: $sub"); }

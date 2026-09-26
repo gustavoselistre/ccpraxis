@@ -108,6 +108,14 @@ If it fails — non-zero exit, no output, crash, hang, panic — or reports a di
 - **Revert to the pre-install snapshot (Recommended)** → `ccpraxis binary restore --latest`, then verify `claude --version` works again.
 - **Leave it in place** → do nothing.
 
+## Step 9: Check the internals this setup relies on
+
+Only if Step 8 verified the new version (skip after a revert):
+
+    perl ~/.claude/ccpraxis/plugins/steward/scripts/claude-internals-check.pl
+
+Exit 0: say so in one line. Exit 1: for each `changed[]` entry, tell the user its `relied_by` setting may no longer work, and offer to re-investigate it before relying on it. Change nothing yourself. Exit 2: surface `error`; the check did not run.
+
 Either way, tell the user to restart Claude Code.
 
 ## Maintenance
