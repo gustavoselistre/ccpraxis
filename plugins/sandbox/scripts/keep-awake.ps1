@@ -71,12 +71,17 @@
 # So the pid file is now a HEARTBEAT as well as an identity: the owning side
 # touches it while it still wants the lock (see bp-keepawake.pl's apply(), which
 # refreshes it on the very tick that finds a live lock and leaves it alone). We
-# poll, and exit when either
-#   * the pid file is GONE      -- someone released us deliberately, or
-#   * it has not been touched within -LeaseSeconds -- nobody is left who wants it.
+# poll, and exit when any of
+#   * the pid file is GONE      -- someone released us deliberately,
+#   * it has not been touched within -LeaseSeconds -- nobody is left who wants
+#     it (with a verified -OwnerWinPid: only if that owner has also exited), or
+#   * the verified owner has exited (RELEASE reason=owner-gone).
 # Exiting drops the wake-lock automatically, because ES_CONTINUOUS is bound to
 # this thread. Worst case an abandoned lock now costs one lease period, not "until
-# the next reboot".
+# the next reboot". That promise holds for EVERY caller: -LeaseSeconds 0 without
+# a verified owner falls back to a 60s lease (LEASE-FALLBACK), and with one the
+# lock ends at the latest one poll after that owner exits. The one hold with no
+# time bound is a verified owner that stays alive -- deliberate (Decision 3).
 #
 # -PidFile: we write our own Windows PID here at startup and remove it on exit,
 # so a launcher that crashed while we were running can still reap us by pid.
@@ -92,16 +97,28 @@
 # sleep during exactly the long unattended run the lock exists to protect.
 #
 # Today: butler's bp-keepawake.pl refreshes on every director tick and passes a
-# lease. launcher.pl's dashboard holder does NOT refresh, so it passes none and
-# keeps the previous hold-until-killed behaviour. Giving that path a refresher
-# (its heartbeat loop is the obvious home) is what would let it opt in too --
-# until then, do not "helpfully" default this to a finite value.
+# lease. launcher.pl's dashboard holder does NOT refresh, so it passes no lease
+# and instead names itself with -OwnerWinPid (its WINDOWS pid, read from
+# /proc/$$/winpid; Decision 16): it holds until the launcher kills it, removes
+# the pid file, or dies. If the launcher cannot read its WINPID it omits the
+# flag and gets the bounded 60s fallback, never an unowned indefinite hold. Do
+# not "helpfully" give that path a finite lease without also giving it a
+# refresher (its heartbeat loop is the obvious home).
+#
+# -OwnerWinPid (package 02): the owner's WINDOWS pid. When given, a stale
+# heartbeat no longer means "abandoned" by itself -- a live owner is QUIET and
+# the lock is held (HOLD-QUIET); an exited owner is GONE and the lock is released
+# at once (RELEASE reason=owner-gone). With -LeaseSeconds 0 and a verified owner,
+# the owner's exit is the only automatic release; an unverifiable owner means
+# OWNER-UNVERIFIABLE and the fallback lease. See the pinning block below the
+# clamps.
 [CmdletBinding()]
 param(
     [string]$PidFile,
-    [int]$LeaseSeconds = 0,     # 0 = no lease (hold until killed)
+    [int]$LeaseSeconds = 0,     # 0 = no lease: needs a verified -OwnerWinPid, else a 60s fallback
     [int]$PollSeconds  = 60,
     [string]$LogFile,
+    [int]$OwnerWinPid = 0,      # WINDOWS pid of the owner; 0 = no owner identity (heartbeat only)
     [switch]$SimulatePowerRequestFailure,
     [switch]$SimulatePowerRequestException
 )
@@ -278,18 +295,118 @@ if ($SimulatePowerRequestFailure) {
     }
 }
 
-# Guard against a caller passing nonsense that would disable the lease entirely.
-if ($LeaseSeconds -lt 60)   { $LeaseSeconds = 60 }
+# Guard against a caller passing nonsense. -LeaseSeconds 0 is NOT nonsense: the
+# param comment and the header have always said it means "no lease, hold until
+# killed". This clamp used to turn 0 into 60 unconditionally, so the launcher's
+# dashboard holder (which passed no lease and never refreshes) silently released
+# after about a minute while KeepAwake.pm still reported it running (Decision 15).
+# Only a positive lease below 60 is raised to 60 here; a negative one is 0. What
+# 0 finally means depends on whether an owner is verified -- see LEASE-FALLBACK.
+if ($LeaseSeconds -lt 0)    { $LeaseSeconds = 0 }
+if ($LeaseSeconds -gt 0 -and $LeaseSeconds -lt 60) { $LeaseSeconds = 60 }
 if ($PollSeconds  -lt 5)    { $PollSeconds  = 5 }
-if ($PollSeconds  -gt $LeaseSeconds) { $PollSeconds = $LeaseSeconds }
+if ($LeaseSeconds -gt 0 -and $PollSeconds -gt $LeaseSeconds) { $PollSeconds = $LeaseSeconds }
+if ($OwnerWinPid  -lt 0)    { $OwnerWinPid  = 0 }
+
+# One log line per event: an exception message can be multi-line (and localised).
+function ConvertTo-KaOneLine {
+    param([string]$Text)
+    if ($null -eq $Text) { return '' }
+    return (($Text -replace '\r?\n', ' ') -replace '\s+', ' ').Trim()
+}
+
+# QUIET IS NOT GONE (package 02, Decision 3). The SUSPEND-DETECTED grace in the
+# lease loop below covers "the whole machine froze", not "the owner is throttled
+# while we keep running" -- and since we hold PowerRequestExecutionRequired, we
+# are exactly the process that keeps polling while the owner is moderated. So a
+# caller may name its owner with -OwnerWinPid, a WINDOWS pid (never an MSYS pid:
+# the $$ of Git-for-Windows perl is a different namespace). We pin that process
+# by holding a handle to it, which makes pid reuse impossible for our lifetime,
+# and ask the handle whether it has exited: still running means QUIET (hold),
+# exited means GONE (release now). The probe is an in-process handle query; it
+# spawns nothing. If the owner cannot be pinned, owner mode is off for good.
+#
+# Pinned here, after the pid file is written and before either wait loop, so the
+# no-pid-file path honours the owner too.
+$script:Owner = $null
+$requestedNoLease = ($LeaseSeconds -eq 0)
+if ($requestedNoLease) {
+    $unverifiedTail = '-- no verified owner, so lease 0 falls back to the 60s lease'
+} else {
+    $unverifiedTail = '-- lease falls back to heartbeat only'
+}
+if ($OwnerWinPid -gt 0) {
+    try {
+        $p = [System.Diagnostics.Process]::GetProcessById($OwnerWinPid)
+        # Reading .Handle opens AND CACHES the process handle for the life of
+        # this object -- that is the pin. HasExited alone opens and closes a
+        # fresh handle per call, which pins nothing.
+        $null      = $p.Handle
+        $exited    = $p.HasExited
+        $started   = $p.StartTime
+        $selfStart = [System.Diagnostics.Process]::GetCurrentProcess().StartTime
+        if ($exited) {
+            Write-KaLog 'OWNER-UNVERIFIABLE' ("winpid={0} reason=exited-at-start {1}" -f $OwnerWinPid, $unverifiedTail)
+            try { $p.Dispose() } catch {}
+        } elseif ($started -gt $selfStart) {
+            # A process that began after us cannot be the one that spawned us:
+            # the pid was reused.
+            Write-KaLog 'OWNER-UNVERIFIABLE' ("winpid={0} reason=started-after-helper {1}" -f $OwnerWinPid, $unverifiedTail)
+            try { $p.Dispose() } catch {}
+        } else {
+            $script:Owner = $p
+            Write-KaLog 'OWNER' ("winpid={0} name={1} started={2}" -f $OwnerWinPid, $p.ProcessName, $started.ToString('yyyy-MM-dd HH:mm:ss'))
+        }
+    } catch {
+        Write-KaLog 'OWNER-UNVERIFIABLE' ("winpid={0} reason={1} {2}" -f $OwnerWinPid, (ConvertTo-KaOneLine $_.Exception.Message), $unverifiedTail)
+        $script:Owner = $null
+    }
+}
+
+# NO HELPER HOLDS FOREVER UNOWNED (Decision 16). "Hold until killed" is only safe
+# while something is certain to end us, and a hard-killed caller (WSL VM kill,
+# forced restart, a window closed without teardown) is certain of nothing --
+# that is the orphan the lease was introduced to end. So lease 0 means "hold
+# until killed, until the pid file is removed, or until the owner is gone" ONLY
+# with a verified owner. Without one (no -OwnerWinPid, or it could not be
+# pinned) it falls back to the pre-02 behaviour: a 60s lease.
+if ($requestedNoLease -and -not $script:Owner) {
+    $LeaseSeconds = 60
+    if ($PollSeconds -gt $LeaseSeconds) { $PollSeconds = $LeaseSeconds }
+    Write-KaLog 'LEASE-FALLBACK' ("requested lease=0s but no verified owner -- using lease={0}s so an unowned helper cannot hold forever" -f $LeaseSeconds)
+}
+
+# 'alive' | 'gone' | 'unknown'. Never throws; a failed probe is 'unknown', which
+# falls back to the heartbeat-only rule for that poll.
+function Get-OwnerState {
+    if (-not $script:Owner) { return 'unknown' }
+    try {
+        $script:Owner.Refresh()
+        if ($script:Owner.HasExited) { return 'gone' }
+        return 'alive'
+    } catch {
+        Write-KaLog 'OWNER-PROBE-FAILED' ("owner={0} reason={1}" -f $OwnerWinPid, (ConvertTo-KaOneLine $_.Exception.Message))
+        return 'unknown'
+    }
+}
 
 try {
     if (-not $PidFile) {
         # No heartbeat file to watch: fall back to the old behaviour rather than
-        # exiting immediately, but still cap it so it cannot outlive a session
-        # by days. A caller with no pid file cannot reap us by pid either.
-        $deadline = (Get-Date).AddSeconds($LeaseSeconds)
-        while ((Get-Date) -lt $deadline) { Start-Sleep -Seconds $PollSeconds }
+        # exiting immediately, but still bound it. A caller with no pid file
+        # cannot reap us by pid either. With a positive lease the bound is the
+        # lease; with lease 0 (only reachable here with a verified owner, see
+        # LEASE-FALLBACK above) it is the owner's lifetime. Either way a verified
+        # owner that exits ends us at the next poll.
+        $deadline = $null
+        if ($LeaseSeconds -gt 0) { $deadline = (Get-Date).AddSeconds($LeaseSeconds) }
+        while (($null -eq $deadline) -or ((Get-Date) -lt $deadline)) {
+            Start-Sleep -Seconds $PollSeconds
+            if ((Get-OwnerState) -eq 'gone') {
+                Write-KaLog 'RELEASE' ("reason=owner-gone lease={0}s owner={1}" -f $LeaseSeconds, $OwnerWinPid)
+                break
+            }
+        }
     }
     else {
         # A SUSPENDED OWNER IS NOT AN ABSENT OWNER. Added 2026-09-17 after this
@@ -304,19 +421,21 @@ try {
         # owner, the lease expires, the lock drops, the machine sleeps properly.
         # Self-reinforcing, and measured: three hours of silence starting 09:00.
         #
-        # We cannot ask the owner whether it is alive -- the pid file holds OUR
-        # pid, not theirs. But we can notice that WE were suspended: a
-        # Start-Sleep that was asked for $PollSeconds and took very much longer
-        # means wall time passed that no process on this machine was running
-        # through. The owner could not have heartbeated during it, so that
-        # interval is not evidence of anything.
+        # Without an owner identity we cannot ask the owner whether it is alive
+        # -- the pid file holds OUR pid, not theirs. But we can notice that WE
+        # were suspended: a Start-Sleep that was asked for $PollSeconds and took
+        # very much longer means wall time passed that no process on this
+        # machine was running through. The owner could not have heartbeated
+        # during it, so that interval is not evidence of anything.
         #
         # On detecting it, grant ONE further lease period from the moment of
         # waking. Bounded on purpose: a genuinely dead owner still releases the
         # lock, just one lease later. The alternative -- forgiving the whole
         # suspended interval -- grows without limit across repeated sleeps, which
         # is how an orphan comes to hold a machine awake indefinitely, the exact
-        # failure the lease was introduced to end.
+        # failure the lease was introduced to end. With a verified owner the
+        # probe decides instead (HOLD-QUIET / owner-gone; see the pinning block
+        # above the try), and GRACE is only the fallback for a probe that failed.
         Write-KaLog 'WATCH' ("effective lease={0}s poll={1}s" -f $LeaseSeconds, $PollSeconds)
         $resumeGraceUntil = $null
         while ($true) {
@@ -332,8 +451,8 @@ try {
                 # a sleep asked for $PollSeconds that took orders of magnitude
                 # longer. Paired with a Kernel-Power 506/507 it shows the machine
                 # went under WHILE the lock was asserted -- story (a).
-                Write-KaLog 'SUSPEND-DETECTED' ("slept={0:N0}s requested={1}s grace={2}s" -f $actualSleep, $PollSeconds, $LeaseSeconds)
-                $resumeGraceUntil = (Get-Date).AddSeconds($LeaseSeconds)
+                Write-KaLog 'SUSPEND-DETECTED' ("slept={0:N0}s requested={1}s grace={2}" -f $actualSleep, $PollSeconds, $(if ($LeaseSeconds -gt 0) { "$($LeaseSeconds)s" } else { 'n/a (no lease; the owner probe decides)' }))
+                if ($LeaseSeconds -gt 0) { $resumeGraceUntil = (Get-Date).AddSeconds($LeaseSeconds) }
             }
 
             # Released deliberately: the file is our reason to exist.
@@ -346,7 +465,30 @@ try {
             # lock. Do not keep the machine awake on behalf of a dead run.
             try {
                 $age = ((Get-Date) - (Get-Item -LiteralPath $PidFile).LastWriteTime).TotalSeconds
+                if ($LeaseSeconds -eq 0) {
+                    # No lease: the heartbeat never expires. Reachable only with
+                    # a verified owner (LEASE-FALLBACK turns an unowned 0 into
+                    # 60s), so the ends are the pid file going away (above),
+                    # being killed, or that owner exiting.
+                    if ((Get-OwnerState) -eq 'gone') {
+                        Write-KaLog 'RELEASE' ("reason=owner-gone age={0:N0}s lease={1}s owner={2}" -f $age, $LeaseSeconds, $OwnerWinPid)
+                        break
+                    }
+                    Write-KaLog 'HOLD' ("heartbeat_age={0:N0}s slept={1:N0}s" -f $age, $actualSleep)
+                    continue
+                }
                 if ($age -gt $LeaseSeconds) {
+                    # Stale heartbeat. With a pinned owner, silence alone is
+                    # not evidence of absence: ask whether it has exited.
+                    $ownerState = Get-OwnerState
+                    if ($ownerState -eq 'alive') {
+                        Write-KaLog 'HOLD-QUIET' ("heartbeat_age={0:N0}s lease={1}s owner={2} -- owner alive, holding" -f $age, $LeaseSeconds, $OwnerWinPid)
+                        continue
+                    }
+                    if ($ownerState -eq 'gone') {
+                        Write-KaLog 'RELEASE' ("reason=owner-gone age={0:N0}s lease={1}s owner={2}" -f $age, $LeaseSeconds, $OwnerWinPid)
+                        break
+                    }
                     if ($resumeGraceUntil -and (Get-Date) -lt $resumeGraceUntil) {
                         Write-KaLog 'GRACE' ("lease expired (age={0:N0}s) but a suspend was seen -- holding" -f $age)
                         continue
@@ -383,6 +525,17 @@ finally {
             Write-KaLog 'POWER-REQUEST-RELEASED' 'handle cleared and closed'
         } catch {}
     }
+    if ($script:Owner) { try { $script:Owner.Dispose() } catch {} }
     Write-KaLog 'EXIT' 'wake-lock released (process exiting)'
-    if ($PidFile) { try { Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue } catch {} }
+    # Remove-Item -LiteralPath on PowerShell 5.1 fails on an 8.3 short-name path
+    # (measured: "An object at the specified path C:\Users\ANDR~1 does not
+    # exist." for a file under $env:TEMP, which Windows hands out in short form),
+    # leaving a stale pid file behind. Test-Path/Get-Item resolve it fine, so fall
+    # back to a direct .NET delete whenever the file survived the cmdlet.
+    if ($PidFile) {
+        try { Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue } catch {}
+        try {
+            if (Test-Path -LiteralPath $PidFile) { [System.IO.File]::Delete($PidFile) }
+        } catch {}
+    }
 }
