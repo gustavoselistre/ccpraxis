@@ -26,8 +26,38 @@ BEGIN {
 }
 use Almanac::Store ();
 use Almanac::Record ();
+use Almanac::GlobalCounts ();
 
 our $VERSION = '1.0';
+
+# Mutating verbs whose success in GLOBAL scope must refresh the one global
+# counts snapshot (spec 19 sec 2.4). Read verbs (list/show/count) and
+# project-scope mutations never refresh.
+my %GLOBAL_COUNTS_VERBS = map { $_ => 1 } qw(create edit complete reopen delete);
+
+# _maybe_refresh_global_counts($scope, \%o) -- called after a mutating
+# verb's own stdout has already been printed, before exit 0. A failed
+# refresh never fails the CLI call (the record write already committed): it
+# prints the spec's machine warning block to STDERR and the process still
+# exits 0.
+sub _maybe_refresh_global_counts {
+    my ($scope, $o) = @_;
+    return unless $scope eq 'global';
+    # refresh() is documented to never die; wrapped anyway so a future
+    # regression there cannot turn an already-committed record write into
+    # a non-zero exit (review S1) -- local $@ keeps this eval from
+    # disturbing the surrounding verb-dispatch eval's own $@.
+    local $@;
+    my $res = eval { Almanac::GlobalCounts::refresh(home => $o->{home}) };
+    unless (ref($res) eq 'HASH' && $res->{ok}) {
+        my $reason = (ref($res) eq 'HASH' && defined $res->{reason}) ? $res->{reason} : 'unknown';
+        print STDERR "almanac: global counts snapshot not refreshed (reason: $reason)\n";
+        print STDERR "almanac-warning:\n";
+        print STDERR "  kind: global_counts_stale\n";
+        print STDERR "  reason: $reason\n";
+    }
+    return;
+}
 
 # ---------------------------------------------------------------------------
 # small helpers
@@ -512,6 +542,8 @@ unless (caller) {
         elsif ($cmd eq 'reopen')   { _cmd_reopen($scope, \%o, \@pos) }
         elsif ($cmd eq 'delete')   { _cmd_delete($scope, \%o, \@pos) }
         elsif ($cmd eq 'count')    { _cmd_count(\%o) }
+
+        _maybe_refresh_global_counts($scope, \%o) if $GLOBAL_COUNTS_VERBS{$cmd};
         1;
     };
     unless ($ok) {

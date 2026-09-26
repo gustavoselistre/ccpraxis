@@ -252,7 +252,7 @@ ok(-f $TODO_PL, 'almanac-todo.pl exists at plugins/almanac/scripts/almanac-todo.
             qr/^\s*use\s+Cwd\b/,             qr/^\s*use\s+File::Basename\b/,
             qr/^\s*use\s+POSIX\b/,           qr/^\s*use\s+JSON::PP\b/,
             qr/^\s*use\s+Encode\b/,          qr/^\s*use\s+Almanac::Store\b/,
-            qr/^\s*use\s+Almanac::Record\b/,
+            qr/^\s*use\s+Almanac::Record\b/, qr/^\s*use\s+Almanac::GlobalCounts\b/,
         );
         my @bad_imports = grep { my $l = $_; !grep { $l =~ $_ } @allowed } @uses;
         unless (ok(@bad_imports == 0, 'AC-42: the file imports only from the S2.0 allowlist')) {
