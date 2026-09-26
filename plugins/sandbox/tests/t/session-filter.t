@@ -554,21 +554,18 @@ criterion('AC-13 -> DC-2: derive_blueprints_dir', sub {
             'AC-14 -> DC-2: choosing 4 (out of range: only 3 options in the default view) falls back to NEW');
     }
 
-    # ---- AC-15 -> DC-2 ----
+    # ---- AC-15 -> DC-2 (message text per spec AC-23: no uuid column) ----
     {
         my $out = "$sessions_dir/.out-ac15";
         my $r = run_picker(sessions_dir => $sessions_dir, out => $out,
                             blueprints_dir => $reg_root, input => "1\n");
-        my $short_newest = substr($NEWEST, 0, 8);
-        my $short_middle = substr($MIDDLE, 0, 8);
-        my $short_oldest = substr($OLDEST, 0, 8);
         unlike($r->{stderr}, qr/\Q$NEWEST\E/, 'AC-15 -> DC-2: menu text never contains the full butler UUID');
-        unlike($r->{stderr}, qr/\Q$short_newest\E/,
-            'AC-15 -> DC-2: menu text never contains the butler UUID\'s 8-char prefix');
-        like($r->{stderr}, qr/\Q$short_middle\E/,
-            'AC-15 -> DC-2: menu text contains the middle-age user session\'s prefix');
-        like($r->{stderr}, qr/\Q$short_oldest\E/,
-            'AC-15 -> DC-2: menu text contains the oldest user session\'s prefix');
+        unlike($r->{stderr}, qr/prose prompt for \Q$NEWEST\E/,
+            'AC-15 -> DC-2: menu text never contains the butler session\'s message text');
+        like($r->{stderr}, qr/prose prompt for \Q$MIDDLE\E/,
+            'AC-15 -> DC-2: menu text contains the middle-age user session\'s message text');
+        like($r->{stderr}, qr/prose prompt for \Q$OLDEST\E/,
+            'AC-15 -> DC-2: menu text contains the oldest user session\'s message text');
         like($r->{stderr}, qr/\[1\]/, 'AC-15 -> DC-2: menu text contains "[1]"');
         like($r->{stderr}, qr/Start a new session/, 'AC-15 -> DC-2: menu text contains "Start a new session"');
     }

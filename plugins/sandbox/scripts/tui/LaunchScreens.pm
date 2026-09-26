@@ -21,6 +21,9 @@ use tui::Layout;
 use tui::Frame;
 use tui::Screen;
 use tui::DashboardScreen;
+# Encode is intentionally NOT `use`d here -- tui::Frame already loads it
+# (S2.0's closed use/require list, AC-N7), and its fully-qualified
+# Encode::encode is reachable once tui::Frame has been required.
 
 # Detail-row geometry for the approval screen. The indent is two columns deeper
 # than an item row's cursor marker so a detail reads as subordinate to the item
@@ -840,6 +843,432 @@ sub _ls_items {
     return [];
 }
 
+# ===========================================================================
+# S2.13 -- the session picker's shared card renderer (blueprint
+# sandbox-session-ux, package 03-picker-cards). ONE renderer for both the
+# plain select-session.pl loop and this dashboard's 'c' screen -- see
+# specs/03-picker-cards-spec.md S2.
+# ===========================================================================
+
+# RESIZE_SETTLE_POLLS -- how many EXTRA full repaints follow a detected
+# resize, mirroring Dashboard.pm's RESIZE_SETTLE_TICKS lesson: a maximize can
+# reflow after it is first reported.
+sub RESIZE_SETTLE_POLLS { return 2 }
+
+# _bytes($x) -- UTF-8-encode a CHARACTER string for a span's text. Every card
+# field is a character string by contract (S2.1); this is the one place that
+# turns it into the bytes tui::Frame::safe expects. Total over any input.
+sub _bytes {
+    my ($x) = @_;
+    return '' unless defined $x && !ref $x;
+    my $t = "$x";
+    my $out = eval { Encode::encode('UTF-8', $t) };
+    return defined $out ? $out : '';
+}
+
+# _card_str($x, $default) -- a defined/non-empty character string, or $default.
+sub _card_str {
+    my ($x, $default) = @_;
+    return $default unless defined $x && !ref $x && length "$x";
+    return "$x";
+}
+
+# _card_dash($x) -- a card field, dash-defaulted (started/active/ago).
+sub _card_dash {
+    my ($x) = @_;
+    return _bytes(_card_str($x, '-'));
+}
+
+# _gutter_span($selected, $is_first_line) -- the 2-column card gutter (S2.1).
+sub _gutter_span {
+    my ($selected, $is_first_line) = @_;
+    if ($selected) {
+        my $g = $is_first_line ? _glyph('cursor') : _glyph('rule.v');
+        return { text => $g . ' ', role => 'accent' };
+    }
+    return { text => '  ', role => 'text.primary' };
+}
+
+# _sep_spans() -- the ' <dot> ' separator, role 'rule', as THREE spans (a
+# leading space, the dot glyph alone, a trailing space) so a caller looking
+# for a span whose text is EXACTLY the dot glyph (S2.1's D contract) finds
+# one -- a single combined span would never satisfy that exact-text lookup.
+sub _sep_spans {
+    return ( { text => ' ', role => 'rule' },
+             { text => _glyph('sep.dot'), role => 'rule' },
+             { text => ' ', role => 'rule' } );
+}
+
+# _badge_spans(\%card) -- the kind_label badge (state.warn) followed by every
+# entry of card.badges (package 07's extension point), falling back to
+# text.muted for an unknown role. Never dies for a hostile shape.
+sub _badge_spans {
+    my ($card) = @_;
+    my @out;
+    my $kl = ref($card) eq 'HASH' ? $card->{kind_label} : undef;
+    if (defined $kl && !ref $kl && length "$kl") {
+        push @out, { text => _bytes(' [' . $kl . ']'), role => 'state.warn' };
+    }
+    my $badges = (ref($card) eq 'HASH' && ref $card->{badges} eq 'ARRAY') ? $card->{badges} : [];
+    for my $b (@$badges) {
+        next unless ref $b eq 'HASH';
+        my $t = (defined($b->{text}) && !ref($b->{text})) ? "$b->{text}" : '';
+        next unless length $t;
+        my $role = (defined($b->{role}) && !ref($b->{role}) && tui::Frame::is_known_role("$b->{role}"))
+                 ? "$b->{role}" : 'text.muted';
+        push @out, { text => _bytes(' [' . $t . ']'), role => $role };
+    }
+    return @out;
+}
+
+# _normalize_msg($s) -- collapse whitespace to single spaces, drop non-
+# whitespace C0/DEL/C1 control characters, trim. undef in, undef out.
+sub _normalize_msg {
+    my ($s) = @_;
+    return undef unless defined $s && !ref $s;
+    my $t = "$s";
+    $t =~ s/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x{80}-\x{9F}]//g;
+    $t =~ s/\s+/ /g;
+    $t =~ s/\A\s+//;
+    $t =~ s/\s+\z//;
+    return $t;
+}
+
+# _message_block($cols, $selected, $label, $text_raw) -> \@lines (1 or 2).
+sub _message_block {
+    my ($cols, $selected, $label, $text_raw) = @_;
+    my $Lw = ($label eq 'Message:') ? 9 : 7;
+    my $norm = _normalize_msg($text_raw);
+    my $has_text = defined($norm) && length($norm);
+    my $text_w = $cols - 4 - $Lw;
+
+    my @lines;
+    if ($text_w < 1) {
+        my $g = _gutter_span($selected, 0);
+        my @spans = ( $g, { text => '  ', role => 'text.muted' },
+                      { text => sprintf('%-*s', $Lw, $label), role => 'text.muted' } );
+        my $w = eval { tui::Frame::spans_width(\@spans) };
+        if (defined($w) && $w > $cols) {
+            my $fitted = eval { tui::Frame::fit_spans(\@spans, $cols, 'text.muted') };
+            @spans = (ref($fitted) eq 'ARRAY') ? @$fitted : @spans;
+        }
+        push @lines, \@spans;
+        return \@lines;
+    }
+
+    # M2: bound the text handed to wrap_capped -- at most 2 rows of $text_w
+    # columns are ever shown, and after safe() every character is at least 1
+    # column, so nothing beyond 2*text_w characters can ever be displayed.
+    # A margin of $text_w on top of that (2.5x total, rounded up by +1)
+    # covers combining/zero-width characters that collapse to fewer columns
+    # than characters, while keeping the cut tight enough that per-card cost
+    # stays comfortably inside the frame budget (M2's own timing bound). The
+    # overflow/ellipsis decision and the displayed output are unchanged --
+    # every dropped character was already beyond what 2*text_w columns could
+    # ever show.
+    my $cut = int(2.5 * $text_w) + 1;
+    if ($has_text && length($norm) > $cut) {
+        $norm = substr($norm, 0, $cut);
+    }
+
+    my $text_role = $has_text ? 'text.primary' : 'text.faint';
+    my $display_text = $has_text ? _bytes($norm) : _bytes('(no message)');
+    # pad_role deliberately differs from $text_role: fit_spans (inside
+    # wrap_line/make_cell) merges its right-pad into the LAST span only when
+    # that span's own role matches the pad role, and the content span here
+    # carries its own explicit role ($text_role) via the {text,role} hashref
+    # -- so a distinct pad_role keeps the pad as a separate trailing span,
+    # and the content span's text stays EXACTLY the message text (S2.1's
+    # "message text is text.primary" / "(no message) is text.faint" hold as
+    # an exact span, not a padded one).
+    my $rows = eval {
+        tui::Frame::wrap_capped({ text => $display_text, role => $text_role }, 'text.muted', $text_w, 0, 2);
+    };
+    $rows = [] unless ref $rows eq 'ARRAY';
+    @$rows = ( tui::Frame::make_cell('', $text_role, $text_w) ) unless @$rows;
+
+    for my $i (0 .. $#$rows) {
+        my $cell = $rows->[$i];
+        my $g = _gutter_span($selected, 0);
+        my @prefix;
+        if ($i == 0) {
+            # Label span kept EXACT (no padding merged in); alignment is a
+            # SEPARATE span so a caller looking for the bare label text
+            # ("Message:"/"First:"/"Last:") finds it verbatim.
+            push @prefix, { text => '  ', role => 'text.muted' },
+                           { text => $label, role => 'text.muted' },
+                           { text => (' ' x ($Lw - length($label))), role => 'text.muted' };
+        }
+        else {
+            push @prefix, { text => ('  ' . (' ' x $Lw)), role => 'text.muted' };
+        }
+        my $cell_spans = (ref($cell) eq 'HASH' && ref $cell->{spans} eq 'ARRAY') ? [ @{ $cell->{spans} } ] : [];
+        # Drop the trailing right-pad fit_spans added to reach exactly
+        # $text_w: it is always the pad_role ('text.muted') and pure
+        # whitespace (see the note above the wrap_capped call), so this is
+        # unambiguous. A message row is a NATURAL-length row, never padded --
+        # AC-4's "no double space reaches the rendered paragraph".
+        while (@$cell_spans) {
+            my $last = $cell_spans->[-1];
+            last unless ref($last) eq 'HASH' && _str($last->{role}) eq 'text.muted';
+            my $t = defined($last->{text}) ? $last->{text} : '';
+            last if $t =~ /\S/;
+            pop @$cell_spans;
+        }
+        push @lines, [ $g, @prefix, @$cell_spans ];
+    }
+    return \@lines;
+}
+
+# ---------------------------------------------------------------------------
+# Card render cache (Decision 30). session_card_lines is a pure function of
+# (card content, cols, selected), but both picker paths sum every card's
+# height on every frame to size the scroll window -- ~250ms for 300 cards.
+# Height and, cheaply, the rendered lines themselves are memoised so a
+# repaint after a keypress does not recompute cards that did not change.
+#
+# The cache key is built from the card's OWN CONTENT plus cols (and, for
+# lines, selected) -- never from the hashref's address. That is deliberate:
+# a refaddr-keyed cache would let a garbage-collected card's address be
+# reused by an unrelated later card, silently serving that card's stale
+# lines. Keying on content instead means a resize (cols changes) or a
+# changed item (any content field changes) can only ever produce a
+# different key, so a stale entry is never read -- there is nothing to
+# invalidate, because the old key simply stops being asked for.
+# ---------------------------------------------------------------------------
+my %_card_height_cache;
+my %_card_lines_cache;
+my $_card_cache_cols;   # the terminal width the two caches above were filled at
+
+# _card_cache_check_width($cols) -- drop both caches whole when $cols differs
+# from the width they were last filled at. Keeps the memo bounded to one
+# width's worth of cards no matter how many widths a resize passes through,
+# since every entry for the old width is discarded together rather than
+# accumulating alongside the new one.
+sub _card_cache_check_width {
+    my ($cols) = @_;
+    $cols = _int($cols, 80);
+    if (!defined($_card_cache_cols) || $_card_cache_cols != $cols) {
+        %_card_height_cache = ();
+        %_card_lines_cache  = ();
+        $_card_cache_cols = $cols;
+    }
+}
+
+# session_card_cache_clear() -- PUBLIC. Empties both memoisation caches and
+# forgets the width they were filled at. Callers (e.g. a first-paint
+# benchmark) use this to force a cold measurement.
+sub session_card_cache_clear {
+    %_card_height_cache = ();
+    %_card_lines_cache  = ();
+    $_card_cache_cols = undef;
+    return 1;
+}
+
+# session_card_cache_size() -- PUBLIC, test-only. Returns the combined entry
+# count across both caches, so a test can assert the memo stays bounded
+# after cycling through several widths.
+sub session_card_cache_size {
+    return scalar(keys %_card_height_cache) + scalar(keys %_card_lines_cache);
+}
+
+sub _card_cache_key {
+    my ($card, $cols) = @_;
+    $card = {} unless ref $card eq 'HASH';
+    return join("\x1e", _int($cols, 80),
+        defined($card->{started})    ? $card->{started}    : '',
+        defined($card->{active})     ? $card->{active}     : '',
+        defined($card->{ago})        ? $card->{ago}        : '',
+        defined($card->{first})      ? $card->{first}      : '',
+        defined($card->{last})       ? $card->{last}       : '',
+        defined($card->{kind_label}) ? $card->{kind_label} : '',
+    );
+}
+
+# session_card_height(\%card, $cols) -> $height (int). Memoised per
+# item-content + terminal width. Used by the "sum every card's height" pass
+# (both picker paths) so sizing the scroll window never re-renders an
+# off-screen card just to count its lines.
+sub session_card_height {
+    my ($card, $cols) = @_;
+    _card_cache_check_width($cols);
+    my $key = _card_cache_key($card, $cols);
+    return $_card_height_cache{$key} if exists $_card_height_cache{$key};
+    my $ln = session_card_lines($card, $cols, 0);
+    my $h = (ref $ln eq 'ARRAY' && @$ln) ? scalar(@$ln) : 3;
+    $_card_height_cache{$key} = $h;
+    return $h;
+}
+
+# session_card_lines_cached(\%card, $cols, $selected) -> \@lines. Same
+# memoisation, keyed additionally on $selected (selection changes the
+# gutter/timestamp colour, never the line count). Only ever used for the
+# visible window, so the cache stays small; also warms the height cache
+# for free since the count is the same regardless of $selected.
+sub session_card_lines_cached {
+    my ($card, $cols, $selected) = @_;
+    $selected = $selected ? 1 : 0;
+    _card_cache_check_width($cols);
+    my $hkey = _card_cache_key($card, $cols);
+    my $key  = $hkey . "\x1e" . $selected;
+    return $_card_lines_cache{$key} if exists $_card_lines_cache{$key};
+    my $ln = session_card_lines($card, $cols, $selected);
+    $_card_lines_cache{$key} = $ln;
+    $_card_height_cache{$hkey} = (ref $ln eq 'ARRAY' && @$ln) ? scalar(@$ln) : 3;
+    return $ln;
+}
+
+# session_card_lines(\%card, $cols, $selected) -> \@lines. PUBLIC, total: see
+# S2.1's contract table. Height is always 3..6 lines; the last is a blank
+# separator.
+sub session_card_lines {
+    my ($card, $cols, $selected) = @_;
+    $card = {} unless ref $card eq 'HASH';
+    my $c = _int($cols, 80);
+    $c = 1 if $c < 1;
+    $selected = $selected ? 1 : 0;
+
+    my $ts_role = $selected ? 'accent' : 'text.primary';
+    my $S = { text => _card_dash($card->{started}), role => $ts_role };
+    my $A = { text => _card_dash($card->{active}),  role => $ts_role };
+    my $AGO = { text => _card_dash($card->{ago}), role => 'text.faint' };
+
+    my @f1 = ( { text => 'started ', role => 'text.muted' }, $S, _sep_spans(),
+               { text => 'last active ', role => 'text.muted' }, $A, _sep_spans(), $AGO );
+    my @f2 = ( $S, _sep_spans(), $A, _sep_spans(), $AGO );
+    my @f3 = ( $A, _sep_spans(), $AGO );
+
+    my @badges = _badge_spans($card);
+    my $budget = $c - 2;
+    $budget = 0 if $budget < 0;
+
+    my @body;
+    my $picked = 0;
+    for my $cand (\@f1, \@f2, \@f3) {
+        my @full = (@$cand, @badges);
+        my $w = eval { tui::Frame::spans_width(\@full) };
+        if (defined($w) && $w <= $budget) { @body = @full; $picked = 1; last; }
+    }
+    unless ($picked) {
+        my @full = (@f3, @badges);
+        my $room = $budget - tui::Frame::ELLIPSIS_COLS();
+        if ($room > 0) {
+            my $trimmed = eval { tui::Frame::fit_spans(\@full, $room, 'text.faint') };
+            @body = (ref($trimmed) eq 'ARRAY' ? @$trimmed : ());
+        }
+        push @body, { text => tui::Frame::ELLIPSIS(), role => 'text.faint' };
+    }
+
+    my $g1 = _gutter_span($selected, 1);
+    my @line1 = ( $g1, @body );
+    # Safety net for pathologically narrow widths (cols < 3) where even the
+    # ellipsis-only fallback above cannot fit alongside the 2-column gutter:
+    # only ever engages when line 1 is ALREADY over budget, so it never
+    # touches (and never pads) the exact-text cases the AC table pins.
+    my $w1 = eval { tui::Frame::spans_width(\@line1) };
+    if (defined($w1) && $w1 > $c) {
+        my $fitted = eval { tui::Frame::fit_spans(\@line1, $c, 'text.faint') };
+        @line1 = (ref($fitted) eq 'ARRAY') ? @$fitted : @line1;
+    }
+    my @lines = ( \@line1 );
+
+    my $first = _normalize_msg($card->{first});
+    $first = undef unless defined($first) && length($first);
+    my $last  = _normalize_msg($card->{last});
+    $last = undef unless defined($last) && length($last);
+
+    if (defined($first) && defined($last) && $first ne $last) {
+        push @lines, @{ _message_block($c, $selected, 'First:', $card->{first}) };
+        push @lines, @{ _message_block($c, $selected, 'Last:',  $card->{last}) };
+    }
+    else {
+        my $src = defined($first) ? $card->{first} : (defined($last) ? $card->{last} : undef);
+        push @lines, @{ _message_block($c, $selected, 'Message:', $src) };
+    }
+
+    push @lines, [];
+    return \@lines;
+}
+
+# session_new_lines($cols, $selected) -> \@lines, height 2: the "+ Start a new
+# session" row and a blank separator.
+sub session_new_lines {
+    my ($cols, $selected) = @_;
+    my $g = _gutter_span($selected, 1);
+    return [ [ $g, { text => '+ Start a new session', role => 'accent' } ], [] ];
+}
+
+# card_window(\@heights, $cursor, $budget, $top) -> {first,last,above,below}.
+# Pure; see S2.1's pseudocode. Never dies for any input.
+sub card_window {
+    my ($heights, $cursor, $budget, $top) = @_;
+    my @h = (ref $heights eq 'ARRAY') ? @$heights : ();
+    @h = map { (_is_num($_) && $_ >= 1) ? int($_) : 1 } @h;
+    my $n = scalar @h;
+    return { first => 0, last => -1, above => 0, below => 0 } if $n == 0;
+
+    $cursor = _is_num($cursor) ? int($cursor) : 0;
+    $cursor = 0 if $cursor < 0;
+    $cursor = $n - 1 if $cursor > $n - 1;
+    $top = _is_num($top) ? int($top) : 0;
+    $top = 0 if $top < 0;
+    $top = $n - 1 if $top > $n - 1;
+    $budget = _is_num($budget) ? int($budget) : 1;
+    $budget = 1 if $budget < 1;
+
+    my $sum = sub {
+        my ($a, $b) = @_;
+        my $s = 0;
+        $s += $h[$_] for $a .. $b;
+        return $s;
+    };
+
+    $top = $cursor if $cursor < $top;
+    while ($top < $cursor && $sum->($top, $cursor) > $budget) { $top++; }
+    my $last = $cursor;
+    while ($last + 1 < $n && $sum->($top, $last + 1) <= $budget) { $last++; }
+    while ($top > 0 && $sum->($top - 1, $last) <= $budget) { $top--; }
+
+    return { first => $top, last => $last, above => $top, below => $n - 1 - $last };
+}
+
+# session_pick_model(\@rows, $label, $error) -> \%model -- the TUI 'c' screen's
+# model, built from --list-json rows. Rows that are not hashes or lack a
+# defined uuid are skipped.
+sub session_pick_model {
+    my ($rows, $label, $error) = @_;
+    my @rows = (ref $rows eq 'ARRAY') ? @$rows : ();
+
+    my $new_row = sub {
+        return { kind => 'row', id => 'NEW', group => 'sessions',
+                 display => '+ Start a new session', disabled => 0, selected => 0 };
+    };
+
+    my (@user_items, @butler_items);
+    for my $r (@rows) {
+        next unless ref $r eq 'HASH';
+        next unless defined $r->{uuid};
+        my $card = (ref $r->{card} eq 'HASH') ? $r->{card} : {};
+        my $item = { kind => 'row', id => "$r->{uuid}", group => 'sessions', card => $card,
+                     display => "$r->{uuid}", disabled => 0, selected => 0 };
+        if ($r->{is_butler}) { push @butler_items, $item }
+        else                 { push @user_items,   $item }
+    }
+    unshift @user_items,   $new_row->();
+    unshift @butler_items, $new_row->();
+
+    return {
+        mode  => 'single',
+        label => _str($label),
+        error => (defined($error) && !ref($error) && length("$error")) ? "$error" : undef,
+        items => \@user_items,
+        views => [
+            { name => 'user',   items => \@user_items,   empty_note => '(no user sessions)' },
+            { name => 'butler', items => \@butler_items, empty_note => '(no butler sessions)' },
+        ],
+    };
+}
+
 sub _landable {
     my ($items, $i) = @_;
     return 0 unless ref $items eq 'ARRAY';
@@ -904,6 +1333,20 @@ sub list_init {
         cancelled => 0,
         closed    => 0,
     };
+
+    # Card mode (package 03-picker-cards): model.views is an arrayref of
+    # exactly 2 hashes, each carrying an arrayref items. Anything else behaves
+    # exactly as before -- ls.views stays unset.
+    my $views = $model->{views};
+    if (ref $views eq 'ARRAY' && @$views == 2
+        && ref $views->[0] eq 'HASH' && ref $views->[0]{items} eq 'ARRAY'
+        && ref $views->[1] eq 'HASH' && ref $views->[1]{items} eq 'ARRAY') {
+        $ls->{views}      = $views;
+        $ls->{view_index} = 0;
+        $ls->{items}      = $views->[0]{items};
+        $ls->{card_top}   = 0;
+    }
+
     $ls->{cursor} = list_first_row($ls);
     return $ls;
 }
@@ -1049,6 +1492,20 @@ sub list_dispatch_key {
             $cur->{selected} = $cur->{selected} ? 0 : 1;
         }
         return 'toggle';
+    }
+
+    # Card mode's [t] view toggle (package 03-picker-cards). Lowercase ONLY --
+    # an unassembled CSI sequence degrades to a single uppercase letter, and
+    # 'T' must never toggle. Checked after cancel/movement, before shortcuts.
+    if ($mode eq 'single' && ref $ls->{views} eq 'ARRAY' && $k eq 't') {
+        my $vi = _is_num($ls->{view_index}) ? int($ls->{view_index}) : 0;
+        $vi = $vi ? 0 : 1;
+        $ls->{view_index} = $vi;
+        $ls->{items}     = (ref $ls->{views}[$vi] eq 'HASH' && ref $ls->{views}[$vi]{items} eq 'ARRAY')
+                          ? $ls->{views}[$vi]{items} : [];
+        $ls->{cursor}    = list_first_row($ls);
+        $ls->{card_top}  = 0;
+        return 'toggle-view';
     }
 
     # Single-keystroke row aliases, checked BEFORE the a/n/r blocks below:
@@ -1333,6 +1790,12 @@ sub list_screen {
     # chrome_rows(), not the literal 2 it was -- see _output_height above.
     my $lh = $r - tui::Screen::chrome_rows() - scalar(@$banners) - 1 - 1;
     $lh = 0 if $lh < 0;
+
+    # Card mode (package 03-picker-cards): a wholly separate body/footer
+    # composition, sharing only the banners computed above. The non-card mode
+    # below is byte-identical to before this package.
+    return _card_list_screen($ls, $c, $lh, $banners) if ref $ls->{views} eq 'ARRAY';
+
     my $vp = tui::Screen::viewport($total, $lh, $ls->{cursor});
 
     my $err = $ls->{error};
@@ -1431,6 +1894,95 @@ sub list_screen {
     };
 }
 
+# _card_list_screen(\%ls, $cols, $lh, \@banners) -> \%screen -- list_screen's
+# card-mode body/footer. ls.card_top is the only ls field this writes.
+sub _card_list_screen {
+    my ($ls, $c, $lh, $banners) = @_;
+    my $items = _ls_items($ls);
+    my $total = scalar @$items;
+
+    my $err = $ls->{error};
+    $err = (defined $err && !ref $err && length "$err") ? "$err" : undef;
+
+    my @lines;
+    my $win = { first => 0, last => -1, above => 0, below => 0 };
+
+    if (defined $err) {
+        push @lines, [ { text => '(list unavailable - ' . $err . ')', role => 'state.crit' } ];
+    }
+    elsif ($total == 0) {
+        push @lines, [ { text => '(nothing to choose)', role => 'text.muted' } ];
+    }
+    else {
+        my @heights;
+        for my $it (@$items) {
+            if (ref $it eq 'HASH' && _str($it->{id}) eq 'NEW') {
+                push @heights, 2;
+            }
+            else {
+                my $card = (ref $it eq 'HASH' && ref $it->{card} eq 'HASH') ? $it->{card} : {};
+                my $h = eval { session_card_height($card, $c) };
+                push @heights, (defined $h && $h >= 1) ? $h : 3;
+            }
+        }
+        my $cursor = _is_num($ls->{cursor})   ? int($ls->{cursor})   : 0;
+        my $top    = _is_num($ls->{card_top}) ? int($ls->{card_top}) : 0;
+        my $budget = ($lh > 0) ? $lh : 1;
+        $win = card_window(\@heights, $cursor, $budget, $top);
+        $ls->{card_top} = _int($win->{first}, 0);
+
+        if ($win->{last} >= $win->{first}) {
+            for my $i ($win->{first} .. $win->{last}) {
+                my $it  = $items->[$i];
+                my $sel = ($i == $cursor) ? 1 : 0;
+                my $ln;
+                if (ref $it eq 'HASH' && _str($it->{id}) eq 'NEW') {
+                    $ln = session_new_lines($c, $sel);
+                }
+                else {
+                    my $card = (ref $it eq 'HASH' && ref $it->{card} eq 'HASH') ? $it->{card} : {};
+                    $ln = eval { session_card_lines_cached($card, $c, $sel) };
+                }
+                push @lines, @$ln if ref $ln eq 'ARRAY';
+            }
+        }
+        @lines = @lines[0 .. $lh - 1] if $lh > 0 && @lines > $lh;
+
+        my $has_rows = grep { ref $_ eq 'HASH' && _str($_->{kind}) eq 'row' && _str($_->{id}) ne 'NEW' } @$items;
+        if (!$has_rows && (!$lh || @lines < $lh)) {
+            my $vi = _is_num($ls->{view_index}) ? int($ls->{view_index}) : 0;
+            my $vw = (ref $ls->{views} eq 'ARRAY' && ref $ls->{views}[$vi] eq 'HASH') ? $ls->{views}[$vi] : {};
+            my $note = _str($vw->{empty_note});
+            push @lines, [ { text => '    ' . $note, role => 'text.muted' } ] if length $note;
+        }
+    }
+
+    my @summary;
+    my @extra;
+    push @extra, '+' . $win->{above} . ' above' if $win->{above};
+    push @extra, '+' . $win->{below} . ' below' if $win->{below};
+    push @summary, { text => join(', ', @extra), role => 'text.faint' } if @extra;
+    push @lines, \@summary if @summary;
+
+    my $vi         = _is_num($ls->{view_index}) ? int($ls->{view_index}) : 0;
+    my $view_name  = (ref $ls->{views} eq 'ARRAY' && ref $ls->{views}[$vi]     eq 'HASH') ? _str($ls->{views}[$vi]{name})     : '';
+    my $other_name = (ref $ls->{views} eq 'ARRAY' && ref $ls->{views}[1 - $vi] eq 'HASH') ? _str($ls->{views}[1 - $vi]{name}) : '';
+    my $footer = 'view: ' . $view_name . '   [t] show ' . $other_name . ' sessions   ' . LIST_FOOTER_LEGEND('single');
+
+    my $label = _str($ls->{label});
+    $label = 'select' unless length $label;
+
+    return {
+        title       => [ { text => $label, role => 'accent' } ],
+        title_role  => 'accent',
+        banners     => $banners,
+        banner_role => 'state.warn',
+        panels      => [ { title => 'options', lines => \@lines, body => \@lines } ],
+        footer      => $footer,
+        footer_role => 'text.faint',
+    };
+}
+
 sub compose_list {
     my ($ls, $rows, $cols) = @_;
     my $r = _int($rows, 24);
@@ -1489,12 +2041,20 @@ sub list_run {
     my $ticks = 0;
     my $idle  = 0;
 
+    # Resize detection (package 03-picker-cards, S2.2): the (cols,rows) of the
+    # last paint, and how many settle repaints remain armed. Neither is reset
+    # by idle counting -- a resize must not look like operator activity.
+    my ($last_cols, $last_rows);
+    my $settle = 0;
+
     my $paint = sub {
         my ($c, $r) = (80, 24);
         my @dim = _try($term_size);
         if (@dim >= 2) { $c = _int($dim[0], 80); $r = _int($dim[1], 24) }
         $c = 80 if $c < 1;
         $r = 24 if $r < 1;
+        $last_cols = $c;
+        $last_rows = $r;
         my $frame = compose_list($ls, $r, $c);
         my @b = _try($render, $prev, $frame);
         my $bytes = (@b && defined $b[0] && !ref $b[0]) ? $b[0] : '';
@@ -1519,6 +2079,26 @@ sub list_run {
         }
         $ticks++;
         unless (defined($key) && !ref($key) && length("$key")) {
+            # A poll that yielded nothing: the idle-resize seam (S2.2). A size
+            # change repaints in full and arms RESIZE_SETTLE_POLLS() further
+            # full repaints (a maximize can reflow after first being
+            # reported); with no change, settle repaints (if any remain) keep
+            # firing until exhausted. Neither branch touches $idle.
+            my ($cc, $rr) = (80, 24);
+            my @dim = _try($term_size);
+            if (@dim >= 2) { $cc = _int($dim[0], 80); $rr = _int($dim[1], 24) }
+            $cc = 80 if $cc < 1;
+            $rr = 24 if $rr < 1;
+            if (defined($last_cols) && ($cc != $last_cols || $rr != $last_rows)) {
+                $settle = RESIZE_SETTLE_POLLS();
+                $prev = undef;
+                $paint->();
+            }
+            elsif ($settle > 0) {
+                $settle--;
+                $prev = undef;
+                $paint->();
+            }
             # A poll that yielded nothing. Bounded so a wait_key that cannot
             # block (EOF on stdin) cannot spin here forever; any real key
             # resets the run.
