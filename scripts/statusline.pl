@@ -791,6 +791,21 @@ sub _bp_is_absolute_path {
     return 0;
 }
 
+# _home_var() -- the first absolute of HOME, USERPROFILE, with no fall-
+# through once one is picked. Shared by _state_dir() and the power-plan
+# CLI lookup below, so both resolve under the SAME home (S1, package 06
+# review): a fake HOME can never pair its own state with a real
+# USERPROFILE install.
+sub _home_var {
+    for my $home ($ENV{HOME}, $ENV{USERPROFILE}) {
+        next unless _bp_is_absolute_path($home);
+        (my $v = $home) =~ s{/+$}{};
+        $v =~ tr{\\}{/};
+        return $v;
+    }
+    return undef;
+}
+
 # _state_dir() -- BpHook::state_dir()'s rule, duplicated (see header above).
 sub _state_dir {
     my $bsd = $ENV{BUTLER_STATE_DIR};
@@ -800,13 +815,8 @@ sub _state_dir {
         $v =~ tr{\\}{/};
         return "$v/continuity";
     }
-    for my $home ($ENV{HOME}, $ENV{USERPROFILE}) {
-        next unless _bp_is_absolute_path($home);
-        (my $v = $home) =~ s{/+$}{};
-        $v =~ tr{\\}{/};
-        return "$v/.claude/butler-state/continuity";
-    }
-    return undef;
+    my $home = _home_var();
+    return defined $home ? "$home/.claude/butler-state/continuity" : undef;
 }
 
 my $sid = $data->{session_id};
@@ -866,6 +876,47 @@ if (length $sid) {
     }
 }
 # -- continuity-badge:end --
+
+# ── Power plan follows arming (Decision 14, package 06) ──────
+# On this session's first draw on the Windows host, start a detached
+# `bp-power-plan.pl reconcile --why statusline`, at most once per session
+# (an O_EXCL marker under plan-checked/<sid> makes "at most once" true even
+# when two draws race). The whole block is wrapped in eval so a failure
+# never costs the draw, and the draw never waits on the child: spawn_detached
+# redirects the child's stdio to null before exec, so this process's stdout
+# pipe reaches EOF at once regardless of how long the child runs.
+# -- power-plan:begin --
+use POSIX ();
+eval {
+    if ($^O =~ /^(MSWin32|msys|cygwin)$/ && !$SANDBOX_ON && length($sid)
+        && (($ENV{CCPRAXIS_POWER_PLAN_STATUSLINE} // '1') ne '0')
+        && !length($ENV{BUTLER_STATE_DIR} // '')
+        && !length($ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR} // '')) {
+        my $pp_state = _state_dir();
+        if (defined $pp_state && -d $pp_state) {
+            my $pp_marker = "$pp_state/plan-checked/$sid";
+            unless (-e $pp_marker) {
+                my $pp_cli = $ENV{CCPRAXIS_POWER_PLAN_CLI};
+                unless (defined $pp_cli && _bp_is_absolute_path($pp_cli) && -f $pp_cli) {
+                    $pp_cli = undef;
+                    my $h = _home_var();
+                    if (defined $h) {
+                        my $cand = "$h/.claude/ccpraxis/plugins/butler/scripts/bp-power-plan.pl";
+                        $pp_cli = $cand if -f $cand;
+                    }
+                }
+                if (defined $pp_cli) {
+                    mkdir("$pp_state/plan-checked") unless -d "$pp_state/plan-checked";
+                    if (sysopen(my $pp_fh, $pp_marker, POSIX::O_WRONLY() | POSIX::O_CREAT() | POSIX::O_EXCL())) {
+                        close($pp_fh);
+                        spawn_detached($^X, $pp_cli, 'reconcile', '--why', 'statusline');
+                    }
+                }
+            }
+        }
+    }
+};
+# -- power-plan:end --
 
 # ── Pending decisions, and every other almanac count ─────────
 #

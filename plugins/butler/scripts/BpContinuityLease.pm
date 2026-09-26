@@ -1211,10 +1211,61 @@ sub daemon_loop {
     my $journal_err_logged_at = 0;
     my $snap = code_snapshot();
 
+    # Package 06: the power plan follows arming. Windows-platform-only,
+    # inside an eval, so a plan failure (including a failed require) can
+    # never take the refresher down with it -- neither the journal step nor
+    # the heartbeat below is skipped on account of it. Same repeat-
+    # suppression shape as JOURNAL-ERROR (spec 2.8), with its own state.
+    my $plan_err_text;
+    my $plan_err_repeats = 0;
+    my $plan_err_logged_at = 0;
+    my $run_plan_step = sub {
+        my ($why) = @_;
+        return unless platform() eq 'windows' && (!exists $opts{plan} || $opts{plan});
+        my $plan_opts = (ref $opts{plan_opts} eq 'HASH') ? $opts{plan_opts} : {};
+        my $outcome;
+        my $ok = eval {
+            require "$DIR/BpPowerPlan.pm" unless grep { m{(?:^|/)BpPowerPlan\.pm$} } keys %INC;
+            $outcome = BpPowerPlan::reconcile($dir, why => $why, %$plan_opts);
+            1;
+        };
+        unless ($ok) {
+            my $err = defined $@ && length $@ ? $@ : 'unknown error';
+            $err =~ s/\n.*//s;
+            $err =~ s/[^\x20-\x7e]/?/g;
+            $err = substr($err, 0, 200);
+            my $now_e = time();
+            if (defined $plan_err_text && $plan_err_text eq $err) {
+                $plan_err_repeats++;
+                if ($plan_err_repeats >= 2 && ($now_e - $plan_err_logged_at) < 3600) {
+                    # suppressed: same text logged less than an hour ago
+                } else {
+                    $log->('PLAN-ERROR', $err);
+                    $plan_err_logged_at = $now_e;
+                }
+            } else {
+                $plan_err_repeats = 0;
+                $log->('PLAN-ERROR', $err);
+                $plan_err_logged_at = $now_e;
+            }
+            $plan_err_text = $err;
+            return;
+        }
+        return unless ref $outcome eq 'HASH';
+        return unless $outcome->{outcome} eq 'corrected' || $outcome->{outcome} eq 'error';
+        $log->('PLAN', sprintf('why=%s outcome=%s found=%s wanted=%s error=%s journaled=%d',
+            $why, $outcome->{outcome},
+            (defined $outcome->{found_guid} ? $outcome->{found_guid} : 'unknown'),
+            (defined $outcome->{wanted_guid} ? $outcome->{wanted_guid} : 'none'),
+            (defined $outcome->{reason} ? $outcome->{reason} : ''),
+            ($outcome->{journaled} ? 1 : 0)));
+    };
+
     while (1) {
         my $reason_data = active_reason($dir);
         unless (defined $reason_data) {
             $log->('IDLE', 'reason=no-live-arm');
+            $run_plan_step->('refresher-exit');
             last;
         }
 
@@ -1269,6 +1320,11 @@ sub daemon_loop {
         sync($dir, %opts, active => 1, log => $ka_log, owner_winpid => $owner_winpid, owner_desc => $desc);
         $log->('TICK', sprintf('active=1 reason=arm sid=%s basis=%s age=%ss arms=%d',
             $reason_data->{sid}, $reason_data->{basis}, $reason_data->{age}, $reason_data->{arms}));
+
+        # Package 06: the power plan follows arming, checked on every tick
+        # BEFORE the journal step so a probe spawned in the same tick sees
+        # the corrected plan.
+        $run_plan_step->('refresher-tick');
 
         # Package 05: the power journal. Windows-platform-only, inside an
         # eval, so a journal failure (including a failed require) can never

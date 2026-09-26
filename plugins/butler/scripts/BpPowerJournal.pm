@@ -25,7 +25,19 @@ use Cwd ();
 
 my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
 require "$DIR/bp-keepawake.pl";
-require "$DIR/BpContinuityLease.pm" unless grep { m{(?:^|/)BpContinuityLease\.pm$} } keys %INC;
+# BpContinuityLease.pm is checked via its OWN symbol table, not %INC: its
+# production entry point runs it as the perl MAIN PROGRAM
+# ("perl BpContinuityLease.pm lease --daemon"), and a script executing AS $0
+# is never added to %INC (only files reached through require/use are). The
+# %INC-based guard every other require in this file uses would therefore
+# find no entry on that path, unconditionally re-require the file, and
+# re-execute its ~1400 lines top to bottom WHILE THE ORIGINAL daemon_loop
+# invocation (the one that got here via its own per-tick require of this
+# module) is still on the call stack -- redefining daemon_loop,
+# _handle_signal, sync, lease_log and every other sub the live $SIG{TERM}
+# closure depends on, mid-flight, for no reason. See BpPowerPlan.pm's
+# identical guard for the same defect, measured the same way.
+require "$DIR/BpContinuityLease.pm" unless defined &BpContinuityLease::platform;
 
 our $JOURNAL_MAX_BYTES     = 2 * 1024 * 1024;   # rotate when the next append would exceed it
 our $JOURNAL_KEEP          = 4;                 # rotated generations kept (.1 .. .4)
@@ -857,7 +869,7 @@ sub build_timeline {
     my $since_ms      = $a{since_ms};
     my $until_ms      = $a{until_ms};
 
-    my (@ticks, @notes);
+    my (@ticks, @notes, @plans);
     # SHOULD-FIX 1 (review) / spec B13: a line that cannot be decoded (a
     # truncated last line after a hard freeze) is skipped AND counted, never
     # silently dropped -- an all-zeros count would read identically to "the
@@ -868,6 +880,11 @@ sub build_timeline {
         if ($rec->{kind} eq 'tick') {
             next unless defined $rec->{ts} && defined $rec->{seq};
             push @ticks, $rec;
+        } elsif ($rec->{kind} eq 'plan') {
+            # Decision 22 (package 06-plan-follows-arming): a kind:plan
+            # record renders as its own "plan" timeline entry rather than
+            # falling through to an "unknown kind: plan" note.
+            push @plans, $rec;
         } else {
             push @notes, $rec;
         }
@@ -1045,6 +1062,19 @@ sub build_timeline {
         }
     }
 
+    for my $p (@plans) {
+        push @entries, {
+            kind => 'plan', t_ms => (defined $p->{ts} ? $p->{ts} : 0) * 1000,
+            local => _local_iso(defined $p->{ts} ? $p->{ts} : 0),
+            why => $p->{why}, armed => $p->{armed}, arm_ids => $p->{arm_ids},
+            found_guid => $p->{found_guid}, found_name => $p->{found_name},
+            wanted_guid => $p->{wanted_guid}, wanted_name => $p->{wanted_name},
+            wanted_basis => $p->{wanted_basis},
+            action => $p->{action}, result => $p->{result},
+            error => $p->{error}, detail => $p->{detail}, rc => $p->{rc}, ms => $p->{ms},
+        };
+    }
+
     for my $n (@notes) {
         push @entries, {
             kind => 'note', t_ms => (defined $n->{ts} ? $n->{ts} : 0) * 1000,
@@ -1096,7 +1126,7 @@ sub build_timeline {
         @entries = @kept;
     }
 
-    my %rank = (event => 0, journal => 1, transcript => 2, note => 3, flag => 4);
+    my %rank = (event => 0, journal => 1, transcript => 2, plan => 3, note => 4, flag => 5);
     my $idx = 0;
     for my $e (@entries) { $e->{__idx} = $idx++ }
     @entries = sort {
@@ -1153,6 +1183,21 @@ sub _summary_for {
     if ($k eq 'journal')    { return "count=$e->{count} power=$e->{power_source} display=$e->{display}" }
     if ($k eq 'event')      { return "id=$e->{id} $e->{message}" }
     if ($k eq 'transcript') { return "count=$e->{count}" }
+    if ($k eq 'plan') {
+        my $why    = defined $e->{why}        ? $e->{why}        : '';
+        my $action = defined $e->{action}     ? $e->{action}     : '';
+        my $result = defined $e->{result}     ? $e->{result}     : '';
+        my $found  = defined $e->{found_guid} ? $e->{found_guid} : '';
+        my $wanted = defined $e->{wanted_guid} ? $e->{wanted_guid} : '';
+        my $s = "why=$why action=$action result=$result found=$found wanted=$wanted";
+        if ($result eq 'error') {
+            my $err    = defined $e->{error}  ? $e->{error}  : '';
+            my $detail = defined $e->{detail} ? $e->{detail} : '';
+            $s .= " error=$err";
+            $s .= " detail=$detail" if length $detail;
+        }
+        return $s;
+    }
     if ($k eq 'note')       { return $e->{note} }
     return '';
 }
