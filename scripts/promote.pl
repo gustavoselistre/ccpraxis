@@ -336,6 +336,13 @@ sub set_at_path {
     return;
 }
 
+sub delete_at_path {
+    my ($data, $path) = @_;
+    if (@$path == 1) { delete $data->{$path->[0]}; }
+    else              { delete $data->{$path->[0]}{$path->[1]}; }
+    return;
+}
+
 # Historical values for a unit: canonical JSON of the value at that unit's
 # path, across every payload-history version that parses as JSON and
 # contains the path (spec S3.4 item 14).
@@ -674,8 +681,24 @@ sub main {
             my $count = 0;
             for my $u (@units) {
                 my $rel = $u->{relation};
-                next if $rel eq 'identical' || $rel eq 'only_left';
-                if ($rel eq 'only_right') {
+                next if $rel eq 'identical';
+                if ($rel eq 'only_left') {
+                    # Decision 125: an only_left unit whose installed value
+                    # canonically matches a value the payload once had (any
+                    # historical version) is retired -- the payload dropped
+                    # it, and the live install should catch up. Any other
+                    # only_left unit is kept silently, as today.
+                    my $hist_set = historical_canon_set(\@hist_versions, $u->{path});
+                    if ($hist_set->{ canon_str($u->{live_val}) }) {
+                        if (pref_honoured($prefs_scope, $u->{name}, 'only_left')) {
+                            push @settings_lines, "  kept-pref $u->{name} (left-only)";
+                        } else {
+                            delete_at_path($result, $u->{path});
+                            push @settings_lines, "  removed $u->{name}";
+                            $count++;
+                        }
+                    }
+                } elsif ($rel eq 'only_right') {
                     if (pref_honoured($prefs_scope, $u->{name}, 'only_right')) {
                         push @settings_lines, "  kept-pref $u->{name} (right-only)";
                     } else {
