@@ -3798,10 +3798,13 @@ sync_copy_plan($prior_skills_plan, _read_copy_plan($SKILLS_COPY_MANIFEST), "$CLA
 # selection + launcher control metadata stay RO in .launcher/. Each launch the
 # host-tier is RECONCILED to exactly the current selection (refresh selected,
 # remove what was placed before that isn't selected/present now -> no zombies),
-# while plugins installed INSIDE the sandbox are PRESERVED. installed_plugins.json
+# while plugins installed INSIDE the sandbox are PRESERVED, refreshed to the
+# host's version when the host has it too (host wins; the container's own
+# plugin auto-updater is off). installed_plugins.json
 # and known_marketplaces.json are real RW files in claude-home, merge-materialized
-# (selection authoritative + sandbox installs preserved). ccpraxis (and any other
-# directory-source marketplace) stays a LIVE read-only bind below.
+# (selection authoritative + sandbox installs preserved or host-refreshed).
+# ccpraxis (and any other directory-source marketplace) stays a LIVE
+# read-only bind below.
 
 make_path("$CLAUDE_DATA/plugins") unless -d "$CLAUDE_DATA/plugins";
 

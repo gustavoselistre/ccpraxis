@@ -168,14 +168,21 @@ host changes:
   no drift, in-container tampering reverted), and anything the launcher placed
   before that's now deselected *or* removed on the host is deleted (no zombies).
 - **Tier 2 — sandbox-installed plugins.** `claude plugin install` /
-  `marketplace add` inside the sandbox land in the same tree and **persist**;
-  the reconcile never touches a dir it didn't place. Provenance comes from a
+  `marketplace add` inside the sandbox land in the same tree and **persist**,
+  as long as the host has never installed that plugin. Provenance comes from a
   copy-plan **manifest** in `.launcher/` (RO in the container), which also lets
   the registry merge tell a sandbox install of an unselected host plugin (keep)
-  from a deselected host plugin (drop).
+  from a deselected host plugin (drop). If the host *has* installed the same
+  plugin (from a copied marketplace, with its cache dir present), the preserved
+  record and cache dir are instead **refreshed to the host's version** at each
+  launch, because the host is authoritative. The container's own plugin
+  auto-updater is off, so it cannot replace the copy the launcher placed. Once
+  the host stops supplying that plugin, the sandbox record and its cache dir
+  are **retained** as last written, not deleted. Directory-source
+  marketplaces are exempt from this refresh (they're a live bind, below).
 - **`installed_plugins.json` / `known_marketplaces.json`** are real RW files in
   `claude-home/plugins/`, re-materialized each launch (selection authoritative +
-  sandbox installs merge-preserved).
+  sandbox installs preserved or host-refreshed, per the rule above).
 - **Directory-source marketplaces** (e.g. `ccpraxis-local`) are the one exception
   — they stay a **live read-only bind** of their `source.path`, so the ccpraxis
   dev loop is always current and the container can't modify it.
