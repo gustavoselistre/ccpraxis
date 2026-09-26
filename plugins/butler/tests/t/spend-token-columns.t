@@ -11,7 +11,9 @@
 # EVERY fixture here is synthetic, built fresh in a tempdir. This file never
 # fetches: CCPRAXIS_SPEND_NO_FETCH=1 is set below (Decision 16), except TC10
 # which deliberately unsets it for a child that also sets the seam, to prove
-# the fleet path (derive-package/derive-blueprint) never calls it either.
+# the fleet path (derive-package/derive-blueprint) now fetches through the
+# seam too, but exactly once per CLI run rather than once per package
+# (Decisions 25/27, package 02).
 #
 # THIS FILE IS THE PACKAGE'S ORACLE for the token-columns behaviour. It must
 # not be weakened to make an implementation's life easier.
@@ -462,10 +464,12 @@ subtest 'TC8: derive-package adds cache_write_5m/1h/unsplit_tokens to tokens.{co
 };
 
 # ===========================================================================
-# TC9 (DC3, Decision 20) -- derive-blueprint sums the three new keys; no
-# fetched-price key anywhere in the document.
+# TC9 (DC3, Decision 20; rewritten per spend-token-report package 02 spec
+# SS4.3 for Decision 27 -- derive-package/derive-blueprint now fetch and
+# stamp a price, so price-shaped keys are EXPECTED, but only at the
+# documented paths, and only when pricing was actually fetched).
 # ===========================================================================
-subtest 'TC9: derive-blueprint sums the split keys across packages; no api_equivalent/price_/pricing key anywhere' => sub {
+subtest 'TC9: derive-blueprint sums the split keys; price keys appear only at the stamped paths' => sub {
     my $dir = tempdir(CLEANUP => 1);
     write_jsonl(runs_path($dir, 'p1'),
         sys_init(session => 's1'),
@@ -486,29 +490,44 @@ subtest 'TC9: derive-blueprint sums the split keys across packages; no api_equiv
         is($doc->{tokens}{coordinator}{cache_write_1h_tokens}, 20, 'TC9: top-level cache_write_1h_tokens sums across packages');
         is($doc->{by_model}{'claude-sonnet-5'}{cache_write_5m_tokens}, 30, 'TC9: by_model cache_write_5m_tokens sums across packages');
 
-        my @bad_keys;
+        my @paths;
         my $scan;
         $scan = sub {
             my ($node, $path) = @_;
             if (ref($node) eq 'HASH') {
-                for my $k (keys %$node) {
-                    push @bad_keys, "$path.$k" if $k =~ /api_equivalent|price_|pricing/;
+                for my $k (sort keys %$node) {
+                    push @paths, "$path.$k" if $k =~ /api_equivalent|price_|pricing/;
                     $scan->($node->{$k}, "$path.$k");
                 }
             } elsif (ref($node) eq 'ARRAY') {
-                $scan->($_, $path) for @$node;
+                $scan->($_, "$path\[\]") for @$node;
             }
         };
         $scan->($doc, '$');
-        is_deeply(\@bad_keys, [], 'TC9: no key anywhere matches /api_equivalent|price_|pricing/') or diag(join(', ', @bad_keys));
+        is_deeply([ sort @paths ],
+            [ '$.api_equivalent_cost_usd', '$.packages[].api_equivalent_cost_usd', '$.packages[].api_equivalent_cost_usd',
+              '$.price_fetched_at', '$.price_source', '$.pricing_status' ],
+            'TC9: price-shaped keys appear only at the stamped paths (two packages)') or diag(join(', ', @paths));
+    }
+
+    # Under this file's NO_FETCH=1, the run above was offline: no cost.
+    is($doc->{pricing_status}, 'offline', 'TC9: pricing_status is offline (this file sets NO_FETCH=1)') if $doc;
+  SKIP: {
+        skip 'TC9 offline: no doc to inspect', 4 unless $doc;
+        ok(!defined($doc->{api_equivalent_cost_usd}), 'TC9: top-level cost undef under NO_FETCH=1');
+        ok(!defined($doc->{packages}[0]{api_equivalent_cost_usd}), 'TC9: packages[0] cost undef under NO_FETCH=1');
+        ok(!defined($doc->{packages}[1]{api_equivalent_cost_usd}), 'TC9: packages[1] cost undef under NO_FETCH=1');
+        is_deeply($doc->{unpriced_reasons}, [ { reason => 'offline', tokens => 54 } ],
+            'TC9: top-level unpriced_reasons is exactly [{offline,54}] (p1 1+1+30, p2 1+1+20)') or diag($JSON->encode($doc->{unpriced_reasons} // []));
     }
 };
 
 # ===========================================================================
-# TC10 (Decision 7, DC3, DC5) -- the fleet path never fetches, even with the
-# seam armed and NO_FETCH unset for the child.
+# TC10 (Decision 7/25/27, DC3, DC5; rewritten per spend-token-report package
+# 02 spec SS4.3 -- the fleet path now DOES fetch, but exactly once per CLI
+# run, never once per package).
 # ===========================================================================
-subtest 'TC10: derive-package/derive-blueprint never call the fetch seam even when it is armed' => sub {
+subtest 'TC10: derive-package and derive-blueprint fetch exactly once per run through the seam' => sub {
     my $dir = tempdir(CLEANUP => 1);
     my $stubdir = tempdir(CLEANUP => 1);
     my $stub = File::Spec->catfile($stubdir, 'stub.pl');
@@ -526,6 +545,9 @@ STUB
     write_jsonl(runs_path($dir, 'p1'),
         sys_init(session => 's1'),
         fleet_assistant_rec(session => 's1', parent => undef, model => 'claude-sonnet-5', input => 1, output => 1));
+    write_jsonl(runs_path($dir, 'p2'),
+        sys_init(session => 's2'),
+        fleet_assistant_rec(session => 's2', parent => undef, model => 'claude-sonnet-5', input => 1, output => 1));
 
     local $ENV{CCPRAXIS_SPEND_FETCH_CMD} = $stub;
     local $ENV{SPEND_STUB_COUNTER}       = $counter;
@@ -533,11 +555,25 @@ STUB
 
     my ($rc, $out) = run_spend('derive-package', '--run-dir', $dir, '--pkg', 'p1');
     is($rc, 0, 'TC10: derive-package exits 0') or diag($out);
-    ok(!-e $counter, 'TC10: derive-package never invoked the fetch seam');
+    my @lines1 = -e $counter ? do { open(my $fh, '<', $counter) or die $!; my @l = <$fh>; close $fh; @l } : ();
+    is(scalar(@lines1), 1, 'TC10: derive-package fetches exactly once (1 counter line)') or diag(join('', @lines1));
 
     my ($rc2, $out2) = run_spend('derive-blueprint', '--run-dir', $dir);
     is($rc2, 0, 'TC10: derive-blueprint exits 0') or diag($out2);
-    ok(!-e $counter, 'TC10: derive-blueprint never invoked the fetch seam either');
+    my @lines2 = -e $counter ? do { open(my $fh, '<', $counter) or die $!; my @l = <$fh>; close $fh; @l } : ();
+    is(scalar(@lines2), 2, 'TC10: derive-blueprint over two packages adds exactly one more line (one fetch per run, not per package)')
+        or diag(join('', @lines2));
+
+    my $doc = slurp_json(derived_path($dir));
+    ok($doc, 'TC10: last doc parses') or diag(slurp_raw(derived_path($dir)) // '<missing>');
+  SKIP: {
+        skip 'TC10: no doc to inspect', 3 unless $doc;
+        is($doc->{pricing_status}, 'unavailable: standard price table not found',
+            'TC10: the stub\'s bare "ok\\n200" body has no price table, so pricing_status names that');
+        chomp(my $last_line = $lines2[-1] // '');
+        is($doc->{price_source}, $last_line, 'TC10: price_source equals the counter\'s last logged line');
+        ok(!defined($doc->{api_equivalent_cost_usd}), 'TC10: top-level cost is undef (no price table to price from)');
+    }
 };
 
 # ===========================================================================

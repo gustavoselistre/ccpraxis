@@ -652,6 +652,14 @@ sub _empty_package_result {
             cost_source        => 'claude-code-self-reported-headless',
         },
         derived => 1,
+        # Package 02 (spend-token-report, Decisions 25/26a/27.1) -- a fresh
+        # stamped api_equivalent_cost_usd sibling of cross_check, computed
+        # below from the SAME dedup requests via _session_price_request.
+        # These three defaults cover the early-return (no-file/empty) paths;
+        # the normal path overwrites them once pricing is computed.
+        api_equivalent_cost_usd => undef,
+        unpriced_tokens         => 0,
+        unpriced_reasons        => [],
     };
 }
 
@@ -685,7 +693,9 @@ sub _safe_usage_num {
 
 # ---------------------------------------------------------------------------
 # derive_package(%opts) -> \%package_result. See spec §2.1-2.4.
-#   opts: jsonl_path => PATH (required), pkg => STR (required)
+#   opts: jsonl_path => PATH (required), pkg => STR (required),
+#         pricing => $p (optional -- spec 02 §2.1/§2.2; BpPricing::offline()
+#         when absent. NEVER calls BpPricing::acquire itself -- see DF9/B5.)
 # A missing file is status=>'no-file'. A file with zero assistant/usage
 # records is status=>'empty'. A line that fails JSON decode is SKIPPED, not
 # fatal, and counted in record_counts.skipped_unparseable.
@@ -694,8 +704,13 @@ sub derive_package {
     my (%opts) = @_;
     my $jsonl_path = $opts{jsonl_path};
     my $pkg        = $opts{pkg};
+    my $pricing        = $opts{pricing} // BpPricing::offline();
+    my $pricing_not_ok = $pricing->{status} ne 'ok';
 
     my $result = _empty_package_result($pkg);
+    # T == 0 here (no-file/empty early returns below): the null rule (spec 02
+    # §2.2) gives cost 0 under ok pricing, null otherwise -- never a guess.
+    $result->{api_equivalent_cost_usd} = $pricing_not_ok ? undef : 0;
 
     unless (defined $jsonl_path && -f $jsonl_path) {
         $result->{status} = 'no-file';
@@ -787,6 +802,10 @@ sub derive_package {
             my $cc_unsplit = $use_split ? 0 : $cc;
             $cc_5m = 0 unless $use_split;
             $cc_1h = 0 unless $use_split;
+            # Package 02 spec Sec2.2: speed, from message.usage.speed, taking
+            # the last record like model does (fed into _session_price_request
+            # below via the same rate rules the session path uses).
+            my $speed = $u->{speed};
 
             $result->{record_counts}{assistant_total}++;
             $result->{record_counts}{$role}++;
@@ -810,6 +829,7 @@ sub derive_package {
                     cache_creation => $cc, cache_read => $cr,
                     cache_write_5m_tokens => $cc_5m, cache_write_1h_tokens => $cc_1h,
                     cache_write_unsplit_tokens => $cc_unsplit,
+                    speed => $speed,
                     session_id => $rec->{session_id},
                     mismatched => 0,
                 };
@@ -873,6 +893,7 @@ sub derive_package {
                 $req->{cache_write_1h_tokens}      = $cc_1h;
                 $req->{cache_write_unsplit_tokens} = $cc_unsplit;
                 $req->{model}          = $model;
+                $req->{speed}          = $speed;
             }
         }
         elsif ($type eq 'system'
@@ -951,6 +972,61 @@ sub derive_package {
     $total += $_->{size} for @pairs;
     $result->{anomaly}{total_tokens} = $total;
 
+    # ------------------------------------------------------------------
+    # Package 02 (spend-token-report, Decisions 25/26a/27.1/27.2): price
+    # every deduplicated request through the SAME _session_price_request
+    # used by the session path (Sec2.2), on an adapter hash. T is the
+    # package's token total -- the sum, over its deduplicated requests, of
+    # input+output+cache_read+cache_write_5m+cache_write_1h+
+    # cache_write_unsplit -- which is exactly the sum of the six
+    # tokens.{coordinator,subagent} fields just accumulated above, so it
+    # is read back from there rather than re-summed a second way.
+    # ------------------------------------------------------------------
+    my $unrounded_cost = 0;
+    my $unpriced_sum   = 0;
+    my %unpriced_reasons;
+    for my $key (@order) {
+        my $req = $requests{$key};
+        my $use_split_req = ($req->{cache_write_5m_tokens} + $req->{cache_write_1h_tokens}) > 0;
+        my $adapter = {
+            model      => $req->{model},
+            effort     => undef,
+            input      => $req->{input},
+            output     => $req->{output},
+            cache_read => $req->{cache_read},
+            use_split  => $use_split_req,
+            cc_5m      => $req->{cache_write_5m_tokens},
+            cc_1h      => $req->{cache_write_1h_tokens},
+            cc_unsplit => $req->{cache_write_unsplit_tokens},
+            speed      => $req->{speed},
+        };
+        my $cells = _session_price_request($adapter, $req->{role}, $pricing);
+        for my $c (@$cells) {
+            $unrounded_cost += $c->{cost_usd};
+            $unpriced_sum   += $c->{unpriced_tokens};
+            $unpriced_reasons{ $c->{reason} } += $c->{tokens} if defined $c->{reason};
+        }
+    }
+    my $T = 0;
+    for my $role (qw(coordinator subagent)) {
+        for my $f (qw(input output cache_read cache_write_5m_tokens cache_write_1h_tokens cache_write_unsplit_tokens)) {
+            $T += $result->{tokens}{$role}{$f};
+        }
+    }
+    my $fully_unpriced = $pricing_not_ok || ($T > 0 && $unpriced_sum == $T);
+    # The unrounded cost is PRIVATE -- it never goes into $result (DF11/DF13:
+    # no private key may reach the JSON, and that includes a direct library
+    # call to derive_package(), not only the packages[] pushed by
+    # derive_blueprint below). A caller that needs the unrounded figure --
+    # only derive_blueprint does, to sum the blueprint's own top-level cost
+    # from UNROUNDED figures rather than re-deriving it from already-rounded
+    # package values (spec Sec2.2) -- passes unrounded_cost_ref, a scalar
+    # ref this sub fills in as a side channel instead.
+    ${ $opts{unrounded_cost_ref} } = $unrounded_cost if ref($opts{unrounded_cost_ref}) eq 'SCALAR';
+    $result->{api_equivalent_cost_usd} = $fully_unpriced ? undef : 0 + sprintf('%.6f', $unrounded_cost);
+    $result->{unpriced_tokens}  = int($unpriced_sum);
+    $result->{unpriced_reasons} = _session_unpriced_reasons_array(\%unpriced_reasons);
+
     $result->{status} = $saw_assistant ? 'ok' : 'empty';
     return $result;
 }
@@ -967,6 +1043,8 @@ sub derive_package {
 sub derive_blueprint {
     my (%opts) = @_;
     my $runs_dir = $opts{runs_dir};
+    my $pricing        = $opts{pricing} // BpPricing::offline();
+    my $pricing_not_ok = $pricing->{status} ne 'ok';
 
     my @pkgs;
     if (ref($opts{pkgs}) eq 'ARRAY') {
@@ -1004,9 +1082,25 @@ sub derive_blueprint {
         derived => 1,
     };
 
+    my $unrounded_cost_sum = 0;
+    my $blueprint_unpriced_tokens = 0;
+    my %blueprint_unpriced_reasons;
+
     for my $pkg (@pkgs) {
         my $jsonl_path = defined($runs_dir) ? "$runs_dir/$pkg.jsonl" : undef;
-        my $pr = derive_package(jsonl_path => $jsonl_path, pkg => $pkg);
+        my $unrounded_cost;
+        my $pr = derive_package(jsonl_path => $jsonl_path, pkg => $pkg, pricing => $pricing,
+            unrounded_cost_ref => \$unrounded_cost);
+
+        # $pr never carries a private key (spec 02 Sec2.2/DF11/DF13) --
+        # derive_package hands the unrounded figure back through the side
+        # channel above instead of stamping it into the result hash.
+        $unrounded_cost_sum += $unrounded_cost // 0;
+        $blueprint_unpriced_tokens += $pr->{unpriced_tokens};
+        for my $r (@{ $pr->{unpriced_reasons} // [] }) {
+            $blueprint_unpriced_reasons{ $r->{reason} } += $r->{tokens};
+        }
+
         push @{ $result->{packages} }, $pr;
 
         for my $role (qw(coordinator subagent)) {
@@ -1038,6 +1132,25 @@ sub derive_blueprint {
             };
         }
     }
+
+    # Blueprint-wide T (spec 02 Sec2.2's null rule applied to the blueprint
+    # totals) is read back from the SAME tokens.{coordinator,subagent} fields
+    # just summed above -- never re-derived a second way.
+    my $T = 0;
+    for my $role (qw(coordinator subagent)) {
+        for my $f (qw(input output cache_read cache_write_5m_tokens cache_write_1h_tokens cache_write_unsplit_tokens)) {
+            $T += $result->{tokens}{$role}{$f};
+        }
+    }
+    my $fully_unpriced = $pricing_not_ok || ($T > 0 && $blueprint_unpriced_tokens == $T);
+
+    $result->{price_source}     = $pricing->{source};
+    $result->{price_fetched_at} = $pricing->{fetched_at};
+    $result->{pricing_status}   = BpPricing::status_string($pricing);
+    $result->{price_fetch_override} = JSON::PP::true if $pricing->{price_fetch_override};
+    $result->{api_equivalent_cost_usd} = $fully_unpriced ? undef : 0 + sprintf('%.6f', $unrounded_cost_sum);
+    $result->{unpriced_tokens}  = int($blueprint_unpriced_tokens);
+    $result->{unpriced_reasons} = _session_unpriced_reasons_array(\%blueprint_unpriced_reasons);
 
     return $result;
 }
@@ -1106,6 +1219,74 @@ sub _session_parse_ts {
         $epoch -= $off_secs;
     }
     return $epoch;
+}
+
+# ---------------------------------------------------------------------------
+# _session_iso_epoch($epoch) -> 'YYYY-MM-DDTHH:MM:SSZ' (UTC). Package 02's own
+# formatter for window bounds/headers -- deliberately not BpPricing::_iso
+# (private to that package), same shape.
+# ---------------------------------------------------------------------------
+sub _session_iso_epoch {
+    my ($e) = @_;
+    my @g = gmtime($e);
+    return sprintf('%04d-%02d-%02dT%02d:%02d:%02dZ', $g[5] + 1900, $g[4] + 1, $g[3], $g[2], $g[1], $g[0]);
+}
+
+# ---------------------------------------------------------------------------
+# _session_hour_label($epoch) -> 'YYYY-MM-DDTHH:00Z' (UTC), the --by hour
+# bucket label (spec 02 Sec2.5). Carries the date so multi-day windows never
+# merge two different days' same hour (N3).
+# ---------------------------------------------------------------------------
+sub _session_hour_label {
+    my ($e) = @_;
+    my @g = gmtime($e);
+    return sprintf('%04d-%02d-%02dT%02d:00Z', $g[5] + 1900, $g[4] + 1, $g[3], $g[2]);
+}
+
+# ---------------------------------------------------------------------------
+# _window_is_leap($y) -> 1|0.
+# ---------------------------------------------------------------------------
+sub _window_is_leap {
+    my ($y) = @_;
+    return ($y % 4 == 0 && ($y % 100 != 0 || $y % 400 == 0)) ? 1 : 0;
+}
+
+# ---------------------------------------------------------------------------
+# _window_parse_bound($raw, $now) -> epoch seconds, or undef when $raw is
+# neither form (spec 02 Sec2.7's time grammar):
+#   absolute: YYYY-MM-DDTHH:MM[:SS]Z, uppercase T/Z only, no fractional
+#             seconds, no numeric offset, every field range-checked;
+#   relative: Nh|Nm|Nd (N is 1-6 digits, no sign, no decimal), resolved as
+#             $now - N*unit. Deliberately a STRICTER grammar than
+#             _session_parse_ts (which accepts offsets/fractions for
+#             TRANSCRIPT timestamps) -- this one judges CLI --since/--until
+#             values instead.
+# ---------------------------------------------------------------------------
+sub _window_parse_bound {
+    my ($raw, $now) = @_;
+    my $v = defined($raw) ? $raw : '';
+
+    if ($v =~ /\A(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?Z\z/) {
+        my ($y, $mo, $d, $h, $mi, $s) = ($1 + 0, $2 + 0, $3 + 0, $4 + 0, $5 + 0, defined($6) ? $6 + 0 : 0);
+        # A year below 1000 is rejected outright, rather than handed to
+        # Time::Local::timegm -- which reinterprets any year under 1000 via
+        # its 2/3-digit-year convention (e.g. 0150 -> 2050, 0000 -> 2000),
+        # silently resolving to a wildly different absolute time (S3).
+        return undef if $y < 1000;
+        return undef if $mo < 1 || $mo > 12;
+        return undef if $h > 23 || $mi > 59 || $s > 59;
+        my @dim = (31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31);
+        $dim[1] = 29 if _window_is_leap($y);
+        return undef if $d < 1 || $d > $dim[$mo - 1];
+        my $epoch = eval { Time::Local::timegm($s, $mi, $h, $d, $mo - 1, $y) };
+        return (!$@ && defined $epoch) ? $epoch : undef;
+    }
+    if ($v =~ /\A(\d{1,6})([hmd])\z/) {
+        my ($n, $unit) = ($1 + 0, $2);
+        my %secs = (h => 3600, m => 60, d => 86400);
+        return $now - $n * $secs{$unit};
+    }
+    return undef;
 }
 
 # ---------------------------------------------------------------------------
@@ -1315,10 +1496,11 @@ sub _session_read_agent_file {
             next;
         }
 
+        my $rec_ts;
         if (defined $rec->{timestamp} && !ref($rec->{timestamp})) {
-            my $ts = _session_parse_ts($rec->{timestamp});
-            if (defined $ts && (!defined($first_ts) || $ts < $first_ts)) {
-                $first_ts = $ts;
+            $rec_ts = _session_parse_ts($rec->{timestamp});
+            if (defined $rec_ts && (!defined($first_ts) || $rec_ts < $first_ts)) {
+                $first_ts = $rec_ts;
             }
         }
 
@@ -1377,6 +1559,12 @@ sub _session_read_agent_file {
                 first_uuid      => $uuid,
                 first_session_id => $session_id,
                 mismatched      => 0,
+                # Package 02 spec Sec2.4 -- the placement timestamp is that
+                # of the FIRST record, in file order, that dedup assigns to
+                # this request. Never overwritten by a later record, even
+                # when this first one had no/an unparseable timestamp (the
+                # request is then timestamp-less, spec's own term).
+                place_ts        => $rec_ts,
             };
             push @order, $key;
         }
@@ -1518,8 +1706,11 @@ sub _session_agent_anomaly {
 }
 
 # ---------------------------------------------------------------------------
-# _session_cell_key($cell) -> the (role, model, effort, token_type) string
-# key used to merge cells emitted by different requests/agents into one.
+# _session_cell_key($cell) -> the (role, model, effort, token_type, hour)
+# string key used to merge cells emitted by different requests/agents into
+# one. `hour` is left undef on every cell (folded to '' by the join below)
+# unless derive_session's by_hour flag is set (spec 02 Sec2.5), so it is a
+# no-op appended field otherwise.
 # ---------------------------------------------------------------------------
 sub _session_cell_key {
     my ($c) = @_;
@@ -1527,7 +1718,7 @@ sub _session_cell_key {
     # this, a field containing a literal \x1e could collide two genuinely
     # distinct cells into one.
     return join("\x1e", map { (my $x = defined($_) ? $_ : ''); $x =~ s/\x1e/\x1e\x1e/g; $x }
-        ($c->{role}, $c->{model}, $c->{effort}, $c->{token_type}));
+        ($c->{role}, $c->{model}, $c->{effort}, $c->{token_type}, $c->{hour}));
 }
 
 # ---------------------------------------------------------------------------
@@ -1540,7 +1731,7 @@ sub _session_merge_cells {
         my $k = _session_cell_key($c);
         my $entry = ($acc->{$k} //= {
             role => $c->{role}, model => $c->{model}, effort => $c->{effort},
-            token_type => $c->{token_type}, tokens => 0, cost_usd => 0, unpriced_tokens => 0,
+            token_type => $c->{token_type}, hour => $c->{hour}, tokens => 0, cost_usd => 0, unpriced_tokens => 0,
             reasons => {},
         });
         $entry->{tokens}          += $c->{tokens};
@@ -1583,13 +1774,15 @@ sub _session_unpriced_reasons_array {
 }
 
 # ---------------------------------------------------------------------------
-# _session_sorted_cells(\%acc) -> \@cells, rounded once at emission, sorted
-# ascending by role, then model, then effort, then token_type (cmp on each),
-# zero-tokens cells dropped. api_equivalent_cost_usd is undef (JSON null)
-# when every token in the cell is unpriced (spec Sec2.7/Decision 18).
+# _session_sorted_cells(\%acc, $pricing_not_ok, $by_hour) -> \@cells, rounded
+# once at emission, sorted ascending by role, then model, then effort, then
+# token_type, then (iff $by_hour) hour (cmp on each), zero-tokens cells
+# dropped. api_equivalent_cost_usd is undef (JSON null) when every token in
+# the cell is unpriced (spec Sec2.7/Decision 18). $by_hour false/absent: no
+# `hour` key at all, byte-identical to package 01 (spec 02 Sec2.5).
 # ---------------------------------------------------------------------------
 sub _session_sorted_cells {
-    my ($acc, $pricing_not_ok) = @_;
+    my ($acc, $pricing_not_ok, $by_hour) = @_;
     my @cells =
         grep { $_->{tokens} > 0 }
         map  {
@@ -1603,7 +1796,9 @@ sub _session_sorted_cells {
             my $fully_unpriced = $pricing_not_ok || ($c->{tokens} > 0 && $c->{unpriced_tokens} == $c->{tokens});
             {
                 role => $c->{role}, model => $c->{model}, effort => $c->{effort},
-                token_type => $c->{token_type}, tokens => int($c->{tokens}),
+                token_type => $c->{token_type},
+                ($by_hour ? (hour => $c->{hour}) : ()),
+                tokens => int($c->{tokens}),
                 api_equivalent_cost_usd => $fully_unpriced ? undef : 0 + sprintf('%.6f', $c->{cost_usd}),
                 unpriced_tokens => int($c->{unpriced_tokens}),
                 unpriced_reasons => _session_unpriced_reasons_array($c->{reasons}),
@@ -1615,6 +1810,7 @@ sub _session_sorted_cells {
         || $a->{model} cmp $b->{model}
         || $a->{effort} cmp $b->{effort}
         || $a->{token_type} cmp $b->{token_type}
+        || ($by_hour ? ($a->{hour} cmp $b->{hour}) : 0)
     } @cells;
     return \@cells;
 }
@@ -1630,6 +1826,19 @@ sub derive_session {
     my $session = $opts{session};
     my $pricing = $opts{pricing} // BpPricing::offline();
     my $pricing_not_ok = $pricing->{status} ne 'ok';
+    my $by_hour = $opts{by_hour} ? 1 : 0;
+
+    # Package 02 spec Sec2.1/Sec2.4 -- a window is GIVEN iff %w was passed
+    # and at least one bound is defined. With no window, every behaviour and
+    # every output byte is exactly as package 01 (B9/TW8).
+    my $win          = $opts{window};
+    my $since        = (ref($win) eq 'HASH') ? $win->{since} : undef;
+    my $until        = (ref($win) eq 'HASH') ? $win->{until} : undef;
+    my $window_given = ref($win) eq 'HASH' && (defined($since) || defined($until));
+
+    my $req_in_window      = 0;
+    my $req_outside_window = 0;
+    my $req_no_timestamp   = 0;
 
     my $sp = defined($session) ? $session : '';
     $sp =~ s{[/\\]+\z}{};
@@ -1724,16 +1933,52 @@ sub derive_session {
 
         my ($order, $requests, $first_ts) = _session_read_agent_file($af->{path}, $record_counts);
 
-        my %agent_cell_acc;
+        # Package 02 spec Sec2.4 -- membership is decided PER DEDUPLICATED
+        # REQUEST, by its placement timestamp, once. With no window, every
+        # request is kept (byte-identical to package 01). @kept_keys
+        # preserves @order's file order, which is what the anomaly and the
+        # hour-bucketed cells both need.
+        my @kept_keys;
+        my $agent_in_window = 0;
         for my $key (@$order) {
             my $req = $requests->{$key};
+            my $pts = $req->{place_ts};
+            if ($window_given) {
+                my $member = defined($pts)
+                    && (!defined($since) || $pts >= $since)
+                    && (!defined($until) || $pts <  $until);
+                if ($member) {
+                    $agent_in_window++;
+                    $req_in_window++;
+                    push @kept_keys, $key;
+                }
+                else {
+                    $req_outside_window++;
+                    $req_no_timestamp++ unless defined $pts;
+                }
+            }
+            else {
+                push @kept_keys, $key;
+            }
+        }
+
+        my %agent_cell_acc;
+        for my $key (@kept_keys) {
+            my $req = $requests->{$key};
             my $cells = _session_price_request($req, $role, $pricing);
+            if ($by_hour) {
+                my $pts = $req->{place_ts};
+                my $label = defined($pts) ? _session_hour_label($pts) : '(no-timestamp)';
+                $_->{hour} = $label for @$cells;
+            }
             _session_merge_cells(\%agent_cell_acc, $cells);
             _session_merge_cells(\%session_cell_acc, $cells);
             _session_merge_by_type(\%type_acc, $cells);
         }
 
-        my $anomaly = _session_agent_anomaly($order, $requests, $role);
+        # The anomaly (Decision 5) runs over the IN-WINDOW requests only, in
+        # file order (spec Sec2.4's "effects when a window is given").
+        my $anomaly = _session_agent_anomaly(\@kept_keys, $requests, $role);
         push @session_pairs, @{ $anomaly->{pairs} };
 
         push @agents, {
@@ -1742,12 +1987,13 @@ sub derive_session {
             spawn_depth => $spawn_depth,
             description => $description,
             first_ts    => $first_ts,
-            cells       => _session_sorted_cells(\%agent_cell_acc, $pricing_not_ok),
+            cells       => _session_sorted_cells(\%agent_cell_acc, $pricing_not_ok, $by_hour),
             anomaly     => $anomaly,
+            ($window_given ? (in_window_requests => $agent_in_window) : ()),
         };
     }
 
-    my $session_cells = _session_sorted_cells(\%session_cell_acc, $pricing_not_ok);
+    my $session_cells = _session_sorted_cells(\%session_cell_acc, $pricing_not_ok, $by_hour);
 
     # Accumulated from the UNROUNDED %type_acc (fed by the same per-request
     # cells as %session_cell_acc), never by re-summing $session_cells'
@@ -1795,6 +2041,16 @@ sub derive_session {
         },
         record_counts => $record_counts,
         agents        => \@agents,
+        # Package 02 spec Sec2.4 -- present ONLY when a window was given
+        # (B9/TW8: with no window, neither this key nor agents[].in_window_
+        # requests exists, so output is byte-for-byte package 01).
+        ($window_given ? (window => {
+            since                    => defined($since) ? _session_iso_epoch($since) : undef,
+            until                    => defined($until) ? _session_iso_epoch($until) : undef,
+            requests_in_window       => $req_in_window,
+            requests_outside_window  => $req_outside_window,
+            requests_no_timestamp    => $req_no_timestamp,
+        }) : ()),
     };
 }
 
@@ -1849,6 +2105,19 @@ sub _fmt_pricing_header {
 }
 
 # ---------------------------------------------------------------------------
+# _fmt_window_header(\%window) -> the "window: ..." line (spec 02 Sec2.7),
+# for both derive-session and report-session text mode. `-` marks an
+# unbounded side.
+# ---------------------------------------------------------------------------
+sub _fmt_window_header {
+    my ($w) = @_;
+    my $s = defined($w->{since}) ? $w->{since} : '-';
+    my $u = defined($w->{until}) ? $w->{until} : '-';
+    return "window: [$s, $u) UTC, requests in-window $w->{requests_in_window}, "
+         . "outside-window $w->{requests_outside_window} (no timestamp $w->{requests_no_timestamp})";
+}
+
+# ---------------------------------------------------------------------------
 # _fmt_cost_cell($pricing_status, $cost_usd, $unpriced_tokens, $tokens, \@reasons)
 # -> the COST grammar (spec Sec3.2).
 # ---------------------------------------------------------------------------
@@ -1899,7 +2168,7 @@ eval { require "$DISPATCH_DIR/bp-dispatch-log.pl"; 1 };
 # normal-path value, not as an anomaly fallback).
 our $DISPATCH_DEFAULT_BUDGET_FALLBACK = 1800;
 
-our @REPORT_DIMENSIONS        = qw(role blueprint package model effort token_type);
+our @REPORT_DIMENSIONS        = qw(role blueprint package model effort token_type hour);
 our @REPORT_DEFAULT_BY        = qw(role model);
 our @ATTRIBUTION_REASONS      = qw(unknown-agent ambiguous id-unresolved no-dispatch-record outside-window);
 our $DRIVER_LABEL             = '(driver)';
@@ -2281,6 +2550,20 @@ sub attribute_session {
             next;
         }
 
+        # Package 02 spec Sec2.6 -- an agent with a window and ZERO in-window
+        # requests is emitted here, BEFORE any other rule (including the
+        # dispatch-hook exact match), as unattributed/outside-window. The
+        # description-heuristic second pass below explicitly skips this
+        # reason, so it can never be promoted to attributed.
+        if (defined($agent->{in_window_requests}) && $agent->{in_window_requests} == 0) {
+            push @attrs, {
+                path => $agent->{path}, role => $agent->{role}, kind => 'unattributed',
+                blueprint => $UNATTRIBUTED_LABEL, package => $UNATTRIBUTED_LABEL,
+                reason => 'outside-window', source => 'none',
+            };
+            next;
+        }
+
         my $role = $agent->{role};
 
         my $tuid = $tuids->[$i];
@@ -2357,6 +2640,10 @@ sub attribute_session {
     if (%S) {
         for my $i (0 .. $#attrs) {
             next unless $attrs[$i]{kind} eq 'unattributed';
+            # Package 02 spec Sec2.6 -- the heuristic never promotes an
+            # outside-window agent (its zero in-window requests contribute
+            # no tokens either way, so a description match would be noise).
+            next if defined($attrs[$i]{reason}) && $attrs[$i]{reason} eq 'outside-window';
             my $desc = $agents[$i]{description};
             next unless defined $desc && !ref($desc);
             next unless $desc =~ /\b(?:package|pkg)\s+(\d{1,3})\b/i;
@@ -2404,12 +2691,20 @@ sub report_session {
     my (%opts) = @_;
     my $pricing = $opts{pricing} // BpPricing::offline();
     my $pricing_not_ok = $pricing->{status} ne 'ok';
-    my $doc = derive_session(session => $opts{session}, pricing => $pricing);
 
     my $by = $opts{by};
     $by = [@REPORT_DEFAULT_BY] unless defined $by;
     die "report_session: invalid --by dimension list\n" unless _valid_by_list($by);
     my $type_in_by = grep { $_ eq 'token_type' } @$by;
+    # Package 02 spec Sec2.1 -- by_hour passed to derive_session iff 'hour'
+    # is in --by.
+    my $hour_in_by = grep { $_ eq 'hour' } @$by;
+
+    my $doc = derive_session(
+        session => $opts{session}, pricing => $pricing,
+        (defined($opts{window}) ? (window => $opts{window}) : ()),
+        by_hour => $hour_in_by ? 1 : 0,
+    );
 
     my ($data_root, $data_root_source) = resolve_data_root($opts{data_root}, $opts{session});
     my $records   = load_dispatch_records($data_root);
@@ -2430,6 +2725,7 @@ sub report_session {
             my %dimval = (
                 role => $c->{role}, model => $c->{model}, effort => $c->{effort},
                 token_type => $c->{token_type}, blueprint => $attr->{blueprint}, package => $attr->{package},
+                hour => $c->{hour},
             );
             my @vals = map { $dimval{$_} } @$by;
             my $key = join("\x1f", @vals);
@@ -2519,6 +2815,9 @@ sub report_session {
             reasons      => \%reasons,
             agents       => $attrs,
         },
+        # Package 02 spec Sec2.7 -- copied from the derive doc, present ONLY
+        # when a window was given.
+        ($doc->{window} ? (window => $doc->{window}) : ()),
     };
 }
 
@@ -2621,6 +2920,10 @@ unless (caller) {
         elsif ($a eq '--data-root')         { $opt{data_root}  = shift @ARGV }
         elsif ($a =~ /^--by=(.*)$/)         { $opt{by}         = $1 }
         elsif ($a eq '--by')                { $opt{by}         = shift @ARGV }
+        elsif ($a =~ /^--since=(.*)$/)      { $opt{since}      = $1 }
+        elsif ($a eq '--since')             { $opt{since}      = shift @ARGV }
+        elsif ($a =~ /^--until=(.*)$/)      { $opt{until}      = $1 }
+        elsif ($a eq '--until')             { $opt{until}      = shift @ARGV }
         else { print STDERR "bp-spend: unrecognised argument '$a'\n"; exit 2 }
     }
 
@@ -2637,6 +2940,97 @@ unless (caller) {
     if ($verb ne 'report-session' && (exists $opt{data_root} || exists $opt{by})) {
         print STDERR "bp-spend: --data-root/--by only apply to report-session\n";
         exit 2;
+    }
+    # Package 02 spec Sec2.7's last error text -- sits beside the two guards
+    # above, before any verb-specific handling (so a fleet verb given a
+    # window flag never reaches BpPricing::acquire).
+    if (!$SESSION_VERBS{$verb} && (exists $opt{since} || exists $opt{until})) {
+        print STDERR "bp-spend: --since/--until only apply to derive-session or report-session\n";
+        exit 2;
+    }
+
+    # ---------------------------------------------------------------------
+    # Package 02 spec Sec2.7 -- for the session verbs, the verb's own
+    # required/shape checks (--session for both; --data-root/--by for
+    # report-session only) run BEFORE --now/--since/--until validation, so
+    # e.g. `report-session --since yesterday` with no --session prints the
+    # "requires --session" error rather than a window-parse error.
+    # ---------------------------------------------------------------------
+    my @by_dims;
+    if ($SESSION_VERBS{$verb}) {
+        unless (defined $opt{session} && length $opt{session}) {
+            print STDERR "bp-spend: $verb requires --session PATH\n";
+            exit 2;
+        }
+        if ($verb eq 'report-session') {
+            if (exists $opt{data_root} && !(defined $opt{data_root} && length $opt{data_root})) {
+                print STDERR "bp-spend: --data-root requires a directory\n";
+                exit 2;
+            }
+            if (exists $opt{by}) {
+                unless (defined $opt{by}) {
+                    print STDERR "bp-spend: --by requires a dimension list\n";
+                    exit 2;
+                }
+                @by_dims = split(/,/, $opt{by}, -1);
+                unless (BpSpend::Derive::_valid_by_list(\@by_dims)) {
+                    print STDERR "bp-spend: --by '$opt{by}' is not a valid dimension list (allowed: "
+                        . join(',', @BpSpend::Derive::REPORT_DIMENSIONS) . "; each at most once)\n";
+                    exit 2;
+                }
+            }
+        }
+    }
+
+    # ---------------------------------------------------------------------
+    # --now/--since/--until validation for the session verbs, IN THIS
+    # ORDER, all before BpPricing::acquire is ever called, so an
+    # invalid/inverted window never fetches (TW11/DF-parity).
+    # $opt{_now_epoch}/{_since_epoch}/{_until_epoch} feed derive_session/
+    # report_session below; $opt{_window_given} tracks whether either flag
+    # was actually passed (a window is "given" iff at least one bound was).
+    # ---------------------------------------------------------------------
+    if ($SESSION_VERBS{$verb}) {
+        my $now_epoch;
+        if (exists $opt{now}) {
+            my $raw = defined($opt{now}) ? $opt{now} : '';
+            if ($raw =~ /\A\d+\z/) { $now_epoch = $raw + 0; }
+            else {
+                print STDERR "bp-spend: --now '$raw' is not a whole-second epoch\n";
+                exit 2;
+            }
+        }
+        else { $now_epoch = time; }
+        $opt{_now_epoch} = $now_epoch;
+
+        my ($since_epoch, $until_epoch, $window_given) = (undef, undef, 0);
+        if (exists $opt{since}) {
+            my $raw = defined($opt{since}) ? $opt{since} : '';
+            $since_epoch = BpSpend::Derive::_window_parse_bound($raw, $now_epoch);
+            unless (defined $since_epoch) {
+                print STDERR "bp-spend: --since '$raw' is not a valid time (use YYYY-MM-DDTHH:MM[:SS]Z in UTC, or Nh, Nm or Nd)\n";
+                exit 2;
+            }
+            $window_given = 1;
+        }
+        if (exists $opt{until}) {
+            my $raw = defined($opt{until}) ? $opt{until} : '';
+            $until_epoch = BpSpend::Derive::_window_parse_bound($raw, $now_epoch);
+            unless (defined $until_epoch) {
+                print STDERR "bp-spend: --until '$raw' is not a valid time (use YYYY-MM-DDTHH:MM[:SS]Z in UTC, or Nh, Nm or Nd)\n";
+                exit 2;
+            }
+            $window_given = 1;
+        }
+        if (defined($since_epoch) && defined($until_epoch) && $since_epoch >= $until_epoch) {
+            print STDERR "bp-spend: empty or inverted window: --since "
+                . BpSpend::Derive::_session_iso_epoch($since_epoch) . " is not before --until "
+                . BpSpend::Derive::_session_iso_epoch($until_epoch) . "\n";
+            exit 2;
+        }
+        $opt{_since_epoch}  = $since_epoch;
+        $opt{_until_epoch}  = $until_epoch;
+        $opt{_window_given} = $window_given;
     }
 
     # ---------------------------------------------------------------------
@@ -2668,31 +3062,48 @@ unless (caller) {
         my $runs_dir = "$run_dir/runs";
         my $out_path = "$runs_dir/spend-derived.json";
 
-        my $bp_result;
+        # A specifically-requested missing package is a CALLER ERROR (spec
+        # §2.6): exit 4, write nothing, NEVER FETCH -- an existing
+        # spend-derived.json from a prior successful call is untouched. This
+        # check runs BEFORE BpPricing::acquire (spec 02 Sec2.3 step order).
         if ($verb eq 'derive-package') {
             my $jsonl_path = "$runs_dir/$opt{pkg}.jsonl";
-            # A specifically-requested missing package is a CALLER ERROR
-            # (spec §2.6): exit 4, write nothing -- an existing
-            # spend-derived.json from a prior successful call is untouched.
             unless (-f $jsonl_path) {
                 print STDERR "bp-spend: no such file $jsonl_path\n";
                 exit 4;
             }
+        }
+
+        # Package 02 spec Sec2.3 step 3 -- the ONLY acquisition for either
+        # verb, exactly once per invocation (including a derive-blueprint
+        # over zero or many packages). --offline means Decision 16's offline
+        # rung; these verbs print no cost.
+        my $pricing = BpPricing::acquire(offline => $opt{offline} ? 1 : 0);
+
+        my $bp_result;
+        if ($verb eq 'derive-package') {
             $bp_result = BpSpend::Derive::derive_blueprint(
-                runs_dir => $runs_dir, pkgs => [ $opt{pkg} ],
+                runs_dir => $runs_dir, pkgs => [ $opt{pkg} ], pricing => $pricing,
             );
         }
         else {
-            $bp_result = BpSpend::Derive::derive_blueprint(runs_dir => $runs_dir);
+            $bp_result = BpSpend::Derive::derive_blueprint(runs_dir => $runs_dir, pricing => $pricing);
         }
 
         my $doc = {
-            generated_at => BpLog::_iso_now($now),
-            derived      => 1,
-            tokens       => $bp_result->{tokens},
-            by_model     => $bp_result->{by_model},
-            anomaly      => $bp_result->{anomaly},
-            packages     => $bp_result->{packages},
+            generated_at            => BpLog::_iso_now($now),
+            derived                 => 1,
+            tokens                  => $bp_result->{tokens},
+            by_model                => $bp_result->{by_model},
+            anomaly                 => $bp_result->{anomaly},
+            packages                => $bp_result->{packages},
+            price_source            => $bp_result->{price_source},
+            price_fetched_at        => $bp_result->{price_fetched_at},
+            pricing_status          => $bp_result->{pricing_status},
+            api_equivalent_cost_usd => $bp_result->{api_equivalent_cost_usd},
+            unpriced_tokens         => $bp_result->{unpriced_tokens},
+            unpriced_reasons        => $bp_result->{unpriced_reasons},
+            ($bp_result->{price_fetch_override} ? (price_fetch_override => $bp_result->{price_fetch_override}) : ()),
         };
 
         eval { BpSpend::Derive::write_derived(path => $out_path, doc => $doc) };
@@ -2710,13 +3121,16 @@ unless (caller) {
     # prints to stdout only. See spec §2.6.
     # ---------------------------------------------------------------------
     if ($verb eq 'derive-session') {
-        unless (defined $opt{session} && length $opt{session}) {
-            print STDERR "bp-spend: derive-session requires --session PATH\n";
-            exit 2;
-        }
+        # --session presence is already validated above, before the
+        # --now/--since/--until window checks (spec Sec2.7 ordering).
 
         my $pricing = BpPricing::acquire(offline => $opt{offline} ? 1 : 0);
-        my $doc = eval { BpSpend::Derive::derive_session(session => $opt{session}, pricing => $pricing) };
+        my $doc = eval {
+            BpSpend::Derive::derive_session(
+                session => $opt{session}, pricing => $pricing,
+                ($opt{_window_given} ? (window => { since => $opt{_since_epoch}, until => $opt{_until_epoch} }) : ()),
+            );
+        };
         if ($@) {
             my $err = $@;
             # Match on the die message's CONTENT, not merely "any die happened"
@@ -2742,6 +3156,7 @@ unless (caller) {
         print "derive-session: token counts by type; API equivalent cost from Anthropic's published prices, not an actual charge\n";
         print "session: $doc->{agents}[0]{path}\n";
         print "pricing: " . BpSpend::Derive::_fmt_pricing_header($doc, $pricing->{long_context}{note}) . "\n";
+        print BpSpend::Derive::_fmt_window_header($doc->{window}) . "\n" if $doc->{window};
         print "requests: $doc->{record_counts}{requests}  assistant-records: $doc->{record_counts}{assistant_records}  agents: "
             . scalar(@{ $doc->{agents} }) . "\n";
         for my $type (@type_order) {
@@ -2781,28 +3196,9 @@ unless (caller) {
     # prints to stdout only. See spec §2.7-2.8.
     # ---------------------------------------------------------------------
     if ($verb eq 'report-session') {
-        unless (defined $opt{session} && length $opt{session}) {
-            print STDERR "bp-spend: report-session requires --session PATH\n";
-            exit 2;
-        }
-        if (exists $opt{data_root} && !(defined $opt{data_root} && length $opt{data_root})) {
-            print STDERR "bp-spend: --data-root requires a directory\n";
-            exit 2;
-        }
-
-        my @by_dims;
-        if (exists $opt{by}) {
-            unless (defined $opt{by}) {
-                print STDERR "bp-spend: --by requires a dimension list\n";
-                exit 2;
-            }
-            @by_dims = split(/,/, $opt{by}, -1);
-            unless (BpSpend::Derive::_valid_by_list(\@by_dims)) {
-                print STDERR "bp-spend: --by '$opt{by}' is not a valid dimension list (allowed: "
-                    . join(',', @BpSpend::Derive::REPORT_DIMENSIONS) . "; each at most once)\n";
-                exit 2;
-            }
-        }
+        # --session/--data-root/--by are already validated above (into
+        # @by_dims), before the --now/--since/--until window checks (spec
+        # Sec2.7 ordering).
 
         my $pricing = BpPricing::acquire(offline => $opt{offline} ? 1 : 0);
         my $doc = eval {
@@ -2811,6 +3207,7 @@ unless (caller) {
                 data_root => $opt{data_root},
                 pricing   => $pricing,
                 (@by_dims ? (by => \@by_dims) : ()),
+                ($opt{_window_given} ? (window => { since => $opt{_since_epoch}, until => $opt{_until_epoch} }) : ()),
             );
         };
         if ($@) {
@@ -2833,6 +3230,7 @@ unless (caller) {
         print "session: $doc->{attribution}{agents}[0]{path}\n";
         print "data-root: $doc->{data_root} (from $doc->{data_root_source})\n";
         print "pricing: " . BpSpend::Derive::_fmt_pricing_header($doc, $pricing->{long_context}{note}) . "\n";
+        print BpSpend::Derive::_fmt_window_header($doc->{window}) . "\n" if $doc->{window};
         print "by: " . join(',', @{ $doc->{by} }) . "\n";
 
         my $type_in_by = grep { $_ eq 'token_type' } @{ $doc->{by} };
@@ -2880,10 +3278,10 @@ unless (caller) {
     if ($verb ne 'snapshot') {
         print STDERR "usage: bp-spend.pl snapshot [--run-dir DIR] [--global-dir DIR] [--offline]\n"
                    . "                            [--force] [--now EPOCH] [--log PATH]\n"
-                   . "       bp-spend.pl derive-package --run-dir DIR --pkg PKG [--now EPOCH]\n"
-                   . "       bp-spend.pl derive-blueprint --run-dir DIR [--now EPOCH]\n"
-                   . "       bp-spend.pl derive-session --session PATH [--json]\n"
-                   . "       bp-spend.pl report-session --session PATH [--data-root DIR] [--by dims] [--json]\n";
+                   . "       bp-spend.pl derive-package --run-dir DIR --pkg PKG [--offline] [--now EPOCH]\n"
+                   . "       bp-spend.pl derive-blueprint --run-dir DIR [--offline] [--now EPOCH]\n"
+                   . "       bp-spend.pl derive-session --session PATH [--since T] [--until T] [--now EPOCH] [--json]\n"
+                   . "       bp-spend.pl report-session --session PATH [--data-root DIR] [--by dims] [--since T] [--until T] [--now EPOCH] [--json]\n";
         exit 2;
     }
 
