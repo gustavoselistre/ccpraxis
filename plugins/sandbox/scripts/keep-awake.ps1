@@ -11,7 +11,11 @@
 # explicit "undo" call is needed (which is exactly why we run it as a dedicated
 # child whose lifetime == the wake-lock's lifetime).
 #
-# We request ES_SYSTEM_REQUIRED. That is the whole request, as of 2026-09-17.
+# We request ES_SYSTEM_REQUIRED. That was the whole request as of 2026-09-17;
+# it no longer is -- see the EXECUTION POWER REQUEST block further down, which
+# also holds a PowerRequestExecutionRequired Power Request alongside it,
+# acquired right after SetThreadExecutionState succeeds and released from the
+# `finally` block below (package 01, Decision 1).
 #
 # THIS BLOCK USED TO CLAIM ES_DISPLAY_REQUIRED WAS "the load-bearing flag on
 # Modern Standby (S0 Low Power Idle) machines", on the reasoning that "those
@@ -41,12 +45,17 @@
 # nearly four hours on DISPLAY+SYSTEM alone, then Desktop Activity Moderation
 # suspended it.
 #
-# WHY WE ARE NOT CHASING AN EXECUTION REQUEST HERE. It protects the CALLING
-# PROCESS only. One held by this PowerShell would keep this PowerShell alive and
-# do nothing for the launcher, the orchestrator, or the agent process doing the
-# actual work -- and the containerised case is already covered differently, since
-# everything inside the WSL VM is one process (`vmmem`) to Windows. Per-process
-# requests are the wrong shape for "keep this machine working overnight".
+# WE DO NOW HOLD AN EXECUTION POWER REQUEST TOO (package 01, Decision 1), and
+# this paragraph used to argue against doing so -- superseded, not deleted, so
+# the reasoning that led here stays legible. The gap this closes is real:
+# PowerRequestExecutionRequired protects the CALLING PROCESS only, and one held
+# by this PowerShell does nothing for the launcher, the orchestrator, or the
+# agent process doing the actual work -- but this PowerShell is not incidental:
+# it is the dedicated process whose lifetime the wake-lock already binds to
+# (see the header above), so an execution request pinned to IT is exactly the
+# shape the earlier reasoning was missing. The containerised case is still
+# covered differently, since everything inside the WSL VM is one process
+# (`vmmem`) to Windows.
 #
 # THE ACTUAL FIX IS TO LEAVE THE REGIME: disabling Modern Standby
 # (PlatformAoAcOverride) restores classic S3 sleep, where ES_SYSTEM_REQUIRED is
@@ -119,6 +128,7 @@ param(
     [int]$PollSeconds  = 60,
     [string]$LogFile,
     [int]$OwnerWinPid = 0,      # WINDOWS pid of the owner; 0 = no owner identity (heartbeat only)
+    [string]$OwnerDesc = '',    # owner's own description (package 04); default text when absent
     [switch]$SimulatePowerRequestFailure,
     [switch]$SimulatePowerRequestException
 )
@@ -157,6 +167,25 @@ function Write-KaLog {
 if ($PidFile) {
     try { Set-Content -LiteralPath $PidFile -Value $PID -Encoding ascii -ErrorAction SilentlyContinue } catch {}
 }
+
+# -OwnerDesc sanitisation (package 04): applied before any use. Non-ASCII or
+# control bytes become '?'; the value is trimmed and capped at 120 chars, so a
+# caller's own cleaning (BpKeepAwake::owner_desc_clean, already stricter) is
+# not the only thing standing between an odd string and this log/reason text.
+$OwnerDesc = (($OwnerDesc -replace '[^\x20-\x7E]', '?').Trim())
+if ($OwnerDesc.Length -gt 120) { $OwnerDesc = $OwnerDesc.Substring(0, 120) }
+
+# The reason text: named after its owner when one was supplied, byte-identical
+# to today's text otherwise (B-9). Logged once, before either power-request
+# branch below, so every path -- real request, simulated failure, simulated
+# exception -- logs the same line.
+if ($OwnerDesc) {
+    $KaReasonText = "ccpraxis keep-awake: execution required -- owner $OwnerDesc"
+    if ($OwnerWinPid -gt 0) { $KaReasonText = "$KaReasonText winpid=$OwnerWinPid" }
+} else {
+    $KaReasonText = 'ccpraxis keep-awake: execution required'
+}
+Write-KaLog 'REASON' ("text=" + $KaReasonText)
 
 Add-Type -Namespace Win32 -Name Power -MemberDefinition @'
 [DllImport("kernel32.dll", SetLastError = true)]
@@ -255,7 +284,7 @@ if ($SimulatePowerRequestFailure) {
         $context = New-Object Win32.Power+POWER_REQUEST_CONTEXT
         $context.Version = $POWER_REQUEST_CONTEXT_VERSION
         $context.Flags = $POWER_REQUEST_CONTEXT_SIMPLE_STRING
-        $context.SimpleReasonString = 'ccpraxis keep-awake: execution required'
+        $context.SimpleReasonString = $KaReasonText
 
         $handle = [Win32.Power]::PowerCreateRequest([ref]$context)
         if ($handle -eq [IntPtr]::Zero -or $handle.ToInt64() -eq -1) {
@@ -527,15 +556,29 @@ finally {
     }
     if ($script:Owner) { try { $script:Owner.Dispose() } catch {} }
     Write-KaLog 'EXIT' 'wake-lock released (process exiting)'
-    # Remove-Item -LiteralPath on PowerShell 5.1 fails on an 8.3 short-name path
-    # (measured: "An object at the specified path C:\Users\ANDR~1 does not
-    # exist." for a file under $env:TEMP, which Windows hands out in short form),
-    # leaving a stale pid file behind. Test-Path/Get-Item resolve it fine, so fall
-    # back to a direct .NET delete whenever the file survived the cmdlet.
+    # The delete cmdlet used below, with -LiteralPath, fails on PowerShell 5.1
+    # against an 8.3 short-name path (measured: "An object at the specified
+    # path C:\Users\ANDR~1 does not exist." for a file under $env:TEMP, which
+    # Windows hands out in short form), leaving a stale pid file behind.
+    # Test-Path/Get-Item resolve it fine, so fall back to a direct .NET delete
+    # whenever the file survived the cmdlet.
     if ($PidFile) {
-        try { Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue } catch {}
+        # IDENTITY-CHECKED (package 04): delete only if the file still names US.
+        # A replace() (bp-keepawake.pl) overwrites this file with a successor's
+        # pid before killing this process; without this check, this process's
+        # own cleanup on exit would delete the SUCCESSOR's pid file.
+        $ownsPidFile = $false
         try {
-            if (Test-Path -LiteralPath $PidFile) { [System.IO.File]::Delete($PidFile) }
+            if (Test-Path -LiteralPath $PidFile) {
+                $curContent = (Get-Content -LiteralPath $PidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+                if ($curContent -and $curContent.Trim() -eq "$PID") { $ownsPidFile = $true }
+            }
         } catch {}
+        if ($ownsPidFile) {
+            try { Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue } catch {}
+            try {
+                if (Test-Path -LiteralPath $PidFile) { [System.IO.File]::Delete($PidFile) }
+            } catch {}
+        }
     }
 }

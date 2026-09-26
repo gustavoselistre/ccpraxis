@@ -18,6 +18,14 @@ package BpContinuityLease;
 # else is holding a lock, and nobody is sitting there to notice the host drop
 # into connected standby or the container reap itself out from under the run.
 #
+# NAMING (Decision 10, resolved by package 04's spec 1.3): this module is BOTH
+# the Windows HOST REFRESHER (daemon_loop starts and refreshes keep-awake.ps1)
+# and the container's busy-lease toucher. Decision 10's "sandbox-side lease"
+# was right about the objects -- the busy-lease and the keep-awake PidFile
+# lease are independent -- but wrong to call the module itself sandbox-side.
+# Packages 04-06 mean this module's Windows branch when they say "the
+# refresher": the host refresher.
+#
 # TWO SURFACES, ONE PER PLATFORM — and they are not alternatives.
 #
 #   Windows host      -> the wake-lock (BpKeepAwake -> keep-awake.ps1). There is
@@ -198,6 +206,12 @@ sub busy_path { return $ENV{BP_BUSY_PATH} // '/tmp/.butler-busy' }
 
 sub daemon_pid_file { my ($dir) = @_; return "$dir/lease.pid" }
 sub wakelock_pid_file { my ($dir) = @_; return "$dir/keepawake.pid" }
+
+# Package 04 constants (spec 2.2): handover timing and the lease.log rotation
+# threshold.
+our $HANDOVER_TIMEOUT_SECONDS = 60;
+our $HANDOVER_RETRY_SECONDS   = 600;
+our $LEASE_LOG_MAX_BYTES      = 1048576;
 
 # ttl_hours — this session's continuity TTL rule (12h, sanitised). The bash
 # side no longer mirrors this rule; it was retired when the old bash TTL
@@ -419,6 +433,177 @@ sub any_active {
 }
 
 # ---------------------------------------------------------------------------
+# active_reason($dir) -> undef | { sid, basis, age, arms }     (package 04)
+#
+# Same store resolution and liveness rules as any_active/new_store_active,
+# but reports WHICH arm kept the lease active rather than a bare boolean, so
+# the refresher's per-tick log line can name it. Invariant:
+# any_active($dir) == (defined active_reason($dir) ? 1 : 0) for every fixture.
+sub active_reason {
+    my ($dir) = @_;
+    my $root = store_root_for($dir);
+    return undef unless defined $root && length $root;
+    my $adir = "$root/armed";
+    return undef unless -d $adir;
+
+    my $cutoff = time() - ttl_hours() * 3600;
+    opendir(my $dh, $adir) or return undef;
+    my @entries = sort grep { /^[A-Za-z0-9_-]{1,128}$/ } readdir($dh);
+    closedir $dh;
+
+    my $count = 0;
+    my $first;
+    for my $e (@entries) {
+        my $f = "$adir/$e";
+        next unless -f $f;
+        my $tp = _arm_file_transcript_path($f);
+        my ($live, $basis, $age);
+        if (defined $tp) {
+            my @st = stat($tp);
+            if (@st) {
+                $basis = 'transcript';
+                $live  = _transcript_path_is_live($tp, $f);
+                my $a  = time() - $st[9];
+                $age   = $a < 0 ? 0 : $a;
+            } else {
+                $basis = 'transcript-missing';
+                $live  = _transcript_path_is_live($tp, $f);
+                my @ast = stat($f);
+                if (@ast) { my $a = time() - $ast[9]; $age = $a < 0 ? 0 : $a } else { $age = 'unknown' }
+            }
+        } else {
+            $basis = 'arm-mtime';
+            my @ast = stat($f);
+            if (@ast) {
+                $live = (($ast[9] // 0) >= $cutoff) ? 1 : 0;
+                my $a = time() - $ast[9];
+                $age = $a < 0 ? 0 : $a;
+            } else {
+                $live = 0;
+                $age  = 'unknown';
+            }
+        }
+        next unless $live;
+        $count++;
+        $first //= { sid => $e, basis => $basis, age => $age };
+    }
+    return undef unless $first;
+    $first->{arms} = $count;
+    return $first;
+}
+
+# ---------------------------------------------------------------------------
+# code_snapshot() -> { abs_path => mtime }                     (package 04)
+# code_changed(\%snap, $now?) -> path | undef
+#
+# The refresher's own liveness-of-code check (spec 2.2/2.3). code_changed
+# returns the first path (sorted) whose mtime differs from the snapshot AND
+# is at least 2s old, so a half-written file mid-promotion never triggers a
+# handover before it finishes compiling.
+sub code_snapshot {
+    my %snap;
+    my $own = Cwd::abs_path(__FILE__) // __FILE__;
+    $own =~ s{\\}{/}g;
+    my @st = stat($own);
+    $snap{$own} = $st[9] if @st;
+    _snapshot_add_new(\%snap);
+    return \%snap;
+}
+
+sub _snapshot_add_new {
+    my ($snap) = @_;
+    for my $inc (values %INC) {
+        my $abs = Cwd::abs_path($inc) // $inc;
+        $abs =~ s{\\}{/}g;
+        next unless index($abs, $DIR) == 0;
+        next if exists $snap->{$abs};
+        my @st = stat($abs);
+        $snap->{$abs} = $st[9] if @st;
+    }
+    return;
+}
+
+sub code_changed {
+    my ($snap, $now) = @_;
+    $now = defined $now ? $now : time();
+    for my $path (sort keys %$snap) {
+        my @st = stat($path);
+        next unless @st;
+        next if $st[9] == $snap->{$path};
+        next unless ($now - $st[9]) >= 2;
+        return $path;
+    }
+    return undef;
+}
+
+# ---------------------------------------------------------------------------
+# live_script_path() -> abs path | undef                        (package 04)
+# is_live_script($path) -> 0|1
+sub live_script_path {
+    my $override = $ENV{CCPRAXIS_LEASE_LIVE_SCRIPT};
+    if (defined $override && length $override) {
+        return _is_abs_legacy($override) ? $override : undef;
+    }
+    my $plat = platform();
+    return undef if $plat eq 'unsupported';
+    my $suffix = $plat eq 'windows'
+        ? '.claude/ccpraxis/plugins/butler/scripts/BpContinuityLease.pm'
+        : '.claude/plugins/marketplaces/ccpraxis-local/butler/scripts/BpContinuityLease.pm';
+    for my $var (qw(HOME USERPROFILE)) {
+        my $val = $ENV{$var};
+        next unless _is_abs_legacy($val);
+        (my $v = "$val/$suffix") =~ tr{\\}{/};
+        return $v if -f $v;
+        return undef;
+    }
+    return undef;
+}
+
+sub is_live_script {
+    my ($path) = @_;
+    my $live = live_script_path();
+    return 1 unless defined $live;
+    my $a = Cwd::abs_path($path) // $path;
+    my $b = Cwd::abs_path($live) // $live;
+    $a =~ tr{\\}{/}; $b =~ tr{\\}{/};
+    return is_windows() ? ((lc($a) eq lc($b)) ? 1 : 0) : (($a eq $b) ? 1 : 0);
+}
+
+# ---------------------------------------------------------------------------
+# lease_log($dir, $event, $detail)                              (package 04)
+#
+# Best effort, never dies: a lease.log that cannot be written must not take
+# the lease down with it (see the edge case in the spec). ASCII-forced: any
+# byte outside \x20-\x7e in $detail becomes '?'.
+sub lease_log {
+    my ($dir, $event, $detail) = @_;
+    return unless defined $dir && length $dir;
+    eval {
+        my $path = "$dir/lease.log";
+        if (-e $path && ((stat($path))[7] // 0) > $LEASE_LOG_MAX_BYTES) {
+            unlink "$path.1";
+            rename($path, "$path.1");
+        }
+        my @t = localtime(time);
+        my $ts = sprintf('%04d-%02d-%02d %02d:%02d:%02d', $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
+        my $d = defined $detail ? $detail : q{};
+        $d =~ s/[^\x20-\x7e]/?/g;
+        open(my $fh, '>>', $path) or return;
+        print {$fh} "$ts pid=$$ $event $d\n";
+        close $fh;
+    };
+    return;
+}
+
+# _owner_desc_for($reason_data) -> string | undef                (package 04)
+sub _owner_desc_for {
+    my ($r) = @_;
+    return undef unless ref $r eq 'HASH';
+    my $raw = sprintf('continuity-lease,sid=%s,arms=%d', $r->{sid} // q{}, $r->{arms} // 0);
+    return BpKeepAwake::owner_desc_clean($raw);
+}
+
+# ---------------------------------------------------------------------------
 # state($dir) -> 'held' | 'released'
 #
 # What is ACTUALLY asserted right now, read off the artifacts — not what the
@@ -542,7 +727,7 @@ sub sync {
     if ($plat eq q{windows}) {
         my %ka = map { $_ => $opts{$_} }
                  grep { exists $opts{$_} }
-                 qw(spawn kill_pid powershell_available log);
+                 qw(spawn kill_pid powershell_available log owner_winpid owner_desc);
         BpKeepAwake::apply($active ? 'active' : 'settled', $dir, \%ka);
     } elsif ($active) {
         touch_busy($opts{busy_path} // busy_path());
@@ -686,6 +871,30 @@ sub _spawn_daemon {
     return $pid;
 }
 
+# _spawn_successor($script, $tick) — the default handover_spawn (package 04,
+# spec 2.2/2.3). Same guards and stdio-to-/dev/null shape as _spawn_daemon; not
+# gated by CCPRAXIS_NO_WAKELOCK (a successor's own BpKeepAwake::spawn still
+# refuses under that opt-out, so no new holder is added). Inherits the calling
+# refresher's %ENV unchanged -- the argument list carries no path, same reason
+# as _spawn_daemon's own header.
+sub _spawn_successor {
+    my ($script, $tick) = @_;
+    return undef if defined $0 && $0 =~ /\.t\z/;
+    return undef unless defined $script && length $script && -f $script;
+    require POSIX;
+    my $pid = fork();
+    die "fork: $!\n" unless defined $pid;
+    if ($pid == 0) {
+        open(STDIN,  '<', '/dev/null');
+        open(STDOUT, '>', '/dev/null');
+        open(STDERR, '>', '/dev/null');
+        my @args = ($^X, $script, 'lease', '--daemon', '--handover');
+        push @args, '--tick', $tick if defined $tick;
+        exec(@args) or POSIX::_exit(127);
+    }
+    return $pid;
+}
+
 # ---------------------------------------------------------------------------
 # _script_main(@argv) — the module's own CLI entry (spec 2.9), so
 # _spawn_daemon has somewhere to exec now that the old CLI script is deleted (E1).
@@ -700,7 +909,9 @@ sub _script_main {
     my ($class, @argv) = @_;
     if (@argv && $argv[0] eq 'lease' && grep { $_ eq '--daemon' } @argv[1 .. $#argv]) {
         my $tick;
+        my $handover = 0;
         for my $i (1 .. $#argv) {
+            $handover = 1 if $argv[$i] eq '--handover';
             next unless $argv[$i] eq '--tick';
             $tick = $argv[$i + 1] if defined $argv[$i + 1];
         }
@@ -710,21 +921,139 @@ sub _script_main {
             return 1;
         }
         my %opts = defined $tick ? (tick => $tick) : ();
+        $opts{handover} = 1 if $handover;
         daemon_loop($dir, %opts);
         return 0;
     }
-    print STDERR "usage: perl BpContinuityLease.pm lease --daemon [--tick N]\n";
+    print STDERR "usage: perl BpContinuityLease.pm lease --daemon [--tick N] [--handover]\n";
+    return 1;
+}
+
+# ---------------------------------------------------------------------------
+# _handle_signal($reason, \$handing_over, $release, $log) — shared by both
+# $SIG{TERM} and $SIG{INT} (AC-7: one common subroutine invoked by both).
+# While a handover is in flight (H4 onward) NEITHER signal may run the release
+# closure: the helper and the lock both belong to the successor now.
+sub _handle_signal {
+    my ($reason, $handing_over_ref, $release, $log) = @_;
+    if ($$handing_over_ref) {
+        $log->('EXIT', 'reason=signal-during-handover');
+        exit 0;
+    }
+    $release->($reason);
+    exit 0;
+}
+
+# ---------------------------------------------------------------------------
+# _do_handover(%a) -> 1 (handed-over) | 0 (continue as holder)
+#
+# Implements H1-H6 (spec 2.3). $a{lock_ref}/$a{locked_ref} are references to
+# daemon_loop's own $lock/$locked so H4 can drop the flock and H6 can retake
+# it. $a{handing_over_ref} is a reference to daemon_loop's $handing_over flag,
+# read by the TERM/INT handlers through _handle_signal.
+sub _do_handover {
+    my (%a) = @_;
+    my ($dir, $pf, $lock_ref, $locked_ref, $handing_over_ref, $reason, $file,
+        $target, $tick, $spawn, $log, $own_script)
+        = @a{qw(dir pf lock_ref locked_ref handing_over_ref reason file target tick spawn log own_script)};
+
+    my $pid_f = wakelock_pid_file($dir);
+    my $live_disp = defined $target ? $target : 'unresolved';
+    $log->('HANDOVER-START', sprintf('reason=%s file=%s live=%s', $reason, $file, $live_disp));
+
+    unlink "$dir/lease.handover";
+    my $w_old = -e $pid_f ? BpKeepAwake::read_pid($pid_f) : undef;
+
+    my $spawn_target = defined $target ? $target : $own_script;
+    my $succ_pid = eval { $spawn->($spawn_target, $tick) };
+    if ($@ || !defined $succ_pid) {
+        $log->('HANDOVER-FAILED', 'reason=spawn-refused retry_in=600s');
+        return 0;
+    }
+
+    my $ready = 0;
+    my $deadline = time() + $HANDOVER_TIMEOUT_SECONDS;
+    while (time() < $deadline) {
+        if (-e "$dir/lease.handover") { $ready = 1; last }
+        select(undef, undef, undef, 0.25);
+    }
+    unless ($ready) {
+        $log->('HANDOVER-FAILED', 'reason=successor-not-ready retry_in=600s');
+        return 0;
+    }
+
+    $$handing_over_ref = 1;
+    close $$lock_ref if $$locked_ref;
+    $$locked_ref = 0;
+
+    my $done_lock   = 0;
+    my $done_helper = 0;
+    my $successor_pid;
+    $deadline = time() + $HANDOVER_TIMEOUT_SECONDS;
+    while (time() < $deadline) {
+        my $lp = BpKeepAwake::read_pid($pf);
+        if (defined $lp && "$lp" ne "$$") { $done_lock = 1; $successor_pid = $lp }
+        my $cur_helper = -e $pid_f ? BpKeepAwake::read_pid($pid_f) : undef;
+        $done_helper = (!defined $w_old) || (($cur_helper // q{}) ne $w_old);
+        last if $done_lock && $done_helper;
+        select(undef, undef, undef, 0.25);
+    }
+
+    if ($done_lock && $done_helper) {
+        $log->('HANDOVER-DONE', sprintf('successor=%s helper=%s',
+            $successor_pid // 'unknown', (defined $w_old ? 'replaced' : 'none')));
+        $log->('EXIT', 'reason=handed-over');
+        return 1;
+    }
+    if ($done_lock) {
+        $log->('HANDOVER-DONE', sprintf('successor=%s helper=pending', $successor_pid // 'unknown'));
+        $log->('EXIT', 'reason=handed-over');
+        return 1;
+    }
+
+    # H6: nobody has taken over the lock. Try to retake it ourselves.
+    if (open(my $relock, '>>', "$dir/lease.lock")) {
+        if (flock($relock, LOCK_EX | LOCK_NB)) {
+            $$lock_ref = $relock;
+            $$locked_ref = 1;
+            _write_pid($pf, $$);
+            $$handing_over_ref = 0;
+            $log->('HANDOVER-FAILED', 'reason=lock-not-taken retry_in=600s');
+            return 0;
+        }
+        close $relock;
+    }
+    $log->('HANDOVER-DONE', 'successor=unknown helper=pending');
+    $log->('EXIT', 'reason=handed-over');
     return 1;
 }
 
 # ---------------------------------------------------------------------------
 # daemon_loop($dir, %opts) — the refresher itself. Blocks.
 #
-# %opts: tick, max_iterations (tests), plus sync()'s seams.
+# %opts: tick, max_iterations (tests), handover (bool), handover_spawn (seam),
+# owner_winpid (default BpKeepAwake::self_winpid()), owner_desc, log (default
+# lease_log), plus sync()'s seams.
 sub daemon_loop {
     my ($dir, %opts) = @_;
-    my $tick = defined $opts{tick} ? clamp_tick($opts{tick}) : tick_seconds();
+    # A .t file calling daemon_loop in-process with no explicit tick (AC-21) is
+    # exercising the loop's CONTROL FLOW, not its cadence -- the same distinction
+    # _spawn_daemon/_spawn_successor/BpKeepAwake::spawn already draw with their
+    # own $0 =~ /\.t\z/ guard. Falling through to the production 60s default
+    # here would make max_iterations-bounded unit tests sleep for real minutes.
+    my $tick = defined $opts{tick} ? clamp_tick($opts{tick})
+             : (defined $0 && $0 =~ /\.t\z/) ? 2
+             : tick_seconds();
     my $pf   = daemon_pid_file($dir);
+    my $handover_flag = $opts{handover} ? 1 : 0;
+    my $log  = $opts{log} // sub { lease_log($dir, @_) };
+    # BpKeepAwake's own log seam hands us a single pre-built message string,
+    # not an (event, detail) pair -- wrap it under one event token so a
+    # keep-awake stop/spawn/replace line is findable in lease.log (spec 2.7's
+    # KEEPAWAKE token).
+    my $ka_log = sub { my ($msg) = @_; $log->('KEEPAWAKE', $msg) };
+    my $handover_spawn = $opts{handover_spawn} // \&_spawn_successor;
+    my $owner_winpid = exists $opts{owner_winpid} ? $opts{owner_winpid} : BpKeepAwake::self_winpid();
 
     make_path($dir) unless -d $dir;
 
@@ -755,26 +1084,74 @@ sub daemon_loop {
     # refresher; running not at all risks a suspended host mid-run. The first is
     # the lesser failure, and BpKeepAwake's atomic claim still stops two
     # refreshers from becoming two wake-locks.
+    # NOT canonicalised through Cwd::abs_path on purpose: this is logged
+    # verbatim (script=<...> below, and as the code-changed handover's
+    # fallback target), and a caller may have started us from an 8.3
+    # short-name path (Windows hands those out for $env:TEMP on a non-ASCII
+    # username) or a test's own literal path string. is_live_script() below
+    # still canonicalises internally for the COMPARISON, so correctness there
+    # is unaffected; only the logged spelling is left alone.
+    my $own_script = __FILE__;
+    $own_script =~ s{\\}{/}g;
+    my $live_at_start = live_script_path();
+    my $is_live = is_live_script($own_script);
+
     my $lock;
     my $locked = 0;
-    if (open $lock, '>>', "$dir/lease.lock") {
-        unless (flock($lock, LOCK_EX | LOCK_NB)) {
+
+    if ($handover_flag) {
+        # S1 (spec 2.3, R2 side): announce readiness via lease.handover, then
+        # retry LOCK_EX|LOCK_NB every 0.05s up to $HANDOVER_TIMEOUT_SECONDS.
+        # We hold NOTHING yet, so TERM/INT here just exit -- no release closure
+        # exists to call, and none is needed.
+        local $SIG{TERM} = sub { exit 0 };
+        local $SIG{INT}  = sub { exit 0 };
+        unless (open $lock, '>>', "$dir/lease.lock") { return 'duplicate' }
+        _write_pid("$dir/lease.handover", $$);
+        my $got = 0;
+        my $deadline = time() + $HANDOVER_TIMEOUT_SECONDS;
+        while (time() < $deadline) {
+            if (flock($lock, LOCK_EX | LOCK_NB)) { $got = 1; last }
+            select(undef, undef, undef, 0.05);
+        }
+        unless ($got) {
+            my $hf = "$dir/lease.handover";
+            my $hp = -e $hf ? BpKeepAwake::read_pid($hf) : undef;
+            unlink $hf if defined $hp && "$hp" eq "$$";
+            $log->('HANDOVER-ABANDONED', 'reason=lock-not-acquired');
             close $lock;
             return 'duplicate';
         }
         $locked = 1;
+        unlink "$dir/lease.handover";     # S2
+        _write_pid($pf, $$);
+    } else {
+        if (open $lock, '>>', "$dir/lease.lock") {
+            unless (flock($lock, LOCK_EX | LOCK_NB)) {
+                close $lock;
+                return 'duplicate';
+            }
+            $locked = 1;
+        }
+        _write_pid($pf, $$);
     }
 
-    _write_pid($pf, $$);
+    $log->('START', sprintf('script=%s dir=%s live=%s is_live=%d tick=%ds winpid=%s handover=%d platform=%s',
+        $own_script, $dir, (defined $live_at_start ? $live_at_start : 'unresolved'), $is_live, $tick,
+        (defined $owner_winpid ? $owner_winpid : 'none'), $handover_flag, platform()));
 
     my $released = 0;
+    my $handing_over = 0;
     my $release = sub {
         return if $released++;
-        sync($dir, %opts, active => 0);
+        my ($reason) = @_;
+        sync($dir, %opts, active => 0, log => $ka_log, owner_winpid => $owner_winpid, owner_desc => $opts{owner_desc});
         unlink $pf;
+        $log->('RELEASE', 'reason=' . (defined $reason ? $reason : 'unknown'));
+        $log->('EXIT', 'reason=released');
     };
-    local $SIG{TERM} = sub { $release->(); exit 0 };
-    local $SIG{INT}  = sub { $release->(); exit 0 };
+    local $SIG{TERM} = sub { _handle_signal('term', \$handing_over, $release, $log) };
+    local $SIG{INT}  = sub { _handle_signal('int',  \$handing_over, $release, $log) };
 
     # THERE IS NO PROCESS-START DEADLINE, AND THAT IS A CORRECTION.
     #
@@ -794,10 +1171,69 @@ sub daemon_loop {
     # and the same files could only either duplicate it or contradict it.
     my $iter = 0;
     my $last_gc = 0;
+    my $next_handover_try = 0;
+    my $did_replace = 0;
+    my $snap = code_snapshot();
 
     while (1) {
-        last unless any_active($dir);
-        sync($dir, %opts, active => 1);
+        my $reason_data = active_reason($dir);
+        unless (defined $reason_data) {
+            $log->('IDLE', 'reason=no-live-arm');
+            last;
+        }
+
+        if (time() >= $next_handover_try) {
+            _snapshot_add_new($snap);
+            my $changed_path = code_changed($snap);
+            my ($ho_reason, $target, $file);
+            if (defined $changed_path) {
+                $ho_reason = 'code-changed';
+                $file      = $changed_path;
+                $target    = live_script_path() // $own_script;
+            } elsif (!$is_live && !$handover_flag) {
+                $ho_reason = 'not-live';
+                $file      = $own_script;
+                $target    = live_script_path();
+            }
+            if (defined $ho_reason) {
+                my $handed = _do_handover(
+                    dir => $dir, pf => $pf, lock_ref => \$lock, locked_ref => \$locked,
+                    handing_over_ref => \$handing_over, reason => $ho_reason, file => $file,
+                    target => $target, tick => $tick, spawn => $handover_spawn, log => $log,
+                    own_script => $own_script,
+                );
+                return 'handed-over' if $handed;
+                $next_handover_try = time() + $HANDOVER_RETRY_SECONDS;
+            }
+        }
+
+        # S3 (spec 2.3): on the successor's first live tick, replace the
+        # inherited helper so it is owned (and logged) by this process.
+        if ($handover_flag && !$did_replace) {
+            $did_replace = 1;
+            my $ka_pid_f = wakelock_pid_file($dir);
+            if (-e $ka_pid_f) {
+                my $old_h = BpKeepAwake::read_pid($ka_pid_f);
+                if (defined $old_h && BpKeepAwake::pid_alive($old_h)) {
+                    my $desc_now = _owner_desc_for($reason_data);
+                    my $r = BpKeepAwake::replace($dir, {
+                        owner_winpid => $owner_winpid, owner_desc => $desc_now, log => $ka_log,
+                    });
+                    if ($r eq 'replaced') {
+                        my $new_h = BpKeepAwake::read_pid($ka_pid_f);
+                        $log->('HELPER-REPLACED', "old=$old_h new=" . (defined $new_h ? $new_h : 'unknown'));
+                    } else {
+                        $log->('HELPER-REPLACE-FAILED', "old=$old_h reason=$r");
+                    }
+                }
+            }
+        }
+
+        my $desc = _owner_desc_for($reason_data);
+        sync($dir, %opts, active => 1, log => $ka_log, owner_winpid => $owner_winpid, owner_desc => $desc);
+        $log->('TICK', sprintf('active=1 reason=arm sid=%s basis=%s age=%ss arms=%d',
+            $reason_data->{sid}, $reason_data->{basis}, $reason_data->{age}, $reason_data->{arms}));
+
         my $now = time;
         if (($now - $last_gc) >= $GC_SESSIONS_INTERVAL) {
             $last_gc = $now;
@@ -812,7 +1248,7 @@ sub daemon_loop {
         sleep $tick;
     }
 
-    $release->();
+    $release->('idle');
     close $lock if $locked;
     return q{done};
 }
