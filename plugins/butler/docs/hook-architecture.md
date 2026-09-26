@@ -8,9 +8,10 @@ The system in one paragraph: every hook is a short shell file that execs one wra
 either exits in bash (the hook does not apply to this session) or execs one perl process that loads
 `BpHook.pm` inside an exit-0 guard and parses the payload once. Continuity is one per-session file,
 written by three commands and one hook. The Stop gate blocks only when that file exists and there is
-no live holder and no silence. When it blocks, the agent sees 7 lines, and those lines carry a
-single-use stop token the gate itself minted. With that token, `butler-hold`, `butler-continuity off`
-and `butler-continuity silence` work even if every other hook has failed. There are no override files.
+no live holder and no silence. When it blocks, the agent sees 7 lines, or 5 without the silence line
+while work is running, and those lines carry a single-use stop token the gate itself minted. With
+that token, `butler-hold`, `butler-continuity off` and `butler-continuity silence` work even if every
+other hook has failed. There are no override files.
 
 ## Harness facts and what they decided
 
@@ -318,14 +319,28 @@ is_armed($sid)                -> true for a coordinator; else armed/<sid> exists
 arm($sid, role=>R, by=>B, transcript_path=>T)  -> under flock armlock/<sid>: writes armed/<sid>,
                                  removes off/<sid> only when B is 'on'.
 disarm($sid, actor=>A, reason=>T) -> under flock armlock/<sid>: removes armed/<sid>, silence/<sid>,
-                                 holder/<sid>.json and the session's stop token; writes off/<sid>.
+                                 running/<sid>, holder/<sid>.json and the session's stop token;
+                                 writes off/<sid>.
 latest_is_off($sid)           -> off/<sid> exists (Decision 36).
 set_silence($sid, reason=>T)  -> writes silence/<sid>. Only butler-continuity.pl calls it.
 take_silence($sid)            -> 1 iff silence/<sid> parses, names this sid, carries a reason of 2+
                                  words and "by":"butler-continuity", and this call unlinked it. A
                                  malformed file (for example one made by touch) is unlinked and ignored.
 holder($sid)                  -> holder record hashref or undef.
-holder_live($sid, $p)         -> the liveness rule of the Holder protocol section.
+holder_live($sid, $p)         -> the liveness rule of the "Liveness at Stop" section (Decision 130).
+running_work($sid, $p)        -> list of {id, type}: the payload's running background_tasks (valid ids
+                                 only, payload order; non-subagent entries dropped while a live holder
+                                 runs, since that holder is itself a shell task) united with -- ONLY
+                                 while the holder is dead (Decision 130, M1+S3) -- the holder record's
+                                 items whose agent-<id>.jsonl or cached .output changed within 60 s
+                                 (Decision 129). Deduped. Stats only, no process. `butler-continuity
+                                 silence` also calls this directly, with no background_tasks, to
+                                 refuse on the holder's dead-holder evidence even before any Stop.
+set_running_snapshot($sid, \@work) -> writes running/<sid> atomically:
+                                 {"session_id":sid,"at":iso,"work":[{"id":..,"type":..},...]}.
+clear_running_snapshot($sid)  -> unlinks running/<sid>.
+running_snapshot($sid)        -> arrayref of {id, type}, or undef when the file is missing,
+                                 unparsable, names another session or holds no valid entry.
 log_reason($sid, $actor, $verb, $text, $project) -> appends one reason-log line.
 invocations($command, $name)  -> list of argv arrayrefs, one per REAL invocation of $name.
 write_ticket($p, $name, \@argv, operator=>0|1, background=>0|1) -> command binding (below).
@@ -504,6 +519,8 @@ continuity/
   armlock/<sid>           flock target for arm and disarm.
   off/<sid>               exists iff the latest continuity event is an off (Decision 36).
   silence/<sid>           exists iff one stop is to be let through.
+  running/<sid>           exists iff the latest armed, non-coordinator Stop of the session was denied
+                          while work was running. Holds that work; `silence` reads it (package 38).
   holder/<sid>.json       the session's holder record (Holder protocol).
   holder/<sid>.lock       flock target for become, extend and holder exit.
   tickets/<k>/            command-binding tickets for one exact command.
@@ -679,25 +696,45 @@ bsp949ih1 still running (last activity 2026-09-25T01:51:00Z)
 bq7x2 unknown
 ```
 
-"Finished" means the session transcript (`transcript_path`, tail-read, at most 1 MiB) holds a
-`<task-notification>` naming the id with a terminal status. "Still running" for a subagent carries
-the mtime of `<dirname(transcript_path)>/<session_id>/subagents/agent-<id>.jsonl` (harness-facts
-(c)). For a background task it is the mtime of its output file when that path appears in the
-transcript. An id that resolves to neither is `unknown`, and the command never fails on it.
+"Finished" depends on the kind of item (package 38). A **subagent** item is one with
+`<dirname(transcript_path)>/<session_id>/subagents/agent-<id>.jsonl` or `.meta.json` (harness-facts
+(c)). Its events are read from the session transcript (`transcript_path`, tail-read, at most 8 MiB) in
+byte order: a `<task-notification>` naming the id (its first `<status>`: `running` is live, anything
+else terminal), and a SendMessage resume marker `"resumedAgentId":"<id>"`, plain or JSON-escaped,
+which is live. A resume writes no notification, so the marker is the live event. The item is
+finished only when its last event is terminal and none of its activity files (`agent-<id>.jsonl`, the
+cached output file) changed within QUIET, two ticks (60 s). A crashed agent with no terminal event is
+held until the deadline, because a quiet file alone never makes an item finished. A **task** item keeps the plain rule: finished when the
+latest notification naming it has a terminal status. "Still running" carries the newest activity
+mtime; for a background task it is the mtime of its output file when that path appears in the
+transcript. An id that resolves to neither is `unknown`, and the command never fails on it. The scan
+is linear: lines without the id are skipped, and each marker is checked by one anchored match.
 
-**Liveness at Stop**, `holder_live($sid, $p)`. All of these must hold:
+**Liveness at Stop**, `holder_live($sid, $p)`. Coordinator and non-coordinator sessions diverge here
+(Decision 130, M1+S3).
+
+For a **coordinator**, all of these must hold:
 
 1. `holder/<sid>.json` parses, names this session, and `deadline` > now.
-2. Held work is running. When the payload carries a `background_tasks` array, at least one entry has
-   `"status":"running"` and an `id` that is one of the record's `items`. For a coordinator that entry
-   must also have `"type":"subagent"`. A held id that is finished, mistyped or invented therefore
-   counts for nothing, so a holder can never act as a reasonless 50-minute silence. When the array is
-   absent (a harness that stopped sending it), an interactive session skips this check and a
-   coordinator fails it, which leaves the coordinator its ledger path.
-3. The process is alive (interactive sessions only; a coordinator skips this, see below). With `/proc`
-   (MSYS on Windows, Linux in the sandbox): `/proc/<pid>/cmdline` is readable and its SHA-1 equals
-   `fp`. A killed holder fails at once, a reused pid fails because its command line differs, and
-   nothing waits out a heartbeat. Without `/proc` (a macOS host): `kill 0, $pid` succeeds.
+2. Held work is running: the payload carries a `background_tasks` array with at least one entry
+   whose `"status":"running"`, `"type":"subagent"` and `id` is one of the record's `items`. A held id
+   that is finished, mistyped or invented counts for nothing. A missing `background_tasks` array
+   fails this check, which leaves the coordinator its ledger path.
+
+For a **non-coordinator** (interactive) session, all of these must hold (Decision 131 extends this:
+it holds even when the held id reads completed, is absent from the payload, or only unheld work is
+running):
+
+1. `holder/<sid>.json` parses, names this session, and `deadline` > now.
+2. The record's `items` is non-empty. `background_tasks` is not consulted at all: the fixed holder
+   already prunes finished items on its own and holds a SendMessage-resumed agent whether or not the
+   harness lists it as running, so a non-empty items list IS the evidence (this closes the deny loop
+   a resumed agent used to hit when `background_tasks` omitted it — reports/38-review.md M1). An
+   empty items record never counts, and another session's holder record never counts.
+3. The process is alive. With `/proc` (MSYS on Windows, Linux in the sandbox): `/proc/<pid>/cmdline`
+   is readable and its SHA-1 equals `fp`. A killed holder fails at once, a reused pid fails because
+   its command line differs, and nothing waits out a heartbeat. Without `/proc` (a macOS host):
+   `kill 0, $pid` succeeds. A dead holder never passes, regardless of its items.
 
 The cost is one small JSON read, one read of `/proc/<pid>/cmdline` (under 1 ms, 7417f0c) and a field of
 a payload that is already parsed. Never `stat` or `status`, which cost 45-70 ms each, and never a
@@ -773,10 +810,10 @@ statusline badge (package 10) reads the per-session `off/` and `silence/` files,
 
 One Stop hook (Decision 5): `plugins/butler/hooks/stop-gate.sh`, logic in
 `plugins/butler/scripts/BpHook/StopGate.pm` (package 06). The only ways past it are a live holder, or
-the off and silence commands, each with a reason (Decision 1, Decision 6). Exact text when an armed
-non-coordinator session stops with no live holder and no silence (Decision 8: at most 8 lines, the
-three commands, nothing else, no pending dispatches, no history). `<token>` is replaced by the token
-this denial minted, in all four places:
+the off and silence commands, each with a reason (Decision 1, Decision 6). The text is built from the
+session's running work (Decision 128). Exact text when an armed non-coordinator session stops with no
+live holder, no silence and nothing running (Decision 8: at most 8 lines, the three commands, nothing
+else, no history). `<token>` is replaced by the token this denial minted, in all four places:
 
 ```
 Continuity is on for this session and no holder is running. Stop token: <token>
@@ -784,14 +821,35 @@ Waiting on a subagent or background task? Hold it, as a background Bash tool cal
   butler-hold --token <token> <id> [<id> ...]
 All work done? Turn continuity off, as a Bash tool call:
   butler-continuity off --reason '<what is done>' --token <token>
-Only this one stop, e.g. to report or to wait for the operator? Let it through:
+Escape hatch, only when a stop is truly necessary, e.g. to talk with an operator who is present:
   butler-continuity silence --reason '<why this stop>' --token <token>
 ```
 
+When the payload's `background_tasks` lists running work (`running_work`), silence is not offered:
+
+```
+Continuity is on for this session and work is still running: <ids><more>. Stop token: <token>
+Hold it, as a background Bash tool call; the holder wakes this session when the work finishes:
+  butler-hold --token <token> <ids>
+If that work is no longer needed and everything is done, turn continuity off, as a Bash tool call:
+  butler-continuity off --reason '<what is done>' --token <token>
+```
+
+`<ids>` is the first 8 ids, joined with `, ` on line 1 and with spaces on line 3; `<more>` is empty for
+8 or fewer, else `, and <N> more`. While the holder is alive, `holder_live` already allows at G8 for
+any non-empty held item, so running work never needs the 60 s window there; when the holder is dead,
+running work also counts a held id whose agent transcript or output changed within 60 s, because a
+SendMessage-resumed agent may be missing from `background_tasks` (Decision 129, amended by Decision
+130). The gate records that work in `running/<sid>`, so a `silence` run anyway explains and points at
+hold instead of setting a silence -- and the command refuses on the same evidence even before any
+Stop (Decision 130 S1).
+
 The text is written to stderr with exit 2, and Claude Code feeds it back verbatim (harness-facts (f)).
-Waiting for the operator goes to `silence`, not `off`: the operator's reply starts the next turn and the
-gate is back in force, while an off would stay off. Reasons are in single quotes so bash expands nothing
-in them.
+Silence is the escape hatch for talking with a present operator: use it sparingly, and only when a
+stop is truly necessary, because the operator's reply starts the next turn and the gate is back in
+force, whereas an off would stay off. A persistent process nobody is waiting on (a dev server, a
+`tail -f`) is not work to hold; if nothing else is pending, turn continuity off with a reason instead.
+Reasons are in single quotes so bash expands nothing in them.
 
 Coordinator variant (off and silence refuse there, Decision 25). `<reason>` is exactly one of: the
 ledger does not exist; status '<s>' is not terminal; the ledger is <n>m stale (limit 15m);
@@ -823,10 +881,13 @@ if role is coordinator:
 if role is judge                         -> allow
 if not is_armed(sid)                     -> allow
 touch armed/<sid>                        ; activity for the wake-lock lease
+clear_running_snapshot(sid)              ; G7b: the snapshot describes only the latest Stop
 holder_live(sid, p)                      -> allow   (checked first, so a silence is not wasted)
 take_silence(sid)                        -> allow   (consumed by exactly this stop)
 t = mint_stop_token(sid)                 ; undef -> allow, one hook-errors.log line
-deny(continuity text with t)
+work = running_work(sid, p)              ; G11
+if work: set_running_snapshot(sid, work) ; deny(running text with t)
+else:    deny(idle text with t)
 ```
 
 `stop_hook_active` is never read. It resets after a wake and is not a block counter (harness-facts
@@ -897,6 +958,8 @@ false; the operator's whole-message record sets it.
 | off or silence | `BP_LEDGER` set in the command's environment | refused: `butler-continuity: a coordinator cannot turn continuity off; it stops when its ledger is terminal.`, exit 1 (Decision 25) |
 | off, silence, status | no ticket (or two) and no valid token | refused: `butler-continuity: no session binding; use the --token from the stop message, or quote arguments in single quotes.`, exit 1 |
 | on | no ticket, or two | refused: `butler-continuity: no session binding for on; run it again as a plain Bash tool call.`, exit 1 |
+| silence | armed, and running work is present at invocation (`running/<sid>` names work from the last Stop, OR `BpHook::running_work` reports work directly, checked with no subprocess -- Decision 130 S1) | not silenced: four lines on stderr naming the work (8-id rule) and pointing at `butler-hold <ids>`, or at `off` if the work is no longer needed; exit 1, no silence file, no reason line. A given `--token` is still consumed |
+| silence | armed, no running/snapshot work, but this session's own live holder holds non-empty items (Decision 133) | not silenced: two lines on stderr naming the held ids and saying the turn can simply end, since the Stop gate already allows it while the holder runs; exit 1, no silence file, no reason line |
 
 There is no `--session` option and no environment variable that names a session. No argument, flag,
 token or environment variable produces `"operator":true`. Only the hook sets it, from a transcript
@@ -907,7 +970,8 @@ outside the model, and so is one that edits the hook. An off by either actor is 
 agent has turned continuity off or silenced it.
 
 Other verbs, each printing one line unless noted: `on [--role driver|reporter]`,
-`silence --reason '<2+ words>' [--token <token>]`, `status` (at most 4 lines: arm state and role, the
+`silence --reason '<2+ words>' [--token <token>]` (marked `(escape hatch: use sparingly)` in the
+usage line), `status` (at most 4 lines: arm state and role, the
 holder and its items and deadline, any pending silence; holder read through `BpHook::holder`),
 `ask --text '<question>'` (files a pending decision in the almanac decision store via
 `Almanac::Decision::file`), `questions`, `answer --id <id> --answer '<text>'`, and the internal
@@ -1127,7 +1191,8 @@ mentions a retired mechanism anywhere.
 
 What each block must carry, in the fewest words. Continuity: when to self-arm (background work
 expected to outlive the turn, unattended multi-step work), when off and silence are acceptable and
-what a reason must say (off when all work is done; silence to report or to wait for the operator),
+what a reason must say (off when all work is done; silence, a sparing escape hatch, only when a stop is
+truly necessary, e.g. to talk with an operator who is present),
 reasons in single quotes, the stop token from a denial, how to call the holder (once, backgrounded,
 re-run to add ids), and the operator branch that 04's Skill-tool measurement decides. Drive-solo: first
 step `butler-continuity on --role driver`, hold on dispatched ids, the one-ledger dispatch rule, and

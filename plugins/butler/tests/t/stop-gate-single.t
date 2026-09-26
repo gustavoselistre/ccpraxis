@@ -356,7 +356,7 @@ Waiting on a subagent or background task? Hold it, as a background Bash tool cal
   butler-hold --token $tok <id> [<id> ...]
 All work done? Turn continuity off, as a Bash tool call:
   butler-continuity off --reason '<what is done>' --token $tok
-Only this one stop, e.g. to report or to wait for the operator? Let it through:
+Escape hatch, only when a stop is truly necessary, e.g. to talk with an operator who is present:
   butler-continuity silence --reason '<why this stop>' --token $tok
 TXT
         is($res->{err}, $expected, 'S2: stderr is exactly the 2.5 continuity template with the token substituted in all 4 places');
@@ -452,7 +452,11 @@ SKIP: {
     kill_sleeper($pid);
 }
 {
-    # S7: live own holder, but no held id is running -> deny, each case.
+    # S7 (Decision 131): live own holder with non-empty items -> allow, no
+    # matter what background_tasks says. A live holder is itself a
+    # background task whose exit re-invokes the session, so the Stop is
+    # allowed (exit 0, empty stderr, no <sid>.current) whether the held id
+    # is completed, absent, or only unheld work runs.
     my @cases = (
         ['held id completed'   => [{ id => 'B', type => 'subagent', status => 'completed' }]],
         ['only non-held running' => [{ id => 'Q', type => 'subagent', status => 'running' }]],
@@ -466,9 +470,25 @@ SKIP: {
         my $pid = spawn_sleeper();
         write_holder($root, $sid, pid => $pid, fp => cmdline_fp_of($pid), items => ['B'], deadline => int(time() + 1800));
         my $res = run_gate(payload_json($sid, background_tasks => $bg), BUTLER_STATE_DIR => $root);
-        is($res->{rc}, 2, "S7 [$label]: exit 2");
+        is($res->{rc}, 0, "S7 [$label]: exit 0");
+        is($res->{err}, '', "S7 [$label]: stderr empty");
+        local %ENV = %ENV; $ENV{BUTLER_STATE_DIR} = $root;
+        ok(!-e (state_dir_of($root) . "/stop-tokens/$sid.current"), "S7 [$label]: no <sid>.current");
         kill_sleeper($pid);
     }
+}
+{
+    # S7b (Decision 131): a live own holder with an EMPTY items record never
+    # counts as holder_live -- deny.
+    my $root = fresh_state_root();
+    my $sid  = next_sid();
+    arm_session($root, $sid);
+    my $pid = spawn_sleeper();
+    write_holder($root, $sid, pid => $pid, fp => cmdline_fp_of($pid), items => [], deadline => int(time() + 1800));
+    my $res = run_gate(payload_json($sid, background_tasks => [{ id => 'B', type => 'subagent', status => 'running' }]),
+        BUTLER_STATE_DIR => $root);
+    is($res->{rc}, 2, 'S7b: live own holder with items=[] -> exit 2');
+    kill_sleeper($pid);
 }
 {
     # S8: another session's live holder never counts.

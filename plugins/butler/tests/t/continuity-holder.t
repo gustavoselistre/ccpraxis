@@ -638,7 +638,10 @@ SKIP: {
     ok(!-f "$CONT_ROOT/holder/$sid.json", 'H4c: no record was written');
 }
 
-# H4(d) -- a live holder whose ids are ALL completed in background_tasks -> 0.
+# H4(d) (Decision 131) -- a live holder whose ids are ALL completed in
+# background_tasks is still holder_live == 1: the holder's own non-empty
+# items record is what counts while the holder process is alive (pid plus
+# fingerprint); background_tasks status is irrelevant to a live holder.
 {
     my $sid = 'hold-h4d-sid';
     my $tp = transcript_path_for($sid);
@@ -648,8 +651,8 @@ SKIP: {
     push @KILL_PIDS, $pid;
     my $h = wait_for_holder($sid, 10);
     ok(defined $h, 'H4d: precondition -- the holder became');
-    is(BpHook::holder_live($sid, { background_tasks => [{ id => 'D1', type => 'subagent', status => 'completed' }] }), 0,
-        'H4d: a live holder whose only id reports completed (never running) is not counted as live');
+    is(BpHook::holder_live($sid, { background_tasks => [{ id => 'D1', type => 'subagent', status => 'completed' }] }), 1,
+        'H4d: a live holder whose only id reports completed is still counted as live (Decision 131)');
     reap_and_log('H4d-cleanup', $pid, $outf, $errf);
 }
 

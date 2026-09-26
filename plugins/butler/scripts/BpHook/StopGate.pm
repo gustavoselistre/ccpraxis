@@ -77,6 +77,12 @@ sub run {
     eval { _touch_armed($sid) };
     eval { _ensure_lease_daemon() };
 
+    # G7b (spec 38 sec 2.3): the running-work snapshot describes only the
+    # latest Stop; every armed interactive Stop drops the previous one
+    # before deciding. A failed unlink leaves at worst a stale snapshot,
+    # which only makes `silence` point at hold; never a changed verdict.
+    eval { BpHook::clear_running_snapshot($sid) };
+
     # G8: a live own holder allows. Decision 50 (R6-H1, supersedes the
     # original spec S11): silence is ONE-TURN -- the very next Stop of this
     # session consumes an outstanding silence whether or not it was needed
@@ -98,14 +104,32 @@ sub run {
         return 0;
     }
 
-    # G11: deny with the continuity text.
+    # G11 (spec 38 sec 2.3, Decision 128): the text is built from the
+    # session's running work. While work runs, silence is not offered at
+    # all: the RUNNING text names the work and offers hold, or off when it
+    # is no longer needed. Only an idle session sees the silence escape
+    # hatch.
+    my @work = BpHook::running_work($sid, $p);
+    if (@work) {
+        eval { BpHook::set_running_snapshot($sid, \@work) };
+        my @ids  = map { $_->{id} } @work;
+        my @shown = @ids > 8 ? @ids[0 .. 7] : @ids;
+        my $more  = @ids > 8 ? ', and ' . (@ids - 8) . ' more' : '';
+        return BpHook::deny(
+            "Continuity is on for this session and work is still running: " . join(', ', @shown) . "$more. Stop token: $t",
+            "Hold it, as a background Bash tool call; the holder wakes this session when the work finishes:",
+            "  butler-hold --token $t " . join(' ', @shown),
+            "If that work is no longer needed and everything is done, turn continuity off, as a Bash tool call:",
+            "  butler-continuity off --reason '<what is done>' --token $t",
+        );
+    }
     return BpHook::deny(
         "Continuity is on for this session and no holder is running. Stop token: $t",
         "Waiting on a subagent or background task? Hold it, as a background Bash tool call:",
         "  butler-hold --token $t <id> [<id> ...]",
         "All work done? Turn continuity off, as a Bash tool call:",
         "  butler-continuity off --reason '<what is done>' --token $t",
-        "Only this one stop, e.g. to report or to wait for the operator? Let it through:",
+        "Escape hatch, only when a stop is truly necessary, e.g. to talk with an operator who is present:",
         "  butler-continuity silence --reason '<why this stop>' --token $t",
     );
 }
