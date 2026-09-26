@@ -50,6 +50,7 @@ use ProtectedPaths qw(path_relation protected_roots target_self_codes normalize_
 use LaunchLog ();   # B1: durable per-launch diagnostic log (next to us in scripts/)
 use Dashboard ();   # B2: the raw-ANSI TUI dashboard framework
 use WtProfile ();   # sandbox-wt-profile/02: [c]-press profile fragment ensure + name
+use HostTz ();      # sandbox-session-ux/01: host-timezone detection for the session exec
 use TokenInfo ();   # s08: pure access/refresh token status struct for the dashboard
 use SpendPanel ();  # b37: pure Claude/Go/Zen spend status struct for the dashboard
                     # (the LAUNCHER loads it and computes; Dashboard.pm renders the
@@ -2644,12 +2645,26 @@ my $CONTAINER_NAME;
         # and the plain path tear down exactly as before.
         kill_orphan_claudes_if_user_confirms(
             sub { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST });
+        # sandbox-session-ux/01 (Decision 8): the host zone is re-derived at
+        # EVERY session launch, never cached and never baked in at `podman
+        # create` -- see HostTz.pm for the full detection algorithm. The probe
+        # is a single `podman exec ... test -f /usr/share/zoneinfo/<iana>`
+        # against the ALREADY-RUNNING container, so it only fires when an IANA
+        # candidate exists.
+        my $HOST_TZ = HostTz::detect(probe_iana => sub {
+            my ($iana) = @_;
+            local $ENV{MSYS2_ARG_CONV_EXCL} = '*' if $WINDOWS_FAMILY;
+            my ($rc, undef, undef) = _capture_out_err($PODMAN, 'exec', $CONTAINER_NAME,
+                'test', '-f', "/usr/share/zoneinfo/$iana");
+            return $rc == 0;
+        });
+        eval { log_ev(HostTz::log_event($HOST_TZ)); 1 };
         # Everything from here on owns the REAL terminal directly: `podman exec
         # -it claude` takes the tty outright and hold_for_keypress drives its
         # own cbreak loop. Nothing may paint into a buffer about to be
         # discarded, and the read mode they assume must be the one they get.
         tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST;
-        my @cmd = ($PODMAN, 'exec', '-it', $CONTAINER_NAME,
+        my @cmd = ($PODMAN, 'exec', '-it', HostTz::exec_env_args($HOST_TZ), $CONTAINER_NAME,
                    'claude', '--dangerously-skip-permissions',
                    @SESSION_FLAGS);
         my $rc = run_claude(@cmd);
@@ -4956,6 +4971,8 @@ if (! _container_exists($CONTAINER_NAME)) {
             claude_data  => $CLAUDE_DATA,
             launcher_dir => $LAUNCHER_DIR,
             statusline   => "${CLAUDE_HOST_CONFIG}/ccpraxis/scripts/statusline.pl",
+            (defined &MountSpec::ensure_global_counts_file
+                ? (global_counts => "${CLAUDE_HOST_CONFIG}/almanac-global-counts.json") : ()),
         );
         push @args, @SKILL_MOUNTS;
         push @args, @PLUGIN_MOUNTS;
@@ -8808,12 +8825,20 @@ sub _row_time_key {
 # (resolve_root, ensure, profile_name) — so it can be extracted and eval'd
 # into a fresh package by a test without ever touching a real filesystem.
 #
-# Contract (see specs/02-launch-claude-uses-profile-spec.md sec 2.2):
-#   - success: { profile => $name, event => undef }
+# Contract (see specs/02-launch-claude-uses-profile-spec.md sec 2.2, amended by
+# sandbox-session-ux/01-container-timezone-spec.md sec 2.3 point 3, Decision
+# 17):
+#   - success: { profile => $name, event => undef }, UNLESS the ensure seam's
+#     result carries appearance => 'fallback', in which case success is
+#     { profile => $name, event => { type => 'launch_profile_appearance_fallback',
+#                                     fields => { reason => R } } } -- R is
+#     appearance_reason when it is a non-ref string matching
+#     /\A[a-z][a-z_]{0,63}\z/, otherwise 'unknown'.
 #   - failure: { profile => undef, event => { type => 'launch_profile_degraded',
 #                                              fields => { reason => $code } } }
-#   profile and event are mutually exclusive on every path. Every seam call is
-#   fenced so this function itself never raises and never emits a warning.
+#   profile and event are mutually exclusive ONLY on failure -- on success, an
+#   event means the profile opened with fallback appearance. Every seam call
+#   is fenced so this function itself never raises and never emits a warning.
 sub wt_profile_plan {
     my (%seams) = @_;
 
@@ -8858,6 +8883,18 @@ sub wt_profile_plan {
     };
     return $make_degrade->('ensure_threw')   unless $name_ok;
     return $make_degrade->('no_profile_name') unless defined($name) && length($name);
+
+    # Decision 17 hand-off: surface a fallback appearance as a log event
+    # instead of discarding it.
+    if (defined($ensure_result->{appearance}) && $ensure_result->{appearance} eq 'fallback') {
+        my $reason = $ensure_result->{appearance_reason};
+        $reason = 'unknown'
+            unless defined($reason) && !ref($reason) && $reason =~ /\A[a-z][a-z_]{0,63}\z/;
+        return {
+            profile => $name,
+            event   => { type => 'launch_profile_appearance_fallback', fields => { reason => $reason } },
+        };
+    }
 
     return { profile => $name, event => undef };
 }
