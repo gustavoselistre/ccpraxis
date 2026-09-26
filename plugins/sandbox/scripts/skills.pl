@@ -37,6 +37,14 @@ our $SCHEMA_VERSION = 3;
 our $CONTAINER_PLUGINS_ROOT = '/root/.claude/plugins';
 our $CONTAINER_PROJECT_PATH = '/project';
 
+# Short notes shown next to a plugin's row in the sandbox selector, keyed by
+# the plugin's full key (name@marketplace) so a same-named plugin from a
+# different marketplace is unaffected. ASCII only -- select-model's STDOUT
+# is UTF-8 encoded, and a non-ASCII note here would double-encode.
+our %PLUGIN_SELECTOR_NOTES = (
+    'steward@ccpraxis-local' => 'only relevant when working on ccpraxis itself',
+);
+
 # Strings from $ENV{HOME}, readdir(), etc. arrive as raw UTF-8 bytes on Git Bash.
 # decode_json() returns Unicode-decoded strings. We need them in the SAME perl
 # internal form, otherwise concatenating them produces double-encoded output.
@@ -1155,6 +1163,16 @@ sub cmd_select_apply {
 
 # --- The actual subcommand ------------------------------------------
 
+# Appends the selector note for a plugin key (if any) after its already-built
+# display string (key, plus a scope tag for suggestions). Keys with no table
+# entry get back exactly the display they were passed.
+sub _plugin_row_display {
+    my ($key, $display) = @_;
+    my $note = $PLUGIN_SELECTOR_NOTES{$key};
+    return $display unless defined $note;
+    return "$display - $note";
+}
+
 sub cmd_select_interactive {
     my %opts = @_;
     my $file = $opts{selection_file} or die "--selection-file required\n";
@@ -1238,7 +1256,7 @@ sub cmd_select_interactive {
                     section   => 'plugins',
                     partition => 'project',
                     id        => $p->{key},
-                    display   => $p->{key},
+                    display   => _plugin_row_display($p->{key}, $p->{key}),
                     is_new    => $is_new_plugin{$p->{key}} ? 1 : 0,
                 };
             }
@@ -1262,7 +1280,7 @@ sub cmd_select_interactive {
                     section   => 'plugins',
                     partition => 'suggestion',
                     id        => $p->{key},
-                    display   => $disp,
+                    display   => _plugin_row_display($p->{key}, $disp),
                     is_new    => $is_new_plugin{$p->{key}} ? 1 : 0,
                 };
             }
