@@ -34,7 +34,7 @@
     {
       "name": "almanac",
       "source": "./almanac",
-      "description": "Durable project records that outlive a session: ccpraxis bug reports filed by agents working in any project (one file per report, written only through almanac-bug.pl, frozen once picked up), and the guidance notes that replace Claude Code's built-in auto-memory. Provides /almanac:bug-report and /almanac:bug-triage, plus a PreToolUse hook denying direct edits to report files."
+      "description": "Durable records that outlive a session, one file per record, written only through their scripts: project and global todos, notes (a pointer plus metadata, in place of Claude Code auto-memory), the project's ordered tasklist, pending product decisions for the operator, and ccpraxis bug reports. Bundles /almanac:todo, /almanac:note, /almanac:task, /almanac:decision, /almanac:bug-report and /almanac:bug-triage, the almanac dispatcher and doctor, and hooks that deny direct edits to the stores."
     }
   ]
 }

@@ -1,0 +1,1 @@
+The record format: one record per file, front matter plus body; parse, serialize, ids, forbidden bytes

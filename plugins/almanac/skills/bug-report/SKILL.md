@@ -15,10 +15,20 @@ Reports live in the project you are working in, one file per report:
 <project>/.ccpraxis-local-data/bug-reports/<id>.md
 ```
 
+`${CLAUDE_PLUGIN_ROOT}` is the almanac plugin directory, `<ccpraxis>/plugins/almanac`. If you are
+reading this file raw rather than through the slash command, the variable may not be set;
+substitute that path yourself.
+
+## Check the queue first
+
+```bash
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" bug list
+```
+
 ## File it
 
 ```bash
-perl <ccpraxis>/plugins/almanac/scripts/almanac-bug.pl file \
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" bug file \
   --title "one line, names the defect not the symptom" \
   --severity high --area butler \
   --body -   <<'REPORT'
@@ -30,10 +40,6 @@ REPORT
 `steward`, `almanac`). `--severity`: `low` | `medium` | `high` | `blocker`, or
 `unknown` — which is what the script records when `--severity` is omitted. The list is now
 enforced as a closed enum, so a value outside it is rejected rather than written.
-
-**Never create or edit the file directly.** A PreToolUse hook denies Edit/Write on that directory.
-The script is the only writer, because a report freezes once ccpraxis picks it up and a direct edit
-would sail past both the state machine and the digest recorded at freeze time.
 
 ## What makes a report worth reading
 
@@ -64,7 +70,7 @@ While the status is `open`, revise freely — but pick the verb that matches wha
 correction. `append` cannot lose what is already there:
 
 ```bash
-almanac-bug.pl append <id> --body - <<'REPORT'
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" bug append <id> --body - <<'REPORT'
 ...
 REPORT
 ```
@@ -76,7 +82,7 @@ directory. It erased the evidence in `20260828-095201-7c1e` (the pid, the nine-d
 figure) during a routine progress note; that was recoverable only by luck.
 
 ```bash
-almanac-bug.pl update <id> --body - --replace <<'REPORT'
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" bug update <id> --body - --replace <<'REPORT'
 ...
 REPORT
 ```
@@ -87,13 +93,13 @@ Once it reaches `reviewing` it is **frozen** — that is what lets a reviewer re
 rewriting it underneath them, and what makes `taken` mean something. If you learn more after that,
 file a follow-up and reference the original id. The refusal message says so too.
 
-Check where things stand with `almanac-bug.pl list`.
+Check where things stand with `bug list`.
 
 ## Before you file
 
 - **Is it actually ccpraxis?** A failing test in the project you are building is not a ccpraxis bug.
-- **Is it already filed?** `almanac-bug.pl list` — if an open report covers it, `update` that one
-  with your new evidence rather than filing a second.
+- **Is it already filed?** If an open report covers it, `append` your new evidence to that one
+  rather than filing a second.
 - **Can you fix it yourself?** Usually not: plugin content is mounted read-only inside a sandbox
   (you will get `EROFS`), and that is deliberate. Reporting *is* the contribution. Say in the report
   that you attempted the fix and what stopped you — that tells the maintainer it needs to land
