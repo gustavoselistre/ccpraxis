@@ -20,7 +20,8 @@ use warnings;
 use FindBin qw($Bin);
 use lib "$Bin/../../scripts";
 use MountSpec qw(winify_path convert_v_to_mount);
-use Exporter qw(import);
+use Exporter ();
+our @ISA = ('Exporter');
 use File::Temp qw(tempdir);
 use File::Path qw(remove_tree);
 use File::Basename qw(dirname);
@@ -53,6 +54,8 @@ our @EXPORT_OK = qw(
     sweep_orphan_containers
     test_container_prefix
     orphan_container_names
+    container_runtime_reachable
+    container_unreachable_reason
 );
 
 our $WINDOWS_FAMILY = $^O =~ /^(MSWin32|cygwin|msys)$/;
@@ -81,6 +84,104 @@ my $COUNTER = 0;
 
 sub podman_bin { $PODMAN }
 sub probe_image { $PROBE_IMAGE }
+
+# ---------------------------------------------------------------------------
+# Reachability probe (Decision 120(a), blueprint hook-continuity-remake
+# package 36) -- `<cli> --version` above only proves the CLI binary is on
+# PATH; it says nothing about whether the daemon/VM behind it is actually
+# reachable. The distinguishing host state this exists for is podman on
+# PATH with the machine STOPPED (this host's normal idle state): `--version`
+# succeeds instantly regardless, so callers that only gate on
+# _detect_container_cli() go on to run real container operations that then
+# fail hard with a raw podman connection error, rather than skipping.
+#
+# `podman info` is used as the probe because, empirically on this host with
+# the machine stopped, it fails FAST (~0.17s, exit 125, "unable to connect
+# to Podman socket") rather than hanging -- so the alarm() bound below is a
+# safety net for a wedged daemon, not the primary defense. Same documented,
+# accepted best-effort gap as launcher.pl's _run_timed(): SIGALRM interrupts
+# a pending backtick on this POSIX-ish perl; on a perl/platform where it
+# doesn't, this degrades to a no-op bound rather than a hard guarantee.
+#
+# Memoized: the reachability of the runtime does not change within a single
+# test process's lifetime for any test in this suite, and repeating the
+# probe would multiply this cost across every caller.
+my ($REACHABLE, $REACHABLE_REASON);
+sub container_runtime_reachable {
+    return $REACHABLE if defined $REACHABLE;
+    my $quoted_podman = _arg_quote($PODMAN);
+    my $cmd = "$quoted_podman info " . _arg_quote('--format') . ' ' . _arg_quote('{{.Host.Arch}}') . ' 2>&1';
+    my $out;
+    my $died = 0;
+    eval {
+        local $SIG{ALRM} = sub { die "TestSandbox: podman info timeout\n" };
+        alarm(15);
+        $out = `$cmd`;
+    };
+    alarm(0);
+    if ($@) {
+        $died = 1;
+    }
+    my $rc = $died ? -1 : ($? >> 8);
+    if ($died) {
+        $REACHABLE = 0;
+        $REACHABLE_REASON = "$PODMAN info did not return within 15s -- container runtime unreachable (or wedged)";
+    } elsif ($rc != 0) {
+        $REACHABLE = 0;
+        (my $reason = $out // '') =~ s/\s+\z//;
+        $reason =~ s/\s+/ /g;
+        $REACHABLE_REASON = "$PODMAN is on PATH but its runtime is unreachable (rc=$rc): $reason";
+    } else {
+        $REACHABLE = 1;
+        $REACHABLE_REASON = undef;
+    }
+    return $REACHABLE;
+}
+
+# The clear skip reason to hand to Test::More's skip()/plan(skip_all=>...)
+# after a false container_runtime_reachable(). Runs the probe if it has not
+# already run in this process.
+sub container_unreachable_reason {
+    container_runtime_reachable() unless defined $REACHABLE;
+    return $REACHABLE_REASON;
+}
+
+# Symbols whose import means the caller intends to actually TALK to the
+# runtime (spawn/exec against a real daemon), as opposed to catalog-style
+# helpers (podman_bin, probe_image, new_temp_dir, new_container_name,
+# register_cleanup_*, cleanup_all, sweep_orphan_containers,
+# orphan_container_names, test_container_prefix, winify_path,
+# container_runtime_reachable/container_unreachable_reason themselves) that
+# work, and were already exercised in this suite, whether or not the daemon
+# is reachable. Gating the auto-skip below on this set specifically -- not
+# on every import -- matters: a caller that requires TestSandbox late, after
+# other assertions already ran, and only ever imports catalog-style helpers
+# (e.g. scratch-root-single.t's per-row child processes, which import only
+# new_temp_dir) must keep running unaffected by machine state, exactly as it
+# did before this probe existed.
+my %NEEDS_REACHABLE_RUNTIME = (podman_run_capture => 1, create_probe_container => 1);
+
+# Custom import (Decision 120(a), package 36): still exports symbols exactly
+# as Exporter's default import would, THEN -- only when the CLI exists (the
+# pre-existing die above already covers "no CLI at all", unchanged) but
+# container_runtime_reachable() is false, and only when the caller actually
+# asked for a runtime-talking symbol -- calls Test::More's plan(skip_all),
+# which prints "1..0 # skip <reason>" and exits 0. That is only safe to do
+# at `use`/`require+import` time, before the caller's own test assertions
+# have run (exactly the six `use TestSandbox qw(...)` files this covers);
+# it is why the gate above matters just as much as the reachability check
+# itself for any caller that imports these symbols LATER, mid-file.
+sub import {
+    my $class = shift;
+    my @syms = @_;
+    $class->export_to_level(1, $class, @syms);
+    if (grep { exists $NEEDS_REACHABLE_RUNTIME{$_} } @syms) {
+        unless (container_runtime_reachable()) {
+            require Test::More;
+            Test::More::plan(skip_all => container_unreachable_reason());
+        }
+    }
+}
 
 sub _tag {
     $COUNTER++;
