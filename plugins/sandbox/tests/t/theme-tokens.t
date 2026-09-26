@@ -277,11 +277,20 @@ sub _process_generated_surface {
     return { outcome => 'checked', status => $status, payload => $payload, verdict => $verdict, text => $text, path => $path, %live_code };
 }
 
-# _is_emoji($cp) -> true iff $cp falls in any block of spec §2.6.1. Block-
-# based and deliberately an over-approximation (spec's own framing). U+FE0F
-# (variation selector-16) is flagged on its own as an explicit request for
-# emoji presentation. U+200D (ZWJ) is deliberately NOT flagged.
-sub _is_emoji {
+# _is_emoji($cp) -> true iff $cp falls in any block of spec §2.6.1 AND
+# carries the Unicode Emoji property; U+FE0F (variation selector-16) is
+# flagged on its own as an explicit request for emoji presentation. U+200D
+# (ZWJ) is deliberately NOT flagged.
+#
+# THE ORACLE FIX (hook-continuity-remake package 10, spec §2.5, carried from
+# almanac-records package 10): the block list alone was a proxy for "is this an
+# emoji", and it rejected characters that merely live in U+2600-U+27BF without
+# being emoji -- including U+2630 and U+2691, the notes and decisions glyphs.
+# The predicate is now the INTERSECTION of the unchanged block list and
+# \p{Emoji}. Never the bare property instead: U+25B6 (cursor) is Emoji=Yes and
+# ships today, so substituting would newly reject it. Mirrored, and required to
+# stay identical in meaning, at plugins/sandbox/tests/t/statusline-rebuild.t.
+sub _in_listed_emoji_block {
     my ($cp) = @_;
     return 0 unless defined $cp;
     for my $r (
@@ -293,8 +302,13 @@ sub _is_emoji {
     ) {
         return 1 if $cp >= $r->[0] && $cp <= $r->[1];
     }
-    return 1 if $cp == 0xFE0F;
     return 0;
+}
+sub _is_emoji {
+    my ($cp) = @_;
+    return 0 unless defined $cp;
+    return 1 if $cp == 0xFE0F;
+    return (_in_listed_emoji_block($cp) && chr($cp) =~ /\p{Emoji}/) ? 1 : 0;
 }
 
 # _emoji_hits($text) -> list of { cp, line, how } for every emoji codepoint
@@ -412,6 +426,41 @@ for my $cp (0x1F4E6, 0x1F7E2, 0x1F534, 0x1F7E1, 0x26AA, 0xFE0F) {
 for my $cp (0xFF5C, 0x2500, 0x2502, 0x25CF, 0x25CB, 0x25B3, 0x25B6, 0x2191, 0x00B7, 0x00D7, 0x280B, 0x2584, 0x0041, 0x200D) {
     ok(!_is_emoji($cp), sprintf('_is_emoji(0x%04X) is FALSE (B-E6, AC-10, fixture)', $cp));
 }
+
+# ---------------------------------------------------------------------------
+# AC-13 (hook-continuity-remake package 10): the oracle fix is an
+# INTERSECTION. Each pair below is chosen so that exactly one of the two
+# conditions holds, which is what tells an intersection apart from either
+# condition used alone:
+#   U+2630, U+2691 -- inside the listed U+2600 block, NOT \p{Emoji}: false
+#                     (a bare block check would say true).
+#   U+25B6         -- \p{Emoji}, OUTSIDE every listed block: false
+#                     (a bare \p{Emoji} check would say true).
+#   U+26AA, U+2716, U+26A0 -- in a block AND \p{Emoji}: true.
+#   U+FE0F         -- flagged on its own: true.
+# ---------------------------------------------------------------------------
+for my $cp (0x2630, 0x2691, 0x25B6) {
+    ok(!_is_emoji($cp), sprintf('AC-13: _is_emoji(0x%04X) is FALSE -- the block list and \p{Emoji} are intersected, never substituted', $cp));
+}
+for my $cp (0x26AA, 0x2716, 0x26A0, 0xFE0F) {
+    ok(_is_emoji($cp), sprintf('AC-13: _is_emoji(0x%04X) is TRUE -- a real emoji inside the banned range is still rejected', $cp));
+}
+ok(_in_listed_emoji_block(0x2630) && chr(0x2630) !~ /\p{Emoji}/,
+    'AC-13 (fixture precondition): U+2630 is inside a listed block and carries no Emoji property on this perl');
+ok(!_in_listed_emoji_block(0x25B6) && chr(0x25B6) =~ /\p{Emoji}/,
+    'AC-13 (fixture precondition): U+25B6 is outside every listed block and does carry the Emoji property');
+
+# AC-13: the glyphs are recovered by the predicate fix, NOT by a waiver. The
+# header's "no size assertion" rule protects later packages that EMPTY these
+# tables; package 10's ruling is that they stay empty, so emptiness is exactly
+# what is pinned here (re-populating them is the stale-waiver rot the header
+# warns about).
+is(scalar(keys %EMOJI_PENDING), 0,
+    'AC-13: %EMOJI_PENDING stays empty -- the new glyphs are admitted by the oracle fix, not waived');
+is(scalar(keys %EMOJI_PENDING_CODEPOINTS), 0,
+    'AC-13: %EMOJI_PENDING_CODEPOINTS stays empty');
+is(scalar(keys %PENDING_GLYPH_REGISTRATION), 0,
+    'AC-13: %PENDING_GLYPH_REGISTRATION stays empty');
 
 # ---------------------------------------------------------------------------
 # B-E11/B-E12/B-E13: the surface-level emoji pending-adoption list (§2.6.3,
@@ -1483,6 +1532,15 @@ is_deeply(Theme::x256_rgb(196), [255, 0, 0],     'x256_rgb(196) == [255,0,0] (B-
         'status.warn' => { cp => 0x25B3, width => 1 },
         'status.crit' => { cp => 0x00D7, width => 1 },
         'status.idle' => { cp => 0x25CB, width => 1 },
+        # AC-14 (hook-continuity-remake package 10, spec §2.4): the counter
+        # and badge glyphs. U+2630 is East-Asian-Wide and declared 2 columns;
+        # every other one is 1. icon.todos/icon.blueprints are unchanged and
+        # deliberately not re-pinned here.
+        'icon.notes'      => { cp => 0x2630, width => 2 },
+        'icon.tasklist'   => { cp => 0x25A3, width => 1 },
+        'icon.decisions'  => { cp => 0x2691, width => 1 },
+        'badge.silenced'  => { cp => 0x2016, width => 1 },
+        'badge.agentoff'  => { cp => 0x2205, width => 1 },
     );
     for my $name (sort keys %REQUIRED_GLYPHS) {
         my $want = $REQUIRED_GLYPHS{$name};
@@ -1975,7 +2033,11 @@ my $theme_generated_block;   # captured here, reused by the read-only surface re
 
         my $comment1 = '# THEME TOKENS -- generated from plugins/sandbox/scripts/Theme.pm.';
         my $comment2 = '# Regenerate: perl -Iplugins/sandbox/scripts -MTheme -e "print Theme::generated_block()"';
-        my @markers_in_order = ($comment1, $comment2, 'my %THEME_RGB = (', ');', 'my %THEME_X256 = (', ');', 'my %THEME_ATTR = (', ');');
+        # AC-15 (hook-continuity-remake package 10, spec §2.4): a FOURTH hash,
+        # %THEME_BG, follows %THEME_ATTR. The order list grows by its open and
+        # close markers; the three existing hashes keep their places.
+        my @markers_in_order = ($comment1, $comment2, 'my %THEME_RGB = (', ');', 'my %THEME_X256 = (', ');', 'my %THEME_ATTR = (', ');',
+                                'my %THEME_BG = (', ');');
         my $pos = -1;
         my $order_ok = 1;
         for my $m (@markers_in_order) {
@@ -1983,7 +2045,7 @@ my $theme_generated_block;   # captured here, reused by the read-only surface re
             if ($idx <= $pos) { $order_ok = 0; last; }
             $pos = $idx;
         }
-        ok($order_ok, 'generated_block(): the two comment lines and the three hash open/close markers appear, in order (B-G4, AC-15)')
+        ok($order_ok, 'generated_block(): the two comment lines and the four hash open/close markers appear, in order -- %THEME_BG after %THEME_ATTR (B-G4, AC-15)')
             or diag('  expected in order: ' . join(' | ', @markers_in_order));
 
         my $roles = Theme::roles();
@@ -2005,7 +2067,82 @@ my $theme_generated_block;   # captured here, reused by the read-only surface re
                     or diag('  offending line(s): ' . join(' | ', @offending));
             }
         }
+
+        # %THEME_BG lists EXACTLY the roles whose record declares `bg`, in
+        # sort order, with %THEME_RGB's line grammar. The role set is derived
+        # from roles() itself, so this is self-consistency, not a shape pin.
+        my @bg_roles = sort grep { ref($roles->{$_}{bg}) eq 'ARRAY' } keys %$roles;
+        ok(scalar(@bg_roles) >= 1,
+            'generated_block(): precondition -- at least one role declares a bg (overlay.warn), so %THEME_BG has a subject (B-G4, AC-15)');
+        my ($bg_body) = $block =~ /my \%THEME_BG = \(\n(.*?)\n\);\n/s;
+        ok(defined($bg_body), 'generated_block(): %THEME_BG block is present and well-formed (B-G4, AC-15)');
+      SKIP: {
+            skip('%THEME_BG body not found', 3) unless defined $bg_body;
+            my @bg_lines = split /\n/, $bg_body;
+            my @names_in_bg = map { /^\s*'([a-z.]+)'/ ? $1 : () } @bg_lines;
+            is_deeply(\@names_in_bg, \@bg_roles,
+                'generated_block(): %THEME_BG lists exactly the roles that declare bg, in sort order (B-G4, AC-15)');
+            my @offending = grep { $_ !~ qr/\A  '[a-z.]+' => \[\d{1,3},\d{1,3},\d{1,3}\],\z/ } @bg_lines;
+            ok(!@offending, 'generated_block(): every %THEME_BG role line matches the %THEME_RGB line grammar (B-G4, AC-15)')
+                or diag('  offending line(s): ' . join(' | ', @offending));
+            ok(index($bg_body, "  'overlay.warn' => [59,10,10],") >= 0,
+                "generated_block(): %THEME_BG carries 'overlay.warn' => [59,10,10] -- the one background Theme already declares (spec 2.4, AC-15)");
+        }
     }
+}
+
+# ---------------------------------------------------------------------------
+# AC-15: "No role is added or changed." Every role that existed on main at
+# 5a29cdc must still exist with byte-identical fields. The values below were
+# read from Theme::roles() at that commit (meaning is pinned by the MD5 of its
+# UTF-8 bytes, to keep the prose out of this table).
+#
+# SCOPE, stated rather than hidden: this pins that no EXISTING role is
+# removed or changed. It deliberately does not pin the full key set -- the
+# file's standing NO SHAPE PINS rule (Decision 15) forbids that, because later
+# packages legitimately add roles. The hazard an added role would bring (a new
+# `class` silently skipping the B-C7 contrast floor) is closed separately by
+# the no-unrecognised-class assertion that follows.
+# ---------------------------------------------------------------------------
+{
+    require Digest::MD5;
+    my %MAIN_ROLES = (
+        'accent'         => { rgb => [66,148,250], x256 => 69, attr => '1', class => 'body', meaning_md5 => '4639df8887f5a67a3234505e7eb140b3' },
+        'gauge.crit'     => { rgb => [236,93,94], x256 => 203, attr => '', class => 'body', meaning_md5 => '482d802819abf4e62114414cbd5804fd' },
+        'gauge.low'      => { rgb => [0,144,255], x256 => 33, attr => '', class => 'body', meaning_md5 => '6491027fefc7aab1250bf965cade8716' },
+        'gauge.mid'      => { rgb => [18,165,148], x256 => 36, attr => '', class => 'body', meaning_md5 => '95af5177ac8703545d2b28eb3b0d24b6' },
+        'gauge.track'    => { rgb => [68,68,68], x256 => 238, attr => '', class => 'decor', meaning_md5 => '88aedd705a90addbbc2cfac0adf99143' },
+        'gauge.warn'     => { rgb => [247,107,21], x256 => 202, attr => '', class => 'body', meaning_md5 => '36da45a35b78cce69a5de577abc2b242' },
+        'overlay.warn'   => { rgb => [245,245,245], x256 => 255, attr => '1', class => 'body', bg => [59,10,10], bg256 => 52, meaning_md5 => '993feea54e1e28828e8b92e38dddd778' },
+        'rule'           => { rgb => [60,70,85], x256 => 238, attr => '2', class => 'decor', meaning_md5 => '8d62bb2b0f9d307dcece923e978683d7' },
+        'state.crit'     => { rgb => [255,90,90], x256 => 203, attr => '1', class => 'body', meaning_md5 => '9cea1e079f19655a32dd8031e69817ba' },
+        'state.idle'     => { rgb => [110,126,148], x256 => 244, attr => '2', class => 'large', meaning_md5 => '5cb77d5d2b8d131a071191bd1c0c6d10' },
+        'state.ok'       => { rgb => [26,168,74], x256 => 35, attr => '1', class => 'body', meaning_md5 => '55c599bd1196aee526a4bff837b4912a' },
+        'state.warn'     => { rgb => [214,128,16], x256 => 172, attr => '1', class => 'body', meaning_md5 => '9cb0ba5a8ac364582cdf744f734fb857' },
+        'text.faint'     => { rgb => [100,116,139], x256 => 243, attr => '2', class => 'large', meaning_md5 => 'fb8ba3e9562dd4ed64d6fc042eba5dd5' },
+        'text.muted'     => { rgb => [148,163,184], x256 => 248, attr => '2', class => 'body', meaning_md5 => '29241a0ba450bfcb393f405bfe471b21' },
+        'text.primary'   => { rgb => [230,230,230], x256 => 254, attr => '', class => 'body', meaning_md5 => '42034a1824481bb2ebf0bce148159032' },
+    );
+    my $roles = Theme::roles();
+    for my $role (sort keys %MAIN_ROLES) {
+        my $want = $MAIN_ROLES{$role};
+        my $rec  = $roles->{$role};
+        if (ref($rec) ne 'HASH') {
+            fail("AC-15: role '$role' (present on main) still exists in Theme::roles()");
+            next;
+        }
+        my %got = map { $_ => $rec->{$_} } grep { $_ ne 'meaning' } keys %$rec;
+        $got{meaning_md5} = defined($rec->{meaning})
+            ? Digest::MD5::md5_hex(Encode::encode('UTF-8', $rec->{meaning})) : undef;
+        is_deeply(\%got, $want,
+            "AC-15: role '$role' has exactly the fields it had on main -- no role is changed by package 10");
+    }
+
+    my %KNOWN_CLASS = map { $_ => 1 } qw(body large decor);
+    my @unrecognised = grep { !defined($roles->{$_}{class}) || !$KNOWN_CLASS{ $roles->{$_}{class} } } sort keys %$roles;
+    ok(!@unrecognised,
+        'AC-15: no role carries an unrecognised class, so the B-C7 contrast floor cannot silently skip any role')
+        or diag('  unrecognised: ' . join(', ', @unrecognised));
 }
 
 # ===========================================================================
@@ -2028,11 +2165,20 @@ my $theme_generated_block;   # captured here, reused by the read-only surface re
             'generated_block() is pure printable ASCII + LF -- no ESC, no C0, no non-ASCII (B-G2 extension, M4, AC-15)');
 
         my @bad = grep { length }
-                  grep { !/\A(?:\#\ .*|my\ \%THEME_(?:RGB|X256|ATTR)\ =\ \(|\);|\ \ '[a-z.]+'\ =>\ (?:\[\d{1,3},\d{1,3},\d{1,3}\]|\d{1,3}|'(?:|1|2|7)'),)\z/ }
+                  grep { !/\A(?:\#\ .*|my\ \%THEME_(?:RGB|X256|ATTR|BG)\ =\ \(|\);|\ \ '[a-z.]+'\ =>\ (?:\[\d{1,3},\d{1,3},\d{1,3}\]|\d{1,3}|'(?:|1|2|7)'),)\z/ }
                   split /\n/, $block, -1;
         ok(!@bad,
             'generated_block(): EVERY line matches one of the four permitted shapes -- nothing unvalidated reaches an installed executable file (M4, AC-15)')
             or diag('  unpermitted line(s): ' . join(' | ', @bad));
+
+        # AC-15: the permitted-line shapes cover %THEME_BG by NAME -- the
+        # opener is one of the four hash openers the shape list admits, and
+        # it really occurs, so the line check above actually saw its lines.
+        ok(index($block, "\nmy %THEME_BG = (\n") >= 0,
+            'generated_block(): the %THEME_BG opener is present as its own line, so M4\'s permitted-shape check covers it (M4, AC-15)');
+        my @hash_openers = ($block =~ /^my \%(THEME_\w+) = \($/mg);
+        is_deeply(\@hash_openers, [qw(THEME_RGB THEME_X256 THEME_ATTR THEME_BG)],
+            'generated_block(): the hash openers are exactly RGB, X256, ATTR, BG, in that order -- no fifth, unvalidated hash (M4, AC-15)');
     }
 }
 
@@ -2060,6 +2206,24 @@ my $theme_generated_block;   # captured here, reused by the read-only surface re
                 "eval'd %THEME_X256 matches roles()'s x256 for every role (B-G5, AC-15)");
             is_deeply(\%Scratch64Roundtrip::__ATTR, { map { $_ => $roles->{$_}{attr} } keys %$roles },
                 "eval'd %THEME_ATTR matches roles()'s attr for every role (B-G5, AC-15)");
+        }
+
+        # AC-15: the round trip covers the fourth hash -- exactly the roles
+        # declaring bg, each with its bg triple. A separate probe, so a block
+        # without %THEME_BG fails THIS assertion (strict vars) without taking
+        # the three pre-existing round trips above down with it.
+        my $bg_probe = $block
+            . '@Scratch64RoundtripBG::__BG{keys %THEME_BG} = values %THEME_BG;' . "\n"
+            . '1;' . "\n";
+        my $bg_ok  = eval "use strict; use warnings;\n" . $bg_probe;   ## no critic (BuiltinFunctions::ProhibitStringyEval)
+        my $bg_err = $@;
+        ok($bg_ok, "generated_block() declares %THEME_BG and still evals cleanly under strict (B-G5, AC-15)")
+            or diag("  eval error: $bg_err");
+      SKIP: {
+            skip('%THEME_BG eval failed', 1) unless $bg_ok;
+            is_deeply(\%Scratch64RoundtripBG::__BG,
+                { map { $_ => $roles->{$_}{bg} } grep { ref($roles->{$_}{bg}) eq 'ARRAY' } keys %$roles },
+                "eval'd %THEME_BG matches roles()'s bg for exactly the roles that declare one (B-G5, AC-15)");
         }
     }
 }

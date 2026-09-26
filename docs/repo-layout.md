@@ -64,7 +64,8 @@ ccpraxis/
 │   │   │   ├── almanac-note.pl                               # note CRUD + promote over Almanac::Store (blueprint almanac-records, package…
 │   │   │   ├── almanac-task.pl                               # the one project tasklist, over Almanac::Store (blueprint almanac-records…
 │   │   │   ├── almanac-todo.pl                               # todo CRUD over Almanac::Store (blueprint almanac-records, package 04-todos).
-│   │   │   └── almanac.pl                                    # Dispatcher: routes almanac type verb to the todo, note, task, decision and bug scripts, and doctor to the diagnostic
+│   │   │   ├── almanac.pl                                    # Dispatcher: routes almanac type verb to the todo, note, task, decision and bug scripts, and doctor to the diagnostic
+│   │   │   └── gen-statusline-counters.pl                    # prints the almanac counting block that scripts/statusline.pl embeds between…
 │   │   ├── skills/                                           # Slash-command skills this plugin provides
 │   │   │   ├── bug-report/
 │   │   │   │   └── SKILL.md                                  # File a ccpraxis tooling bug report from whatever project you are working in.
