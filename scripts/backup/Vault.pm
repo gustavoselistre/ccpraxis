@@ -203,6 +203,41 @@ sub run_phase {
         return { status => 'complete' } if ref($vc) eq 'HASH' && !$vc->{present};
     }
 
+    # ---- U2: global_almanac (almanac-records package 16, spec 2.10) --
+    #      runs once per backup, BEFORE the project loop: git pull --rebase
+    #      refuses a worktree with modified tracked files once almanac/ is
+    #      itself tracked, so this must land before any project's sync-project
+    #      touches the vault. A failure here never blocks project backups --
+    #      no checkpoint, so a resume retries it, and the loop falls through
+    #      to U3 regardless. ----
+    unless ($ctx->{is_done}->('global_almanac')) {
+        my $gr = _run_capture($^X, "$root/plugins/steward/scripts/vault-sync.pl", 'sync-global-almanac');
+        my ($gok, $gj, $gerr) = _interpret_response($gr, 'vault-sync.pl sync-global-almanac');
+        if ($gok) {
+            $gj = _sanitize_utf8($gj);
+            my $committed = $gj->{committed} ? 1 : 0;
+            my $pushed    = $gj->{pushed}    ? 1 : 0;
+            my @skipped   = (ref($gj->{skipped_stores}) eq 'ARRAY') ? @{ $gj->{skipped_stores} } : ();
+            $ctx->{checkpoint}->('global_almanac', { committed => $committed, pushed => $pushed, skipped => scalar(@skipped) });
+            $ctx->{note}->('global_almanac', {
+                committed => $committed, pushed => $pushed, commit => $gj->{commit}, skipped => scalar(@skipped),
+            });
+            for my $sk (@skipped) {
+                next unless ref($sk) eq 'HASH';
+                $ctx->{note}->('almanac_store_skipped', {
+                    scope => 'global', path => $sk->{path}, message => $sk->{message}, holder => $sk->{holder},
+                });
+            }
+            $record_success->('global_almanac');
+        }
+        else {
+            $ctx->{note}->('global_almanac_failed', { error => $gerr });
+            $record_failure->('global_almanac', $gerr);
+            # No checkpoint -- a later re-entry retries. Continue to U3: a
+            # failed global sync never blocks project backups.
+        }
+    }
+
     # ---- U3: project_list (S2.3) -- runs directly after vault_check (U1)
     #      whenever U1 recorded present => 1. The todos step this used to be
     #      gated on (Decision 7's original barrier) was retired outright by
@@ -421,6 +456,18 @@ sub _process_project {
             slug => $slug, applied => ($sj->{applied} // 0),
             action_counts => ($sj->{action_counts} // {}), cache_repaired => ($sj->{cache_repaired} // []),
         });
+
+        # almanac-records package 16, spec 2.10: a skipped_stores entry is
+        # NOT a failure -- one note per entry, and the project proceeds to
+        # commit-and-push normally.
+        my @skipped_stores = (ref($sj->{skipped_stores}) eq 'ARRAY') ? @{ $sj->{skipped_stores} } : ();
+        for my $sk (@skipped_stores) {
+            next unless ref($sk) eq 'HASH';
+            $ctx->{note}->('almanac_store_skipped', {
+                scope   => 'project', slug => $slug,
+                path    => $sk->{path}, message => $sk->{message}, holder => $sk->{holder},
+            });
+        }
 
         # MAJOR 4 (same defect class one level down): filter, never
         # dereference blindly -- _confirm_push already guards this exact

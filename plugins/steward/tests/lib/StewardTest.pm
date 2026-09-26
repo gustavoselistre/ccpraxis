@@ -51,7 +51,23 @@ sub vault_sync_script { return $SCRIPT }
 my $TEST_NUM = 0;
 my $FAILS    = 0;
 
-sub ok {
+# ($;$) mirrors Test::More's own ok() prototype: the FIRST argument is
+# evaluated in SCALAR context at every normal call site compiled after this
+# declaration is visible (i.e. after `use StewardTest qw(ok ...)`, since that
+# import happens at compile time before the rest of the importing file is
+# parsed). Without this, `ok((grep { ... } @list), $name)` passes the grep's
+# LIST-context result: with zero matches that list collapses to just
+# ($name), so $cond becomes the (truthy) name string and the assertion passes
+# with $name undef -- a real false-pass measured in 16-mutation-r2.md
+# (MF-A). The prototype is invisible to a direct `&ok(...)` call (the `&`
+# sigil deliberately bypasses prototype checking in Perl) and to any call
+# that resolves at runtime rather than compile time (e.g. through a `require`
+# happening after the call site was already compiled) -- for those paths this
+# module cannot rely on the prototype, so it also guards at runtime below.
+sub ok ($;$) {
+    die "StewardTest::ok() takes at most (cond, name) -- got " . scalar(@_)
+      . " args; this call bypassed the ($;\$) prototype (e.g. via &ok(...))"
+        if @_ > 2;
     my ($cond, $name) = @_;
     $TEST_NUM++;
     if ($cond) {
