@@ -542,11 +542,45 @@ sub parse_dag {
         my $deps_raw = $row{depends_on} // '';
         my @deps;
         for my $d (split /[,\s]+/, $deps_raw) {
-            push @deps, $d if $d =~ /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+            # package 30 (spec §2.2): a token containing '/' is kept VERBATIM,
+            # whether or not it is a well-formed cross-blueprint EXTREF -- the
+            # malformed shape is resolved (to state 'malformed') by
+            # external_dep_state, not filtered here. A token with no '/' keeps
+            # the original local-package whitelist unchanged.
+            if ($d =~ m{/}) {
+                push @deps, $d;
+            } elsif ($d =~ /^[A-Za-z0-9][A-Za-z0-9_.-]*$/) {
+                push @deps, $d;
+            }
         }
         $dag{$pkg} = \@deps;
     }
     return \%dag;
+}
+
+# parse_ext_ref($tok) -> ($bp, $pkg) for a well-formed EXTREF (spec §2.1:
+# NAME "/" NAME); empty list for anything else, including a local token.
+sub parse_ext_ref {
+    my ($tok) = @_;
+    return () unless defined $tok && !ref $tok;
+    return () unless $tok =~ m{^([A-Za-z0-9][A-Za-z0-9_.-]*)/([A-Za-z0-9][A-Za-z0-9_.-]*)$};
+    return ($1, $2);
+}
+
+# external_dep_state($data, $tok) -> $state (spec §2.2). Pure read: never
+# dies, never writes. Resolution order is the live blueprints/<bp> first,
+# then blueprints/_archive/<bp> (spec §2.2 / B7).
+sub external_dep_state {
+    my ($data, $tok) = @_;
+    my ($bp, $pkg) = parse_ext_ref($tok);
+    return 'malformed' unless defined $bp;
+    for my $root ("$data/blueprints/$bp", "$data/blueprints/_archive/$bp") {
+        next unless -f "$root/blueprint.md";
+        return 'missing-package' unless -f "$root/packages/$pkg.md";
+        my $st = ledger_fm($root, $pkg, 'status');
+        return (defined $st && length $st) ? $st : 'pending';
+    }
+    return 'missing-blueprint';
 }
 
 # ledger_fm($bpdir, $pkg, $key): read status/write_set from ledger frontmatter.
@@ -604,6 +638,19 @@ sub read_state {
                 priority  => ledger_fm($bpdir, $pkg, 'priority'),
             };
         }
+        # package 30 (spec §2.2): every cross-blueprint token ('<bp>/<pkg>')
+        # that appears anywhere in this blueprint's DAG becomes a key in the
+        # status view too, mapped to its external_dep_state. A package id can
+        # never contain '/', so this key can never collide with a package key
+        # (spec's invariant) -- deps_met/has_progressable_work/ready_packages
+        # need no changes at all: they already just look up $status->{$d}.
+        for my $pkg (keys %$dag) {
+            for my $d (@{ $dag->{$pkg} }) {
+                next unless $d =~ m{/};
+                next if exists $status{$d};
+                $status{$d} = external_dep_state($data, $d);
+            }
+        }
         $bp_meta{$bp}   = \%meta;
         $bp_status{$bp} = \%status;
     }
@@ -616,6 +663,44 @@ sub read_state {
         bp_status  => \%bp_status,
         candidates => $candidate_bps,
     };
+}
+
+# _log_external_missing($dsdir, $bp, $meta, $status): for every non-terminal
+# package of $bp whose DAG holds a cross token whose resolved state is
+# missing-blueprint, missing-package or malformed, append exactly one
+# EXTERNAL-MISSING line (spec §2.3). No dedupe across calls -- matches the
+# existing ORDER-PRUNE/NOT-AUDITED convention.
+sub _log_external_missing {
+    my ($dsdir, $bp, $meta, $status) = @_;
+    for my $pkg (sort keys %$meta) {
+        next if _is_terminal($status->{$pkg} // 'pending');
+        for my $d (@{ $meta->{$pkg}{deps} || [] }) {
+            next unless $d =~ m{/};
+            my $st = $status->{$d};
+            next unless defined $st && $st =~ /^(?:missing-blueprint|missing-package|malformed)$/;
+            _append_run_log($dsdir, "EXTERNAL-MISSING $bp/$pkg waits on $d ($st)");
+        }
+    }
+}
+
+# _external_waits_for($meta, $status) -> \@waits (spec §2.3): one entry per
+# PENDING package with at least one unmet cross token, sorted by package;
+# each entry's deps lists only the unmet cross tokens, in cell order.
+sub _external_waits_for {
+    my ($meta, $status) = @_;
+    my @waits;
+    for my $pkg (sort keys %$meta) {
+        next unless ($status->{$pkg} // 'pending') eq 'pending';
+        my @unmet;
+        for my $d (@{ $meta->{$pkg}{deps} || [] }) {
+            next unless $d =~ m{/};
+            my $st = $status->{$d} // 'pending';
+            next if $st eq 'done';
+            push @unmet, { ref => $d, state => $st };
+        }
+        push @waits, { package => $pkg, deps => \@unmet } if @unmet;
+    }
+    return \@waits;
 }
 
 # mark_announced: add a blueprint to announced.json atomically.
@@ -830,6 +915,13 @@ sub _cmd_next {
     my %announced = %{ $state->{announced} };
     my %bp_meta   = %{ $state->{bp_meta} };
     my %bp_status = %{ $state->{bp_status} };
+
+    # package 30 (spec §2.3): report every unresolvable cross token in scope,
+    # for every `next` call, regardless of which action this call ends up
+    # returning.
+    for my $bp (keys %bp_meta) {
+        _log_external_missing($dsdir, $bp, $bp_meta{$bp}, $bp_status{$bp});
+    }
 
     # e04 §2.4/AC4: prune, IN MEMORY, any order.json entry whose blueprint no
     # longer exists on disk -- before B2a's coverage check and the B3 walk see
@@ -1114,6 +1206,9 @@ sub _cmd_next {
                         && (($status->{ $_->{package} } // 'pending') eq 'pending')
                         && (($now - $_->{since}) >= $reclaim_after)
                         && !BpHook::BindDispatch::bound_since($data, $bp, $_->{package}, $_->{since})
+                        # package 30 / AC-12 (B11): never reclaim a pending
+                        # entry whose deps (local or external) are unmet.
+                        && deps_met($meta->{ $_->{package} }{deps}, $status)
                     } @$inflight_entries;
                 if (@reclaimable) {
                     my $entry = $reclaimable[0];
@@ -1247,6 +1342,13 @@ sub _cmd_next {
             { blueprint => $_->{blueprint}, package => $_->{package},
               ledger    => $_->{ledger},    since   => $_->{since} }
         } @$inflight_entries ];
+        # package 30 (spec §2.3): external_waits key only when non-empty, so
+        # a fixture with no cross tokens (AC-13/B12) produces a byte-identical
+        # action.
+        {
+            my $ew = _external_waits_for($bp_meta{ $f->{blueprint} } // {}, $bp_status{ $f->{blueprint} } // {});
+            $action->{external_waits} = $ew if @$ew;
+        }
         print _encode_action($action), "\n";
         keepawake_apply('active', $dsdir, $opts);
         return 0;
