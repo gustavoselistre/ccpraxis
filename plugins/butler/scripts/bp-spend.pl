@@ -614,8 +614,10 @@ sub _empty_package_result {
         pkg    => $pkg,
         status => 'ok',
         tokens => {
-            coordinator => { input => 0, output => 0, cache_creation => 0, cache_read => 0 },
-            subagent    => { input => 0, output => 0, cache_creation => 0, cache_read => 0 },
+            coordinator => { input => 0, output => 0, cache_creation => 0, cache_read => 0,
+                              cache_write_5m_tokens => 0, cache_write_1h_tokens => 0, cache_write_unsplit_tokens => 0 },
+            subagent    => { input => 0, output => 0, cache_creation => 0, cache_read => 0,
+                              cache_write_5m_tokens => 0, cache_write_1h_tokens => 0, cache_write_unsplit_tokens => 0 },
         },
         by_model      => {},
         record_counts => {
@@ -647,6 +649,7 @@ sub _empty_package_result {
             total_cost_usd     => undef,
             model_usage        => {},
             output_tokens_total => undef,
+            cost_source        => 'claude-code-self-reported-headless',
         },
         derived => 1,
     };
@@ -770,6 +773,20 @@ sub derive_package {
             my $output = _safe_usage_num($u->{output_tokens},               $result->{record_counts});
             my $cc     = _safe_usage_num($u->{cache_creation_input_tokens}, $result->{record_counts});
             my $cr     = _safe_usage_num($u->{cache_read_input_tokens},     $result->{record_counts});
+            # Spec Sec2.7 (Decision 20): read the 5m/1h cache-write split the
+            # same way _session_read_agent_file does. use_split means the
+            # ephemeral_{5m,1h} hash is present AND its sum is > 0; otherwise
+            # the whole cache_creation figure is unsplit.
+            my ($cc_5m, $cc_1h) = (0, 0);
+            my $has_split_hash = ref($u->{cache_creation}) eq 'HASH';
+            if ($has_split_hash) {
+                $cc_5m = _safe_usage_num($u->{cache_creation}{ephemeral_5m_input_tokens}, $result->{record_counts});
+                $cc_1h = _safe_usage_num($u->{cache_creation}{ephemeral_1h_input_tokens}, $result->{record_counts});
+            }
+            my $use_split = $has_split_hash && ($cc_5m + $cc_1h > 0);
+            my $cc_unsplit = $use_split ? 0 : $cc;
+            $cc_5m = 0 unless $use_split;
+            $cc_1h = 0 unless $use_split;
 
             $result->{record_counts}{assistant_total}++;
             $result->{record_counts}{$role}++;
@@ -791,6 +808,8 @@ sub derive_package {
                     role => $role, model => $model,
                     input => $input, output => $output,
                     cache_creation => $cc, cache_read => $cr,
+                    cache_write_5m_tokens => $cc_5m, cache_write_1h_tokens => $cc_1h,
+                    cache_write_unsplit_tokens => $cc_unsplit,
                     session_id => $rec->{session_id},
                     mismatched => 0,
                 };
@@ -850,6 +869,9 @@ sub derive_package {
                 $req->{input}          = $input;
                 $req->{cache_creation} = $cc;
                 $req->{cache_read}     = $cr;
+                $req->{cache_write_5m_tokens}      = $cc_5m;
+                $req->{cache_write_1h_tokens}      = $cc_1h;
+                $req->{cache_write_unsplit_tokens} = $cc_unsplit;
                 $req->{model}          = $model;
             }
         }
@@ -902,15 +924,22 @@ sub derive_package {
         $result->{tokens}{$role}{output}         += $req->{output};
         $result->{tokens}{$role}{cache_creation} += $req->{cache_creation};
         $result->{tokens}{$role}{cache_read}     += $req->{cache_read};
+        $result->{tokens}{$role}{cache_write_5m_tokens}      += $req->{cache_write_5m_tokens};
+        $result->{tokens}{$role}{cache_write_1h_tokens}      += $req->{cache_write_1h_tokens};
+        $result->{tokens}{$role}{cache_write_unsplit_tokens} += $req->{cache_write_unsplit_tokens};
 
         my $bm = ($result->{by_model}{$model} //= {
             role => $role, input => 0, output => 0, cache_creation => 0, cache_read => 0,
+            cache_write_5m_tokens => 0, cache_write_1h_tokens => 0, cache_write_unsplit_tokens => 0,
         });
         $bm->{role} = 'mixed' if $bm->{role} ne $role;
         $bm->{input}          += $req->{input};
         $bm->{output}         += $req->{output};
         $bm->{cache_creation} += $req->{cache_creation};
         $bm->{cache_read}     += $req->{cache_read};
+        $bm->{cache_write_5m_tokens}      += $req->{cache_write_5m_tokens};
+        $bm->{cache_write_1h_tokens}      += $req->{cache_write_1h_tokens};
+        $bm->{cache_write_unsplit_tokens} += $req->{cache_write_unsplit_tokens};
     }
 
     $result->{cross_check}{output_tokens_total} = $output_authoritative_seen
@@ -959,8 +988,10 @@ sub derive_blueprint {
     my $result = {
         status => 'ok',
         tokens => {
-            coordinator => { input => 0, output => 0, cache_creation => 0, cache_read => 0 },
-            subagent    => { input => 0, output => 0, cache_creation => 0, cache_read => 0 },
+            coordinator => { input => 0, output => 0, cache_creation => 0, cache_read => 0,
+                              cache_write_5m_tokens => 0, cache_write_1h_tokens => 0, cache_write_unsplit_tokens => 0 },
+            subagent    => { input => 0, output => 0, cache_creation => 0, cache_read => 0,
+                              cache_write_5m_tokens => 0, cache_write_1h_tokens => 0, cache_write_unsplit_tokens => 0 },
         },
         by_model => {},
         packages => [],
@@ -979,7 +1010,8 @@ sub derive_blueprint {
         push @{ $result->{packages} }, $pr;
 
         for my $role (qw(coordinator subagent)) {
-            for my $f (qw(input output cache_creation cache_read)) {
+            for my $f (qw(input output cache_creation cache_read
+                          cache_write_5m_tokens cache_write_1h_tokens cache_write_unsplit_tokens)) {
                 $result->{tokens}{$role}{$f} += $pr->{tokens}{$role}{$f};
             }
         }
@@ -988,9 +1020,11 @@ sub derive_blueprint {
             my $src = $pr->{by_model}{$model};
             my $bm = ($result->{by_model}{$model} //= {
                 role => $src->{role}, input => 0, output => 0, cache_creation => 0, cache_read => 0,
+                cache_write_5m_tokens => 0, cache_write_1h_tokens => 0, cache_write_unsplit_tokens => 0,
             });
             $bm->{role} = 'mixed' if $bm->{role} ne $src->{role};
-            for my $f (qw(input output cache_creation cache_read)) {
+            for my $f (qw(input output cache_creation cache_read
+                          cache_write_5m_tokens cache_write_1h_tokens cache_write_unsplit_tokens)) {
                 $bm->{$f} += $src->{$f};
             }
         }
@@ -1025,46 +1059,11 @@ sub derive_blueprint {
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
-# Price table (spec §2.4). US dollars per million tokens (MTok), fetched live
-# 2026-09-23 from the docs pricing page (chosen over claude.com/pricing per
-# Decisions 11-12, because only the docs page itemises the cache-write
-# 5m/1h split). `claude-haiku-4-5-20251001` is priced from the
-# `claude-haiku-4-5` alias row -- an alias identity, not a sibling/older-model
-# substitution (Decision 8 is not violated). Every other id is read from a
-# row that names that exact id.
+# Pricing (spec Sec2.4, blueprint spend-token-report). Prices are acquired
+# fresh per report run through BpPricing::acquire() -- never pinned in code.
+# See BpPricing.pm. Loading it has no side effects (no network/spawn/I-O).
 # ---------------------------------------------------------------------------
-our $SESSION_PRICE_SOURCE = 'https://platform.claude.com/docs/en/about-claude/pricing';
-our $SESSION_PRICE_AS_OF  = '2026-09-23';
-our @SESSION_PRICE_REQUIRED = qw(
-    claude-opus-5-5 claude-sonnet-5 claude-fable-5-1
-    claude-haiku-4-5-20251001 claude-opus-5
-);
-our %SESSION_PRICES = (
-    'claude-opus-5-5'           => { input => 4,  output => 20, cache_write_5m => 5,     cache_write_1h => 8,  cache_read => 0.20 },
-    'claude-sonnet-5'           => { input => 2,  output => 10, cache_write_5m => 2.50,  cache_write_1h => 4,  cache_read => 0.20 },
-    'claude-fable-5-1'          => { input => 10, output => 50, cache_write_5m => 12.50, cache_write_1h => 20, cache_read => 0.25 },
-    'claude-haiku-4-5-20251001' => { input => 1,  output => 5,  cache_write_5m => 1.25,  cache_write_1h => 2,  cache_read => 0.10 },
-    'claude-opus-5'             => { input => 5,  output => 25, cache_write_5m => 6.25,  cache_write_1h => 10, cache_read => 0.50 },
-);
-our %SESSION_PRICES_MISSING = ();   # model id => reason string; empty for this release
-
-# ---------------------------------------------------------------------------
-# session_price_table() -> { source, as_of, required => \@, prices => \%,
-# missing => \% }. Returns COPIES -- callers must not mutate the originals.
-# ---------------------------------------------------------------------------
-sub session_price_table {
-    my %prices;
-    for my $id (keys %SESSION_PRICES) {
-        $prices{$id} = { %{ $SESSION_PRICES{$id} } };
-    }
-    return {
-        source   => $SESSION_PRICE_SOURCE,
-        as_of    => $SESSION_PRICE_AS_OF,
-        required => [ @SESSION_PRICE_REQUIRED ],
-        prices   => \%prices,
-        missing  => { %SESSION_PRICES_MISSING },
-    };
-}
+require "$DIR/BpPricing.pm";
 
 # ---------------------------------------------------------------------------
 # _norm_scalar_or_unknown($v) -> $v when it is a defined, non-ref, non-empty
@@ -1412,24 +1411,18 @@ sub _session_read_agent_file {
 # ---------------------------------------------------------------------------
 # _session_price_request($req, $role) -> ( \@cells, \%unpriced_deltas ).
 # Prices one deduplicated request's non-zero token-type amounts per the
-# precedence of spec B9 -- exactly one reason applies to any unpriced
+# precedence of spec Sec2.7 -- exactly one reason applies to any unpriced
 # amount:
-#   1. request speed present and != 'standard' -> non-standard-speed
-#   2. else model not a key of %SESSION_PRICES  -> model-not-in-table
-#   3. else token type is cache_write_unsplit   -> cache-write-unsplit
-#   4. else priced: cost = tokens / 1_000_000 * rate[model][token_type]
+#   1. a whole-request reason (from BpPricing::rates_for_request)
+#   2. else token type is cache_write_unsplit -> cache-write-unsplit
+#   3. else the tier's rate for this type is undef -> rate-missing
+#   4. else priced: cost = tokens / 1_000_000 * rate
 # ---------------------------------------------------------------------------
 sub _session_price_request {
-    my ($req, $role) = @_;
+    my ($req, $role, $p) = @_;
 
     my $model  = _norm_scalar_or_unknown($req->{model});
     my $effort = _norm_scalar_or_unknown($req->{effort});
-    # No `!ref` guard here (fix-batch review L3, per spec B8's literal
-    # wording): a ref-valued (boolean/object/array) `speed` is still PRESENT
-    # and is not the exact string 'standard', so it must be treated as
-    # non-standard-speed, not silently priced as standard.
-    my $non_standard_speed = defined($req->{speed})
-        && (ref($req->{speed}) || $req->{speed} ne 'standard');
 
     my %amounts;
     $amounts{input}               = $req->{input};
@@ -1446,37 +1439,43 @@ sub _session_price_request {
         $amounts{cache_write_unsplit}  = $req->{cc_unsplit};
     }
 
+    my $input_total = $req->{input} + $req->{cache_read}
+        + ($req->{use_split} ? ($req->{cc_5m} + $req->{cc_1h}) : $req->{cc_unsplit});
+
+    my $outcome = BpPricing::rates_for_request(
+        $p, model => $req->{model}, speed => $req->{speed}, input_total => $input_total,
+    );
+
     my @cells;
-    my %unpriced_deltas;
     for my $type (qw(input output cache_write_5m cache_write_1h cache_read cache_write_unsplit)) {
         my $tokens = $amounts{$type};
         next unless $tokens > 0;
 
         my $reason;
         my $cost = 0;
-        if ($non_standard_speed) {
-            $reason = 'non-standard-speed';
-        }
-        elsif (!exists $SESSION_PRICES{$model}) {
-            $reason = 'model-not-in-table';
+        if (defined $outcome->{reason}) {
+            $reason = $outcome->{reason};
         }
         elsif ($type eq 'cache_write_unsplit') {
             $reason = 'cache-write-unsplit';
         }
+        elsif (!defined $outcome->{rates}{$type}) {
+            $reason = 'rate-missing';
+        }
         else {
-            $cost = $tokens / 1_000_000 * $SESSION_PRICES{$model}{$type};
+            $cost = $tokens / 1_000_000 * $outcome->{rates}{$type};
         }
 
         my $unpriced_tokens = defined($reason) ? $tokens : 0;
-        $unpriced_deltas{$reason} += $tokens if defined $reason;
 
         push @cells, {
             role => $role, model => $model, effort => $effort, token_type => $type,
             tokens => $tokens, cost_usd => $cost, unpriced_tokens => $unpriced_tokens,
+            reason => $reason,
         };
     }
 
-    return (\@cells, \%unpriced_deltas);
+    return \@cells;
 }
 
 # ---------------------------------------------------------------------------
@@ -1542,31 +1541,72 @@ sub _session_merge_cells {
         my $entry = ($acc->{$k} //= {
             role => $c->{role}, model => $c->{model}, effort => $c->{effort},
             token_type => $c->{token_type}, tokens => 0, cost_usd => 0, unpriced_tokens => 0,
+            reasons => {},
         });
         $entry->{tokens}          += $c->{tokens};
         $entry->{cost_usd}        += $c->{cost_usd};
         $entry->{unpriced_tokens} += $c->{unpriced_tokens};
+        $entry->{reasons}{ $c->{reason} } += $c->{tokens} if defined $c->{reason};
     }
     return;
 }
 
 # ---------------------------------------------------------------------------
-# _session_sorted_cells(\%acc) -> \@cells, rounded per B10 (0 +
-# sprintf('%.6f', $c) once at emission), sorted ascending by role, then
-# model, then effort, then token_type (cmp on each), zero-tokens cells
-# dropped.
+# _session_merge_by_type(\%acc, \@cells) -> merges @cells into %acc keyed by
+# token_type ALONE (role/model/effort collapsed) -- feeds derive_session's
+# totals.<type> figures from the same unrounded per-request contributions
+# %session_cell_acc gets, so a type total is never built by re-summing
+# already-rounded per-cell figures (Decision 18, spec Sec2.7 rounding note).
+# ---------------------------------------------------------------------------
+sub _session_merge_by_type {
+    my ($acc, $cells) = @_;
+    for my $c (@$cells) {
+        my $entry = ($acc->{ $c->{token_type} } //= { tokens => 0, cost_usd => 0, unpriced_tokens => 0, reasons => {} });
+        $entry->{tokens}          += $c->{tokens};
+        $entry->{cost_usd}        += $c->{cost_usd};
+        $entry->{unpriced_tokens} += $c->{unpriced_tokens};
+        $entry->{reasons}{ $c->{reason} } += $c->{tokens} if defined $c->{reason};
+    }
+    return;
+}
+
+# ---------------------------------------------------------------------------
+# _session_unpriced_reasons_array(\%reasons) -> \@[{reason,tokens}], sorted
+# ascending by reason (cmp), tokens>0 only (spec Sec2.7's unpriced_reasons).
+# ---------------------------------------------------------------------------
+sub _session_unpriced_reasons_array {
+    my ($reasons) = @_;
+    return [
+        map { { reason => $_, tokens => int($reasons->{$_}) } }
+        sort grep { $reasons->{$_} > 0 } keys %$reasons
+    ];
+}
+
+# ---------------------------------------------------------------------------
+# _session_sorted_cells(\%acc) -> \@cells, rounded once at emission, sorted
+# ascending by role, then model, then effort, then token_type (cmp on each),
+# zero-tokens cells dropped. api_equivalent_cost_usd is undef (JSON null)
+# when every token in the cell is unpriced (spec Sec2.7/Decision 18).
 # ---------------------------------------------------------------------------
 sub _session_sorted_cells {
-    my ($acc) = @_;
+    my ($acc, $pricing_not_ok) = @_;
     my @cells =
         grep { $_->{tokens} > 0 }
         map  {
             my $c = $acc->{$_};
+            # S1 (fix-batch review): null iff pricing_status ne 'ok' OR the
+            # cell is fully unpriced -- not only the latter, which by itself
+            # left an offline/unavailable cell showing a dollar zero whenever
+            # its unpriced_tokens happened not to equal tokens (defensive;
+            # in practice rates_for_request already marks every token of an
+            # offline/unavailable request unpriced).
+            my $fully_unpriced = $pricing_not_ok || ($c->{tokens} > 0 && $c->{unpriced_tokens} == $c->{tokens});
             {
                 role => $c->{role}, model => $c->{model}, effort => $c->{effort},
                 token_type => $c->{token_type}, tokens => int($c->{tokens}),
-                cost_usd => 0 + sprintf('%.6f', $c->{cost_usd}),
+                api_equivalent_cost_usd => $fully_unpriced ? undef : 0 + sprintf('%.6f', $c->{cost_usd}),
                 unpriced_tokens => int($c->{unpriced_tokens}),
+                unpriced_reasons => _session_unpriced_reasons_array($c->{reasons}),
             };
         }
         keys %$acc;
@@ -1588,18 +1628,20 @@ sub _session_sorted_cells {
 sub derive_session {
     my (%opts) = @_;
     my $session = $opts{session};
+    my $pricing = $opts{pricing} // BpPricing::offline();
+    my $pricing_not_ok = $pricing->{status} ne 'ok';
 
-    my $p = defined($session) ? $session : '';
-    $p =~ s{[/\\]+\z}{};
+    my $sp = defined($session) ? $session : '';
+    $sp =~ s{[/\\]+\z}{};
 
     my ($main, $dir);
-    if ($p =~ /\.jsonl\z/) {
-        $main = $p;
-        ($dir = $p) =~ s/\.jsonl\z//;
+    if ($sp =~ /\.jsonl\z/) {
+        $main = $sp;
+        ($dir = $sp) =~ s/\.jsonl\z//;
     }
     else {
-        $dir  = $p;
-        $main = "$p.jsonl";
+        $dir  = $sp;
+        $main = "$sp.jsonl";
     }
     my $subdir = "$dir/subagents";
 
@@ -1644,7 +1686,7 @@ sub derive_session {
     };
 
     my %session_cell_acc;
-    my %unpriced = ('model-not-in-table' => 0, 'cache-write-unsplit' => 0, 'non-standard-speed' => 0);
+    my %type_acc;   # token_type => {tokens,cost_usd,unpriced_tokens,reasons=>{}}
     my @agents;
     my @session_pairs;
 
@@ -1685,12 +1727,10 @@ sub derive_session {
         my %agent_cell_acc;
         for my $key (@$order) {
             my $req = $requests->{$key};
-            my ($cells, $deltas) = _session_price_request($req, $role);
+            my $cells = _session_price_request($req, $role, $pricing);
             _session_merge_cells(\%agent_cell_acc, $cells);
             _session_merge_cells(\%session_cell_acc, $cells);
-            for my $reason (keys %$deltas) {
-                $unpriced{$reason} += $deltas->{$reason};
-            }
+            _session_merge_by_type(\%type_acc, $cells);
         }
 
         my $anomaly = _session_agent_anomaly($order, $requests, $role);
@@ -1702,38 +1742,48 @@ sub derive_session {
             spawn_depth => $spawn_depth,
             description => $description,
             first_ts    => $first_ts,
-            cells       => _session_sorted_cells(\%agent_cell_acc),
+            cells       => _session_sorted_cells(\%agent_cell_acc, $pricing_not_ok),
             anomaly     => $anomaly,
         };
     }
 
-    my $session_cells = _session_sorted_cells(\%session_cell_acc);
+    my $session_cells = _session_sorted_cells(\%session_cell_acc, $pricing_not_ok);
 
+    # Accumulated from the UNROUNDED %type_acc (fed by the same per-request
+    # cells as %session_cell_acc), never by re-summing $session_cells'
+    # already-rounded per-cell figures (fix-batch review M1/redteam L8/n2 --
+    # a double-round). Rounding happens exactly once, below, at emission.
     my %totals;
     for my $type (qw(input output cache_write_5m cache_write_1h cache_read cache_write_unsplit)) {
-        $totals{$type} = { tokens => 0, cost_usd => 0, unpriced_tokens => 0 };
+        my $e = $type_acc{$type} // { tokens => 0, cost_usd => 0, unpriced_tokens => 0, reasons => {} };
+        # S1 (fix-batch review): null iff pricing_status ne 'ok' OR fully
+        # unpriced -- a zero-token type in an offline/unavailable document
+        # must never show a dollar zero.
+        my $fully_unpriced = $pricing_not_ok || ($e->{tokens} > 0 && $e->{unpriced_tokens} == $e->{tokens});
+        $totals{$type} = {
+            tokens => int($e->{tokens}),
+            api_equivalent_cost_usd => $fully_unpriced ? undef : 0 + sprintf('%.6f', $e->{cost_usd}),
+            unpriced_tokens => int($e->{unpriced_tokens}),
+            unpriced_reasons => _session_unpriced_reasons_array($e->{reasons}),
+        };
     }
-    # Accumulated from the UNROUNDED %session_cell_acc, not from $session_cells
-    # (whose cost_usd is already rounded to 6dp by _session_sorted_cells) --
-    # fix-batch review M1/redteam L8/n2: summing already-rounded per-cell
-    # figures and rounding the sum again is a double-round. Rounding happens
-    # exactly once, below, at final emission.
-    for my $c (values %session_cell_acc) {
-        $totals{ $c->{token_type} }{tokens}          += $c->{tokens};
-        $totals{ $c->{token_type} }{cost_usd}        += $c->{cost_usd};
-        $totals{ $c->{token_type} }{unpriced_tokens} += $c->{unpriced_tokens};
-    }
-    for my $type (keys %totals) {
-        $totals{$type}{cost_usd} = 0 + sprintf('%.6f', $totals{$type}{cost_usd});
+
+    my %unpriced = do { no warnings 'once'; map { $_ => 0 } @BpPricing::UNPRICED_REASONS };
+    for my $type (keys %type_acc) {
+        for my $reason (keys %{ $type_acc{$type}{reasons} }) {
+            $unpriced{$reason} += $type_acc{$type}{reasons}{$reason};
+        }
     }
 
     my $session_anomaly_total = 0;
     $session_anomaly_total += $_->{size} for @session_pairs;
 
     return {
-        cost_basis   => 'notional-api-equivalent',
-        price_source => $SESSION_PRICE_SOURCE,
-        price_as_of  => $SESSION_PRICE_AS_OF,
+        cost_basis        => 'fetched',
+        price_source      => $pricing->{source},
+        price_fetched_at  => $pricing->{fetched_at},
+        pricing_status    => BpPricing::status_string($pricing),
+        ($pricing->{price_fetch_override} ? (price_fetch_override => JSON::PP::true) : ()),
         cells        => $session_cells,
         totals       => \%totals,
         unpriced     => \%unpriced,
@@ -1746,6 +1796,70 @@ sub derive_session {
         record_counts => $record_counts,
         agents        => \@agents,
     };
+}
+
+# ---------------------------------------------------------------------------
+# _totals_grand(\%totals) -> ($tokens, $cost_usd, $unpriced_tokens, \@reasons)
+# -- sums derive_session's six totals.<type> entries into one grand figure,
+# for the text-mode TOTAL line (shared by derive-session and report-session).
+# ---------------------------------------------------------------------------
+sub _totals_grand {
+    my ($totals) = @_;
+    my ($tokens, $cost, $unpriced) = (0, 0, 0);
+    my %reasons;
+    for my $type (qw(input output cache_write_5m cache_write_1h cache_read cache_write_unsplit)) {
+        my $t = $totals->{$type};
+        $tokens   += $t->{tokens};
+        $cost     += ($t->{api_equivalent_cost_usd} // 0);
+        $unpriced += $t->{unpriced_tokens};
+        for my $r (@{ $t->{unpriced_reasons} }) { $reasons{ $r->{reason} } += $r->{tokens}; }
+    }
+    return ($tokens, $cost, $unpriced, _session_unpriced_reasons_array(\%reasons));
+}
+
+# ---------------------------------------------------------------------------
+# _fmt_tok_segment(\%type_to_tokens) -> "input=N cache_write_5m=N ..." (spec
+# Sec3.2's fixed TOK segment, always all six in this order).
+# ---------------------------------------------------------------------------
+sub _fmt_tok_segment {
+    my ($tok) = @_;
+    return join(' ', map { "$_=$tok->{$_}" } qw(input cache_write_5m cache_write_1h cache_write_unsplit cache_read output));
+}
+
+# ---------------------------------------------------------------------------
+# _fmt_pricing_header($doc) -> the "pricing: <P>" line's <P> (spec Sec3.2).
+# ---------------------------------------------------------------------------
+sub _fmt_pricing_header {
+    my ($doc, $long_context_note) = @_;
+    my $st = $doc->{pricing_status};
+    # S4 (fix-batch review): a leftover CCPRAXIS_SPEND_FETCH_CMD looks exactly
+    # like a real fetch otherwise, so a report run under the override always
+    # says so.
+    my $override_note = $doc->{price_fetch_override} ? ", fetched via override command" : '';
+    if ($st eq 'ok') {
+        my $line = "ok, source $doc->{price_source}, fetched-at $doc->{price_fetched_at}$override_note";
+        $line .= ", $long_context_note" if defined $long_context_note;
+        return $line;
+    }
+    return "offline (no fetch: --offline or CCPRAXIS_SPEND_NO_FETCH)" if $st eq 'offline';
+    my $line = $st;
+    $line .= ", source $doc->{price_source}" if defined $doc->{price_source};
+    $line .= $override_note;
+    return $line;
+}
+
+# ---------------------------------------------------------------------------
+# _fmt_cost_cell($pricing_status, $cost_usd, $unpriced_tokens, $tokens, \@reasons)
+# -> the COST grammar (spec Sec3.2).
+# ---------------------------------------------------------------------------
+sub _fmt_cost_cell {
+    my ($status, $cost, $unpriced, $tokens, $reasons) = @_;
+    return 'unavailable: offline' if $status eq 'offline';
+    return $status if $status =~ /^unavailable:/;
+    my $rtext = join(', ', map { "$_->{reason} $_->{tokens}" } @$reasons);
+    return sprintf('$%.6f', $cost // 0) if $unpriced == 0;
+    return sprintf('$%.6f + unpriced %d tokens (%s)', $cost // 0, $unpriced, $rtext) if $unpriced > 0 && $unpriced < $tokens;
+    return sprintf('unpriced %d tokens (%s)', $unpriced, $rtext);
 }
 
 # ===========================================================================
@@ -2288,11 +2402,14 @@ sub _valid_by_list {
 # ---------------------------------------------------------------------------
 sub report_session {
     my (%opts) = @_;
-    my $doc = derive_session(session => $opts{session});
+    my $pricing = $opts{pricing} // BpPricing::offline();
+    my $pricing_not_ok = $pricing->{status} ne 'ok';
+    my $doc = derive_session(session => $opts{session}, pricing => $pricing);
 
     my $by = $opts{by};
     $by = [@REPORT_DEFAULT_BY] unless defined $by;
     die "report_session: invalid --by dimension list\n" unless _valid_by_list($by);
+    my $type_in_by = grep { $_ eq 'token_type' } @$by;
 
     my ($data_root, $data_root_source) = resolve_data_root($opts{data_root}, $opts{session});
     my $records   = load_dispatch_records($data_root);
@@ -2321,19 +2438,35 @@ sub report_session {
                 $row = {};
                 for my $idx (0 .. $#$by) { $row->{ $by->[$idx] } = $vals[$idx]; }
                 $row->{tokens} = 0; $row->{cost_usd} = 0; $row->{unpriced_tokens} = 0;
+                $row->{reasons} = {};
+                $row->{by_type} = { map { $_ => 0 } @REPORT_TOKEN_TYPES };
                 $rows{$key} = $row;
             }
             $row->{tokens}          += $c->{tokens};
-            $row->{cost_usd}        += $c->{cost_usd};
+            $row->{cost_usd}        += ($c->{api_equivalent_cost_usd} // 0);
             $row->{unpriced_tokens} += $c->{unpriced_tokens};
+            $row->{by_type}{ $c->{token_type} } += $c->{tokens};
+            for my $r (@{ $c->{unpriced_reasons} }) { $row->{reasons}{ $r->{reason} } += $r->{tokens}; }
         }
     }
 
     my @rows = values %rows;
     for my $row (@rows) {
-        $row->{tokens}          = int($row->{tokens});
-        $row->{unpriced_tokens} = int($row->{unpriced_tokens});
-        $row->{cost_usd}        = 0 + sprintf('%.6f', $row->{cost_usd});
+        my $by_type = delete $row->{by_type};
+        unless ($type_in_by) {
+            $row->{input_tokens}              = $by_type->{input};
+            $row->{cache_write_5m_tokens}     = $by_type->{cache_write_5m};
+            $row->{cache_write_1h_tokens}     = $by_type->{cache_write_1h};
+            $row->{cache_write_unsplit_tokens} = $by_type->{cache_write_unsplit};
+            $row->{cache_read_tokens}         = $by_type->{cache_read};
+            $row->{output_tokens}             = $by_type->{output};
+        }
+        my $fully_unpriced = $pricing_not_ok || ($row->{tokens} > 0 && $row->{unpriced_tokens} == $row->{tokens});
+        $row->{tokens}                  = int($row->{tokens});
+        $row->{unpriced_tokens}         = int($row->{unpriced_tokens});
+        $row->{api_equivalent_cost_usd} = $fully_unpriced ? undef : 0 + sprintf('%.6f', $row->{cost_usd});
+        $row->{unpriced_reasons}        = _session_unpriced_reasons_array(delete $row->{reasons});
+        delete $row->{cost_usd};
     }
     @rows = sort {
         my $cmp = 0;
@@ -2369,9 +2502,11 @@ sub report_session {
     }
 
     return {
-        cost_basis   => 'notional-api-equivalent',
-        price_source => $SESSION_PRICE_SOURCE,
-        price_as_of  => $SESSION_PRICE_AS_OF,
+        cost_basis        => 'fetched',
+        price_source      => $pricing->{source},
+        price_fetched_at  => $pricing->{fetched_at},
+        pricing_status    => BpPricing::status_string($pricing),
+        ($pricing->{price_fetch_override} ? (price_fetch_override => JSON::PP::true) : ()),
         by           => [@$by],
         data_root    => $data_root,
         data_root_source => $data_root_source,
@@ -2580,7 +2715,8 @@ unless (caller) {
             exit 2;
         }
 
-        my $doc = eval { BpSpend::Derive::derive_session(session => $opt{session}) };
+        my $pricing = BpPricing::acquire(offline => $opt{offline} ? 1 : 0);
+        my $doc = eval { BpSpend::Derive::derive_session(session => $opt{session}, pricing => $pricing) };
         if ($@) {
             my $err = $@;
             # Match on the die message's CONTENT, not merely "any die happened"
@@ -2603,29 +2739,23 @@ unless (caller) {
         }
 
         my @type_order = qw(input output cache_write_5m cache_write_1h cache_read cache_write_unsplit);
-        print "derive-session: notional as-if-API-billed cost equivalent, not an actual charge\n";
+        print "derive-session: token counts by type; API equivalent cost from Anthropic's published prices, not an actual charge\n";
         print "session: $doc->{agents}[0]{path}\n";
-        print "price-source: $doc->{price_source} (as-of $doc->{price_as_of})\n";
+        print "pricing: " . BpSpend::Derive::_fmt_pricing_header($doc, $pricing->{long_context}{note}) . "\n";
         print "requests: $doc->{record_counts}{requests}  assistant-records: $doc->{record_counts}{assistant_records}  agents: "
             . scalar(@{ $doc->{agents} }) . "\n";
-        my $grand_total_cost   = 0;
-        my $grand_total_tokens = 0;
         for my $type (@type_order) {
             my $t = $doc->{totals}{$type};
-            # sprintf('%.6f', ...) directly, no `+ 0` (fix-batch redteam L7) --
-            # a tiny dollar amount stringifies as exponent notation (e.g.
-            # `5e-05`) once coerced back to a number; this is TEXT-MODE DISPLAY
-            # ONLY and never touches the JSON-mode numeric value in $doc.
-            printf "total %s: %s tokens, \$%.6f notional as-if-API-billed, unpriced %s tokens\n",
-                $type, $t->{tokens}, $t->{cost_usd}, $t->{unpriced_tokens};
-            $grand_total_cost   += $t->{cost_usd};
-            $grand_total_tokens += $t->{tokens};
+            my $ct = BpSpend::Derive::_fmt_cost_cell($doc->{pricing_status}, $t->{api_equivalent_cost_usd},
+                $t->{unpriced_tokens}, $t->{tokens}, $t->{unpriced_reasons});
+            print "total $type: $t->{tokens} tokens, api_equivalent_cost=$ct\n";
         }
-        printf "TOTAL: \$%.6f notional as-if-API-billed across %s tokens\n",
-            $grand_total_cost, $grand_total_tokens;
-        print "unpriced: model-not-in-table $doc->{unpriced}{'model-not-in-table'}, "
-            . "cache-write-unsplit $doc->{unpriced}{'cache-write-unsplit'}, "
-            . "non-standard-speed $doc->{unpriced}{'non-standard-speed'}\n";
+        my ($gt, $gc, $gu, $gr) = BpSpend::Derive::_totals_grand($doc->{totals});
+        my $gtok = { map { $_ => $doc->{totals}{$_}{tokens} } qw(input cache_write_5m cache_write_1h cache_write_unsplit cache_read output) };
+        my $gct = BpSpend::Derive::_fmt_cost_cell($doc->{pricing_status}, $gc, $gu, $gt, $gr);
+        print "TOTAL: $gt tokens, " . BpSpend::Derive::_fmt_tok_segment($gtok) . ", api_equivalent_cost=$gct\n";
+        print "unpriced: " . join(', ', map { "$_ $doc->{unpriced}{$_}" }
+            qw(unknown-model cache-write-unsplit non-standard-speed rate-missing offline pricing-unavailable)) . "\n";
         print "anomaly consecutive-same-size-cache-write: count $doc->{anomaly}{count}, total_tokens $doc->{anomaly}{total_tokens}\n";
 
         # Surface the six diagnostic counters in text mode too (fix-batch
@@ -2674,10 +2804,12 @@ unless (caller) {
             }
         }
 
+        my $pricing = BpPricing::acquire(offline => $opt{offline} ? 1 : 0);
         my $doc = eval {
             BpSpend::Derive::report_session(
                 session   => $opt{session},
                 data_root => $opt{data_root},
+                pricing   => $pricing,
                 (@by_dims ? (by => \@by_dims) : ()),
             );
         };
@@ -2697,22 +2829,36 @@ unless (caller) {
             exit 0;
         }
 
-        print "report-session: notional as-if-API-billed cost equivalent, not an actual charge\n";
+        print "report-session: token counts by type; API equivalent cost from Anthropic's published prices, not an actual charge\n";
         print "session: $doc->{attribution}{agents}[0]{path}\n";
         print "data-root: $doc->{data_root} (from $doc->{data_root_source})\n";
-        print "price-source: $doc->{price_source} (as-of $doc->{price_as_of})\n";
+        print "pricing: " . BpSpend::Derive::_fmt_pricing_header($doc, $pricing->{long_context}{note}) . "\n";
         print "by: " . join(',', @{ $doc->{by} }) . "\n";
 
-        my $grand_cost   = 0;
-        my $grand_tokens = 0;
+        my $type_in_by = grep { $_ eq 'token_type' } @{ $doc->{by} };
         for my $row (@{ $doc->{rows} }) {
             my @parts = map { "$_=$row->{$_}" } @{ $doc->{by} };
-            printf "row: %s | %s tokens, \$%.6f notional as-if-API-billed, unpriced %s tokens\n",
-                join(' ', @parts), $row->{tokens}, $row->{cost_usd}, $row->{unpriced_tokens};
-            $grand_cost   += $row->{cost_usd};
-            $grand_tokens += $row->{tokens};
+            my %tok;
+            if ($type_in_by) {
+                %tok = map { $_ => 0 } qw(input cache_write_5m cache_write_1h cache_write_unsplit cache_read output);
+                $tok{ $row->{token_type} } = $row->{tokens};
+            }
+            else {
+                %tok = (
+                    input => $row->{input_tokens}, cache_write_5m => $row->{cache_write_5m_tokens},
+                    cache_write_1h => $row->{cache_write_1h_tokens}, cache_write_unsplit => $row->{cache_write_unsplit_tokens},
+                    cache_read => $row->{cache_read_tokens}, output => $row->{output_tokens},
+                );
+            }
+            my $ct = BpSpend::Derive::_fmt_cost_cell($doc->{pricing_status}, $row->{api_equivalent_cost_usd},
+                $row->{unpriced_tokens}, $row->{tokens}, $row->{unpriced_reasons});
+            printf "row: %s | %s tokens, %s, api_equivalent_cost=%s\n",
+                join(' ', @parts), $row->{tokens}, BpSpend::Derive::_fmt_tok_segment(\%tok), $ct;
         }
-        printf "TOTAL: \$%.6f notional as-if-API-billed across %s tokens\n", $grand_cost, $grand_tokens;
+        my ($gt, $gc, $gu, $gr) = BpSpend::Derive::_totals_grand($doc->{totals});
+        my $gtok = { map { $_ => $doc->{totals}{$_}{tokens} } qw(input cache_write_5m cache_write_1h cache_write_unsplit cache_read output) };
+        my $gct = BpSpend::Derive::_fmt_cost_cell($doc->{pricing_status}, $gc, $gu, $gt, $gr);
+        print "TOTAL: $gt tokens, " . BpSpend::Derive::_fmt_tok_segment($gtok) . ", api_equivalent_cost=$gct\n";
 
         my $sum_types = sub {
             my ($map) = @_;

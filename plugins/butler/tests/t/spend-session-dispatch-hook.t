@@ -26,6 +26,9 @@ use File::Path qw(make_path);
 use File::Basename qw(dirname);
 use File::Find ();
 
+# spend-token-report Decision 16: never let this test reach a live fetch.
+$ENV{CCPRAXIS_SPEND_NO_FETCH} = 1;
+
 my $SPEND_PL = "$Bin/../../scripts/bp-spend.pl";
 ok(-f $SPEND_PL, 'bp-spend.pl exists') or BAIL_OUT('nothing to test');
 ok(eval { require $SPEND_PL; 1 }, 'bp-spend.pl loads as a module') or BAIL_OUT("require: $@");

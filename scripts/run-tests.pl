@@ -365,6 +365,9 @@ require File::Spec->catfile($ROOT_ABS, qw(plugins butler tests lib TestPlatform.
 # whoever adds the next test having read the rule.
 $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
 
+# spend-token-report Decision 8: no sweep ever performs a live pricing fetch.
+$ENV{CCPRAXIS_SPEND_NO_FETCH} = 1;
+
 # RunTestsContainerLane -- package 05's run-tests-container.pl, required into
 # an ISOLATED namespace rather than main:: (blueprint test-platform-split,
 # package 06-route-by-marker, spec section 2.3). Neither file declares its own
@@ -740,6 +743,8 @@ sub run_one {
     $ENV{BUTLER_STATE_DIR}                  = File::Spec->catdir($sandbox, '.claude', 'butler-state');
     $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR}    = File::Spec->catdir($sandbox, 'active');
     $ENV{CCPRAXIS_NO_WAKELOCK}              = 1;
+    # spend-token-report Decision 8: no per-file sandbox ever performs a live pricing fetch.
+    $ENV{CCPRAXIS_SPEND_NO_FETCH}           = 1;
 
     # FIX-BATCH M2 (review, step 7): GIT_CONFIG_GLOBAL used to point straight
     # at the operator's REAL ~/.gitconfig -- git has no read-only mode for

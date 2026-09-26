@@ -31,11 +31,59 @@ use Test::More;
 use JSON::PP;
 use POSIX qw(strftime);
 
+# spend-token-report Decision 16: never let this test reach a live fetch.
+$ENV{CCPRAXIS_SPEND_NO_FETCH} = 1;
+
 my $SPEND_PL = "$Bin/../../scripts/bp-spend.pl";
 ok(-f $SPEND_PL, 'bp-spend.pl exists') or BAIL_OUT('nothing to test');
 
 my $PERL = $^X;
 my $JSON = JSON::PP->new->canonical;
+
+# Canonical F-MD fixture (spec §4.3), used only by AC15 to get real dollar
+# figures via CCPRAXIS_SPEND_PRICING_FILE (a no-network convenience ahead of
+# the NO_FETCH offline check, Decision 16).
+my $F_MD = <<'MD';
+# Pricing
+
+Learn about Anthropic's pricing structure for models and features.
+
+## Model pricing
+
+The following table shows pricing for all Claude models.
+
+| Model | Base Input Tokens | 5m Cache Writes | 1h Cache Writes | Cache Hits & Refreshes | Output Tokens |
+|---|---|---|---|---|---|
+| Claude Opus 5.5 | $4 / MTok | $5 / MTok | $8 / MTok | $0.20 / MTok | $20 / MTok |
+| Claude Sonnet 5 | $2 / MTok | $2.50 / MTok | $4 / MTok | $0.20 / MTok | $10 / MTok |
+| Claude Fable 5.1 | $10 / MTok | $12.50 / MTok | $20 / MTok | $0.25 / MTok | $50 / MTok |
+| Claude Haiku 4.5 (`claude-haiku-4-5-20251001`) | $1 / MTok | $1.25 / MTok | $2 / MTok | $0.10 / MTok | $5 / MTok |
+| Claude Opus 5 ([deprecated](/docs/en/about-claude/model-deprecations)) | $5 / MTok | $6.25 / MTok | $10 / MTok | $0.50 / MTok | $25 / MTok |
+| `claude-test-9` | $3 / MTok | $3.75 / MTok | Not available | $0.30 / MTok | $15 / MTok |
+
+## Batch processing
+
+| Model | Batch input | Batch output |
+|---|---|---|
+| Claude Opus 5.5 | $2 / MTok | $10 / MTok |
+| Claude Sonnet 5 | $1 / MTok | $5 / MTok |
+
+## Long context pricing
+
+When using the 1M token context window, requests that exceed 200K input tokens are charged at long context rates. The 200K threshold is based on input tokens, including cache reads and writes.
+
+| Model | Input (<= 200K) | Input (> 200K) | Output (<= 200K) | Output (> 200K) |
+|---|---|---|---|---|
+| Claude Opus 5.5 | $4 / MTok | $8 / MTok | $20 / MTok | $30 / MTok |
+
+Prompt caching multipliers apply on top of long context rates.
+
+## Fast mode pricing
+
+| Model | Input | Output |
+|---|---|---|
+| Claude Opus 5.5 | $24 / MTok | $120 / MTok |
+MD
 
 # ---------------------------------------------------------------------------
 # CLI helper
@@ -926,16 +974,26 @@ subtest 'AC14: report-session (text and --json) leaves BOTH the session tree and
 };
 
 # ===========================================================================
-# AC15 (criterion 7 / DC7, B10/B11) -- labeling, text and --json.
+# AC15 (criterion 7 / DC7, B10/B11) -- replaced per Decision 11/14/16/18/21:
+# "notional as-if-API-billed" is gone, replaced by §3.2's api_equivalent_cost=
+# grammar; price_as_of is replaced by price_fetched_at; CCPRAXIS_SPEND_
+# PRICING_FILE supplies F-MD so real dollar figures exist under this file's
+# NO_FETCH=1 guard (a fixture file read is not a fetch, Decision 16).
 # ===========================================================================
-subtest 'AC15: every $-digit text line self-labels; no exponent notation; --json echoes cost_basis/price_source/price_as_of' => sub {
+subtest 'AC15: every $-digit text line self-labels with api_equivalent_cost=; no exponent notation; --json echoes cost_basis/price_source/price_fetched_at/pricing_status' => sub {
     my ($main, $data_root) = build_mixed_fixture();
+    my $mdfile = File::Spec->catfile(tempdir(CLEANUP => 1), 'F-MD.md');
+    open(my $fh, '>:raw', $mdfile) or die $!;
+    print $fh $F_MD;
+    close $fh;
+    local $ENV{CCPRAXIS_SPEND_PRICING_FILE} = $mdfile;
+
     my ($rc, $out) = run_spend('report-session', '--session', $main, '--data-root', $data_root);
     is($rc, 0, 'AC15: text mode exits 0') or diag($out);
     my @lines = split(/\n/, $out);
-    my @missing = grep { /\$\d/ && !/notional as-if-API-billed/ } @lines;
-    is_deeply(\@missing, [], 'AC15: every line with $<digit> also says "notional as-if-API-billed"') or diag(join("\n", @missing));
-    like($lines[0] // '', qr/notional as-if-API-billed/, 'AC15: the first line states the cost basis');
+    my @missing = grep { /\$\d/ && !/api_equivalent_cost=/ } @lines;
+    is_deeply(\@missing, [], 'AC15: every line with $<digit> also says "api_equivalent_cost="') or diag(join("\n", @missing));
+    like($lines[0] // '', qr/API equivalent cost/, 'AC15: the first line states the cost basis');
     my @exp = grep { /\$\d+(?:\.\d+)?e[-+]?\d+/i } @lines;
     is_deeply(\@exp, [], 'AC15: no dollar figure renders in exponent notation');
 
@@ -944,10 +1002,11 @@ subtest 'AC15: every $-digit text line self-labels; no exponent notation; --json
     my $doc = eval { JSON::PP->new->decode($out2) };
     ok($doc, 'AC15: --json stdout parses') or diag($out2);
   SKIP: {
-        skip 'AC15: doc unavailable', 3 unless $doc;
-        is($doc->{cost_basis}, 'notional-api-equivalent', 'AC15: cost_basis is the exact literal');
-        is($doc->{price_source}, 'https://platform.claude.com/docs/en/about-claude/pricing', 'AC15: price_source echoed');
-        is($doc->{price_as_of}, '2026-09-23', 'AC15: price_as_of echoed');
+        skip 'AC15: doc unavailable', 4 unless $doc;
+        is($doc->{cost_basis}, 'fetched', 'AC15: cost_basis is the exact literal "fetched"');
+        is($doc->{price_source}, "file:$mdfile", 'AC15: price_source is file:<path>');
+        is($doc->{pricing_status}, 'ok', 'AC15: pricing_status ok when the fixture file parses');
+        like($doc->{price_fetched_at}, qr/\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\z/, 'AC15: price_fetched_at is an ISO timestamp');
     }
 };
 
@@ -994,8 +1053,8 @@ subtest 'AC17: derive-session/derive-package fleet-path behaviours are unaffecte
     my ($rc, $out) = run_spend('derive-session', '--session', $main, '--json');
     is($rc, 0, 'AC17: derive-session --json still exits 0') or diag($out);
     my $doc = eval { JSON::PP->new->decode($out) };
-    is_deeply([sort keys %$doc], [sort qw(cost_basis price_source price_as_of cells totals unpriced anomaly record_counts agents)],
-        'AC17: derive-session still produces package 01\'s exact nine-key document') if $doc;
+    is_deeply([sort keys %$doc], [sort qw(cost_basis price_source price_fetched_at pricing_status cells totals unpriced anomaly record_counts agents)],
+        'AC17: derive-session still produces the exact 10-key document of spec §3.1') if $doc;
 
     write_jsonl(File::Spec->catfile($dir, 'runs', 'pkgAC17.jsonl'),
         { type => 'system', subtype => 'init', session_id => 'sess-1', model => 'claude-sonnet-5' },
@@ -1034,15 +1093,20 @@ subtest 'AC18: --json top-level/row/attribution.agents key sets exact; library =
   SKIP: {
         skip 'AC18: report_session/CLI unavailable', 4 unless ($doc && $cli_doc);
         # data_root_source added 2026-09-23 with the session-cwd default: a
-        # defaulted data root now says which rule chose it.
-        is_deeply([sort keys %$doc], [sort qw(cost_basis price_source price_as_of by data_root data_root_source rows totals attribution)],
-            'AC18: top-level key set is EXACTLY the eight keys of §2.7 plus data_root_source');
+        # defaulted data root now says which rule chose it. price_as_of ->
+        # price_fetched_at, plus pricing_status, per spec §3.1 (Decisions 11, 18).
+        is_deeply([sort keys %$doc], [sort qw(cost_basis price_source price_fetched_at pricing_status by data_root data_root_source rows totals attribution)],
+            'AC18: top-level key set is EXACTLY the 10 keys of spec §3.1');
         is($doc->{data_root_source}, 'explicit', 'AC18: an explicit --data-root reports source explicit');
         my $bad_rows = 0;
         for my $r (@{ $doc->{rows} }) {
-            $bad_rows++ unless join(',', sort keys %$r) eq join(',', sort (qw(role model tokens cost_usd unpriced_tokens)));
+            $bad_rows++ unless join(',', sort keys %$r) eq join(',', sort (qw(
+                role model tokens api_equivalent_cost_usd unpriced_tokens unpriced_reasons
+                input_tokens cache_write_5m_tokens cache_write_1h_tokens
+                cache_write_unsplit_tokens cache_read_tokens output_tokens
+            )));
         }
-        is($bad_rows, 0, 'AC18: every row\'s key set is exactly the selected dims plus tokens/cost_usd/unpriced_tokens');
+        is($bad_rows, 0, 'AC18: every row\'s key set is exactly the selected dims plus tokens/api_equivalent_cost_usd/unpriced_tokens/unpriced_reasons and the six *_tokens keys (token_type is not in --by here, spec §3.1)');
 
         my ($dsdoc) = call_derive_session(session => $main);
         is(scalar(@{ $doc->{attribution}{agents} }), scalar(@{ $dsdoc->{agents} }),

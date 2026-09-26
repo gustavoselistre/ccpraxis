@@ -27,6 +27,9 @@ use File::Path qw(make_path);
 use Test::More;
 use JSON::PP;
 
+# spend-token-report Decision 16: never let this test reach a live fetch.
+$ENV{CCPRAXIS_SPEND_NO_FETCH} = 1;
+
 my $SPEND_PL  = "$Bin/../../scripts/bp-spend.pl";
 ok(-f $SPEND_PL, 'bp-spend.pl exists') or BAIL_OUT('nothing to test');
 
@@ -390,36 +393,78 @@ subtest 'AC6: a cache_creation split types 5m/1h separately; an unsplit figure n
 };
 
 # ===========================================================================
-# AC7 (criterion 5 / DC5, §2.4) — the price table itself.
+# AC7 (criterion 5 / DC5, §2.4) — replaced per Decision 14/10/18: the pinned
+# session_price_table() is gone; BpPricing::parse_document is the oracle for
+# per-model rates now, exercised on the spec's canonical F-MD fixture.
 # ===========================================================================
+my $F_MD = <<'MD';
+# Pricing
+
+Learn about Anthropic's pricing structure for models and features.
+
+## Model pricing
+
+The following table shows pricing for all Claude models.
+
+| Model | Base Input Tokens | 5m Cache Writes | 1h Cache Writes | Cache Hits & Refreshes | Output Tokens |
+|---|---|---|---|---|---|
+| Claude Opus 5.5 | $4 / MTok | $5 / MTok | $8 / MTok | $0.20 / MTok | $20 / MTok |
+| Claude Sonnet 5 | $2 / MTok | $2.50 / MTok | $4 / MTok | $0.20 / MTok | $10 / MTok |
+| Claude Fable 5.1 | $10 / MTok | $12.50 / MTok | $20 / MTok | $0.25 / MTok | $50 / MTok |
+| Claude Haiku 4.5 (`claude-haiku-4-5-20251001`) | $1 / MTok | $1.25 / MTok | $2 / MTok | $0.10 / MTok | $5 / MTok |
+| Claude Opus 5 ([deprecated](/docs/en/about-claude/model-deprecations)) | $5 / MTok | $6.25 / MTok | $10 / MTok | $0.50 / MTok | $25 / MTok |
+| `claude-test-9` | $3 / MTok | $3.75 / MTok | Not available | $0.30 / MTok | $15 / MTok |
+
+## Batch processing
+
+| Model | Batch input | Batch output |
+|---|---|---|
+| Claude Opus 5.5 | $2 / MTok | $10 / MTok |
+| Claude Sonnet 5 | $1 / MTok | $5 / MTok |
+
+## Long context pricing
+
+When using the 1M token context window, requests that exceed 200K input tokens are charged at long context rates. The 200K threshold is based on input tokens, including cache reads and writes.
+
+| Model | Input (<= 200K) | Input (> 200K) | Output (<= 200K) | Output (> 200K) |
+|---|---|---|---|---|
+| Claude Opus 5.5 | $4 / MTok | $8 / MTok | $20 / MTok | $30 / MTok |
+
+Prompt caching multipliers apply on top of long context rates.
+
+## Fast mode pricing
+
+| Model | Input | Output |
+|---|---|---|
+| Claude Opus 5.5 | $24 / MTok | $120 / MTok |
+MD
+
 my @REQUIRED_IDS = qw(
     claude-opus-5-5 claude-sonnet-5 claude-fable-5-1
-    claude-haiku-4-5-20251001 claude-opus-5
+    claude-haiku-4-5 claude-opus-5
 );
 my %EXPECTED_RATES = (
-    'claude-opus-5-5'           => { input => 4,  output => 20, cache_write_5m => 5,     cache_write_1h => 8,  cache_read => 0.20 },
-    'claude-sonnet-5'           => { input => 2,  output => 10, cache_write_5m => 2.50,  cache_write_1h => 4,  cache_read => 0.20 },
-    'claude-fable-5-1'          => { input => 10, output => 50, cache_write_5m => 12.50, cache_write_1h => 20, cache_read => 0.25 },
-    'claude-haiku-4-5-20251001' => { input => 1,  output => 5,  cache_write_5m => 1.25,  cache_write_1h => 2,  cache_read => 0.10 },
-    'claude-opus-5'             => { input => 5,  output => 25, cache_write_5m => 6.25,  cache_write_1h => 10, cache_read => 0.50 },
+    'claude-opus-5-5'  => { input => 4,  output => 20, cache_write_5m => 5,     cache_write_1h => 8,  cache_read => 0.20 },
+    'claude-sonnet-5'  => { input => 2,  output => 10, cache_write_5m => 2.50,  cache_write_1h => 4,  cache_read => 0.20 },
+    'claude-fable-5-1' => { input => 10, output => 50, cache_write_5m => 12.50, cache_write_1h => 20, cache_read => 0.25 },
+    'claude-haiku-4-5' => { input => 1,  output => 5,  cache_write_5m => 1.25,  cache_write_1h => 2,  cache_read => 0.10 },
+    'claude-opus-5'    => { input => 5,  output => 25, cache_write_5m => 6.25,  cache_write_1h => 10, cache_read => 0.50 },
 );
 
-subtest 'AC7: session_price_table() reports source/as-of and exact per-model rates' => sub {
-    my ($t, $err) = call_price_table();
-    ok(!$err, 'AC7: session_price_table does not die') or diag($err);
+subtest 'AC7 (replaced): BpPricing::parse_document(F-MD) yields exact rates for the five ids, keyed by normalised id' => sub {
+    my $p = eval { BpPricing::parse_document($F_MD, source => 'file:F-MD', fetched_at => '2026-09-26T00:00:00Z') };
+    my $err = $@;
+    ok(!$err, 'AC7: parse_document does not die') or diag($err);
   SKIP: {
-        skip 'AC7: session_price_table unavailable', 4 unless $t;
-        is($t->{source}, 'https://platform.claude.com/docs/en/about-claude/pricing', 'AC7: price_source URL exact');
-        is($t->{as_of}, '2026-09-23', 'AC7: price_as_of exact');
-        my @missing_required = grep {
-            !( exists $t->{prices}{$_} xor exists $t->{missing}{$_} )
-        } @REQUIRED_IDS;
-        is_deeply(\@missing_required, [], 'AC7: every required id is in EXACTLY ONE of prices/missing');
+        skip 'AC7: parse_document unavailable', 3 unless $p;
+        is($p->{status}, 'ok', 'AC7: F-MD parses to status ok') or diag($JSON->encode($p));
+        my @missing_required = grep { !exists $p->{models}{$_} } @REQUIRED_IDS;
+        is_deeply(\@missing_required, [], 'AC7: every required id (normalised) is a key of models');
         my @bad;
         for my $id (@REQUIRED_IDS) {
-            next unless exists $t->{prices}{$id};
+            next unless exists $p->{models}{$id};
             my $want = $EXPECTED_RATES{$id};
-            my $got  = $t->{prices}{$id};
+            my $got  = $p->{models}{$id};
             for my $k (qw(input output cache_write_5m cache_write_1h cache_read)) {
                 push @bad, "$id.$k" unless defined($got->{$k}) && $got->{$k} > 0 && $got->{$k} == $want->{$k};
             }
@@ -430,9 +475,13 @@ subtest 'AC7: session_price_table() reports source/as-of and exact per-model rat
 };
 
 # ===========================================================================
-# AC8 (criterion 5 / DC5, B8/B9) — unpriced reasons, exactly one per amount.
+# AC8 (criterion 5 / DC5, B8/B9) — renamed per Decision 10/14: model-not-in-
+# table is now unknown-model, cost_usd is now api_equivalent_cost_usd (undef,
+# never a $0 guess), and pricing is supplied explicitly (offline is the
+# NO_FETCH default; this passes F-MD explicitly so the reasons are exercised
+# against real rates, not blanket offline).
 # ===========================================================================
-subtest 'AC8: model-not-in-table, cache-write-unsplit and non-standard-speed each degrade to $0, counted once' => sub {
+subtest 'AC8: unknown-model, cache-write-unsplit and non-standard-speed each stay unpriced, counted once' => sub {
     my $dir = tempdir(CLEANUP => 1);
     my ($main) = session_paths($dir, 'sess-ac8');
     # Cells are keyed by (role, model, effort, token_type) per spec Sec2.5 -- each
@@ -453,17 +502,18 @@ subtest 'AC8: model-not-in-table, cache-write-unsplit and non-standard-speed eac
         assistant_rec(request_id => 'req-standard', model => 'claude-sonnet-5',
             effort => 'e-standard', input => 10, output => 10),
     );
-    my ($doc, $err) = call_derive_session(session => $main);
+    my $pricing = eval { BpPricing::parse_document($F_MD, source => 'file:F-MD', fetched_at => '2026-09-26T00:00:00Z') };
+    my ($doc, $err) = call_derive_session(session => $main, pricing => $pricing);
     ok(!$err, 'AC8: derive_session does not die') or diag($err);
   SKIP: {
         skip 'AC8: derive_session unavailable', 6 unless $doc;
-        is($doc->{unpriced}{'model-not-in-table'}, 1000 + 1, 'AC8: unknown-model tokens (input+output) land under model-not-in-table');
+        is($doc->{unpriced}{'unknown-model'}, 1000 + 1, 'AC8: unknown-model tokens (input+output) land under unknown-model');
         is($doc->{unpriced}{'cache-write-unsplit'}, 500, 'AC8: unsplit cache-write tokens land under cache-write-unsplit');
         is($doc->{unpriced}{'non-standard-speed'}, 200 + 300, 'AC8: ALL tokens of a non-standard-speed request are unpriced');
         ok($doc->{record_counts}{speed_absent} >= 3, 'AC8: every record lacking usage.speed increments speed_absent');
         my ($fast_cell) = grep { $_->{token_type} eq 'output' && $_->{tokens} == 300 } @{ $doc->{cells} };
-        is($fast_cell->{cost_usd}, 0, 'AC8: the non-standard-speed request contributes $0');
-        my $reason_sum = $doc->{unpriced}{'model-not-in-table'} + $doc->{unpriced}{'cache-write-unsplit'} + $doc->{unpriced}{'non-standard-speed'};
+        ok(!defined($fast_cell->{api_equivalent_cost_usd}), 'AC8: the non-standard-speed request is undef, never a $0 guess');
+        my $reason_sum = $doc->{unpriced}{'unknown-model'} + $doc->{unpriced}{'cache-write-unsplit'} + $doc->{unpriced}{'non-standard-speed'};
         my $totals_unpriced_sum = 0;
         $totals_unpriced_sum += $_->{unpriced_tokens} for values %{ $doc->{totals} };
         is($reason_sum, $totals_unpriced_sum, 'AC8: the three unpriced reasons sum to sum(totals[*].unpriced_tokens)');
@@ -480,20 +530,21 @@ subtest 'AC9: 1,000,000 input tokens on claude-sonnet-5 costs exactly $2; sessio
     write_jsonl($main,
         assistant_rec(model => 'claude-sonnet-5', effort => 'high', input => 1_000_000, output => 0),
     );
-    my ($doc, $err) = call_derive_session(session => $main);
+    my $pricing = eval { BpPricing::parse_document($F_MD, source => 'file:F-MD', fetched_at => '2026-09-26T00:00:00Z') };
+    my ($doc, $err) = call_derive_session(session => $main, pricing => $pricing);
     ok(!$err, 'AC9: derive_session does not die') or diag($err);
   SKIP: {
         skip 'AC9: derive_session unavailable', 3 unless $doc;
         my ($cell) = grep { $_->{token_type} eq 'input' } @{ $doc->{cells} };
-        ok($cell, 'AC9: an input cell exists') and is($cell->{cost_usd}, 2, 'AC9: cell cost_usd == 2.00 exactly (2 $/MTok * 1M)');
-        is($doc->{totals}{input}{cost_usd}, 2, 'AC9: totals.input.cost_usd == 2.00 exactly');
+        ok($cell, 'AC9: an input cell exists') and is($cell->{api_equivalent_cost_usd}, 2, 'AC9: cell api_equivalent_cost_usd == 2.00 exactly (2 $/MTok * 1M)');
+        is($doc->{totals}{input}{api_equivalent_cost_usd}, 2, 'AC9: totals.input.api_equivalent_cost_usd == 2.00 exactly');
 
         my %agent_sum;
         for my $agent (@{ $doc->{agents} }) {
             for my $c (@{ $agent->{cells} }) {
                 my $key = join("\x1f", $c->{role}, $c->{model}, $c->{effort}, $c->{token_type});
                 $agent_sum{$key}{tokens}          += $c->{tokens};
-                $agent_sum{$key}{cost_usd}        += $c->{cost_usd};
+                $agent_sum{$key}{cost_usd}        += ($c->{api_equivalent_cost_usd} // 0);
                 $agent_sum{$key}{unpriced_tokens} += $c->{unpriced_tokens};
             }
         }
@@ -502,7 +553,7 @@ subtest 'AC9: 1,000,000 input tokens on claude-sonnet-5 costs exactly $2; sessio
             my $key = join("\x1f", $c->{role}, $c->{model}, $c->{effort}, $c->{token_type});
             my $want = $agent_sum{$key} // { tokens => 0, cost_usd => 0, unpriced_tokens => 0 };
             $mismatch++ unless $c->{tokens} == $want->{tokens}
-                            && abs($c->{cost_usd} - $want->{cost_usd}) < 1e-9
+                            && abs(($c->{api_equivalent_cost_usd} // 0) - $want->{cost_usd}) < 1e-9
                             && $c->{unpriced_tokens} == $want->{unpriced_tokens};
         }
         is($mismatch, 0, 'AC9: every session cell equals the element-wise sum of agents[].cells');
@@ -510,30 +561,41 @@ subtest 'AC9: 1,000,000 input tokens on claude-sonnet-5 costs exactly $2; sessio
 };
 
 # ===========================================================================
-# AC10 (criterion 6 / DC6, B14/B15) — text and --json labeling.
+# AC10 (criterion 6 / DC6, B14/B15) — replaced per Decision 11/14/16/18/21:
+# the "notional as-if-API-billed" label is gone (§3.2's api_equivalent_cost=
+# grammar governs instead), and price_as_of is replaced by price_fetched_at.
+# Run with CCPRAXIS_SPEND_PRICING_FILE=F-MD so dollar lines actually exist
+# (this test's own NO_FETCH=1 would otherwise make every cost "unavailable").
 # ===========================================================================
-subtest 'AC10: text-mode dollar lines self-label; --json echoes cost_basis/price_source/price_as_of' => sub {
+subtest 'AC10: text-mode dollar lines self-label with api_equivalent_cost=; --json echoes cost_basis/price_source/price_fetched_at/pricing_status' => sub {
     my $dir = tempdir(CLEANUP => 1);
     my ($main) = session_paths($dir, 'sess-ac10');
     write_jsonl($main, assistant_rec(model => 'claude-sonnet-5', input => 1000, output => 1000));
 
+    my $mdfile = File::Spec->catfile($dir, 'F-MD.md');
+    open(my $fh, '>:raw', $mdfile) or die $!;
+    print $fh $F_MD;
+    close $fh;
+    local $ENV{CCPRAXIS_SPEND_PRICING_FILE} = $mdfile;
+
     my ($rc, $out) = run_spend('derive-session', '--session', $main);
     is($rc, 0, 'AC10 text: exits 0') or diag($out);
     my @lines = split(/\n/, $out);
-    my @dollar_lines_missing_label = grep { /\$\d/ && !/notional as-if-API-billed/ } @lines;
-    is_deeply(\@dollar_lines_missing_label, [], 'AC10: every line with $<digit> also says "notional as-if-API-billed"')
+    my @dollar_lines_missing_label = grep { /\$\d/ && !/api_equivalent_cost=/ } @lines;
+    is_deeply(\@dollar_lines_missing_label, [], 'AC10: every line with $<digit> also says "api_equivalent_cost="')
         or diag(join("\n", @dollar_lines_missing_label));
-    like($lines[0] // '', qr/notional as-if-API-billed/, 'AC10: the FIRST line states the cost basis');
+    like($lines[0] // '', qr/API equivalent cost/, 'AC10: the FIRST line states the cost basis');
 
     my ($rc2, $out2) = run_spend('derive-session', '--session', $main, '--json');
     is($rc2, 0, 'AC10 json: exits 0') or diag($out2);
     my $doc = eval { JSON::PP->new->decode($out2) };
     ok($doc, 'AC10 json: stdout parses as JSON') or diag($out2);
   SKIP: {
-        skip 'AC10 json: doc unavailable', 3 unless $doc;
-        is($doc->{cost_basis}, 'notional-api-equivalent', 'AC10: cost_basis is the exact literal');
-        is($doc->{price_source}, 'https://platform.claude.com/docs/en/about-claude/pricing', 'AC10: price_source echoed');
-        is($doc->{price_as_of}, '2026-09-23', 'AC10: price_as_of echoed');
+        skip 'AC10 json: doc unavailable', 4 unless $doc;
+        is($doc->{cost_basis}, 'fetched', 'AC10: cost_basis is the exact literal "fetched"');
+        is($doc->{price_source}, "file:$mdfile", 'AC10: price_source is file:<path>');
+        is($doc->{pricing_status}, 'ok', 'AC10: pricing_status ok when the fixture file parses');
+        like($doc->{price_fetched_at}, qr/\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\z/, 'AC10: price_fetched_at is an ISO timestamp');
     }
 };
 
@@ -583,15 +645,15 @@ subtest 'AC12: exact top-level/agent/totals/unpriced/record_counts key sets; lib
         skip 'AC12: derive_session/CLI unavailable', 8 unless ($doc && $cli_doc);
         is_deeply(
             [ sort keys %$doc ],
-            [ sort qw(cost_basis price_source price_as_of cells totals unpriced anomaly record_counts agents) ],
-            'AC12: top-level key set is EXACTLY the nine keys of §2.5'
+            [ sort qw(cost_basis price_source price_fetched_at pricing_status cells totals unpriced anomaly record_counts agents) ],
+            'AC12: top-level key set is EXACTLY the 10 keys of spec §3.1'
         );
         is_deeply([ sort keys %{ $doc->{totals} } ],
             [ sort qw(input output cache_write_5m cache_write_1h cache_read cache_write_unsplit) ],
             'AC12: totals has exactly the six token types');
         is_deeply([ sort keys %{ $doc->{unpriced} } ],
-            [ sort ('model-not-in-table', 'cache-write-unsplit', 'non-standard-speed') ],
-            'AC12: unpriced has exactly the three reasons');
+            [ sort qw(unknown-model cache-write-unsplit non-standard-speed rate-missing offline pricing-unavailable fast-long-context-unspecified) ],
+            'AC12: unpriced has exactly the seven reasons of spec §2.1 (Decision 10/22, Decision 24 M1, C3), zeros kept');
         is_deeply([ sort keys %{ $doc->{record_counts} } ],
             [ sort qw(assistant_records requests unkeyed request_usage_mismatch multi_iteration speed_absent skipped_unparseable malformed_usage_field) ],
             'AC12: record_counts has exactly the eight counters');
