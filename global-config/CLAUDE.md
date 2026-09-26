@@ -101,3 +101,9 @@ If you must write new code that reads/writes Windows registry env vars:
 - Round-trip values as opaque **UTF-8 bytes** through base64. PowerShell read: `[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($v))`. PowerShell write: `[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$b64'))` → `SetEnvironmentVariable`. Perl side: keep as raw UTF-8 bytes; **never call `Encode::encode` on values you received from `decode_base64`** — those are already UTF-8, and re-encoding treats each byte as Latin-1 and produces `Ã©` instead of `é`, accumulating corruption on each run.
 - **Round-trip-test on a throwaway variable** (e.g. `CCPRAXIS_ENC_TEST`) containing `André` BEFORE touching PATH/PATHEXT. Verify byte-perfect read-back. Only then operate on the real var.
 - **Snapshot the current PATH to a file** before modifying (e.g. `~/.claude/.path-snapshots/<timestamp>.txt`), so the user can restore manually if anything goes wrong.
+
+## Durable facts go in almanac notes
+
+Claude Code memory is disabled; record a durable cross-project fact as a global almanac note (`perl ~/.claude/ccpraxis/plugins/almanac/scripts/almanac-note.pl create --global --title "..."`), never as a memory. Your notes index is imported on the next line from `~/.claude/almanac-notes.md`, which `almanac-migrate-memories.pl render-index` generates from your own vault; every `target` in it is relative to `~/.claude/claude-code-vault/`.
+
+@~/.claude/almanac-notes.md
