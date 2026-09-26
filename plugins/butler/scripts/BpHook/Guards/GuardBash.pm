@@ -568,6 +568,102 @@ sub _resolve_binding_cached {
     return { blueprint => $bp, package => $pkg, write_set => $ws };
 }
 
+# ---------------------------------------------------------------------------
+# 29-driver-validation-scope -- the driver's opt-in BP_VALIDATE_LEDGER=<path>
+# scoping (spec sec 2.1/2.2). The name is read only from the command text
+# (BpHook::_tokenize_words), never from the hook process's own %ENV.
+# ---------------------------------------------------------------------------
+sub _fold_path {
+    my ($s) = @_;
+    return '' unless defined $s;
+    (my $v = $s) =~ tr{\\}{/};
+    $v =~ s{/+$}{};
+    if ($v =~ m{^/([A-Za-z])/(.*)$}) {
+        $v = "$1:/$2";
+    }
+    $v = lc($v) if _widen_ws_is_ci();
+    return $v;
+}
+
+# _named_validation_ledger($cmd) -> ($state, $value). $state is one of
+# 'absent', 'value', 'bad'. Never dies (spec 2.1: "on any internal failure
+# it returns ('bad', undef)").
+sub _named_validation_ledger {
+    my ($cmd) = @_;
+    my @r = eval {
+        return ('bad', undef) unless defined $cmd && length $cmd;
+        (my $trimmed = $cmd) =~ s/^[\x20\t]+//;
+        my $words = BpHook::_tokenize_words($trimmed);
+        return ('bad', undef) unless ref $words eq 'ARRAY';
+        my @prefix;
+        for my $w (@$words) {
+            last unless ref $w eq 'HASH' && defined $w->{raw}
+                && $w->{raw} =~ /^[A-Za-z_][A-Za-z0-9_]*=/;
+            push @prefix, $w;
+        }
+        my @matches = grep { index($_->{raw}, 'BP_VALIDATE_LEDGER=') == 0 } @prefix;
+        return ('absent', undef) if @matches == 0;
+        return ('bad', undef) if @matches > 1;
+        my $mw = $matches[0];
+        return ('bad', undef) unless defined $mw->{literal};
+        my $value = substr($mw->{literal}, length('BP_VALIDATE_LEDGER='));
+        return ('bad', undef) unless length($value);
+        return ('bad', undef) if $value =~ /[\s;&|<>()]/;
+        return ('value', $value);
+    };
+    return ('bad', undef) if $@;
+    return @r;
+}
+
+# _resolve_named_ledger($data_n, $value, \%ledger_cache) -> { blueprint,
+# package, write_set } | undef. Spec sec 2.2. Never dies.
+sub _resolve_named_ledger {
+    my ($data_n, $value, $ledger_cache) = @_;
+    my $r = eval {
+        return undef unless defined $data_n && length $data_n;
+        return undef unless defined $value && length $value;
+        (my $v = $value) =~ tr{\\}{/};
+        $v =~ s{^\./}{};
+        return undef unless $v =~ m{^(.+)/blueprints/([^/]+)/packages/([^/]+)\.md$};
+        my ($prefix, $bp, $pkg) = ($1, $2, $3);
+        return undef unless _valid_member_name($bp) && _valid_member_name($pkg);
+
+        my $fp = _fold_path($prefix);
+        return undef
+            unless $fp eq _fold_path(basename($data_n)) || $fp eq _fold_path($data_n);
+
+        my $iraw = _read_bytes("$data_n/.drive-solo/inflight.json");
+        return undef unless defined $iraw && length $iraw;
+        my $idata = eval { JSON::PP->new->utf8->decode($iraw) };
+        return undef unless ref $idata eq 'HASH' && ref $idata->{packages} eq 'ARRAY';
+        my $found = 0;
+        for my $e (@{ $idata->{packages} }) {
+            next unless ref $e eq 'HASH';
+            if (defined $e->{blueprint} && defined $e->{package}
+                && $e->{blueprint} eq $bp && $e->{package} eq $pkg)
+            {
+                $found = 1;
+                last;
+            }
+        }
+        return undef unless $found;
+
+        my $key = "$bp/$pkg";
+        my $ws;
+        if (exists $ledger_cache->{$key}) {
+            $ws = $ledger_cache->{$key};
+        }
+        else {
+            $ws = _read_ledger_write_set($data_n, $bp, $pkg);
+            $ledger_cache->{$key} = $ws;
+        }
+        return undef unless defined $ws;
+        return { blueprint => $bp, package => $pkg, write_set => $ws };
+    };
+    return undef if $@;
+    return $r;
+}
+
 # _is_full_sweep_runner($cmd) -> true iff $cmd invokes scripts/run-tests.pl
 # with no path operand, with --fast, or with two-or-more path operands
 # (24-interlock-scope-review S-1). Write-set scoping approximates what a
@@ -684,11 +780,26 @@ sub _gb_d {
                         # S-2: only now, with a live writer confirmed, pay
                         # for resolving the caller's own binding -- and only
                         # once per call.
-                        if (defined $own_binding && !$caller_ws_tried) {
-                            $caller_ws_tried = 1;
-                            my $caller_resolved = _resolve_binding_cached($data_n, $own_binding, \%ledger_ws_cache);
-                            $caller_ws = $caller_resolved->{write_set} if defined $caller_resolved;
-                            $full_sweep = _is_full_sweep_runner($cmd) if defined $caller_ws;
+                        if (!$caller_ws_tried) {
+                            if (defined $own_binding) {
+                                $caller_ws_tried = 1;
+                                my $caller_resolved = _resolve_binding_cached($data_n, $own_binding, \%ledger_ws_cache);
+                                $caller_ws = $caller_resolved->{write_set} if defined $caller_resolved;
+                                $full_sweep = _is_full_sweep_runner($cmd) if defined $caller_ws;
+                            }
+                            elsif (!defined $aid) {
+                                # 29-driver-validation-scope: the driver main
+                                # thread has no binding of its own, but may
+                                # opt in to the same scoping via a leading
+                                # BP_VALIDATE_LEDGER=<ledger> on the command.
+                                $caller_ws_tried = 1;
+                                my ($st, $val) = _named_validation_ledger($cmd);
+                                if ($st eq 'value') {
+                                    my $r = _resolve_named_ledger($data_n, $val, \%ledger_ws_cache);
+                                    $caller_ws = $r->{write_set} if defined $r;
+                                }
+                                $full_sweep = _is_full_sweep_runner($cmd) if defined $caller_ws;
+                            }
                         }
 
                         if (defined $caller_ws) {
