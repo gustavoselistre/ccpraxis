@@ -308,7 +308,9 @@ my $CONTAINER_BASELINE = {
         DISABLE_LOGOUT_COMMAND                   => '0',
         DISABLE_UPGRADE_COMMAND                  => '1',
         ENABLE_PROMPT_CACHING_1H                 => '1',
-        FORCE_AUTOUPDATE_PLUGINS                 => '1',
+        # FORCE_AUTOUPDATE_PLUGINS removed (06-plugins-current-at-start,
+        # Decision 11): the container is host-refresh materialized now, so
+        # its own auto-updater is turned off rather than left racing the copy.
         CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY       => '1',
     },
     extraKnownMarketplaces => {

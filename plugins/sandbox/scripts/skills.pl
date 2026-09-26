@@ -23,6 +23,7 @@ use strict;
 use warnings;
 use JSON::PP;
 use Encode qw(decode);
+use B ();
 use Fcntl qw(:flock);
 use File::Basename qw(dirname);
 use File::Path qw(make_path);
@@ -104,6 +105,29 @@ sub denormalize_to_windows {
         $p =~ s|/|\\|g;
     }
     return $p;
+}
+
+# 06-plugins-current-at-start (Decision 11/22-24). A filesystem test on a
+# path decoded from JSON (may carry non-ASCII codepoints, e.g. U+00E9, with
+# the utf8 flag set) must run on the UTF-8 BYTE form, per spec section 2.4.
+sub _dir_exists_fs {
+    my $p = shift;
+    return 0 unless defined $p && length $p;
+    my $bytes = utf8::is_utf8($p) ? Encode::encode('UTF-8', $p) : $p;
+    return -d $bytes;
+}
+
+# True iff $v decoded from JSON as a JSON *integer* (not a string, not a
+# float). JSON::PP marks a decoded number with the IOK flag and no POK flag;
+# a decoded string always carries POK. Used for the top-level "version" carry
+# (spec 2.2 / AC11).
+sub _is_json_integer {
+    my $v = shift;
+    return 0 if ref $v;
+    return 0 unless defined $v;
+    my $sv = B::svref_2object(\$v);
+    my $flags = $sv->FLAGS;
+    return ($flags & B::SVp_IOK()) && !($flags & B::SVp_POK());
 }
 
 sub read_json {
@@ -2001,7 +2025,26 @@ sub cmd_materialize_plugins {
     $host_data = {} unless ref $host_data eq 'HASH';
     my $host_plugins = (ref $host_data->{plugins} eq 'HASH')
         ? $host_data->{plugins} : {};
+    my $host_top_version = (ref $host_data eq 'HASH') ? $host_data->{version} : undef;
     my $project_path = normalize_path($opts{project_path});
+
+    # 06-plugins-current-at-start (Decision 11/22): a marketplace whose host
+    # known_marketplaces.json entry is source.source eq "directory" is a live
+    # bind (ccpraxis-local etc), never copied, so its keys are never
+    # host-refreshed below. Derived from dirname($host_plugins_file), NOT
+    # home()/_load_known_marketplaces, so a test passing --plugins-file stays
+    # hermetic (spec 2.1). Missing/unparseable -> nothing is directory-source.
+    my $host_km_file = dirname($host_plugins_file) . '/known_marketplaces.json';
+    my $host_km = -f $host_km_file ? read_json($host_km_file) : {};
+    $host_km = {} unless ref $host_km eq 'HASH';
+    my %directory_source_mkt;
+    for my $mkt_name (keys %$host_km) {
+        my $mkt_entry = $host_km->{$mkt_name};
+        next unless ref $mkt_entry eq 'HASH';
+        my $src = $mkt_entry->{source};
+        $directory_source_mkt{$mkt_name} = 1
+            if ref $src eq 'HASH' && ($src->{source} // '') eq 'directory';
+    }
 
     # The host-side prefix that needs to be replaced with the container's
     # plugin root. Discovery normalizes paths to Git Bash form, e.g.
@@ -2057,11 +2100,22 @@ sub cmd_materialize_plugins {
     # the merge below. Read BEFORE we overwrite it.
     my $manifest_file = $opts{manifest};
     my %prior_keys;
+    # 06-plugins-current-at-start (spec 2.3): a prior entry carrying an
+    # `origin` (host-refresh / host-refresh-retained) never counts as
+    # "placed by the launcher" for %prior_keys, so a refreshed-but-unselected
+    # key is never dropped as deselected. Its dest_rel is remembered
+    # separately, for the retain rule (Behaviour 9 / AC7).
+    my %prior_refresh_dest_rel;
     if ($manifest_file && -f $manifest_file) {
         my $pj = read_json($manifest_file);
         if (ref $pj eq 'ARRAY') {
             for my $e (@$pj) {
-                $prior_keys{$e->{key}} = 1 if ref $e eq 'HASH' && defined $e->{key};
+                next unless ref $e eq 'HASH' && defined $e->{key};
+                if (defined $e->{origin} && ($e->{origin} eq 'host-refresh' || $e->{origin} eq 'host-refresh-retained')) {
+                    $prior_refresh_dest_rel{$e->{key}} = $e->{dest_rel};
+                } elsif (!defined $e->{origin}) {
+                    $prior_keys{$e->{key}} = 1;
+                }
             }
         }
     }
@@ -2156,10 +2210,67 @@ sub cmd_materialize_plugins {
     for my $key (sort keys %$existing_plugins) {
         next if exists $plugins_out{$key};   # host-selected this launch -> fresh wins
         next if exists $prior_keys{$key};    # we placed it before, now deselected -> drop
-        $plugins_out{$key} = $existing_plugins->{$key};  # sandbox-installed -> preserve
+
+        # 06-plugins-current-at-start (spec 2.1, Behaviour 4/8/9): a preserved
+        # key whose host install is current is rewritten to the host's
+        # version rather than kept stale (Decision 11's root cause). Directory-
+        # source marketplaces (live binds) and any key with no present host
+        # dir are kept verbatim.
+        my $mkt_name = ($key =~ /\@([^@]*)$/) ? $1 : undef;
+        my $is_dir_source = defined $mkt_name && exists $directory_source_mkt{$mkt_name};
+        my $host_inst = (!$is_dir_source) ? $best_host_install->($key) : undef;
+        my $host_dir  = $host_inst ? normalize_path($host_inst->{installPath}) : undef;
+        my $host_dir_present = defined $host_dir && _dir_exists_fs($host_dir);
+        my $rewritten = $host_dir_present ? $rewrite->($host_dir) : undef;
+        my $dest_rel;
+        my $refreshable = 0;
+        if ($host_inst && $host_dir_present && defined $rewritten
+            && $rewritten =~ m{^\Q$CONTAINER_PLUGINS_ROOT\E/(.+)$}) {
+            $dest_rel   = $1;
+            $refreshable = 1;
+        }
+        # Review M1: a record that isn't an array (Claude Code's old v1
+        # single-object shape, a null, or any other in-container write) must
+        # never be dereferenced as one below -- that used to die and, wrapped
+        # in run_perl_or_die at the call site, abort every launch. Fall
+        # through to the verbatim branch instead.
+        $refreshable = 0 unless ref $existing_plugins->{$key} eq 'ARRAY';
+
+        if ($refreshable) {
+            my @refreshed = map {
+                my %e = (ref $_ eq 'HASH') ? %$_ : ();
+                $e{version}     = $host_inst->{version};
+                $e{installPath} = $rewritten;
+                if (defined $host_inst->{gitCommitSha}) {
+                    $e{gitCommitSha} = $host_inst->{gitCommitSha};
+                } else {
+                    delete $e{gitCommitSha};
+                }
+                $e{lastUpdated} = $host_inst->{lastUpdated} if defined $host_inst->{lastUpdated};
+                \%e;
+            } @{ $existing_plugins->{$key} };
+            $plugins_out{$key} = \@refreshed;
+            push @copy_plan, { key => $key, src => $host_dir, dest_rel => $dest_rel, origin => 'host-refresh' };
+        } else {
+            $plugins_out{$key} = $existing_plugins->{$key};  # preserve verbatim
+            if (exists $prior_refresh_dest_rel{$key}) {
+                # Host no longer supplies a previously refreshed key (spec
+                # Behaviour 9 / AC7): keep the cache dir alive with a retain
+                # entry carrying no src, so reconcile_copy_plan doesn't prune it.
+                push @copy_plan, { key => $key, dest_rel => $prior_refresh_dest_rel{$key}, origin => 'host-refresh-retained' };
+            }
+        }
     }
 
     my $registry = { plugins => \%plugins_out };
+    # 06-plugins-current-at-start (spec 2.2 / AC11): mirror the host file's
+    # top-level "version" only when it decoded as a JSON integer (matches the
+    # schema Claude Code itself writes, "version": 2).
+    # Review S4: force the numeric form at the point of use. _is_json_integer
+    # must still run BEFORE this line -- once assigned, "0 + $v" makes the SV
+    # numeric-only regardless of how $host_top_version got here, but the
+    # is-it-really-an-integer decision has to happen on the untouched value.
+    $registry->{version} = 0 + $host_top_version if _is_json_integer($host_top_version);
 
     my $dir = dirname($output);
     make_path($dir) unless -d $dir;
