@@ -531,6 +531,7 @@ sub _load_record {
     unless (-f $path) {
         _die(kind => 'not_found', id => $id, path => $path);
     }
+    $Almanac::Store::RECORD_READS++;
     my $rec = eval { Almanac::Record::read_file($path) };
     if (my $err = $@) {
         my $problems = (ref($err) eq 'Almanac::Record::Error') ? $err->{problems} : [];
@@ -573,12 +574,31 @@ sub read {
     return $self->_load_record($id, $self->_record_path($id));
 }
 
+# _rank_id_cmp($ra, $rb, $ia, $ib) -> $cmp_result -- the ONE comparator for
+# "rank first (cmp), then id, unranked after every ranked entry", shared
+# verbatim between _list_records and _rank_scan (spec 18-almanac-insert-perf
+# S2.2) so the two orderings cannot drift apart.
+sub _rank_id_cmp {
+    my ($ra, $rb, $ia, $ib) = @_;
+    if (defined $ra && defined $rb) {
+        my $c = $ra cmp $rb;
+        return $c ? $c : ($ia cmp $ib);
+    } elsif (defined $ra) {
+        return -1;
+    } elsif (defined $rb) {
+        return 1;
+    } else {
+        return $ia cmp $ib;
+    }
+}
+
 # _list_records() -- the actual directory-scan-and-sort work, WITHOUT the
 # recovery step. Shared by list() (the public verb) and reorder() (which
 # already holds the store lock and must never re-enter it -- see MUST-4's
 # note on _list_records below). Total order is (rank, id): rank_cmp first,
 # ties (and unranked records) broken by id, unranked sorting after all
 # ranked records.
+
 sub _list_records {
     my ($self) = @_;
     my $ids = $self->ids;
@@ -587,21 +607,65 @@ sub _list_records {
         push @records, $self->_load_record($id, $self->_record_path($id));
     }
 
-    @records = sort {
-        my ($ra, $rb) = ($a->{rank}, $b->{rank});
-        if (defined $ra && defined $rb) {
-            my $c = $ra cmp $rb;
-            $c ? $c : ($a->{id} cmp $b->{id});
-        } elsif (defined $ra) {
-            -1;
-        } elsif (defined $rb) {
-            1;
-        } else {
-            $a->{id} cmp $b->{id};
-        }
-    } @records;
+    @records = sort { _rank_id_cmp($a->{rank}, $b->{rank}, $a->{id}, $b->{id}) } @records;
 
     return \@records;
+}
+
+# _rank_scan($self) -> \@entries -- the O(1)-per-insert replacement for
+# calling list() just to learn neighbour ranks (spec 18-almanac-insert-perf
+# S2.2). Each entry is { id, rank }, in the exact order _list_records would
+# yield. Revalidates a per-handle cache against each record's stat signature
+# AND seal digest -- a hit needs both to match, so a stale rank can never be
+# served (see the spec's edge-case proof: any Store write that changes a
+# record's bytes reseals it first, before its rename). Acquires no lock.
+sub _rank_scan {
+    my ($self) = @_;
+    $self->recover if $self->{writable};
+
+    my $ids   = $self->ids;
+    my $cache = $self->{_rank_cache} ||= {};
+    my %seen;
+    my @entries;
+
+    for my $id (@$ids) {
+        $seen{$id} = 1;
+        my $path = $self->_record_path($id);
+        my @st   = stat($path);
+        my $sig  = @st ? join(',', $st[0], $st[1], $st[7], $st[9], $st[10]) : '';
+
+        my $seal;
+        if (CORE::open(my $sfh, '<:raw', seal_path_for($path))) {
+            local $/;
+            $seal = <$sfh>;
+            close $sfh;
+        }
+
+        my $c = $cache->{$id};
+        my $rank;
+        if ($c && $sig ne '' && $c->{sig} eq $sig && defined $seal && $c->{seal} eq $seal) {
+            $rank = $c->{rank};
+        } else {
+            my $rec  = $self->_load_record($id, $path);
+            my @st2  = stat($path);
+            my $sig2 = @st2 ? join(',', $st2[0], $st2[1], $st2[7], $st2[9], $st2[10]) : '';
+            if (defined $seal && $seal =~ /\A([0-9a-f]{64})\n\z/ && $1 eq $rec->{rev}
+                && $sig ne '' && $sig eq $sig2) {
+                $cache->{$id} = { sig => $sig, seal => $seal, rank => $rec->{rank} };
+            } else {
+                CORE::delete $cache->{$id};
+            }
+            $rank = $rec->{rank};
+        }
+        push @entries, { id => $id, rank => $rank };
+    }
+
+    for my $k (keys %$cache) {
+        CORE::delete $cache->{$k} unless $seen{$k};
+    }
+
+    @entries = sort { _rank_id_cmp($a->{rank}, $b->{rank}, $a->{id}, $b->{id}) } @entries;
+    return \@entries;
 }
 
 # list() -- runs recovery first (S2.11), then parses every record. A
@@ -800,6 +864,7 @@ sub update {
         unless (-f $path) {
             _die(kind => 'not_found', id => $id, path => $path);
         }
+        $Almanac::Store::RECORD_READS++;
         my $current = eval { Almanac::Record::read_file($path) };
         if (my $rerr = $@) {
             my $problems = (ref($rerr) eq 'Almanac::Record::Error') ? $rerr->{problems} : [];
@@ -881,6 +946,7 @@ sub delete {
         unless (-f $path) {
             _die(kind => 'not_found', id => $id, path => $path);
         }
+        $Almanac::Store::RECORD_READS++;
         my $current = eval { Almanac::Record::read_file($path) };
         if (my $rerr = $@) {
             my $problems = (ref($rerr) eq 'Almanac::Record::Error') ? $rerr->{problems} : [];
@@ -914,6 +980,8 @@ sub delete {
 # 2.9 -- the single write path, and the one test seam.
 # =============================================================================
 our $ON_BEFORE_RENAME;   # TEST SEAM ONLY. undef on every product code path.
+our $RECORD_READS = 0;   # TEST SEAM -- see spec 18-almanac-insert-perf S2.1. Counts every read
+                         # of a record file's (<id>.md) bytes. No product code reads this.
 
 sub _write_record {
     my ($self, $path, $record, $verb) = @_;
@@ -1020,6 +1088,7 @@ sub check_seal {
     my ($record_path) = @_;
     my $bytes;
     if (CORE::open(my $fh, '<:raw', $record_path)) {
+        $Almanac::Store::RECORD_READS++;
         local $/;
         $bytes = <$fh>;
         close $fh;
@@ -1168,7 +1237,7 @@ sub _sequential_ranks {
 sub insert_first {
     my ($self, %args) = @_;
     $self->_require_writable('insert_first');
-    my $list  = $self->list();
+    my $list  = $self->_rank_scan();
     my $first = @$list ? $list->[0]{rank} : undef;
     my $rank  = rank_between(undef, $first) . rank_jitter();
     return $self->create(%args, rank => $rank);
@@ -1177,7 +1246,7 @@ sub insert_first {
 sub insert_last {
     my ($self, %args) = @_;
     $self->_require_writable('insert_last');
-    my $list = $self->list();
+    my $list = $self->_rank_scan();
     # CRITICAL-1: $list->[-1] is only the true maximum RANK when the last
     # entry in list()'s DISPLAY order is itself ranked. list() sorts
     # unranked records after every ranked one (S2.10), so the instant any
@@ -1196,15 +1265,15 @@ sub _insert_relative {
     my ($self, $ref_id, $where, %args) = @_;
     $self->_require_writable($where);
     # Existence checked CHEAPLY (a directory stat, via exists()) before the
-    # full list() parse: list() dies malformed/id_mismatch on ANY corrupt
-    # record in the store (Decision 4, no partial result), which must not
-    # stand between a caller and the not_found this ref_id deserves when it
-    # is simply absent. Once ref_id is confirmed present, list() is still
-    # exactly what S2.11 step 2 specifies for computing neighbour ranks.
+    # full _rank_scan() parse: _rank_scan() dies malformed/id_mismatch on ANY
+    # corrupt record in the store (Decision 4, no partial result), which must
+    # not stand between a caller and the not_found this ref_id deserves when
+    # it is simply absent. Once ref_id is confirmed present, _rank_scan() is
+    # still exactly what S2.11 step 2 specifies for computing neighbour ranks.
     unless ($self->exists($ref_id)) {
         _die(kind => 'not_found', id => $ref_id, path => $self->_record_path($ref_id));
     }
-    my $list = $self->list();
+    my $list = $self->_rank_scan();
     my ($ref_rec) = grep { $_->{id} eq $ref_id } @$list;
     unless ($ref_rec) {
         _die(kind => 'not_found', id => $ref_id, path => $self->_record_path($ref_id));
