@@ -58,6 +58,7 @@ use SpendPanel ();  # b37: pure Claude/Go/Zen spend status struct for the dashbo
                     # TokenInfo has, and t/spend-panel asserts both halves)
 use Resources ();   # s09: pure resource-probe parsers + the injectable probe seam
 use RunState ();    # s10: pure orchestrator/run-state summarizer for the dashboard
+use SessionFork (); # sandbox-session-ux/07: host-session-fork path/uuid helpers (pure, no fs writes)
 
 # THE HOST CANNOT PROBE A CONTAINER'S PIDS, SO IT ASKS THE SAMPLER INSTEAD.
 #
@@ -251,6 +252,16 @@ my $SANDBOX_PLUGIN    = "$CLAUDE_HOST_CONFIG/ccpraxis/plugins/sandbox";
 my $CONTAINER_CONFIG  = "$SANDBOX_PLUGIN/container";
 my $SANDBOX_SKILLS_PL = "$SANDBOX_PLUGIN/scripts/skills.pl";
 my $SELECT_SESSION_PL = "$SANDBOX_PLUGIN/scripts/select-session.pl";
+# select-session.pl's dedicated "host-session fork failed" exit code (see its
+# own header comment) -- the ONLY exit that makes pick_session_action /
+# _pick_session_via_screen return to the picker, bounded to 3 retries.
+use constant SELECT_SESSION_FORK_FAILED_EXIT => 3;
+# Decision 34 (review M1): set just before a bounded fork-retry loop
+# exhausts and returns ('cancel', undef) instead of falling through to a
+# new session. The single 'cancel' call site (below, where $action is
+# handled) prints this AFTER host_leave, since an emit into a live alt-
+# screen frame is a byte the screen restore is about to discard.
+my $PICK_ERROR;
 my $HOST_PLUGINS_DIR  = "$CLAUDE_HOST_CONFIG/plugins";
 # B2: the canonical entry paths the dashboard spawns for a new claude session,
 # and whether the raw-ANSI TUI is even possible (else the plain heartbeat loop).
@@ -928,6 +939,11 @@ $CLAUDE_HOST_CONFIG = do {
 my $CCPRAXIS_DATA            = "$PROJECT_PATH/.ccpraxis-local-data";
 my $CLAUDE_DATA              = "$CCPRAXIS_DATA/claude-home";
 
+# sandbox-session-ux/07: the operator's HOST projects dir for this project
+# (~/.claude/projects/<encoded cwd>), read-only, never written. Both picker
+# spawns pass it so a host session can be listed and forked into $CLAUDE_DATA.
+my $HOST_SESSIONS_DIR = SessionFork::host_sessions_dir($CLAUDE_HOST_CONFIG, $PROJECT_PATH);
+
 # How many launches' logs to keep under claude-home/sandbox-logs/. Operator's
 # call: the last 10. Env-overridable for debugging a long-tail problem.
 my $LOG_RETENTION_LAUNCHES   = ($ENV{CCPRAXIS_LOG_RETENTION} && $ENV{CCPRAXIS_LOG_RETENTION} =~ /\A\d+\z/
@@ -1596,9 +1612,11 @@ sub _select_via_screen {
 # _pick_session_via_screen() -> ('new'|'resume'|'cancel', $uuid) with no
 # --output file round-trip. Its plain-path twin is byte-for-byte today's.
 sub _pick_session_via_screen {
-    my ($sessions_dir) = @_;
+    my ($sessions_dir, $retries_left, $notice) = @_;
+    $retries_left = 3 unless defined $retries_left;
     my ($rc, $out, $err) = _capture_out_err($^X, $SELECT_SESSION_PL,
-        '--sessions-dir', $sessions_dir, '--project-label', $PROJECT_NAME, '--list-json');
+        '--sessions-dir', $sessions_dir, '--host-sessions-dir', $HOST_SESSIONS_DIR,
+        '--project-label', $PROJECT_NAME, '--list-json');
     my $data = ($rc == 0) ? eval { JSON::PP->new->utf8->decode($out) } : undef;
     if (ref $data ne 'HASH') {
         _emit_err("WARNING: session selector could not list sessions; starting a new session.\n");
@@ -1607,13 +1625,62 @@ sub _pick_session_via_screen {
     my @rows = (ref $data->{sessions} eq 'ARRAY') ? @{ $data->{sessions} } : ();
     return ('new', undef) unless @rows || $data->{error};
 
-    my $model = tui::LaunchScreens::session_pick_model(
-        \@rows, "resume a session - $PROJECT_NAME", $data->{error});
+    # Decision 34 (review M2): a fork error from an EARLIER retry ($notice)
+    # takes priority over --list-json's own $data->{error} (a plain listing
+    # error), so the operator sees why the picker came back rather than the
+    # picker just blinking back with no explanation.
+    my $error_for_screen = (defined($notice) && length($notice)) ? $notice : $data->{error};
+    my $model = tui::LaunchScreens::session_pick_model(\@rows, "resume a session - $PROJECT_NAME", $error_for_screen);
     my $res = _launch_run_list($model);
     my $d = $res->{decision};
     return ('cancel', undef) unless $d->{confirmed};
     my $id = $d->{cursor_id};
     return ('new', undef) if !defined $id || $id eq 'NEW';
+
+    # Decision 34 (red-team S1, promoted MUST-FIX): host-ness is decided by
+    # looking the picked item up in @rows and reading ITS OWN `origin` --
+    # never by pattern-matching a "host:" prefix out of $cursor_id, which is
+    # exactly the shape a spoofed SANDBOX row could be given (S1's attack).
+    # The candidate id is rebuilt the same way session_pick_model built it
+    # (host rows: "host:<uuid>"; everything else: bare uuid), so this only
+    # ever matches the row the operator actually saw highlighted.
+    my ($row) = grep {
+        defined($_->{uuid})
+            && $id eq ((defined($_->{origin}) && $_->{origin} eq 'host') ? "host:$_->{uuid}" : "$_->{uuid}")
+    } @rows;
+
+    if (defined($row) && defined($row->{origin}) && $row->{origin} eq 'host') {
+        # Decision 14/32/33/34: a HOST row is forked into the sandbox BEFORE
+        # resuming. A failed fork shows its error and returns to the picker
+        # (never falls through to a new session on its own) ONLY when
+        # select-session.pl --fork exits its dedicated fork-failed code, and
+        # only up to 3 times -- a picker that fails on EVERY run must never
+        # loop the launcher forever, and once it does, Decision 34 CANCELS
+        # rather than silently starting the blank session the operator never
+        # asked for.
+        my $host_uuid = $row->{uuid};
+        unless (defined($host_uuid) && SessionFork::is_uuid_shaped($host_uuid)) {
+            _emit_err("ERROR: malformed host session id; starting a new session.\n");
+            return ('new', undef);
+        }
+        my ($frc, $fout, $ferr) = _capture_out_err($^X, $SELECT_SESSION_PL,
+            '--sessions-dir', $sessions_dir, '--host-sessions-dir', $HOST_SESSIONS_DIR,
+            '--fork', $host_uuid);
+        if ($frc == 0 && $fout =~ /\ARESUME\s+([0-9a-f-]{36})\s*\z/i) {
+            return ('resume', $1);
+        }
+        my ($first_err_line) = split /\n/, ($ferr // '');
+        $first_err_line = 'unknown error' unless defined($first_err_line) && length($first_err_line);
+        $first_err_line = _pp_sanitize($first_err_line);
+        if ($frc == SELECT_SESSION_FORK_FAILED_EXIT && $retries_left > 0) {
+            my $msg = "WARNING: could not duplicate the host session ($first_err_line); returning to the picker.";
+            _emit_err("$msg\n");
+            return _pick_session_via_screen($sessions_dir, $retries_left - 1, $msg);
+        }
+        $PICK_ERROR = "ERROR: could not duplicate the host session ($first_err_line); cancelling.";
+        return ('cancel', undef);
+    }
+
     return ('resume', $id);
 }
 
@@ -2614,6 +2681,13 @@ my $CONTAINER_NAME;
                 # Leave FIRST: an emit into a live frame is a byte the
                 # alt-screen restore is about to throw away.
                 tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST;
+                # Decision 34 (review M1): a bounded fork-retry exhaustion
+                # sets $PICK_ERROR before returning 'cancel' -- show it here,
+                # after the frame is gone, so "Cancelled." is not the only
+                # thing the operator sees for a fork that kept failing.
+                if (defined($PICK_ERROR) && length($PICK_ERROR)) {
+                    _emit_out("$PICK_ERROR\n");
+                }
                 _emit_out("Cancelled.\n");
                 reset_terminal();
                 exit 0;
@@ -4114,6 +4188,8 @@ ensure_claude_json_onboarded();
 # The decision token comes back through a temp file under .launcher/ so
 # we don't need to fight the terminal to read it.
 sub pick_session_action {
+    my ($retries_left) = @_;
+    $retries_left = 3 unless defined $retries_left;
     my $sessions_dir = "$CLAUDE_DATA/projects/-project";
     # TUI path: the pick happens in-process from a --list-json snapshot, so
     # there is no --output round-trip and no child owning the terminal.
@@ -4123,15 +4199,42 @@ sub pick_session_action {
     unlink $out_file;
     my $rc = system($^X, $SELECT_SESSION_PL,
         '--sessions-dir',  $sessions_dir,
+        '--host-sessions-dir', $HOST_SESSIONS_DIR,
         '--project-label', $PROJECT_NAME,
         '--output',        $out_file);
     my $exit = $rc >> 8;
     if ($exit == 2) {
         return ('cancel', undef);
     }
+    if ($exit == SELECT_SESSION_FORK_FAILED_EXIT) {
+        # Decision 32/33/34: a failed host-session fork (picked inside
+        # select-session.pl's own loop, per S2.2) is reported and sent back
+        # to the picker -- it must never fall through to a new session
+        # silently. Bounded to at most 3 retries: a picker that fails on
+        # EVERY run must never loop the launcher forever. Once exhausted,
+        # Decision 34 CANCELS (never 'new' -- the operator picked a specific
+        # host conversation, possibly 4 times running; a silent blank
+        # session is exactly the surprise Decision 32 rules out).
+        #
+        # Review M2: select-session.pl already printed its own error to
+        # this same terminal, but by the time the picker respawns and
+        # re-enters the alt screen, that text is gone with no chance for
+        # the operator to read it. Print it again and wait for Enter before
+        # the picker redraws -- the smallest fix that makes it visible.
+        if ($retries_left > 0) {
+            _emit_err("WARNING: host-session fork failed; returning to the picker.\n");
+            _emit_err("Press Enter to continue...");
+            my $ignored = <STDIN>;
+            return pick_session_action($retries_left - 1);
+        }
+        _emit_err("ERROR: host-session fork kept failing after 3 retries; cancelling.\n");
+        return ('cancel', undef);
+    }
     if ($exit != 0) {
-        # Selector failed for some other reason. Don't block the user —
-        # fall through to a fresh session, which is the safest default.
+        # Any other non-zero exit (a usage error against a script we invoke
+        # correctly) is exceedingly rare, and is NOT the dedicated fork-fail
+        # code -- no retry (a picker that crashes every time must never loop
+        # the launcher).
         _emit_err("WARNING: session selector exited $exit; starting a new session.\n");
         return ('new', undef);
     }
@@ -4144,7 +4247,11 @@ sub pick_session_action {
     if ($token =~ /^RESUME\s+([0-9a-fA-F-]+)\s*$/) {
         return ('resume', $1);
     }
-    _emit_err("WARNING: session selector returned unrecognized token '$token'; starting a new session.\n");
+    # red-team N2: $token round-trips through --output, so it can carry any
+    # bytes a container-controlled sandbox sessionId put into a RESUME line
+    # (the regex above only accepted the well-formed case). Strip control
+    # bytes before it reaches this terminal.
+    _emit_err("WARNING: session selector returned unrecognized token '" . _pp_sanitize($token) . "'; starting a new session.\n");
     return ('new', undef);
 }
 

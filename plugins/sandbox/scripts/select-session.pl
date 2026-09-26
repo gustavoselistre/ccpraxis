@@ -16,9 +16,16 @@
 #   RESUME <uuid>         — resume the session with this UUID
 #
 # Exit codes:
-#   0   chose NEW or RESUME (written to --output)
+#   0   chose NEW or RESUME (written to --output, or printed as "RESUME
+#       <uuid>" on stdout in --fork mode)
 #   2   cancelled (Esc / q / Ctrl-C) — --output is removed/empty
-#   1   usage error or unreadable inputs
+#   3   host-session fork failed: --fork mode could not produce a resumable
+#       session (no such host session, or SessionFork::fork_session itself
+#       failed), or the plain/TUI picker's own fork-before-resume path hit
+#       the same failure after a HOST row was picked. Nothing is written to
+#       --output/stdout on this exit. Callers use this dedicated code (never
+#       plain 1) to decide whether returning to the picker makes sense.
+#   1   usage error or unreadable inputs (any other failure)
 #
 # Why an output file instead of stdout: the launcher invokes this via
 # system() (not backticks) so stdin/stdout/stderr stay attached to the
@@ -39,6 +46,11 @@ use Cwd ();
 use POSIX qw(strftime);
 use JSON::PP ();
 use Encode ();
+
+# Dedicated exit code for a failed host-session fork -- see the "Exit codes"
+# block in the header comment above. Kept as a named constant rather than a
+# bare 3 at each call site.
+use constant FORK_FAILED_EXIT => 3;
 
 binmode STDOUT, ':raw';
 binmode STDERR, ':raw';
@@ -68,6 +80,10 @@ my $OUTPUT_FILE   = '';
 my $BLUEPRINTS_DIR     = '';
 my $BLUEPRINTS_DIR_SET = 0;   # 1 iff --blueprints-dir was supplied (even if empty)
 my $LIST_JSON          = 0;   # 08-launcher-screens: data mode, no terminal at all
+my $HOST_SESSIONS_DIR     = '';
+my $HOST_SESSIONS_DIR_SET = 0;   # 1 iff --host-sessions-dir was supplied -- "origin mode" (07)
+my $FORK_UUID             = '';
+my $FORK_UUID_SET         = 0;   # 1 iff --fork was supplied -- non-interactive fork mode (07)
 
 # Parse @ARGV into the globals above. Split out from the entry point so
 # the `unless (caller)` guard at the bottom can run it only when the script is
@@ -94,6 +110,14 @@ sub parse_args {
             $BLUEPRINTS_DIR = $1;         $BLUEPRINTS_DIR_SET = 1;
         } elsif ($a eq '--list-json') {
             $LIST_JSON = 1;
+        } elsif ($a eq '--host-sessions-dir' && @argv) {
+            $HOST_SESSIONS_DIR = shift @argv; $HOST_SESSIONS_DIR_SET = 1;
+        } elsif ($a =~ /^--host-sessions-dir=(.*)$/) {
+            $HOST_SESSIONS_DIR = $1;         $HOST_SESSIONS_DIR_SET = 1;
+        } elsif ($a eq '--fork' && @argv) {
+            $FORK_UUID = shift @argv; $FORK_UUID_SET = 1;
+        } elsif ($a =~ /^--fork=(.*)$/) {
+            $FORK_UUID = $1;         $FORK_UUID_SET = 1;
         } else {
             print STDERR "select-session.pl: unknown arg: $a\n";
             exit 1;
@@ -103,9 +127,22 @@ sub parse_args {
         print STDERR "select-session.pl: --sessions-dir is required\n";
         exit 1;
     }
+    # --fork is a non-interactive mode: requires --sessions-dir and
+    # --host-sessions-dir, never --output, and cannot be combined with
+    # --list-json (usage error).
+    if ($FORK_UUID_SET) {
+        if ($LIST_JSON) {
+            print STDERR "select-session.pl: --fork cannot be combined with --list-json\n";
+            exit 1;
+        }
+        if (!$HOST_SESSIONS_DIR_SET || !length $HOST_SESSIONS_DIR) {
+            print STDERR "select-session.pl: --fork requires --host-sessions-dir\n";
+            exit 1;
+        }
+    }
     # --list-json is a DATA mode: it prints the session list and touches no
     # terminal and no --output file, so that flag is not required for it.
-    if (!length $OUTPUT_FILE && !$LIST_JSON) {
+    if (!length $OUTPUT_FILE && !$LIST_JSON && !$FORK_UUID_SET) {
         print STDERR "select-session.pl: --output is required\n";
         exit 1;
     }
@@ -140,6 +177,23 @@ sub derive_blueprints_dir {
 # =====================================================================
 # SessionFilter / SessionIndex integration
 # =====================================================================
+
+my $HAVE_SESSION_FORK;   # undef = not tried yet
+
+# load_session_fork() -- lazy require, same idiom as load_session_index()/
+# load_session_filter() below: a test that `require`s this script to unit-
+# test its pure helpers never runs main() (the `unless (caller)` guard), so
+# an eager `use SessionFork ()` at compile time would double-load the module
+# under a second %INC key whenever the test also required SessionFork.pm
+# directly by its own absolute path (harmless, but noisy "subroutine
+# redefined" warnings). Loading on demand, from the same dir tui::LaunchScreens
+# and SessionIndex already resolve against, avoids that entirely.
+sub load_session_fork {
+    return $HAVE_SESSION_FORK if defined $HAVE_SESSION_FORK;
+    my $dir = File::Basename::dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
+    $HAVE_SESSION_FORK = eval { require "$dir/SessionFork.pm"; 1 } ? 1 : 0;
+    return $HAVE_SESSION_FORK;
+}
 
 my $HAVE_SESSION_FILTER;   # undef = not tried yet
 
@@ -186,8 +240,13 @@ sub write_action {
 # list_sessions($dir) -> @sessions. Each element:
 #   { uuid, mtime, kind, started_at, last_active_at, first_typed, last_typed,
 #     same_message }
-# Entries SessionIndex marks `empty` are dropped here and never reach any
-# view. Order is index_dir()'s own (last_active_at desc, id asc).
+#
+# Listing goes straight through SessionIndex::index_dir() -- package 02's
+# one index -- rather than a second directory scan here. Entries the index
+# marks `empty` (Decision 4: no typed message at all) are dropped by this
+# consumer and never reach any view; index_dir() itself still returns them
+# (its own contract leaves that filtering to callers). Order otherwise
+# matches index_dir()'s own (last_active_at desc, id asc) unchanged.
 sub list_sessions {
     my ($dir) = @_;
     $dir = $SESSIONS_DIR unless defined $dir;
@@ -202,6 +261,7 @@ sub list_sessions {
         next unless defined $e->{id};
         push @out, {
             uuid           => $e->{id},
+            path           => $e->{path},
             mtime          => $e->{mtime},
             kind           => $e->{kind},
             started_at     => $e->{started_at},
@@ -212,6 +272,75 @@ sub list_sessions {
         };
     }
     return @out;
+}
+
+# origin_sessions($dir, $forced_origin) -> @sessions -- list_sessions($dir),
+# each row tagged with an `origin`. When $forced_origin is given (host
+# rows), every row gets that origin. Otherwise (sandbox rows) a row is
+# `fork` (+ `source_session_id`) when SessionFork::read_provenance finds a
+# sidecar, else `sandbox`.
+#
+# red-team S1 (MUST-FIX, promoted by Decision 34): a listed row's `id` is
+# SessionIndex's filename stem ONLY when the stem is uuid-shaped -- when it
+# is not, index_file() falls back to the first record's `sessionId`, which
+# for a file the CONTAINER wrote (any file under the sandbox sessions dir)
+# is content the container controls. A crafted `"sessionId":"host:<real
+# host uuid>"` would otherwise be listed as an id identical in shape to a
+# genuine host row's item id, and picking it forks the named HOST session.
+# Closed two ways, both applied here:
+#   - every row whose id is not uuid_shaped is dropped outright (closes the
+#     sandbox-row spoof: "host:<uuid>" is never uuid-shaped);
+#   - a HOST row's id must equal ITS OWN file's stem -- never a
+#     content-derived id -- so host-ness/identity for a host row never
+#     comes from anything the container wrote.
+sub origin_sessions {
+    my ($dir, $forced_origin) = @_;
+    my @candidates = list_sessions($dir);
+    my $is_host = defined($forced_origin) && $forced_origin eq 'host';
+    my @out;
+    for my $s (@candidates) {
+        next unless load_session_fork() && SessionFork::is_uuid_shaped($s->{uuid});
+        if ($is_host) {
+            my $stem = defined($s->{path}) ? $s->{path} : '';
+            $stem =~ s{.*[/\\]}{};
+            $stem =~ s/\.jsonl\z//i;
+            next unless length($stem) && lc($stem) eq lc($s->{uuid});
+        }
+        push @out, $s;
+    }
+    for my $s (@out) {
+        if (defined $forced_origin) {
+            $s->{origin} = $forced_origin;
+            next;
+        }
+        my $prov = eval { SessionFork::read_provenance($dir, $s->{uuid}) };
+        if (ref $prov eq 'HASH') {
+            $s->{origin}            = 'fork';
+            $s->{source_session_id} = $prov->{source_session_id};
+        } else {
+            $s->{origin} = 'sandbox';
+        }
+    }
+    return @out;
+}
+
+# merged_sessions() -> @sessions -- sandbox rows (list_sessions($SESSIONS_DIR),
+# origin-tagged sandbox/fork) plus, in origin mode, host rows from
+# $HOST_SESSIONS_DIR (origin host). Sort: last_active_at desc, then uuid
+# asc, then origin (sandbox < fork < host) as the final tie-break.
+sub merged_sessions {
+    my @sessions = origin_sessions($SESSIONS_DIR);
+    if ($HOST_SESSIONS_DIR_SET && length $HOST_SESSIONS_DIR) {
+        push @sessions, origin_sessions($HOST_SESSIONS_DIR, 'host');
+    }
+    my %rank = (sandbox => 0, fork => 1, host => 2);
+    @sessions = sort {
+        (defined($b->{last_active_at}) ? $b->{last_active_at} : -1)
+            <=> (defined($a->{last_active_at}) ? $a->{last_active_at} : -1)
+            or $a->{uuid} cmp $b->{uuid}
+            or ($rank{$a->{origin} // ''} // 9) <=> ($rank{$b->{origin} // ''} // 9)
+    } @sessions;
+    return @sessions;
 }
 
 # =====================================================================
@@ -271,8 +400,34 @@ sub card_fields {
         first      => (defined($s->{first_typed}) ? $s->{first_typed} : $s->{last_typed}),
         last       => ($s->{same_message} ? undef : $s->{last_typed}),
         kind_label => $kind_label,
-        badges     => [],
+        badges     => origin_badges($s),
     };
+}
+
+# origin_badges(\%session) -> \@badges
+#
+# package 07-host-session-fork: an origin badge per S2.2's table, but ONLY
+# in "origin mode" (--host-sessions-dir was supplied) -- otherwise every
+# card.badges stays [] and today's output is byte-for-byte unchanged (D14,
+# AC-21).
+sub origin_badges {
+    my ($s) = @_;
+    return [] unless $HOST_SESSIONS_DIR_SET;
+    return [] unless ref $s eq 'HASH';
+    my $origin = $s->{origin};
+    return [] unless defined $origin && !ref $origin;
+    if ($origin eq 'host') {
+        return [ { text => 'host', role => 'accent' } ];
+    }
+    if ($origin eq 'sandbox') {
+        return [ { text => 'sandbox', role => 'text.muted' } ];
+    }
+    if ($origin eq 'fork') {
+        my $sid = $s->{source_session_id};
+        return [] unless defined $sid && length $sid;
+        return [ { text => 'duplicated from host ' . SessionFork::short_id($sid), role => 'state.ok' } ];
+    }
+    return [];
 }
 
 # =====================================================================
@@ -312,11 +467,16 @@ sub build_options {
         if (length($msg) > 100) { $msg = substr($msg, 0, 100) . '...'; }
         $msg = '(no message)' unless length $msg;
         my $label_txt = sprintf('%s  (%s)  %s', $card->{active}, $card->{ago}, $msg);
+        if ($HOST_SESSIONS_DIR_SET && ref($card->{badges}) eq 'ARRAY' && @{ $card->{badges} }) {
+            $label_txt .= ' [' . $card->{badges}[0]{text} . ']';
+        }
         my $label = eval { Encode::encode('UTF-8', $label_txt) };
         $label = $label_txt unless defined $label;
+        my $action = (defined($s->{origin}) && $s->{origin} eq 'host')
+            ? "HOST $s->{uuid}" : "RESUME $s->{uuid}";
         push @opts, {
             label     => $label,
-            action    => "RESUME $s->{uuid}",
+            action    => $action,
             is_butler => ($s->{is_butler} ? 1 : 0),
             card      => $card,
         };
@@ -671,13 +831,52 @@ unless (caller) {
         print STDERR "select-session.pl: cannot load SessionIndex.pm: $SESSION_INDEX_ERR\n";
         exit 1;
     }
+    unless (load_session_fork()) {
+        print STDERR "select-session.pl: cannot load SessionFork.pm\n";
+        exit 1;
+    }
 
-    my @sessions = list_sessions();
+    # --fork <host uuid>: non-interactive mode (package 07-host-session-fork).
+    # Usage errors (malformed uuid also blocks path traversal, e.g. "../x")
+    # and "combined with --list-json" were already exited 1 in parse_args.
+    # Never touches a terminal, never writes --output. Decision 32/33: a
+    # fork failure here is reported to the caller (non-empty stderr,
+    # FORK_FAILED_EXIT, empty stdout) -- it is the caller's job to decide
+    # whether to return to the picker rather than silently starting a new
+    # session.
+    if ($FORK_UUID_SET) {
+        unless (load_session_fork() && SessionFork::is_uuid_shaped($FORK_UUID)) {
+            print STDERR "select-session.pl: --fork requires a well-formed uuid\n";
+            exit 1;
+        }
+        my $host_file = "$HOST_SESSIONS_DIR/$FORK_UUID.jsonl";
+        unless (-f $host_file) {
+            print STDERR "select-session.pl: --fork: no such host session: $FORK_UUID\n";
+            exit FORK_FAILED_EXIT;
+        }
+        my ($new, $err) = SessionFork::fork_session($host_file, $SESSIONS_DIR);
+        unless (defined $new) {
+            my $msg = sanitize_cell(defined($err) && length($err) ? $err : 'unknown error');
+            print STDERR "select-session.pl: fork failed: $msg\n";
+            exit FORK_FAILED_EXIT;
+        }
+        print "RESUME $new\n";
+        exit 0;
+    }
+
+    my @sessions = merged_sessions();
     my $sids     = butler_sids();                      # {} on any failure (D4)
     SessionFilter::mark_sessions(\@sessions, $sids) if load_session_filter();
     for my $s (@sessions) {
         my $kind_hidden = defined($s->{kind}) && $s->{kind} ne 'human';
         $s->{is_butler} = ($s->{is_butler} || $kind_hidden) ? 1 : 0;
+        # A fork inherits is_butler from its host source through provenance
+        # (Decision 12's "same human-only filter", extended -- AC-26): its
+        # OWN uuid is fresh and never matches $sids on its own.
+        if (!$s->{is_butler} && defined($s->{origin}) && $s->{origin} eq 'fork'
+                && defined($s->{source_session_id}) && load_session_filter()) {
+            $s->{is_butler} = 1 if SessionFilter::is_butler_session($s->{source_session_id}, $sids);
+        }
     }
 
     # 08-launcher-screens: the DATA mode. One JSON object on stdout, exit 0.
@@ -693,7 +892,10 @@ unless (caller) {
             my $dir_disp = eval { Encode::decode('UTF-8', $SESSIONS_DIR, Encode::FB_DEFAULT) };
             $dir_disp = $SESSIONS_DIR unless defined $dir_disp;
             if (!-d $SESSIONS_DIR) {
-                $error = "sessions directory is not readable: $dir_disp";
+                # package 07 S2.2: a fresh sandbox with no sessions yet is
+                # not an error -- it's exactly when forking a host session
+                # matters (a nonexistent dir is created on the first fork).
+                $error = undef;
             }
             elsif (opendir(my $probe, $SESSIONS_DIR)) {
                 closedir $probe;
@@ -708,6 +910,7 @@ unless (caller) {
                 uuid      => $s->{uuid},
                 mtime     => $s->{mtime},
                 is_butler => ($s->{is_butler} ? 1 : 0),
+                origin    => $s->{origin},
                 card      => card_fields($s, time),
             };
         }
@@ -726,6 +929,32 @@ unless (caller) {
     my $action = run_tui(@opts);
     if (!defined $action || $action eq 'CANCEL') {
         exit 2;
+    }
+
+    # Picking a host row (Decision 14): fork before resuming. On failure,
+    # report the error and exit FORK_FAILED_EXIT without writing --output
+    # (Decision 32/33) -- the launcher's caller decides whether to return to
+    # the picker rather than silently starting a new session.
+    if ($action =~ /\AHOST\s+(\S+)\s*\z/) {
+        my $host_uuid = $1;
+        # red-team S2 (SHOULD-FIX): the plain picker's HOST id came straight
+        # from the option list -- validate it the same way --fork already
+        # does (is_uuid_shaped) BEFORE it is used to build a path. Without
+        # this, a content-derived host-row id (S1) that slipped past
+        # origin_sessions could still contain "/" or ".." and target a file
+        # outside $HOST_SESSIONS_DIR.
+        unless (load_session_fork() && SessionFork::is_uuid_shaped($host_uuid)) {
+            print STDERR "select-session.pl: fork failed: malformed host session id\n";
+            exit FORK_FAILED_EXIT;
+        }
+        my $host_file = "$HOST_SESSIONS_DIR/$host_uuid.jsonl";
+        my ($new, $err) = SessionFork::fork_session($host_file, $SESSIONS_DIR);
+        unless (defined $new) {
+            my $msg = sanitize_cell(defined($err) && length($err) ? $err : 'unknown error');
+            print STDERR "select-session.pl: fork failed: $msg\n";
+            exit FORK_FAILED_EXIT;
+        }
+        $action = "RESUME $new";
     }
 
     write_action($action);
