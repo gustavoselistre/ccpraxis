@@ -18,6 +18,11 @@
 # above, never from reading any file this package's write set would create
 # or edit.
 #
+# EDITED for package 28 (fork-guard-bash-cost): butler-fork-ok ticket writes
+# moved from GuardFork's Bash branch to ContinuityOffCheck, so cases that
+# exercise that write now go through tw() (ContinuityOffCheck) rather than
+# gf() (GuardFork). This oracle's sha goes stale on purpose.
+#
 # Runs standalone: perl this file
 use strict;
 use warnings;
@@ -112,6 +117,12 @@ sub payload_bash {
 sub gf {
     my ($p, %env) = @_;
     return GuardHarness::run_module('Guards::GuardFork', $p, env => \%env);
+}
+
+# package 28: butler-fork-ok ticket writing moved to ContinuityOffCheck.
+sub tw {
+    my ($p, %env) = @_;
+    return GuardHarness::run_module('ContinuityOffCheck', $p, env => \%env);
 }
 
 # ---------------------------------------------------------------------------
@@ -305,7 +316,7 @@ sub find_ticket_files { my ($base) = @_; return sort(bsd_glob("$base/continuity/
         my $base = GuardHarness::fresh_state();
         my $S = BpHook::state_dir();
         my $argv = $c;
-        gf(payload_bash(cmd => "butler-fork-ok " . quoted_argv(@$argv),
+        tw(payload_bash(cmd => "butler-fork-ok " . quoted_argv(@$argv),
                          session_id => 'sess-a8', tool_use_id => 'T1', cwd => '/proj'));
         my $res = run_cli(@$argv);
         my $label = "AC-8: --reason " . join(' ', map { "'$_'" } @$argv[1..$#$argv]);
@@ -348,7 +359,7 @@ my ($AC10_BASE, $AC10_S, $AC10_CWD, $AC10_REASON);
     my $reason = q{needs the parent conversation verbatim};
     $AC10_REASON = $reason;
 
-    my $mres = gf(payload_bash(cmd => "butler-fork-ok --reason '$reason'",
+    my $mres = tw(payload_bash(cmd => "butler-fork-ok --reason '$reason'",
                                 session_id => 'A', tool_use_id => 'T1', cwd => $cwd));
     is($mres->{rc}, 0, 'AC-10: run_module on the Bash dispatch -> rc 0');
     is($mres->{out} . $mres->{err}, '', 'AC-10: ...and no output');
@@ -463,7 +474,7 @@ my ($AC10_BASE, $AC10_S, $AC10_CWD, $AC10_REASON);
     my $S = BpHook::state_dir();
     my $reason = 'needs parent context badly';
     for my $sid ('A', 'B') {
-        gf(payload_bash(cmd => "butler-fork-ok --reason '$reason'",
+        tw(payload_bash(cmd => "butler-fork-ok --reason '$reason'",
                          session_id => $sid, tool_use_id => 'T1', cwd => '/proj'));
     }
     my $res = run_cli('--reason', $reason);
@@ -514,7 +525,7 @@ my ($AC10_BASE, $AC10_S, $AC10_CWD, $AC10_REASON);
     my $r1 = 'the first reason given here';
     my $r2 = 'the second reason given here';
     for my $r ($r1, $r2) {
-        gf(payload_bash(cmd => "butler-fork-ok --reason '$r'",
+        tw(payload_bash(cmd => "butler-fork-ok --reason '$r'",
                          session_id => 'A', tool_use_id => 'T1', cwd => '/proj'));
         run_cli('--reason', $r);
     }
@@ -564,7 +575,7 @@ my ($AC10_BASE, $AC10_S, $AC10_CWD, $AC10_REASON);
         [q{butler-fork-ok --reason "$WHY"}          => 'an unpredictable word'],
     ) {
         my ($cmd, $label) = @$c;
-        my $res = gf(payload_bash(cmd => $cmd, session_id => 'sess-a20', tool_use_id => 'T1', cwd => '/proj'));
+        my $res = tw(payload_bash(cmd => $cmd, session_id => 'sess-a20', tool_use_id => 'T1', cwd => '/proj'));
         is($res->{rc}, 0, "AC-20: $label -> rc 0");
         is($res->{out} . $res->{err}, '', "AC-20: $label -> no output");
     }
@@ -580,7 +591,7 @@ my ($AC10_BASE, $AC10_S, $AC10_CWD, $AC10_REASON);
     my $base = GuardHarness::fresh_state();
     my $S = BpHook::state_dir();
     my $reason = "Andr\x{e9} needs the parent context"; # 'André ...'
-    gf(payload_bash(cmd => "butler-fork-ok --reason '$reason'",
+    tw(payload_bash(cmd => "butler-fork-ok --reason '$reason'",
                      session_id => 'A', tool_use_id => 'T1', cwd => '/proj'));
     my $res = run_cli('--reason', $reason);
     is($res->{rc}, 0, 'AC-21: CLI with a non-ASCII reason -> exit 0');
@@ -630,21 +641,33 @@ my ($AC10_BASE, $AC10_S, $AC10_CWD, $AC10_REASON);
 }
 
 # ===========================================================================
-# AC-23 -- no duplicate ticket writers.
+# AC-23 -- no duplicate ticket writers (package 28: ContinuityOffCheck is
+# the one writer of butler-fork-ok too).
 # ===========================================================================
 {
     local %ENV = %ENV;
     my $base = GuardHarness::fresh_state();
-    my $S = BpHook::state_dir();
-    GuardHarness::run_module('ContinuityOffCheck',
-        payload_bash(cmd => "butler-fork-ok --reason 'needs parent context'",
+    tw(payload_bash(cmd => "butler-fork-ok --reason 'needs parent context'",
                      session_id => 'sess-a23', tool_use_id => 'T1', cwd => '/proj'));
     my @tf23a = find_ticket_files($base);
-    is(scalar(@tf23a), 0, 'AC-23: ContinuityOffCheck writes no ticket for a butler-fork-ok command');
-
+    is(scalar(@tf23a), 1,
+        'AC-23: ContinuityOffCheck is the one writer: exactly one ticket for a butler-fork-ok command');
+}
+{
+    local %ENV = %ENV;
+    my $base = GuardHarness::fresh_state();
     gf(payload_bash(cmd => 'butler-hold a1', session_id => 'sess-a23b', tool_use_id => 'T1', cwd => '/proj'));
     my @tf23b = find_ticket_files($base);
-    is(scalar(@tf23b), 0, 'AC-23: GuardFork writes no ticket for a butler-hold command');
+    is(scalar(@tf23b), 0,
+        'AC-23: ContinuityOffCheck is the one writer: exactly one ticket for a butler-fork-ok command');
+}
+{
+    local %ENV = %ENV;
+    my $base = GuardHarness::fresh_state();
+    gf(payload_bash(cmd => "butler-fork-ok --reason 'needs parent context'",
+                     session_id => 'sess-a23', tool_use_id => 'T1', cwd => '/proj'));
+    my @tf23c = find_ticket_files($base);
+    is(scalar(@tf23c), 0, 'AC-23: GuardFork writes no ticket for a butler-fork-ok command');
 }
 
 # ===========================================================================
@@ -783,7 +806,7 @@ my ($AC10_BASE, $AC10_S, $AC10_CWD, $AC10_REASON);
         is(scalar(@hits), 1, 'AC-30: among PreToolUse entries, exactly ONE command mentions guard-fork.sh');
         SKIP: {
             skip 'AC-30: no matching entry to inspect', 2 unless @hits;
-            is($hits[0]{group}{matcher}, 'Task|Agent|Bash', "AC-30: its group's matcher is Task|Agent|Bash");
+            is($hits[0]{group}{matcher}, 'Task|Agent', "AC-30: its group's matcher is Task|Agent");
             my $expect = q{unset BASH_ENV ; f="${CLAUDE_PLUGIN_ROOT}/hooks/guard-fork.sh" ; w="${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh" ; [ -f "$f" ] && [ -f "$w" ] || exit 0 ; bash -n "$f" 2>/dev/null && bash -n "$w" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash "$f"};
             is($hits[0]{hook}{command}, $expect, 'AC-30: the command equals the 2.5 template exactly');
             is($hits[0]{hook}{timeout}, 15, 'AC-30: timeout is 15');
@@ -815,7 +838,7 @@ my ($AC10_BASE, $AC10_S, $AC10_CWD, $AC10_REASON);
     ok(-f $ARCH_DOC, 'AC-32 precondition: hook-architecture.md exists') or BAIL_OUT('hook-architecture.md missing');
     my $src = GuardHarness::read_bytes($ARCH_DOC);
     like($src, qr/^### file: guard-fork\.sh$/m, 'AC-32: an inventory row for guard-fork.sh');
-    like($src, qr/^### registration: hooks\.json PreToolUse \[Task\|Agent\|Bash\] guard-fork\.sh$/m,
+    like($src, qr/^### registration: hooks\.json PreToolUse \[Task\|Agent\] guard-fork\.sh$/m,
          'AC-32: a registration row naming its matcher group');
     like($src, qr/^\|\s*guard-fork\.sh\s*\|\s*3\s*\|/m, 'AC-32: a budget-table line starting "| guard-fork.sh | 3 |"');
 }
@@ -860,7 +883,7 @@ my ($AC10_BASE, $AC10_S, $AC10_CWD, $AC10_REASON);
     # ticket key normalizes both forms to the same UTF-8 bytes (BpHook.pm's
     # _utf8_bytes), so a decoded-character command string here still claims
     # the byte-form argv the CLI is run with below.
-    gf(payload_bash(cmd => "butler-fork-ok --reason '$mismatch_chars'",
+    tw(payload_bash(cmd => "butler-fork-ok --reason '$mismatch_chars'",
                      session_id => 'sess-m1a', tool_use_id => 'T1', cwd => '/proj'));
 
     my $res = run_cli('--reason', $mismatch);
@@ -879,7 +902,7 @@ my ($AC10_BASE, $AC10_S, $AC10_CWD, $AC10_REASON);
     my $S = BpHook::state_dir();
     my $reason = 'a reason the cli truly accepts here';
 
-    gf(payload_bash(cmd => "butler-fork-ok --reason '$reason'",
+    tw(payload_bash(cmd => "butler-fork-ok --reason '$reason'",
                      session_id => 'A', tool_use_id => 'T1', cwd => '/proj'));
     my $res = run_cli('--reason', $reason);
     is($res->{rc}, 0, 'D93-M1b: an ordinary valid reason -> CLI exit 0');
@@ -906,7 +929,7 @@ my ($AC10_BASE, $AC10_S, $AC10_CWD, $AC10_REASON);
     ok(length($cut_nospace) >= 10 && scalar(@cut_words) >= 2,
         'D93-M1c precondition: the first 300 characters alone are still a valid reason');
 
-    gf(payload_bash(cmd => "butler-fork-ok --reason '$long'",
+    tw(payload_bash(cmd => "butler-fork-ok --reason '$long'",
                      session_id => 'A', tool_use_id => 'T1', cwd => '/proj'));
     my $res = run_cli('--reason', $long);
     is($res->{rc}, 0, 'D93-M1c: a >300-char reason whose truncated form stays valid -> CLI exit 0');
@@ -933,7 +956,7 @@ my ($AC10_BASE, $AC10_S, $AC10_CWD, $AC10_REASON);
 
     # record reason1 for session A -- an ordinary successful flow, leaving a
     # valid, still-unredeemed token.
-    gf(payload_bash(cmd => "butler-fork-ok --reason '$reason1'",
+    tw(payload_bash(cmd => "butler-fork-ok --reason '$reason1'",
                      session_id => 'A', tool_use_id => 'T1', cwd => '/proj'));
     my $res1 = run_cli('--reason', $reason1);
     is($res1->{rc}, 0, 'D93-m2 setup: reason1 records successfully');
@@ -945,7 +968,7 @@ my ($AC10_BASE, $AC10_S, $AC10_CWD, $AC10_REASON);
     make_path("$S/reasons.log");
     ok(-d "$S/reasons.log", 'D93-m2 setup: reasons.log is now a directory (unwritable as a log)');
 
-    gf(payload_bash(cmd => "butler-fork-ok --reason '$reason2'",
+    tw(payload_bash(cmd => "butler-fork-ok --reason '$reason2'",
                      session_id => 'A', tool_use_id => 'T2', cwd => '/proj'));
     my $res2 = run_cli('--reason', $reason2);
     is($res2->{rc}, 1, 'D93-m2: the second record fails (reasons.log write failure)');

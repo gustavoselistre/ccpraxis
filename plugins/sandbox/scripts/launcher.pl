@@ -1028,6 +1028,11 @@ my $PLUGINS_COPY_MANIFEST      = "$LAUNCHER_DIR/.host-tier-plugins.json";
 # belonging to a selected, LIVE-BOUND plugin; the launcher binds $EMPTY_SKILL_DIR
 # over each one so the container sees a skill directory with no SKILL.md.
 my $HOST_ONLY_MASKS_FILE       = "$LAUNCHER_DIR/.host-only-masks.json";
+# Decision 19 (review M2): the signature (sorted container_paths) that the
+# CURRENT container was created with. Compared against a freshly computed
+# signature in the drift check below, the same "no saved record is not drift"
+# rule the Containerfile/launcher-hash checks already follow.
+my $HOST_ONLY_MASKS_SIGNATURE_FILE = "$LAUNCHER_DIR/.host-only-masks-signature";
 my $EMPTY_SKILL_DIR            = "$LAUNCHER_DIR/empty-skill";
 my $MARKETPLACES_COPY_MANIFEST = "$LAUNCHER_DIR/.host-tier-marketplaces.json";
 my $SKILLS_COPY_MANIFEST       = "$LAUNCHER_DIR/.host-tier-skills.json";
@@ -2896,6 +2901,43 @@ if (_container_exists($CONTAINER_NAME)) {
     if (defined $div && length $div) {
         push @STALE_REASONS, "  - Skills changed since container was created: $div";
     }
+
+    # Decision 19 (review M2): a plugin newly enabled by ANY settings layer is
+    # newly masked (Decision 10), but masks only ever reach `podman create`'s
+    # argv -- an already-created container keeps the OLD mask set forever, the
+    # exact bug this package closes, one layer up. NO SAVED SIGNATURE IS NOT
+    # DRIFT, same rule as the Containerfile/launcher-hash checks above.
+    my $mask_sig = _host_only_mask_signature();
+    if (defined $mask_sig) {
+        my $saved_mask_sig = _read_file($HOST_ONLY_MASKS_SIGNATURE_FILE);
+        chomp $saved_mask_sig if defined $saved_mask_sig;
+        if (defined $saved_mask_sig && length $saved_mask_sig && $saved_mask_sig ne $mask_sig) {
+            push @STALE_REASONS, "  - Host-only mask set changed since container was created";
+        }
+    }
+}
+
+# _host_only_mask_signature() -> sorted, comma-joined container_paths of every
+# host-only-masks entry, or undef if the subcommand fails (fail-open: undef
+# means "cannot tell", never "assume drift"). Independent of @PLUGIN_MOUNTS
+# (not built yet at this point in the script) -- it shells out to skills.pl
+# itself, same as _skill_divergence_msg does for skill drift.
+sub _host_only_mask_signature {
+    my $seed_settings = -f $CONTAINER_SETTINGS_JSON
+        ? $CONTAINER_SETTINGS_JSON
+        : "$CONTAINER_CONFIG/settings.json";
+    my ($rc, $out, $err) = _capture_out_err($^X, $SANDBOX_SKILLS_PL,
+        'host-only-masks',
+        '--selection-file', $SELECTION_FILE,
+        '--project-path',   $PROJECT_PATH,
+        '--user-settings',  "$CLAUDE_DATA/settings.json",
+        '--seed-settings',  $seed_settings,
+        '--plugins-snapshot', $PLUGINS_SNAPSHOT_FILE);
+    return undef if $rc != 0;
+    my $masks = eval { require JSON::PP; JSON::PP::decode_json($out) };
+    return undef unless ref $masks eq 'ARRAY';
+    return join(',', sort map { $_->{container_path} }
+        grep { ref $_ eq 'HASH' && defined $_->{container_path} } @$masks);
 }
 
 # Silent podman-inspect for existence check (avoids dumping the
@@ -3825,15 +3867,18 @@ if (-f "$HOST_PLUGINS_DIR/known_marketplaces.json") {
     }
 }
 
-# Mask the host-only skills of any selected plugin that is served by one of the
-# live binds above.
+# Mask the host-only skills of any plugin -- selected in the picker OR enabled
+# in any settings layer the container can see (Decision 10) -- that is served
+# by one of the live binds above.
 #
 # `host-only: true` was enforced on only one of the two paths into a container.
 # discover_skills drops a host-only STANDALONE skill; plugin-shipped skills came
-# in through plugin selection, which never opened a SKILL.md. discover_plugins
-# now drops a plugin whose skills are ALL host-only (sandbox, todo), but that
-# cannot help a MIXED plugin -- steward ships /steward:setup-project and
-# /steward:audit, which belong in a container, next to four skills that do not.
+# in through plugin selection, which never opened a SKILL.md. Resolution here
+# goes straight through plugin_directory_source + plugin_skill_census, so a
+# plugin whose skills are ALL host-only (sandbox, todo) is masked whole even
+# though discover_plugins would drop it from the picker, and a MIXED plugin --
+# steward ships /steward:setup-project and /steward:audit, which belong in a
+# container, next to four skills that do not -- keeps its container-safe skills.
 #
 # A directory-source marketplace is bind-mounted LIVE and read-only, so there is
 # no copy to leave a skill out of. Bind an empty directory over the skill dir
@@ -3843,21 +3888,31 @@ if (-f "$HOST_PLUGINS_DIR/known_marketplaces.json") {
 #
 # Ordering matters: every mask must come AFTER the marketplace bind it nests
 # inside, which is why this block sits below the loop above rather than beside it.
-if (@PLUGIN_MOUNTS && -f $SELECTION_FILE) {
-    run_perl_to_file('host-only mask discovery', $HOST_ONLY_MASKS_FILE,
+#
+# host-only mask discovery -- FAILS OPEN (review M1). A mask error must never
+# abort the launch, so this calls _capture_out_err directly rather than the
+# die-on-nonzero-exit helper used elsewhere for perl-to-file writes. A
+# non-zero exit here is warned and the launch proceeds with no masks -- a
+# host-only skill left visible, no worse than before this package existed.
+if (@PLUGIN_MOUNTS) {
+    my $seed_settings = -f $CONTAINER_SETTINGS_JSON
+        ? $CONTAINER_SETTINGS_JSON
+        : "$CONTAINER_CONFIG/settings.json";
+    my ($mask_rc, $mask_out, $mask_err) = _capture_out_err($^X, $SANDBOX_SKILLS_PL,
         'host-only-masks',
         '--selection-file', $SELECTION_FILE,
         '--project-path',   $PROJECT_PATH,
+        '--user-settings',  "$CLAUDE_DATA/settings.json",
+        '--seed-settings',  $seed_settings,
         '--plugins-snapshot', $PLUGINS_SNAPSHOT_FILE);
 
     my $masks;
-    {
-        local $/;
-        if (open my $fh, '<:raw', $HOST_ONLY_MASKS_FILE) {
-            my $raw = <$fh>;
-            close $fh;
-            $masks = eval { require JSON::PP; JSON::PP::decode_json($raw) };
-        }
+    if ($mask_rc != 0) {
+        _emit_err($mask_err) if defined $mask_err && length $mask_err;
+        _emit_err("Warning: host-only mask discovery failed (perl exit @{[$mask_rc >> 8]}); host-only plugin skills will be visible in the container.\n");
+    } else {
+        _write_file($HOST_ONLY_MASKS_FILE, $mask_out);
+        $masks = eval { require JSON::PP; JSON::PP::decode_json($mask_out) };
     }
     if (ref $masks eq 'ARRAY' && @$masks) {
         # One shared empty directory serves every mask: it is mounted read-only
@@ -4980,6 +5035,14 @@ if (! _container_exists($CONTAINER_NAME)) {
     _write_file("$LAUNCHER_DIR/container-created",
         strftime("%Y-%m-%dT%H:%M:%S", gmtime(time)));
     _write_file("$LAUNCHER_DIR/launcher-hash",    launcher_hash());
+    {
+        # Decision 19 (review M2): record the mask signature this container
+        # was actually created with, so the drift check above has something
+        # to compare a future launch's signature against.
+        my $mask_sig_now = _host_only_mask_signature();
+        _write_file($HOST_ONLY_MASKS_SIGNATURE_FILE, $mask_sig_now)
+            if defined $mask_sig_now;
+    }
     run_perl_or_die('record-mount failed', 'record-mount',
         '--selection-file',     $SELECTION_FILE,
         '--discovery-snapshot', $SNAPSHOT_FILE);

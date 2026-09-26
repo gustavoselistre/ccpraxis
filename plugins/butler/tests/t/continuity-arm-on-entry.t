@@ -124,7 +124,8 @@ sub off_path   { my ($sid, $base) = @_; return state_root($base) . "/off/$sid" }
 fresh_base();
 
 my $SID_N = 0;
-sub mk_sid { my ($tag) = @_; $SID_N++; (my $s = "s$SID_N" . ($tag // '')) =~ s/[^A-Za-z0-9_-]/-/g; return substr($s, 0, 48) }
+my @MINTED_SIDS;
+sub mk_sid { my ($tag) = @_; $SID_N++; (my $s = "s$SID_N" . ($tag // '')) =~ s/[^A-Za-z0-9_-]/-/g; $s = substr($s, 0, 48); push @MINTED_SIDS, $s; return $s }
 
 sub payload_for {
     my (%o) = @_;
@@ -922,12 +923,30 @@ for my $bad_command (42, [1, 2]) {
 # BUTLER_STATE_DIR explicitly except the two AC17 sub-cases that
 # deliberately test the HOME/USERPROFILE fallback, and those pinned HOME/
 # USERPROFILE to an unrelated relative or decoy value, never the real one.
+#
+# A plain before/after existence check of the real armed/ dir is vacuous on
+# any host where continuity has ever armed a real session (it already
+# exists, so "existed -> exists" can never fail). Instead: (1) prove nothing
+# fell back to the decoy HOME pinned above, and (2) prove that none of the
+# session ids THIS FILE minted (never a real UUID) exists under the real
+# root -- independent of whatever the real root already contains. Access to
+# the real root is per-path -e probes only, never a directory listing.
 # ===========================================================================
-if (defined $REAL_STATE_ROOT) {
-    ok(!-e "$REAL_STATE_ROOT/armed", 'guard: the real ~/.claude/butler-state/continuity/armed was never created');
-}
-else {
-    pass('guard: no real HOME/USERPROFILE was available to check (nothing to protect)');
+{
+    my $DECOY_ROOT = "$FAKE_HOME/.claude/butler-state/continuity";
+    ok(!-e "$DECOY_ROOT/armed" && !-e "$DECOY_ROOT/off",
+       'guard: nothing fell back to HOME -- the decoy home has no continuity armed/ or off/');
+
+    ok(scalar(@MINTED_SIDS) > 0, 'guard: this file minted session ids to check');
+
+    if (defined $REAL_STATE_ROOT) {
+        my @leaked = grep { -e "$REAL_STATE_ROOT/armed/$_" || -e "$REAL_STATE_ROOT/off/$_" } @MINTED_SIDS;
+        is_deeply(\@leaked, [],
+            'guard: no session id minted by this file exists under the real ~/.claude/butler-state/continuity (armed/ or off/)');
+    }
+    else {
+        pass('guard: no real HOME/USERPROFILE was available to check (nothing to protect)');
+    }
 }
 
 $? = 0;

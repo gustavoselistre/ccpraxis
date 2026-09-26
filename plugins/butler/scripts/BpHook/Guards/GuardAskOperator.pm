@@ -77,48 +77,41 @@ sub _question_text {
         $text = $PLACEHOLDER;
     }
     $text =~ s/[\r\n]+/ /g;
+    $text =~ s/[\t\x{2028}\x{2029}]+/ /g;
+    $text =~ s/\p{Cc}//g;
     return $text;
 }
 
 # ---------------------------------------------------------------------------
-# _resolve_root($p) -> CLAUDE_PROJECT_DIR if non-empty, else BP_PROJECT_ROOT
-# if non-empty, else dirname(BpHook::data_dir($p)), else undef.
+# file_question($p, $text) -> $id|undef. Files $text as an almanac pending
+# decision (Almanac::Decision::file), never falling back to the process
+# cwd (Hooks, and GuardHarness::run_module in-process, can have the repo as
+# their cwd -- a fallback there would write real state). Package 09 re-
+# point (Decision 108, spec sec 2.5); one call site so a future change edits
+# one place.
 # ---------------------------------------------------------------------------
-sub _resolve_root {
-    my ($p) = @_;
-    my $cpd = $ENV{CLAUDE_PROJECT_DIR};
-    return $cpd if defined $cpd && length $cpd;
-    my $bppr = $ENV{BP_PROJECT_ROOT};
-    return $bppr if defined $bppr && length $bppr;
-    my $dd = BpHook::data_dir($p);
-    return undef unless defined $dd && length $dd;
-    return dirname($dd);
-}
-
-# ---------------------------------------------------------------------------
-# queue_question($p, $text) -> $path|undef. Appends
-# "- [<iso_now>] <text>\n" (UTF-8) to <root>/.ccpraxis-local-data/
-# .subagent-guard/questions.md, creating the directory if needed. Kept in
-# one sub so package 09 (almanac re-point) edits one place.
-# ---------------------------------------------------------------------------
-sub queue_question {
+sub file_question {
     my ($p, $text) = @_;
-    my $root = _resolve_root($p);
-    return undef unless defined $root && length $root;
-    (my $root_fs = $root) =~ tr{\\}{/};
-    $root_fs =~ s{/+\z}{};
-    my $qdir = "$root_fs/.ccpraxis-local-data/.subagent-guard";
-    unless (-d $qdir) {
-        eval { require File::Path; File::Path::make_path($qdir) };
+
+    my $start;
+    if (ref $p eq 'HASH' && defined $p->{cwd} && length $p->{cwd} && -d $p->{cwd}) {
+        $start = $p->{cwd};
     }
-    return undef unless -d $qdir;
-    my $qpath = "$qdir/questions.md";
-    my $line = '- [' . _iso_now() . '] ' . $text . "\n";
-    utf8::encode($line) if utf8::is_utf8($line);
-    open(my $fh, '>>:raw', $qpath) or return undef;
-    my $ok = print {$fh} $line;
-    $ok &&= close($fh);
-    return $ok ? $qpath : undef;
+    elsif (defined $ENV{CLAUDE_PROJECT_DIR} && length $ENV{CLAUDE_PROJECT_DIR} && -d $ENV{CLAUDE_PROJECT_DIR}) {
+        $start = $ENV{CLAUDE_PROJECT_DIR};
+    }
+    else {
+        return undef;
+    }
+
+    my $decision_pl = "$SELF_DIR/../../../../almanac/scripts/almanac-decision.pl";
+    unless (grep { m{(?:^|/)almanac-decision\.pl$} } keys %INC) {
+        local $@;
+        return undef unless eval { require $decision_pl; 1 };
+    }
+
+    my $rec = eval { Almanac::Decision::file(title => $text, cwd => $start) };
+    return (ref $rec eq 'HASH' && defined $rec->{id}) ? $rec->{id} : undef;
 }
 
 # ---------------------------------------------------------------------------
@@ -136,7 +129,7 @@ sub run {
     return 0 unless BpHook::is_armed($sid);
 
     my $text = _question_text($p);
-    my $qpath = queue_question($p, $text);
+    my $id = file_question($p, $text);
 
     my $ledger = $ENV{BP_LEDGER};
     my $why = (defined $ledger && length $ledger)
@@ -145,11 +138,11 @@ sub run {
 
     my @lines;
     push @lines, "BLOCKED: $why, so asking the operator would stop unattended work for an answer nobody is there to give.";
-    if (defined $qpath) {
-        push @lines, 'The question is queued in ' . BpHook::Guards::Common::path_echo($qpath) . '.';
+    if (defined $id) {
+        push @lines, "The question is filed as pending decision $id.";
     }
     else {
-        push @lines, 'The question could not be queued; note it in your report instead.';
+        push @lines, 'The question could not be filed; note it in your report instead.';
     }
     push @lines, 'Decide it yourself unless it is a product decision (.ccpraxis-local-data/guidance/escalate-product-decisions-only.md).';
     push @lines, 'Carry on with the work that does not depend on the answer; queued questions are surfaced when the run reports.';

@@ -89,6 +89,11 @@
                   "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/track-dispatch.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
+               },
+               {
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/guard-fork.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "timeout" : 15,
+                  "type" : "command"
                }
             ],
             "matcher" : "Task|Agent"
@@ -97,11 +102,6 @@
             "hooks" : [
                {
                   "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/context-ceiling.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
-                  "timeout" : 15,
-                  "type" : "command"
-               },
-               {
-                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/guard-fork.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                }

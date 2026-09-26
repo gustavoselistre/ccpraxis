@@ -117,28 +117,77 @@ sub old_shape_fixture {
     );
 }
 
-# Resolve a real, substantial OLD-SHAPE blueprint.md by PROPERTY (largest file
-# under .ccpraxis-local-data/blueprints), never by a hardcoded initiative name --
-# same reasoning as t/blueprint-write-api.t's $LIVE_BP (a fixture that names a
-# specific initiative is a fixture with an expiry date). Every criterion that uses
-# it SKIPs when nothing qualifies.
-my $BP_ROOT_DIRS = "$PROJ/.ccpraxis-local-data/blueprints";
-my $LIVE_OLD_SHAPE = do {
-    my @cands = sort { -s $b <=> -s $a }
-                grep { -f && -s $_ > 50_000 }
-                (glob("$BP_ROOT_DIRS/*/blueprint.md"), glob("$BP_ROOT_DIRS/_archive/*/blueprint.md"));
-    $cands[0];
-};
-my $HAVE_OLD_SHAPE = defined $LIVE_OLD_SHAPE && -f $LIVE_OLD_SHAPE;
+# Deterministic, in-file synthetic generator of a SUBSTANTIAL old-shape
+# blueprint (Decision 26: no real data in fixtures). Replaces the earlier
+# real-file lookup, which copied real operator data and went stale/SKIP the
+# moment the largest real blueprint.md became new-shape.
+#
+# Package-status rows: pkg, depends_on cell, status cell (glyph + word).
+# Glyph bytes (UTF-8): checkmark U+2705, white-square U+2B1C, wrench U+1F527,
+# magnifier U+1F50D, no-entry U+26D4, pause U+23F8, wastebasket U+1F5D1.
+my $GLYPH_DONE      = "\xE2\x9C\x85"; # checkmark
+my $GLYPH_PENDING   = "\xE2\xAC\x9C"; # white square
+my $GLYPH_RUNNING   = "\xF0\x9F\x94\xA7"; # wrench
+my $GLYPH_REVIEWING = "\xF0\x9F\x94\x8D"; # magnifier
+my $GLYPH_BLOCKED   = "\xE2\x9B\x94"; # no-entry
+my $GLYPH_PARKED    = "\xE2\x8F\xB8"; # pause
+my $GLYPH_DROPPED   = "\xF0\x9F\x97\x91"; # wastebasket
+my $EMDASH          = "\xE2\x80\x94";
+my $MIDDOT          = "\xC2\xB7";
 
-sub stage_live_old_shape_copy {
-    return undef unless $HAVE_OLD_SHAPE;
-    my $bytes = read_file($LIVE_OLD_SHAPE);
-    return undef unless defined $bytes;
-    my $d = fresh_dir();
-    my $dst = "$d/blueprint.md";
-    write_file($dst, $bytes);
-    return $dst;
+my @OLD_SHAPE_ROWS = (
+    ['o01', $EMDASH,     "$GLYPH_DONE done"],
+    ['o02', 'o01',       "$GLYPH_DONE done"],
+    ['o03', 'o01',       "$GLYPH_RUNNING running"],
+    ['o04', 'o02, o03',  "$GLYPH_REVIEWING reviewing"],
+    ['o05', $EMDASH,     "$GLYPH_PENDING pending"],
+    ['o06', 'o05',       "$GLYPH_BLOCKED blocked"],
+    ['o07', 'o05',       "$GLYPH_PARKED parked"],
+    ['o08', 'o06',       "$GLYPH_DROPPED dropped"],
+    ['o09', 'o04',       "$GLYPH_PENDING pending"],
+    ['o10', 'o09',       "$GLYPH_PENDING pending"],
+    ['o11', 'o09, o10',  "$GLYPH_PENDING pending"],
+    ['o12', $EMDASH,     "$GLYPH_DONE done"],
+);
+
+sub substantial_old_shape_fixture {
+    my @lines;
+    push @lines, '# Blueprint: synthetic-old-shape', '';
+    push @lines, '```', 'blueprint: synthetic-old-shape', 'status: running', '```', '';
+    push @lines, '## Objective', 'This synthetic blueprint exists only to exercise the old table shape.', '';
+    push @lines, '## Decisions', '';
+    push @lines, '| # | Decision | Decided | Date |';
+    push @lines, '|---|---|---|---|';
+    my $filler = 'filler filler filler filler filler filler filler filler filler filler filler filler';
+    for my $n (1 .. 400) {
+        push @lines, "| $n | SYN-$n: synthetic decision $n, $filler | user | 2026-01-01 |";
+    }
+    push @lines, '';
+    push @lines, '## Package status', '';
+    push @lines, '| pkg | deliverable | depends_on | model | status |';
+    push @lines, '|-----|-------------|------------|-------|--------|';
+    for my $row (@OLD_SHAPE_ROWS) {
+        my ($pkg, $deps, $status) = @$row;
+        push @lines, "| $pkg | synthetic deliverable $pkg | $deps | sonnet | $status |";
+    }
+    push @lines, '';
+    push @lines, "Status values: $GLYPH_DONE done $MIDDOT $GLYPH_PENDING pending $MIDDOT "
+        . "$GLYPH_RUNNING running $MIDDOT $GLYPH_REVIEWING reviewing $MIDDOT "
+        . "$GLYPH_BLOCKED blocked $MIDDOT $GLYPH_PARKED parked $MIDDOT $GLYPH_DROPPED dropped";
+    push @lines, '';
+    push @lines, '## Packages', '';
+    for my $row (@OLD_SHAPE_ROWS) {
+        my $pkg = $row->[0];
+        push @lines, "### $pkg -- synthetic package $pkg", '';
+        push @lines, "- **scope:** synthetic scope sentence for package $pkg.";
+        push @lines, "- **write_set:** \`plugins/synthetic/$pkg/\`", '';
+    }
+    push @lines, '## Harvest log', '';
+    push @lines, '| pkg | verified outputs | verified by | date |';
+    push @lines, '|---|---|---|---|';
+    push @lines, '| o01 | synthetic | orchestrator | 2026-01-01 |', '';
+    push @lines, '## Incidents', 'None recorded for this synthetic fixture.', '';
+    return join("\n", @lines);
 }
 
 # The ledger-pointer text a retired verb's refusal must carry (spec §2.2). Checked
@@ -260,17 +309,30 @@ sub assert_ledger_pointer {
 }
 
 # ===========================================================================
-# Item 5 (criterion 6/DC4/DC7, behavior 7): status --file on the real
-# archived old-shape fixture (copy, never the live path).
+# Fixture-sanity (placed before item 5 so a shrunken or mis-shaped generator
+# fails loudly instead of silently passing).
 # ===========================================================================
-SKIP: {
-    skip('item5: no substantial old-shape blueprint.md available as a fixture', 2)
-        unless $HAVE_OLD_SHAPE;
-    my $p = stage_live_old_shape_copy();
-    skip('item5: could not stage a copy of the old-shape fixture', 2) unless defined $p;
+{
+    cmp_ok(length(substantial_old_shape_fixture()), '>', 50_000,
+        'fixture: the synthetic old-shape blueprint is substantial (>50 KB, the bar the old live-file lookup used)');
+    like(substantial_old_shape_fixture(), qr/^\| pkg \| deliverable \| depends_on \| model \| status \|$/m,
+        'fixture: it carries the old 5-column header with a status column');
+    like(substantial_old_shape_fixture(), qr/^Status values: /m,
+        'fixture: it carries the old legend line');
+    is(substantial_old_shape_fixture(), substantial_old_shape_fixture(),
+        'fixture: the generator is deterministic');
+}
+
+# ===========================================================================
+# Item 5 (criterion 6/DC4/DC7, behavior 7): status --file on a synthetic
+# substantial old-shape fixture (Decision 26: no real data).
+# ===========================================================================
+{
+    my $p = stage(substantial_old_shape_fixture());
     my ($rc, $out, $err) = run_pl(['status', '--file', $p]);
-    is($rc, 0, 'item5: status against the real archived old-shape fixture exits 0') or diag("stderr: $err");
-    ok(length($out) > 0, 'item5: ...and prints real per-package values');
+    is($rc, 0, 'item5: status against the synthetic substantial old-shape fixture exits 0') or diag("stderr: $err");
+    my $expected = join('', map { "$_->[0]: $_->[2]\n" } @OLD_SHAPE_ROWS);
+    is($out, $expected, "item5: ...and prints every package's status value, in table order");
 }
 
 # ===========================================================================
@@ -301,13 +363,14 @@ SKIP: {
         'item7(old-shape): parse_dag sees both packages despite the extra status column');
     is_deeply($dag->{b02}, ['b01'], 'item7(old-shape): b02 depends on b01');
 }
-SKIP: {
-    skip('item7(live old-shape): no substantial old-shape blueprint.md available', 1)
-        unless $HAVE_OLD_SHAPE;
-    my $c = read_file($LIVE_OLD_SHAPE);
+{
+    my $c = substantial_old_shape_fixture();
     my $dag = BpOrch::parse_dag($c);
-    ok(scalar(keys %$dag) > 0,
-        'item7(live old-shape): parse_dag returns a non-empty graph on the real archived fixture');
+    is_deeply([sort keys %$dag], [map { $_->[0] } @OLD_SHAPE_ROWS],
+        'item7(substantial old-shape): parse_dag sees all 12 packages');
+    is_deeply($dag->{o04}, ['o02','o03'], 'item7(substantial old-shape): multi-dep row parsed');
+    is_deeply($dag->{o01}, [], 'item7(substantial old-shape): em-dash means no deps');
+    is_deeply($dag->{o11}, ['o09','o10'], 'item7(substantial old-shape): second multi-dep row parsed');
 }
 
 # ===========================================================================

@@ -1,16 +1,18 @@
 # BpHook::ContinuityOffCheck -- the PreToolUse module behind
 # hooks/next/continuity-off-check.sh (package 04 of blueprint
 # hook-continuity-remake). Writes command tickets for every predictable
-# butler-continuity/butler-hold invocation, and tells an operator-typed
-# `/butler:continuity off` apart from anything an agent could produce.
+# butler-continuity/butler-hold/butler-fork-ok invocation (package 28,
+# Decision 105 -- this module is the one and only ticket writer for all
+# three names), and tells an operator-typed `/butler:continuity off` apart
+# from anything an agent could produce.
 #
 # Contract: .ccpraxis-local-data/blueprints/hook-continuity-remake/specs/
-# 04-continuity-command-spec.md SS2.3/2.4. Evidence for the discriminator:
+# 04-continuity-command-spec.md SS2.3/2.4; 28-fork-guard-bash-cost-spec.md
+# SS2.2. Evidence for the discriminator:
 # reports/04-continuity-command/evidence/off-record-shapes.md.
 #
-# ADDITIVE ONLY (Decision 19): nothing here is registered, and BpHook.pm is
-# never edited. run() never denies and never prints -- it only ever writes
-# tickets, and always returns 0.
+# ADDITIVE ONLY (Decision 19): BpHook.pm is never edited. run() never denies
+# and never prints -- it only ever writes tickets, and always returns 0.
 package BpHook::ContinuityOffCheck;
 use strict;
 use warnings;
@@ -49,7 +51,7 @@ sub run {
     my $off_cache;
     my $off_computed = 0;
 
-    for my $name (qw(butler-continuity butler-hold)) {
+    for my $name (qw(butler-continuity butler-hold butler-fork-ok)) {
         my @invocations = BpHook::invocations($cmd, $name);
         for my $argv (@invocations) {
             next if ref $argv ne 'ARRAY';

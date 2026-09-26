@@ -27,10 +27,20 @@ require "$Bin/BpHook.pm"
     unless grep { m{(?:^|/)BpHook\.pm$} } keys %INC;
 require "$Bin/BpContinuityLease.pm"
     unless grep { m{(?:^|/)BpContinuityLease\.pm$} } keys %INC;
-require "$Bin/BpProjectRoot.pm"
-    unless grep { m{(?:^|/)BpProjectRoot\.pm$} } keys %INC;
 
-my $USAGE = q{usage: butler-continuity on [--role driver|reporter] | off [--reason '<why>'] [--token T] | silence --reason '<why>' [--token T] | status | ask --text '<question>'};
+my $USAGE = q{usage: butler-continuity on [--role driver|reporter] | off [--reason '<why>'] [--token T] | silence --reason '<why>' [--token T] | status | ask --text '<question>' | questions | answer --id <id> --answer '<text>'};
+
+# Almanac::Decision -- loaded lazily, only for ask/questions/answer (Decision
+# 108, spec sec 2.3). No spawn; a missing almanac plugin is a legible refusal.
+my $ALMANAC_DECISION_PL;
+sub _load_almanac_decision {
+    return 1 if grep { m{(?:^|/)almanac-decision\.pl$} } keys %INC;
+    $ALMANAC_DECISION_PL = "$Bin/../../almanac/scripts/almanac-decision.pl";
+    return 0 unless -f $ALMANAC_DECISION_PL;
+    local $@;
+    my $ok = eval { require $ALMANAC_DECISION_PL; 1 };
+    return $ok ? 1 : 0;
+}
 
 sub _bytes {
     my ($s) = @_;
@@ -81,7 +91,12 @@ sub sanitize_text {
     my ($raw) = @_;
     return '' unless defined $raw;
     my $s = $raw;
-    { local $@; eval { utf8::decode($s) } }    # best effort; raw bytes on failure
+    # Decode only when $s is still raw bytes (utf8 flag off). Package 09
+    # (Decision 108) also feeds this an ALREADY-decoded almanac record field
+    # (a character string, flag on) -- calling utf8::decode on that would
+    # flip the flag back off against the byte 0xE9 alone (not valid UTF-8 on
+    # its own), corrupting it on the way to _bytes()'s encode.
+    { local $@; eval { utf8::decode($s) } unless utf8::is_utf8($s) }    # best effort; raw bytes on failure
     $s =~ s/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?//g;   # OSC ... BEL|ST
     $s =~ s/\x1b\[[0-9;?]*[ -~]//g;                    # CSI ... final byte
     $s =~ s/[\r\n\t]+/ /g;
@@ -144,14 +159,16 @@ my @argv0 = @ARGV;    # the untouched copy, ticket key material
 my @args  = @ARGV;
 
 my $verb = shift @args;
-usage_die() unless defined $verb && $verb =~ /^(?:on|off|silence|status|ask)$/;
+usage_die() unless defined $verb && $verb =~ /^(?:on|off|silence|status|ask|questions|answer)$/;
 
 my %allowed = (
-    on      => { role => 1 },
-    off     => { reason => 1, token => 1 },
-    silence => { reason => 1, token => 1 },
-    status  => {},
-    ask     => { text => 1 },
+    on        => { role => 1 },
+    off       => { reason => 1, token => 1 },
+    silence   => { reason => 1, token => 1 },
+    status    => {},
+    ask       => { text => 1 },
+    questions => {},
+    answer    => { id => 1, answer => 1 },
 );
 
 my %flags;
@@ -195,8 +212,15 @@ if (exists $flags{role}) {
 }
 
 if ($verb eq 'ask') {
-    if (!defined $flags{text} || !length $flags{text}) {
+    if (!defined $flags{text} || sanitize_text($flags{text}) eq '') {
         refuse("ask needs --text '<question>'.");
+    }
+}
+
+if ($verb eq 'answer') {
+    if (!defined $flags{id} || !length $flags{id}
+        || !defined $flags{answer} || sanitize_text($flags{answer}) eq '') {
+        refuse("answer needs --id <id> --answer '<text>'.");
     }
 }
 
@@ -218,7 +242,7 @@ if (defined $ENV{BP_LEDGER} && length $ENV{BP_LEDGER}) {
 # Step 3: state root (every verb except ask).
 # ---------------------------------------------------------------------------
 my $ROOT;
-if ($verb ne 'ask') {
+if ($verb ne 'ask' && $verb ne 'questions' && $verb ne 'answer') {
     $ROOT = BpHook::state_dir();
     unless (defined $ROOT) {
         refuse("no continuity state directory (set HOME, or an absolute BUTLER_STATE_DIR).");
@@ -397,10 +421,25 @@ if ($verb eq 'status') {
         my $ldir = BpContinuityLease::legacy_dir();
         # R4-L-tasklist (review m3): status "starts no process" (spec
         # SS2.2). BpContinuityLease::state()'s default pid_alive probe runs
-        # `tasklist` on Windows; substituting kill(0, ...) keeps the same
-        # shape of answer without ever spawning anything.
+        # `tasklist` on Windows -- but a Windows keepawake.pid holds a
+        # WINDOWS pid, which is never in the same namespace as this (MSYS)
+        # process's own signal-0 liveness check (Decision 83; CLAUDE.md's
+        # pid-namespace landmine), so that probe always answered false here.
+        # Judge liveness by the pid file's OWN heartbeat age instead: held
+        # iff its mtime is under TICK_SECONDS * stale_ticks() (300s) old. A
+        # negative age (clock skew) counts as held; a missing file or failed
+        # stat counts as not held. No spawn, no signalling, whatever the
+        # recorded pid.
+        my $stale_after = do { no warnings 'once'; $BpContinuityLease::TICK_SECONDS } * BpContinuityLease::stale_ticks();
         $wl = defined $ldir
-            ? BpContinuityLease::state($ldir, pid_alive => sub { kill(0, $_[0]) ? 1 : 0 })
+            ? BpContinuityLease::state($ldir, pid_alive => sub {
+                  my $pf = BpContinuityLease::wakelock_pid_file($ldir);
+                  my @st = stat($pf);
+                  return 0 unless @st;
+                  my $age = time() - $st[9];
+                  return 1 if $age < 0;
+                  return $age < $stale_after ? 1 : 0;
+              })
             : 'released';
     }
     push @lines, "wake-lock: $wl";
@@ -409,32 +448,83 @@ if ($verb eq 'status') {
     exit 0;
 }
 
+if ($verb eq 'ask' || $verb eq 'questions' || $verb eq 'answer') {
+    unless (_load_almanac_decision()) {
+        refuse("almanac plugin not found ($ALMANAC_DECISION_PL).");
+    }
+}
+
+# _project_display() -- the project directory to show the operator, derived
+# from the open decision store's own root (which ends in one fixed suffix
+# component, then the almanac data directory) with those two trailing path
+# segments peeled off generically -- never by naming that data directory's
+# path literally in this file (Q17).
+sub _project_display {
+    my $root = eval { Almanac::Decision::open_decisions()->root };
+    return '-' unless defined $root && length $root;
+    $root =~ s{/[^/]+\z}{};
+    $root =~ s{/[^/]+\z}{};
+    return length($root) ? $root : '-';
+}
+
 if ($verb eq 'ask') {
-    my $text = $flags{text};
-    $text =~ s/[\r\n]+/ /g;
+    my $title = sanitize_text($flags{text});
 
-    my $root = BpProjectRoot::resolve();
-    my $dir  = "$root/.ccpraxis-local-data/.subagent-guard";
-    my $path = "$dir/questions.md";
-    unless (-d $dir) {
-        eval { require File::Path; File::Path::make_path($dir) };
+    my $rec = eval { Almanac::Decision::file(title => $title) };
+    if (my $e = $@) {
+        my $kind = (ref $e && exists $e->{kind}) ? $e->{kind} : 'error';
+        refuse("cannot reach the decision store ($kind).");
     }
+    my $list = eval { Almanac::Decision::list_decisions() } || [];
+    my $n = scalar(grep { defined $_->{fields}{status} && $_->{fields}{status} eq 'unanswered' } @$list);
+    my $project = _project_display();
+    out("queued pending decision $rec->{id} ($n waiting) in $project\n");
+    exit 0;
+}
 
-    my $ok = 0;
-    if (open(my $fh, '>>', $path)) {
-        $ok = print {$fh} '- [' . iso_now() . "] $text\n";
-        $ok &&= close($fh);
+if ($verb eq 'questions') {
+    my $list = eval { Almanac::Decision::list_decisions() };
+    if (my $e = $@) {
+        my $kind = (ref $e && exists $e->{kind}) ? $e->{kind} : 'error';
+        refuse("cannot reach the decision store ($kind).");
     }
-    unless ($ok) {
-        refuse("cannot write $path");
-    }
+    $list = [] unless ref $list eq 'ARRAY';
+    my @unanswered = grep { defined $_->{fields}{status} && $_->{fields}{status} eq 'unanswered' } @$list;
 
-    my $n = 0;
-    if (open(my $rfh, '<', $path)) {
-        while (my $l = <$rfh>) { $n++ if $l =~ /^\s*-\s/ }
-        close $rfh;
+    my $project = _project_display();
+
+    my @lines;
+    for my $rec (@unanswered) {
+        my $title   = sanitize_text($rec->{fields}{title});
+        my $created = defined $rec->{fields}{created} ? $rec->{fields}{created} : '';
+        push @lines, "- $rec->{id} [$created] $title";
     }
-    out("queued ($n waiting): $path\n");
+    push @lines, scalar(@unanswered) . " waiting in $project";
+    out(join("\n", @lines) . "\n");
+    exit 0;
+}
+
+if ($verb eq 'answer') {
+    my $id  = $flags{id};
+    my $ans = sanitize_text($flags{answer});
+
+    my ($rec, $changed) = eval { Almanac::Decision::answer($id, answer => $ans) };
+    if (my $e = $@) {
+        my $kind = (ref $e && exists $e->{kind}) ? $e->{kind} : 'error';
+        if ($kind eq 'not_found') {
+            refuse("no pending decision $id in " . _project_display() . '.');
+        }
+        if ($kind eq 'usage' && ref($e) && defined($e->{detail}) && $e->{detail} eq 'already_answered') {
+            refuse("decision $id is already answered.");
+        }
+        refuse("cannot reach the decision store ($kind).");
+    }
+    if ($changed) {
+        out("answered $id: $rec->{fields}{title}\n");
+    }
+    else {
+        out("$id already answered; nothing changed\n");
+    }
     exit 0;
 }
 

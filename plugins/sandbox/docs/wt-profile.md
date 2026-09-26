@@ -19,15 +19,25 @@ automatically from every application's `Fragments` folder, at:
 %LOCALAPPDATA%\Microsoft\Windows Terminal\Fragments\ccpraxis\claude-sandbox.json
 ```
 
-The user's own `LocalState\settings.json` is never read and never written by
-this feature.
+The user's own Windows Terminal `settings.json` (the packaged/Store location
+or the unpackaged one, whichever exists) is read, read-only, on every `[c]`
+press, to copy the operator's default profile's appearance into the
+fragment. It is never written, never backed up and never copied by this
+feature — only its `profiles.defaults` and default-profile appearance keys
+are inspected.
 
 ## What it sets
 
-The fragment sets exactly one appearance key, `scrollbarState: "hidden"`, plus
-the `name` and `guid` needed to identify the profile. Nothing else is
-overridden, so the window otherwise inherits the user's own
-`profiles.defaults` and looks like their normal terminal minus the scrollbar.
+The fragment always sets `scrollbarState: "hidden"`, plus the `name` and
+`guid` needed to identify the profile. On top of that, it copies the related
+appearance keys (font face/size/weight/features, `colorScheme`, cursor and
+background colors, `opacity`, `useAcrylic`, `padding` and a few others) from
+the operator's default Windows Terminal profile, merged with
+`profiles.defaults`. If the settings file cannot be read or parsed, or no
+default profile can be resolved, the fragment falls back to just
+`scrollbarState: "hidden"` — the window still inherits the user's own
+`profiles.defaults` and looks like their normal terminal minus the
+scrollbar.
 
 ## When it is written
 
@@ -37,12 +47,22 @@ not rewritten — the common case, on every press after the first.
 
 ## What happens when it fails
 
-Writing or reading the fragment is a best-effort, cosmetic step. If it fails
-for any reason — `%LOCALAPPDATA%` unresolvable, the fragment directory
-uncreatable, the file unwritable, or anything else — the `[c]` window still
-opens, under no profile, exactly as it did before this feature existed. One
-`launch_profile_degraded` event carrying a machine-readable reason is written
-to the launch log so the failure is visible without ever blocking the session.
+Writing or reading the fragment is a best-effort, cosmetic step. If the
+fragment itself cannot be produced — `%LOCALAPPDATA%` unresolvable, the
+fragment directory uncreatable, the file unwritable, or anything else — the
+`[c]` window still opens, under no profile, exactly as it did before this
+feature existed. One `launch_profile_degraded` event carrying a
+machine-readable reason is written to the launch log so that failure is
+visible without ever blocking the session.
+
+Reading the operator's `settings.json` for appearance is a narrower,
+separate failure mode: if that file is missing, unreadable, unparseable, or
+has no resolvable default profile, the `[c]` window still opens under the
+`claude-sandbox` profile — only its appearance falls back to the bare
+`scrollbarState: "hidden"` fragment, not the pre-feature no-profile
+behavior. This never blocks the session, but today it is not yet written to
+the launch log as its own event — only visible to a caller inspecting
+`WtProfile::ensure_fragment`'s return value directly.
 
 ## What does NOT degrade
 

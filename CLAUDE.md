@@ -54,9 +54,19 @@ disk. So a promoted skill fix needs a **new session**, even for a skill this ses
 Stale skill text in an old session is this, not a file bug. A **new** `skills/<name>/` is not
 mounted at all until a full manager launch.
 
-**Promotion is a merge:** `git -C ~/.claude/ccpraxis pull <this-clone> main`. `install.pl` only
-re-wires PATH and plugin registration; it never copies plugin code, so a clean install run does not
-mean promotion happened. Full mechanics: `plugins/sandbox/docs/working-on-ccpraxis.md`.
+**Promotion is one command: `perl scripts/promote.pl`**, run from this clone (`--dry-run`
+previews and writes nothing). It (1) merges this clone's `main` into the live install
+(`git -C ~/.claude/ccpraxis pull --no-rebase --ff --no-edit <clone> main`; the live install has
+commits of its own, so this is usually a merge commit), refusing on a dirty live tree; then
+(2) syncs the `global-config/` payload into `~/.claude`: `CLAUDE.md` is replaced after a backup
+to `~/.claude/.promotion-backups/<ts>/`, and refused, with the offending lines shown, if it holds
+a line no committed version of the payload ever had; `settings.json` is merged key by key (the
+payload wins only over values it once had, and `.backup-preferences.json` is honoured);
+`known_marketplaces.json` is only reported. A bare `git pull` is not a promotion: it leaves
+the installed global config at whatever was last copied, which is how `~/.claude/CLAUDE.md` sat
+at the Aug 26 payload for a month. `install.pl` only re-wires PATH and plugin registration; it
+never copies plugin code, so a clean install run does not mean promotion happened. Full
+mechanics: `plugins/sandbox/docs/working-on-ccpraxis.md`.
 
 ## Language and runtime
 
@@ -280,5 +290,6 @@ blueprint over ad-hoc edits.
 ## Do not confuse these two
 
 - `global-config/CLAUDE.md` — a **payload** of this repo, installed to the user's
-  `~/.claude/CLAUDE.md`. Editing it changes what every project sees on this machine.
+  `~/.claude/CLAUDE.md` by `scripts/promote.pl`. Editing it changes what every project sees on
+  this machine once promoted.
 - **This file** — instructions for working on ccpraxis itself.

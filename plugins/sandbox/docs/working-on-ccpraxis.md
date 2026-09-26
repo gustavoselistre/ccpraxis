@@ -42,15 +42,26 @@ structural, not policy-enforced.
 ## Promoting to live
 
 ```bash
-git -C ~/.claude/ccpraxis status --short          # must be clean
-git -C ~/.claude/ccpraxis pull /c/Development/ccpraxis main
+cd /c/Development/ccpraxis
+perl scripts/promote.pl --dry-run    # preview: merge + payload sync, writes nothing
+perl scripts/promote.pl              # apply
 ```
 
-**That is the whole promotion.** Because `~/.claude/ccpraxis` *is* the installed plugin tree — the
-`ccpraxis-local` marketplace is a `directory` source whose `installLocation` is
-`~/.claude/ccpraxis/plugins`, and `~/.claude/ccpraxis/plugins/*/bin` is what sits on your `PATH` —
-the merge lands the new code exactly where Claude Code reads it. There is **no separate "installed"
-copy** to refresh.
+The script merges this clone's `main` into `~/.claude/ccpraxis` (refusing on a dirty live tree,
+aborting cleanly on a conflict), which lands plugin code where Claude Code reads it — because
+`~/.claude/ccpraxis` *is* the installed plugin tree, the `ccpraxis-local` marketplace is a
+`directory` source whose `installLocation` is `~/.claude/ccpraxis/plugins`, and
+`~/.claude/ccpraxis/plugins/*/bin` is what sits on your `PATH`, so there is **no separate
+"installed" copy** to refresh. It also syncs the three `global-config/` files below, with backups
+under `~/.claude/.promotion-backups/<ts>/`:
+
+| payload | live | rule |
+|---|---|---|
+| `global-config/CLAUDE.md` | `~/.claude/CLAUDE.md` | replaced if every live line appears in some committed version of the payload; otherwise refused with those lines listed |
+| `global-config/settings.json` | `~/.claude/settings.json` | per key (one-level dotted units, as `settings-export-merge`): payload keys added, payload wins over a value it once had, a never-seen live value is kept and reported, live-only keys kept, `.backup-preferences.json` honoured |
+| `global-config/known_marketplaces.json` | `~/.claude/plugins/known_marketplaces.json` | reported only; add with `/plugin marketplace add` |
+
+Exit codes: 0 ok, 1 a file refused, 2 refused/failed, 3 usage.
 
 **When you additionally need `install.pl`:** only when the *wiring* changed, not the code — a new
 plugin with its own `bin/` directory, a changed `ccpraxis-install.pl` hook, or a PATH/PATHEXT
@@ -65,7 +76,7 @@ cd ~/.claude/ccpraxis && perl install.pl --confirm  # apply
 > `ccpraxis-install.pl` hook; it does not copy or refresh plugin code. Treating it as the promotion
 > step lets a successful-looking install mask a merge that never happened.
 
-**Verify the promotion took:**
+**Verify the promotion took:** the report's `result: ok` line, alongside:
 
 ```bash
 git -C ~/.claude/ccpraxis log --oneline -1     # your commit is at HEAD

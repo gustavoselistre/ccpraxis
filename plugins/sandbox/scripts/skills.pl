@@ -1757,8 +1757,9 @@ sub cmd_mounts {
 # Subcommand: host-only-masks
 # =====================================================================
 #
-# Emits the container paths of every host-only skill belonging to a SELECTED
-# plugin that reaches the container through a LIVE BIND rather than a copy.
+# Emits the container paths of every host-only skill belonging to a plugin --
+# selected in the picker OR enabled in any settings layer (Decision 10) -- that
+# reaches the container through a LIVE BIND rather than a copy.
 #
 # Two different mechanisms put a plugin's files into the container, and a
 # host-only skill has to be removed from each differently:
@@ -1773,28 +1774,71 @@ sub cmd_mounts {
 #     written: a nested bind over a subtree of a read-only bind mounts fine and
 #     leaves its siblings intact.
 #
-# discover_plugins has already dropped any plugin whose skills are ALL
-# host-only, so what reaches here is the MIXED case -- steward, which ships two
-# container-usable skills alongside four host-only ones.
+# Decision 10: masks are computed for every plugin key SELECTED in the picker
+# OR ENABLED (truthy) in any settings layer the container can see -- project
+# settings.json, project settings.local.json, the container's user settings,
+# and the seed settings the launcher would copy in on a fresh create. This is
+# a UNION across layers, deliberately not Claude Code's local-over-project
+# precedence: an over-mask (enabled true in one layer, false in another) costs
+# one inert bind, while an under-mask is the bug this closes. Resolution goes
+# straight through plugin_directory_source + plugin_skill_census -- it never
+# consults discover_plugins/installed_plugins.json, so a plugin whose skills
+# are ALL host-only (which discover_plugins would drop) is still masked whole,
+# and no installed_plugins.json record is required at all.
+# M3 (review m2): a settings.json saved by a Windows editor can carry a
+# leading UTF-8 BOM (EF BB BF). decode_json rejects that byte sequence outright,
+# so read_json's shared path would silently treat the whole layer as malformed
+# -- reintroducing exactly the under-mask this package closes. Strip it here,
+# scoped to this one caller, rather than in shared read_json.
+sub _enabled_plugin_keys_from_settings_file {
+    my ($file) = @_;
+    return () unless defined $file && length $file && -f $file;
+    my $data = do {
+        open my $fh, '<:raw', $file or return ();
+        local $/;
+        my $content = <$fh>;
+        close $fh;
+        $content =~ s/^\xEF\xBB\xBF// if defined $content;
+        eval { decode_json($content) };
+    };
+    return () unless ref $data eq 'HASH' && ref $data->{enabledPlugins} eq 'HASH';
+    my %keys;
+    for my $key (keys %{ $data->{enabledPlugins} }) {
+        $keys{$key} = 1 if $data->{enabledPlugins}{$key};
+    }
+    return %keys;
+}
+
 sub cmd_host_only_masks {
     my %opts = @_;
-    my $file   = $opts{selection_file} or die "--selection-file required\n";
     my $output = $opts{output};
 
-    my $state   = load_state($file);
-    my $plugins = discover_plugins(%opts);
-    my %by_key  = map { $_->{key} => $_ } @$plugins;
+    my %keys;
+    if (defined $opts{selection_file} && length $opts{selection_file} && -f $opts{selection_file}) {
+        my $state = load_state($opts{selection_file});
+        $keys{$_} = 1 for @{ $state->{selected_plugins} || [] };
+    }
+
+    my @layer_files;
+    if (defined $opts{project_path} && length $opts{project_path}) {
+        push @layer_files, "$opts{project_path}/.claude/settings.json",
+                            "$opts{project_path}/.claude/settings.local.json";
+    }
+    push @layer_files, $opts{user_settings} if defined $opts{user_settings};
+    push @layer_files, $opts{seed_settings} if defined $opts{seed_settings};
+
+    for my $layer_file (@layer_files) {
+        my %layer_keys = _enabled_plugin_keys_from_settings_file($layer_file);
+        $keys{$_} = 1 for keys %layer_keys;
+    }
 
     my @masks;
-    for my $key (@{ $state->{selected_plugins} || [] }) {
-        my $p = $by_key{$key} or next;
-        my @host_only = @{ $p->{host_only_skills} || [] };
-        next unless @host_only;
-
-        my ($mkt, $rel) = plugin_directory_source($key);
+    for my $key (sort keys %keys) {
+        my ($mkt, $rel, $root) = plugin_directory_source($key);
         next unless defined $rel;
 
-        for my $skill (@host_only) {
+        my $census = plugin_skill_census("$root/$rel");
+        for my $skill (@{ $census->{host_only} }) {
             push @masks, {
                 key            => $key,
                 skill          => $skill,
@@ -1802,6 +1846,10 @@ sub cmd_host_only_masks {
             };
         }
     }
+
+    my %seen;
+    @masks = grep { !$seen{$_->{container_path}}++ } @masks;
+    @masks = sort { $a->{key} cmp $b->{key} || $a->{skill} cmp $b->{skill} } @masks;
 
     my $json = JSON::PP->new->canonical(1)->pretty->utf8->encode(\@masks);
     if (defined $output && length $output) {
@@ -3013,8 +3061,8 @@ Commands:
   clone-to-project    --project-path P (--plugin-key K | --mcp-name N)
                                                     Promote a Suggestion to Project: append scope=project install (plugins) or add to enabledMcpjsonServers (MCP) in settings.json. Idempotent; only ADDS, never edits existing.
   materialize-credentials --output FILE             Emit sandbox-isolated .credentials.json: claudeAiOauth + mcpOAuth from previous container state only (host token never injected; one-time reset marker gates it).
-  host-only-masks     --selection-file F --output FILE
-                                      Container paths of host-only skills in selected live-bound plugins; the launcher masks each.
+  host-only-masks     [--selection-file F] [--project-path P] [--user-settings U] [--seed-settings S] [--output FILE]
+                                      Container paths of host-only skills of every selected or enabled live-bound plugin; the launcher masks each.
   materialize-known-marketplaces --output FILE      Emit container-shaped known_marketplaces.json: rewrites Windows installLocation paths to the container mount target; drops directory-source marketplaces whose source.path isn't mounted.
   help                                              Show this help.
 

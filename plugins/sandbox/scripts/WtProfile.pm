@@ -4,6 +4,7 @@ use warnings;
 use Digest::SHA ();   # core; sha1() only, called fully-qualified
 use File::Path  ();   # core; make_path() only, always with the error-capture form
 use File::Spec  ();   # core; catfile/catdir/splitpath only
+use JSON::PP    ();   # core; decode/encode only, always fenced in eval, never imported
 
 # =============================================================================
 # WtProfile.pm -- everything about the ccpraxis Windows Terminal profile
@@ -26,7 +27,9 @@ use File::Spec  ();   # core; catfile/catdir/splitpath only
 #   * No "use utf8". Every literal in this file is ASCII.
 #   * No top-level side effects: loading this module performs no I/O, opens
 #     no file, reads no environment variable, and prints nothing. The only
-#     place %ENV is read is inside fragment_root(), and only on call.
+#     places %ENV is read are inside fragment_root(), settings_candidates(),
+#     and ensure_fragment()'s default (one-argument) path -- and only on
+#     call, never at load.
 #   * NEVER DIES, NEVER WARNS -- a hard contract, not a style note (spec
 #     sec-2.0/2.5). Nothing in this module calls die/warn/carp/croak/print/
 #     printf/say, and nothing it calls is allowed to do so on its behalf:
@@ -55,6 +58,29 @@ my $PROFILE_NAME      = 'claude-sandbox';     # fed into the GUID chain, and wt.
 my $APP_DIR_NAME      = 'ccpraxis';           # the directory this module owns under the Fragments root
 my $FRAGMENT_FILENAME = 'claude-sandbox.json';
 my $SCROLLBAR_STATE   = 'hidden';
+
+# The allow-listed appearance keys (spec sec-2.4), in RENDER order. 'font' is
+# handled specially (merged per sub-key -- see _merge_font below) but still
+# occupies its slot in this order for fragment_json()'s rendering loop.
+my @ALLOW_LIST_ORDER = qw(
+    font colorScheme cursorShape cursorHeight foreground background
+    selectionBackground cursorColor opacity useAcrylic padding
+    antialiasingMode intenseTextStyle adjustIndistinguishableColors
+);
+
+# Top-level allow-listed keys OTHER than font -- these follow the simple
+# "profile wins over defaults, else absent" rule (spec sec-2.3).
+my @TOP_LEVEL_KEYS = grep { $_ ne 'font' } @ALLOW_LIST_ORDER;
+
+# Font sub-keys kept from a font object at any merge layer (spec sec-2.3).
+my @FONT_SUBKEYS = qw(face size weight features axes cellHeight cellWidth);
+
+# The closed set of appearance_reason values (spec sec-2.2).
+my %APPEARANCE_REASONS = map { $_ => 1 } qw(
+    settings_not_found settings_unreadable settings_unparseable no_default_profile
+);
+
+my $MAX_SETTINGS_BYTES = 4_194_304;   # 4 MiB (spec sec-2.2)
 
 # =============================================================================
 # GUID DERIVATION (spec sec-2.2, Decision 6) -- pure Perl UUIDv5 (SHA-1) over
@@ -140,25 +166,62 @@ sub profile_name {
 # profile_guid()/profile_name(), never as literals in this rendering code.
 # =============================================================================
 
-# fragment_json() -> $bytes
+# _encode_json_scalar($value) -> $bytes | undef
+#
+# JSON::PP->new->canonical(1)->ascii(1)->allow_nonref(1)->encode($value)
+# (spec sec-2.5), fenced -- returns undef (never dies/warns) on any failure.
+sub _encode_json_scalar {
+    my ($value) = @_;
+    my $encoded;
+    my $ok = eval {
+        local $SIG{__WARN__} = sub { };
+        $encoded = JSON::PP->new->canonical(1)->ascii(1)->allow_nonref(1)->encode($value);
+        1;
+    };
+    return undef unless $ok;
+    return $encoded;
+}
+
+# fragment_json(\%app?) -> $bytes
 #
 # Pure, deterministic, byte-stable. ASCII only, LF-only, two-space indent,
-# one trailing LF, no BOM. See spec sec-2.3 for the pinned literal this must
-# reproduce byte-for-byte.
+# one trailing LF, no BOM. With no argument, undef, or an empty hashref, the
+# output is byte-identical to today's pinned three-key literal (spec
+# sec-2.5). With appearance keys, each present allow-listed key (spec
+# sec-2.4) is rendered in section-2.4 order after scrollbarState, 6-space
+# indent, one per line, commas between and none after the last.
 sub fragment_json {
+    my ($app) = @_;
     my $name  = profile_name();
     my $guid  = profile_guid();
     my $state = $SCROLLBAR_STATE;
 
-    return "{\n"
-         . "  \"profiles\": [\n"
-         . "    {\n"
-         . "      \"name\": \"$name\",\n"
-         . "      \"guid\": \"$guid\",\n"
-         . "      \"scrollbarState\": \"$state\"\n"
-         . "    }\n"
-         . "  ]\n"
-         . "}\n";
+    my @rendered;
+    if (ref($app) eq 'HASH') {
+        for my $key (@ALLOW_LIST_ORDER) {
+            next unless exists($app->{$key}) && defined($app->{$key});
+            my $encoded = _encode_json_scalar($app->{$key});
+            next unless defined $encoded;
+            push @rendered, "      \"$key\": $encoded";
+        }
+    }
+
+    my $scrollbar_line = "      \"scrollbarState\": \"$state\"" . (@rendered ? ",\n" : "\n");
+
+    my $out = "{\n"
+            . "  \"profiles\": [\n"
+            . "    {\n"
+            . "      \"name\": \"$name\",\n"
+            . "      \"guid\": \"$guid\",\n"
+            . $scrollbar_line;
+
+    $out .= join(",\n", @rendered) . "\n" if @rendered;
+
+    $out .= "    }\n"
+          . "  ]\n"
+          . "}\n";
+
+    return $out;
 }
 
 # fragment_path($root) -> $path | undef
@@ -241,13 +304,289 @@ sub _mkdir_error_message {
     return @parts ? join('; ', @parts) : undef;
 }
 
-# ensure_fragment($root) -> \%result
+# =============================================================================
+# APPEARANCE (spec sec-2.1/2.2/2.3, Decision 9) -- read-only access to the
+# operator's Windows Terminal settings.json, tolerant JSONC parsing, and the
+# profiles.defaults/defaultProfile merge. Nothing here ever opens the
+# settings file for writing.
+# =============================================================================
+
+# _validate_localappdata($value) -> $trimmed | undef
 #
-# Idempotently makes the fragment exist under $root with exactly
-# fragment_json()'s bytes. Always returns a hashref. Never dies, never
-# warns, never prints (spec sec-2.2/2.5, done criterion 6).
+# Shared validity rule for a %ENV{LOCALAPPDATA}-shaped value, used by both
+# fragment_root() and settings_candidates(): defined and non-whitespace,
+# trailing separator(s) trimmed, must match ^[A-Za-z]:[\\/], and must not
+# contain a '..' segment. Never dies, never warns.
+sub _validate_localappdata {
+    my ($value) = @_;
+    return undef unless defined($value) && $value =~ /\S/;
+
+    (my $trimmed = $value) =~ s{[\\/]+\z}{};
+
+    my $looks_resolvable = ($trimmed =~ m{\A[A-Za-z]:[\\/]})
+                         && ($trimmed !~ m{(?:\A|[\\/])\.\.(?:[\\/]|\z)});
+    return $looks_resolvable ? $trimmed : undef;
+}
+
+# settings_candidates(\%env?) -> @paths
+#
+# Pure, no I/O. Resolves the two known Windows Terminal settings.json
+# locations (packaged/Store, then unpackaged) from $env->{LOCALAPPDATA} (or
+# %ENV when $env is omitted), joined with literal backslashes -- never
+# File::Spec (spec sec-2.1). An invalid LOCALAPPDATA returns the empty list.
+sub settings_candidates {
+    my ($env) = @_;
+    $env = \%ENV unless defined $env;
+
+    my $trimmed = _validate_localappdata($env->{LOCALAPPDATA});
+    return () unless defined $trimmed;
+
+    return (
+        "$trimmed\\Packages\\Microsoft.WindowsTerminal_8wekyb3d8bbwe\\LocalState\\settings.json",
+        "$trimmed\\Microsoft\\Windows Terminal\\settings.json",
+    );
+}
+
+# _strip_jsonc_comments($bytes) -> $stripped | undef
+#
+# String-aware removal of '// ...' (to end of line) and '/* ... */' comments
+# (spec sec-2.2 point 3). Content inside a JSON string literal (including
+# '//', '/*' and escaped quotes) is never altered. Returns undef if a '/*'
+# is never closed (unparseable). Never dies, never warns.
+sub _strip_jsonc_comments {
+    my ($s) = @_;
+    return undef unless defined $s;
+
+    my $out = '';
+    my $len = length($s);
+    my $i = 0;
+    my $in_string = 0;
+
+    while ($i < $len) {
+        my $c = substr($s, $i, 1);
+
+        if ($in_string) {
+            $out .= $c;
+            if ($c eq "\\" && $i + 1 < $len) {
+                $out .= substr($s, $i + 1, 1);
+                $i += 2;
+                next;
+            }
+            $in_string = 0 if $c eq '"';
+            $i++;
+            next;
+        }
+
+        if ($c eq '"') {
+            $in_string = 1;
+            $out .= $c;
+            $i++;
+            next;
+        }
+
+        if ($c eq '/' && $i + 1 < $len && substr($s, $i + 1, 1) eq '/') {
+            my $nl = index($s, "\n", $i);
+            if ($nl == -1) {
+                $out .= ' ';
+                $i = $len;
+            } else {
+                $out .= ' ';
+                $i = $nl;
+            }
+            next;
+        }
+
+        if ($c eq '/' && $i + 1 < $len && substr($s, $i + 1, 1) eq '*') {
+            my $close = index($s, '*/', $i + 2);
+            return undef if $close == -1;
+            $out .= ' ';
+            $i = $close + 2;
+            next;
+        }
+
+        $out .= $c;
+        $i++;
+    }
+
+    return $out;
+}
+
+# _resolve_profiles_shape($data) -> ($list_arrayref | undef, $defaults_hashref)
+#
+# Resolves the "profiles" shape (spec sec-2.2): an object with an array
+# "list" (defaults come from its "defaults" hash, or {} if absent/not a
+# hash), or a legacy bare array (no defaults). Returns (undef, {}) for
+# anything else.
+sub _resolve_profiles_shape {
+    my ($data) = @_;
+    my $profiles = (ref($data) eq 'HASH') ? $data->{profiles} : undef;
+
+    if (ref($profiles) eq 'HASH') {
+        my $list = $profiles->{list};
+        return (undef, {}) unless ref($list) eq 'ARRAY';
+        my $defaults = (ref($profiles->{defaults}) eq 'HASH') ? $profiles->{defaults} : {};
+        return ($list, $defaults);
+    }
+    if (ref($profiles) eq 'ARRAY') {
+        return ($profiles, {});
+    }
+    return (undef, {});
+}
+
+# _match_default_profile($list, $default_profile) -> \%entry | undef
+#
+# Matches spec sec-2.2's "default-profile match" rule: a braced-GUID-shaped
+# value matches the first list entry whose guid equals it case-insensitively;
+# otherwise the first entry whose name equals it exactly.
+sub _match_default_profile {
+    my ($list, $default_profile) = @_;
+    return undef unless ref($list) eq 'ARRAY';
+    return undef unless defined($default_profile) && !ref($default_profile);
+
+    if ($default_profile =~ /\A\{[0-9A-Fa-f-]{36}\}\z/) {
+        for my $entry (@$list) {
+            next unless ref($entry) eq 'HASH';
+            my $g = $entry->{guid};
+            next unless defined($g) && !ref($g);
+            return $entry if lc($g) eq lc($default_profile);
+        }
+        return undef;
+    }
+
+    for my $entry (@$list) {
+        next unless ref($entry) eq 'HASH';
+        my $n = $entry->{name};
+        next unless defined($n) && !ref($n);
+        return $entry if $n eq $default_profile;
+    }
+    return undef;
+}
+
+# _apply_legacy_font(\%font, $source_hashref) -> ()
+#
+# Layer helper (spec sec-2.3): copies fontFace/fontSize/fontWeight from
+# $source_hashref into %font as face/size/weight, when defined.
+sub _apply_legacy_font {
+    my ($font, $source) = @_;
+    return unless ref($source) eq 'HASH';
+    $font->{face}   = $source->{fontFace}   if defined $source->{fontFace};
+    $font->{size}   = $source->{fontSize}   if defined $source->{fontSize};
+    $font->{weight} = $source->{fontWeight} if defined $source->{fontWeight};
+}
+
+# _apply_font_object(\%font, $font_value) -> ()
+#
+# Layer helper (spec sec-2.3): copies the allow-listed font sub-keys from
+# $font_value (a "font" object) into %font, when present and non-null. A
+# non-object $font_value is ignored for this layer.
+sub _apply_font_object {
+    my ($font, $font_value) = @_;
+    return unless ref($font_value) eq 'HASH';
+    for my $key (@FONT_SUBKEYS) {
+        next unless exists($font_value->{$key}) && defined($font_value->{$key});
+        $font->{$key} = $font_value->{$key};
+    }
+}
+
+# _merge_appearance($defaults, $profile) -> \%app
+#
+# Implements spec sec-2.3's merge rule. $defaults and $profile are both
+# expected to be hashrefs (callers pass {} when absent).
+sub _merge_appearance {
+    my ($defaults, $profile) = @_;
+    $defaults = {} unless ref($defaults) eq 'HASH';
+    $profile  = {} unless ref($profile)  eq 'HASH';
+
+    my %app;
+    for my $key (@TOP_LEVEL_KEYS) {
+        if (defined $profile->{$key}) {
+            $app{$key} = $profile->{$key};
+        } elsif (defined $defaults->{$key}) {
+            $app{$key} = $defaults->{$key};
+        }
+    }
+
+    my %font;
+    _apply_legacy_font(\%font, $defaults);
+    _apply_font_object(\%font, $defaults->{font});
+    _apply_legacy_font(\%font, $profile);
+    _apply_font_object(\%font, $profile->{font});
+
+    $app{font} = \%font if %font;
+
+    return \%app;
+}
+
+# default_appearance($settings_path) -> \%result
+#
+# Reads $settings_path (read-only) and resolves the effective appearance of
+# the default profile (spec sec-2.2). Never writes, never dies, never warns.
+# Success: { ok => 1, appearance => \%app }. Failure: { ok => 0, reason => R }
+# with R drawn from the closed set in %APPEARANCE_REASONS.
+sub default_appearance {
+    my ($settings_path) = @_;
+
+    if (!defined($settings_path) || $settings_path !~ /\S/) {
+        return { ok => 0, reason => 'settings_not_found' };
+    }
+    return { ok => 0, reason => 'settings_not_found' } unless _quiet_is_file($settings_path);
+
+    my $size = -s $settings_path;
+    return { ok => 0, reason => 'settings_unreadable' } unless defined($size) && $size <= $MAX_SETTINGS_BYTES;
+
+    my $raw = _read_raw($settings_path);
+    return { ok => 0, reason => 'settings_unreadable' } unless defined $raw;
+
+    $raw =~ s/\A\xEF\xBB\xBF//;
+
+    my $stripped = _strip_jsonc_comments($raw);
+    return { ok => 0, reason => 'settings_unparseable' } unless defined $stripped;
+
+    my $data;
+    my $decode_ok = eval {
+        local $SIG{__WARN__} = sub { };
+        $data = JSON::PP->new->utf8(1)->relaxed(1)->decode($stripped);
+        1;
+    };
+    return { ok => 0, reason => 'settings_unparseable' } unless $decode_ok && ref($data) eq 'HASH';
+
+    my ($list, $defaults) = _resolve_profiles_shape($data);
+    return { ok => 0, reason => 'no_default_profile' } unless defined $list;
+
+    my $default_profile = $data->{defaultProfile};
+    return { ok => 0, reason => 'no_default_profile' } unless defined($default_profile) && !ref($default_profile);
+
+    my $matched = _match_default_profile($list, $default_profile);
+    return { ok => 0, reason => 'no_default_profile' } unless defined $matched;
+
+    my $app = _merge_appearance($defaults, $matched);
+    return { ok => 1, appearance => $app };
+}
+
+# _resolve_settings_path(\%opts) -> $path | undef
+#
+# spec sec-2.6 point 1: if $opts explicitly carries a 'settings_path' key
+# (even undef), that value is the only source considered -- no filesystem or
+# %ENV access. Otherwise the first settings_candidates(\%ENV) entry for
+# which -f is true, or undef if none qualifies.
+sub _resolve_settings_path {
+    my ($opts) = @_;
+    return $opts->{settings_path} if exists $opts->{settings_path};
+
+    for my $candidate (settings_candidates(\%ENV)) {
+        return $candidate if _quiet_is_file($candidate);
+    }
+    return undef;
+}
+
+# ensure_fragment($root, \%opts?) -> \%result
+#
+# Idempotently makes the fragment exist under $root with the operator's
+# copied appearance (or today's base bytes on fallback). Always returns a
+# hashref. Never dies, never warns, never prints (spec sec-2.2/2.5/2.6).
 sub ensure_fragment {
-    my ($root) = @_;
+    my ($root, $opts) = @_;
+    $opts = {} unless ref($opts) eq 'HASH';
 
     if (!defined($root) || $root !~ /\S/) {
         return {
@@ -289,7 +628,16 @@ sub ensure_fragment {
         }
     }
 
-    my $wanted = fragment_json();
+    # Appearance resolution (spec sec-2.6 point 3): a failure here is NOT an
+    # ensure_fragment() failure -- it degrades to the base three-key fragment
+    # with a machine-readable reason.
+    my $settings_path      = _resolve_settings_path($opts);
+    my $appearance_result  = default_appearance($settings_path);
+    my $appearance_status  = $appearance_result->{ok} ? 'copied' : 'fallback';
+    my $appearance_reason  = $appearance_result->{ok} ? undef : $appearance_result->{reason};
+    my $appearance         = $appearance_result->{ok} ? $appearance_result->{appearance} : undef;
+
+    my $wanted = fragment_json($appearance);
 
     # Idempotent no-op: content already matches. Read-only -- never opens
     # the file for writing, never truncates, never touches mtime (AC-3.3).
@@ -304,7 +652,9 @@ sub ensure_fragment {
         if (defined($existing_size) && $existing_size == length($wanted)) {
             my $existing = _read_raw($path);
             if (defined($existing) && $existing eq $wanted) {
-                return { ok => 1, action => 'unchanged', path => $path };
+                my %result = (ok => 1, action => 'unchanged', path => $path, appearance => $appearance_status);
+                $result{appearance_reason} = $appearance_reason if $appearance_status eq 'fallback';
+                return \%result;
             }
         }
     }
@@ -332,7 +682,9 @@ sub ensure_fragment {
         };
     }
 
-    return { ok => 1, action => 'wrote', path => $path };
+    my %result = (ok => 1, action => 'wrote', path => $path, appearance => $appearance_status);
+    $result{appearance_reason} = $appearance_reason if $appearance_status eq 'fallback';
+    return \%result;
 }
 
 # =============================================================================
