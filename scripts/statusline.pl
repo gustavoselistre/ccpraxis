@@ -492,27 +492,80 @@ if (length $sid) {
 # A COUNT, BECAUSE THE ALTERNATIVE WAS STOPPING. Unattended work used to halt
 # the moment an agent wanted to ask something -- hours of idle for an answer
 # nobody was there to give, and usually for a question the agent could have
-# settled itself. Questions are queued now instead, and the thing that makes
-# queueing acceptable rather than a way of losing them is that the operator can
-# SEE there are some waiting without going to look.
+# settled itself. Questions are filed as almanac pending decisions now
+# instead, and the thing that makes that acceptable rather than a way of
+# losing them is that the operator can SEE there are some waiting without
+# going to look.
 #
-# Read straight from the file butler-continuity's `ask` appends to, counted the
-# same way (a leading "- " is one question). No verb is shelled out to: the
-# statusline runs on every render and must stay cheap.
-#
-# Project-scoped like the queue itself, and silent when there are none -- a zero
-# would spend a column saying nothing.
+# Package 09 (Decision 108) re-points this at the almanac decision store.
+# The read below mirrors Almanac::Store::resolve_project_root by hand
+# (AC-S3 forbids importing it: this file may load nothing from the repo) and
+# never absorbs the legacy queue -- that happens only on the next real store
+# open (ask/questions/the guard). Package 10 keeps its own accessor design
+# and exactly-one-reader rule, and may later replace this read.
 my $pending_questions = 0;
 {
-    my $qdir = $ENV{CLAUDE_PROJECT_DIR};
-    $qdir = $cwd if !defined $qdir || !length $qdir;
-    if (defined $qdir && length $qdir) {
-        my $qf = "$qdir/.ccpraxis-local-data/.subagent-guard/questions.md";
-        if (open my $qfh, '<', $qf) {
-            while (my $l = <$qfh>) { $pending_questions++ if $l =~ /^\s*-\s/ }
-            close $qfh;
+    # -- pending-decisions:begin --
+    # 1. project: mirror Almanac::Store::resolve_project_root (cannot be
+    #    imported, AC-S3): walk up from $cwd (workspace.current_dir, '\'
+    #    folded to '/') to the first dir with -d .ccpraxis-local-data or
+    #    -e .git; else $ENV{CLAUDE_PROJECT_DIR} if non-empty; else $cwd.
+    #    Parent step stops at 'X:/' and '/'. Stats only.
+    my $start = defined $cwd ? $cwd : '';
+    $start =~ tr{\\}{/};
+    my $project;
+    {
+        my $dir = $start;
+        while (length $dir) {
+            if (-d "$dir/.ccpraxis-local-data" || -e "$dir/.git") { $project = $dir; last }
+            last if $dir =~ m{\A[A-Za-z]:/?\z} || $dir eq '/';
+            my $idx = rindex($dir, '/');
+            last if $idx < 0;
+            my $parent = substr($dir, 0, $idx);
+            $parent = '/' if $parent eq '';
+            $parent = "$parent/" if $parent =~ m{\A[A-Za-z]:\z};
+            last if $parent eq $dir;
+            $dir = $parent;
         }
     }
+    if (!defined $project) {
+        my $cpd = $ENV{CLAUDE_PROJECT_DIR};
+        $project = (defined $cpd && length $cpd) ? $cpd : $start;
+    }
+    $project =~ s{/\z}{} if length($project) > 1;
+
+    # 2. dir = "<project>/.ccpraxis-local-data/almanac/decision"; opendir or
+    #    leave 0.
+    my $dir = "$project/.ccpraxis-local-data/almanac/decision";
+    if (opendir(my $dh, $dir)) {
+        # 3. for each entry matching /\A[A-Za-z0-9][A-Za-z0-9._-]*\.md\z/
+        #    that is -f: open '<:raw'; line 1 must be '---' (after stripping
+        #    \r); read at most 64 more lines, stopping at the closing '---';
+        #    count it iff one frontmatter line matches
+        #    /^status:[ \t]*unanswered[ \t]*$/. Unreadable file -> skip.
+        while (defined(my $entry = readdir($dh))) {
+            next unless $entry =~ /\A[A-Za-z0-9][A-Za-z0-9._-]*\.md\z/;
+            my $path = "$dir/$entry";
+            next unless -f $path;
+            open(my $fh, '<:raw', $path) or next;
+            my $first = <$fh>;
+            unless (defined $first) { close $fh; next }
+            $first =~ s/\r?\n\z//;
+            unless ($first eq '---') { close $fh; next }
+            my $found = 0;
+            for (1 .. 64) {
+                my $l = <$fh>;
+                last unless defined $l;
+                $l =~ s/\r?\n\z//;
+                last if $l eq '---';
+                $found = 1 if $l =~ /^status:[ \t]*unanswered[ \t]*$/;
+            }
+            close $fh;
+            $pending_questions++ if $found;
+        }
+        closedir $dh;
+    }
+    # -- pending-decisions:end --
 }
 
 # ── ...and where it goes ─────────────────────────────────────

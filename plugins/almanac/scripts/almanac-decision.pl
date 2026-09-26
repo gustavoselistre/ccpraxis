@@ -27,6 +27,7 @@ BEGIN {
 }
 use Almanac::Store ();
 use Almanac::Record ();
+use Almanac::LegacyQueue ();
 
 # Loading this script brings Almanac::Task::* with it (spec S2.3): a
 # `require` of the sibling script's absolute path, at compile time, so
@@ -87,8 +88,10 @@ sub _err_reason {
 # this sub. It is the ONLY ->open( call in the whole file.
 sub open_decisions {
     my (%opt) = @_;
-    return Almanac::Store->open(scope => 'project', type => 'decision',
+    my $store = Almanac::Store->open(scope => 'project', type => 'decision',
         root => $opt{root}, home => $opt{home}, cwd => $opt{cwd});
+    Almanac::LegacyQueue::absorb($store);     # never dies
+    return $store;
 }
 
 sub file {

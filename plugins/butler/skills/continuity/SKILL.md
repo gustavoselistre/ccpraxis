@@ -78,18 +78,20 @@ Run these as plain Bash tool calls, arguments in single quotes.
   only for ids still running.
 - **New session id:** after `/clear` or a carry-over, the session is unarmed — run
   `butler-continuity on` again. `--resume` keeps the arm.
-- **Questions:** queue one with `butler-continuity ask --text '<question>'` and keep working.
+- **Questions:** file one with `butler-continuity ask --text '<question>'` and keep working. List
+  waiting ones with `butler-continuity questions`; clear one with `butler-continuity answer --id <id> --answer '<text>'` -- only the operator's answer, or a stale one.
 - **Subagents:** cannot turn continuity on, off or silence it, or hold; those refuse.
 <!-- continuity:end -->
 
 ## If you have a question for the operator
 
-Queue it. Do NOT end the turn for it — see the `ask` line in "Using continuity".
+File it. Do NOT end the turn for it — see the `ask` line in "Using continuity".
 
 An armed session IS unattended work — that is what arming means — so a turn that
 ends to ask something stops the work for an answer nobody is there to give. The
-question is recorded, the statusline shows how many are waiting, and they are
-answered when the work stops for a reason that is actually about the work.
+question becomes a pending decision in the project, the statusline's `?N` counts
+how many are waiting, and they are answered when the work stops for a reason
+that is actually about the work.
 
 Meanwhile: decide it yourself if it is not a product call
 (`.ccpraxis-local-data/guidance/escalate-product-decisions-only.md`), and carry

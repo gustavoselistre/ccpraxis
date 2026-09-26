@@ -36,14 +36,19 @@
 #   no-halt-for-questions.t ROOT-A                                | OTHER (a root-resolution population
 #                                                                    this successor does not have)
 #   no-halt-for-questions.t ROOT-BPPR                             | OTHER (same file's own naming; folded
-#                                                                    into this file's AO-6 as the
-#                                                                    BP_PROJECT_ROOT population)
+#                                                                    into this file's AO-6, which now
+#                                                                    asserts BP_PROJECT_ROOT is IGNORED --
+#                                                                    Decision 108, spec 09 sec 2.5)
 #   no-halt-for-questions.t ROOT-C                                | OTHER (a root-resolution population
 #                                                                    this successor does not have)
 #   no-halt-for-questions.t ROOT-B/ROOT-D, writer halves          | OTHER (the WRITER side of those
 #                                                                    scenarios belongs to whatever wrote
 #                                                                    the legacy state, not this guard)
 #   old "guard-ask-operator.sh exists" file-existence check       | SRC
+#
+# Queue assertions re-pointed at the almanac decision store by package 09
+# (Decision 108); reason codes above are unaffected -- this file's own
+# queue assertions are re-pointed, not weakened.
 #
 # Runs standalone: perl this file
 use strict;
@@ -54,11 +59,21 @@ use File::Temp qw(tempdir tempfile);
 use File::Path qw(make_path);
 use File::Spec ();
 use JSON::PP ();
+use Cwd ();
 
 BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
 
 use lib dirname(__FILE__) . '/../lib';
 use GuardHarness;
+
+require(Cwd::abs_path(dirname(__FILE__) . '/../../../almanac/scripts/almanac-decision.pl'));
+
+# filed($root) -- the almanac decision store's own records for $root.
+sub filed {
+    my ($root) = @_;
+    return [] unless -d "$root/.ccpraxis-local-data/almanac/decision";
+    return Almanac::Decision::list_decisions(root => $root);
+}
 
 # ---------------------------------------------------------------------------
 # Ambient isolation for the WHOLE file, up front. R9-RM4 (review M4):
@@ -130,6 +145,7 @@ sub mk_root {
 }
 
 sub questions_path { my ($root) = @_; return "$root/.ccpraxis-local-data/.subagent-guard/questions.md" }
+sub no_legacy { return !-e "$_[0]/.ccpraxis-local-data/.subagent-guard/questions.md" }
 
 my $ISO_RE = qr/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ/;
 
@@ -181,12 +197,16 @@ for my $role (qw(manual driver reporter)) {
     like($lines[0], qr/\bARMED\b/, "AO-1 (role $role): line 1 contains ARMED");
     like($lines[0], qr/^BLOCKED: continuity is ARMED for this session, so asking the operator would stop unattended work for an answer nobody is there to give\.$/,
          "AO-1 (role $role): exact line 1 text");
+    like($lines[1], qr/^The question is filed as pending decision \S+\.$/,
+         "AO-1 (role $role): line 2 names the filed decision");
 
-    my $qpath = questions_path($root);
-    ok(-f $qpath, "AO-1 (role $role): questions.md was created");
-    my $content = read_bytes($qpath) // '';
-    like($content, qr/^- \[$ISO_RE\] Should I rename it\?$/m,
-         "AO-1 (role $role): questions.md gained the exact appended line");
+    my $recs = filed($root);
+    is(scalar(@$recs), 1, "AO-1 (role $role): exactly one pending decision filed");
+    if (@$recs) {
+        is($recs->[0]{fields}{title}, 'Should I rename it?', "AO-1 (role $role): filed with the exact title");
+        is($recs->[0]{fields}{status}, 'unanswered', "AO-1 (role $role): filed unanswered");
+    }
+    ok(no_legacy($root), "AO-1 (role $role): no legacy questions.md was written");
 }
 
 # ===========================================================================
@@ -200,6 +220,7 @@ for my $role (qw(manual driver reporter)) {
     is($res->{rc}, 0, 'AO-2: unarmed, BP_LEDGER unset -> exit 0');
     ok(!-e questions_path($root), 'AO-2: nothing written to questions.md');
     ok(!-d "$root/.ccpraxis-local-data/.subagent-guard", 'AO-2: the queue directory itself was never created');
+    ok(!-d "$root/.ccpraxis-local-data/almanac", 'AO-2: no almanac/ dir was created');
 }
 
 # ===========================================================================
@@ -260,12 +281,11 @@ for my $role (qw(manual driver reporter)) {
     ao(payload(session_id => $sid, cwd => $root,
         questions => ['Third-a?', 'Third-b?']), env => \%env);
 
-    my $content = read_bytes(questions_path($root)) // '';
-    my @lines = grep { length } split /\n/, $content;
-    is(scalar(@lines), 3, 'AO-5: three calls (one with two questions joined by " | " into a single queued line) append three question lines');
-    like($lines[0], qr/\] First question\?$/,      'AO-5: line 1');
-    like($lines[1], qr/\] Second question\?$/,     'AO-5: line 2');
-    like($lines[2], qr/\] Third-a\? \| Third-b\?$/, 'AO-5: line 3 joins the two-question call with " | "');
+    my $recs = filed($root);
+    my %titles = map { $_->{fields}{title} => 1 } @$recs;
+    is(scalar(@$recs), 3, 'AO-5: three calls file three pending decisions');
+    is_deeply([ sort keys %titles ], [ sort ('First question?', 'Second question?', 'Third-a? | Third-b?') ],
+       'AO-5: the set of titles is exactly the three calls (one with two questions joined by " | ")');
 
     # 17 questions -> 16 plus the truncation marker.
     my $root17 = mk_root();
@@ -274,9 +294,10 @@ for my $role (qw(manual driver reporter)) {
     my @seventeen = map { "Q$_?" } (1 .. 17);
     ao(payload(session_id => $sid17, cwd => $root17, questions => \@seventeen),
         env => { CLAUDE_PROJECT_DIR => $root17 });
-    my $c17 = read_bytes(questions_path($root17)) // '';
     my $expect17 = join(' | ', map { "Q$_?" } (1 .. 16)) . ' | (+more, truncated at 16)';
-    like($c17, qr/\Q$expect17\E$/m, 'AO-5: 17 questions -> 16 plus the truncation marker');
+    my $recs17 = filed($root17);
+    is(scalar(@$recs17), 1, 'AO-5: the 17-question call files one decision');
+    is($recs17->[0]{fields}{title}, $expect17, 'AO-5: 17 questions -> 16 plus the truncation marker') if @$recs17;
 
     # embedded newline in a question is flattened to one line.
     my $root_nl = mk_root();
@@ -284,10 +305,10 @@ for my $role (qw(manual driver reporter)) {
     ok(GuardHarness::arm($sid_nl, 'manual'), 'AO-5 setup: a session for the embedded-newline case');
     ao(payload(session_id => $sid_nl, cwd => $root_nl, questions => ["line one\r\nline two"]),
         env => { CLAUDE_PROJECT_DIR => $root_nl });
-    my $c_nl = read_bytes(questions_path($root_nl)) // '';
-    my @nl_lines = grep { length } split /\n/, $c_nl;
-    is(scalar(@nl_lines), 1, 'AO-5: an embedded CR/LF question is written as one queue line');
-    like($nl_lines[0], qr/\] line one line two$/, 'AO-5: the CR/LF run collapsed to one space');
+    my $recs_nl = filed($root_nl);
+    is(scalar(@$recs_nl), 1, 'AO-5: an embedded CR/LF question files one decision');
+    is($recs_nl->[0]{fields}{title}, 'line one line two',
+       'AO-5: the CR/LF run collapsed to one space in the filed title') if @$recs_nl;
 
     # no question text at all -> the placeholder.
     my $root_none = mk_root();
@@ -295,52 +316,73 @@ for my $role (qw(manual driver reporter)) {
     ok(GuardHarness::arm($sid_none, 'manual'), 'AO-5 setup: a session for the no-recoverable-text case');
     ao(payload(session_id => $sid_none, cwd => $root_none, tool => 'AskUserQuestion'),
         env => { CLAUDE_PROJECT_DIR => $root_none });
-    my $c_none = read_bytes(questions_path($root_none)) // '';
-    like($c_none, qr/\(question text not recoverable from the payload\)$/m,
-         'AO-5: no question text at all -> the placeholder');
+    my $recs_none = filed($root_none);
+    is(scalar(@$recs_none), 1, 'AO-5: no question text at all files one decision');
+    is($recs_none->[0]{fields}{title}, '(question text not recoverable from the payload)',
+       'AO-5: no question text at all -> the placeholder') if @$recs_none;
 }
 
 # ===========================================================================
-# AO-6 -- ROOT resolution precedence.
+# AO-6, rewritten (Decision 108, OTHER: "one accessor, spec 09 sec 2.5").
+# BP_PROJECT_ROOT is no longer a resolution input.
 # ===========================================================================
 {
+    # (i) cwd /nonexistent/wherever, both CLAUDE_PROJECT_DIR and
+    # BP_PROJECT_ROOT set: filed in CLAUDE_PROJECT_DIR, nothing under
+    # BP_PROJECT_ROOT.
     my $root_cpd = mk_root();
     my $root_bppr = mk_root();
     my $sid = 'ao6-precedence';
     ok(GuardHarness::arm($sid, 'manual'), 'AO-6 setup: session armed');
-
     ao(payload(session_id => $sid, cwd => '/nonexistent/wherever', questions => ['Which root?']),
         env => { CLAUDE_PROJECT_DIR => $root_cpd, BP_PROJECT_ROOT => $root_bppr });
-    ok(-f questions_path($root_cpd), 'AO-6: CLAUDE_PROJECT_DIR wins when both it and BP_PROJECT_ROOT are set');
-    ok(!-e questions_path($root_bppr), 'AO-6: BP_PROJECT_ROOT is not used while CLAUDE_PROJECT_DIR is set');
+    is(scalar(@{ filed($root_cpd) }), 1, 'AO-6 (i): filed in CLAUDE_PROJECT_DIR');
+    ok(!-d "$root_bppr/.ccpraxis-local-data/almanac", 'AO-6 (i): nothing under BP_PROJECT_ROOT');
 
+    # (ii) the same cwd, only BP_PROJECT_ROOT set: rc 2, could-not-be-filed,
+    # nothing under BP_PROJECT_ROOT.
     my $sid2 = 'ao6-bppr-only';
     ok(GuardHarness::arm($sid2, 'manual'), 'AO-6 setup: a second armed session');
-    ao(payload(session_id => $sid2, cwd => '/nonexistent/wherever', questions => ['Which root now?']),
+    my $res2 = ao(payload(session_id => $sid2, cwd => '/nonexistent/wherever', questions => ['Which root now?']),
         env => { BP_PROJECT_ROOT => $root_bppr });
-    ok(-f questions_path($root_bppr), 'AO-6: with CLAUDE_PROJECT_DIR unset, BP_PROJECT_ROOT is used');
+    is($res2->{rc}, 2, 'AO-6 (ii): BP_PROJECT_ROOT alone still denies');
+    like($res2->{err}, qr/The question could not be filed; note it in your report instead\.$/m,
+         'AO-6 (ii): the exact "could not be filed" line appears');
+    ok(!-d "$root_bppr/.ccpraxis-local-data/almanac", 'AO-6 (ii): still nothing under BP_PROJECT_ROOT');
 
+    # (iii) cwd $root_cwd, env {}: filed in $root_cwd.
     my $root_cwd = mk_root();
     my $sid3 = 'ao6-cwd-only';
     ok(GuardHarness::arm($sid3, 'manual'), 'AO-6 setup: a third armed session');
     ao(payload(session_id => $sid3, cwd => $root_cwd, questions => ['And now?']), env => {});
-    ok(-f questions_path($root_cwd),
-       'AO-6: with both CLAUDE_PROJECT_DIR and BP_PROJECT_ROOT unset, the payload cwd\'s own project '
-     . '(a directory holding .ccpraxis-local-data) is used');
+    is(scalar(@{ filed($root_cwd) }), 1,
+       'AO-6 (iii): with both CLAUDE_PROJECT_DIR and BP_PROJECT_ROOT unset, the payload cwd\'s own project is used');
 
+    # (iv) no cwd, env {}: rc 2, could-not-be-filed.
     my $sid4 = 'ao6-none-resolvable';
     ok(GuardHarness::arm($sid4, 'manual'), 'AO-6 setup: a fourth armed session, no cwd at all');
     my $res_none = ao(payload(session_id => $sid4, questions => ['Anyone?']), env => {});
-    is($res_none->{rc}, 2, 'AO-6: with no root resolvable, the call still denies');
-    like($res_none->{err}, qr/The question could not be queued; note it in your report instead\.$/m,
-         'AO-6: the exact "could not be queued" line appears');
+    is($res_none->{rc}, 2, 'AO-6 (iv): with no root resolvable, the call still denies');
+    like($res_none->{err}, qr/The question could not be filed; note it in your report instead\.$/m,
+         'AO-6 (iv): the exact "could not be filed" line appears');
+
+    # (v) cwd $root_cwd/sub/dir (created), CLAUDE_PROJECT_DIR => a second
+    # root: filed in $root_cwd because the walk wins (Almanac::Store DC8).
+    my $sub = "$root_cwd/sub/dir";
+    make_path($sub);
+    my $root_cpd2 = mk_root();
+    my $sid5 = 'ao6-walk-wins';
+    ok(GuardHarness::arm($sid5, 'manual'), 'AO-6 setup: a fifth armed session');
+    ao(payload(session_id => $sid5, cwd => $sub, questions => ['Walk or env?']),
+        env => { CLAUDE_PROJECT_DIR => $root_cpd2 });
+    my $recs5 = filed($root_cwd);
+    ok((grep { defined $_->{fields}{title} && $_->{fields}{title} eq 'Walk or env?' } @$recs5),
+       'AO-6 (v): the cwd walk wins over CLAUDE_PROJECT_DIR (Almanac::Store DC8)');
 }
 
 # ===========================================================================
-# AO-7 -- the file and line format equal what "butler-continuity ask"
-# produces for the same text (verified against
-# plugins/butler/scripts/butler-continuity.pl's own "ask" verb source,
-# never spawned).
+# AO-7 -- the filed record equals what "butler-continuity ask" produces for
+# the same text: the same Almanac::Decision::file call.
 # ===========================================================================
 {
     my $root = mk_root();
@@ -348,11 +390,14 @@ for my $role (qw(manual driver reporter)) {
     ok(GuardHarness::arm($sid, 'manual'), 'AO-7 setup: session armed');
     ao(payload(session_id => $sid, cwd => $root, questions => ['Format check?']),
         env => { CLAUDE_PROJECT_DIR => $root });
-    is(questions_path($root), "$root/.ccpraxis-local-data/.subagent-guard/questions.md",
-       'AO-7: the queue file path matches butler-continuity ask\'s own $root/.ccpraxis-local-data/.subagent-guard/questions.md');
-    my $content = read_bytes(questions_path($root)) // '';
-    like($content, qr/^- \[$ISO_RE\] Format check\?\n\z/,
-         'AO-7: the appended line matches butler-continuity ask\'s own "- [<iso_now>] <text>\n" format exactly');
+    my $recs = filed($root);
+    is(scalar(@$recs), 1, 'AO-7: exactly one record was filed');
+    if (@$recs) {
+        is($recs->[0]{fields}{title}, 'Format check?', 'AO-7: the filed title is "Format check?"');
+        is($recs->[0]{fields}{status}, 'unanswered', 'AO-7: the filed record is unanswered');
+        like($recs->[0]{fields}{created} // '', qr/\A$ISO_RE\z/, 'AO-7: created matches the ISO shape');
+    }
+    ok(no_legacy($root), 'AO-7: no legacy questions.md was written');
 }
 
 # ===========================================================================
@@ -369,6 +414,7 @@ for my $role (qw(manual driver reporter)) {
         is($res->{rc}, 0, "AO-8: tool $tool allows even though the session is armed");
     }
     ok(!-e questions_path($root), 'AO-8: nothing was written for any non-AskUserQuestion tool');
+    ok(!-d "$root/.ccpraxis-local-data/almanac", 'AO-8: no almanac/ dir was created');
 }
 
 # ===========================================================================

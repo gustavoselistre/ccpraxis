@@ -47,11 +47,23 @@ use File::Path qw(make_path);
 use JSON::PP ();
 use Cwd qw(getcwd abs_path);
 
+# Queue assertions re-pointed at the almanac decision store by package 09
+# (Decision 108); reason codes below.
 my $GUARD = "$Bin/../../hooks/guard-ask-operator.sh";
 # butler-continuity was the CLI here; it is on the deletion list and gone
 # (package 16 batch E1). butler-continuity.pl is the one continuity CLI
 # left, and shares the same BpProjectRoot::resolve() ladder (reason DEL).
 my $CONT  = "$Bin/../../scripts/butler-continuity.pl";
+
+require("$Bin/../../../almanac/scripts/almanac-decision.pl");
+
+# filed($root) -- the almanac decision store's own records for $root.
+sub filed {
+    my ($root) = @_;
+    return [] unless -d "$root/.ccpraxis-local-data/almanac/decision";
+    return Almanac::Decision::list_decisions(root => $root);
+}
+sub no_legacy { return !-e "$_[0]/.ccpraxis-local-data/.subagent-guard/questions.md" }
 
 ok(-f $GUARD, 'guard-ask-operator.sh exists') or BAIL_OUT('guard missing');
 # The old ok(-f $RUNSTATE...) or BAIL_OUT is RETIRED along with $RUNSTATE
@@ -114,13 +126,7 @@ sub arm_state {
 
 sub queue_contents {
     my ($root) = @_;
-    my $p = "$root/.ccpraxis-local-data/.subagent-guard/questions.md";
-    return '' unless -f $p;
-    open my $fh, '<', $p or return '';
-    local $/;
-    my $c = <$fh>;
-    close $fh;
-    return $c // '';
+    return join("\n", map { $_->{fields}{title} } @{ filed($root) });
 }
 
 # ── AC1/AC2 — RETIRED (package 03-retire-runstate, spec §2.3(a)/§6) ───────
@@ -187,6 +193,7 @@ PAYLOAD_EOF`;
              . 'with no run active, which is the overnight case the run-only check missed');
     like($out, qr/ARMED/, 'AC4 and the refusal names the real reason rather than claiming a run');
     like(queue_contents($root), qr/Should I rename it\?/, 'AC5 the question is queued');
+    ok(no_legacy($root), 'AC4: no legacy questions.md was written');
 
     # AC8/B10 (spec §2.3(c)): the denial stops naming a dead verb. Reason MSG
     # (Decision 68(c)): package 14's GuardAskOperator.pm dropped the old
@@ -217,6 +224,24 @@ PAYLOAD_EOF`;
                  . 'the operator is normal when nothing unattended is in flight');
 }
 
+# _cont_ask($cwd, \%env, $text) -- runs butler-continuity ask --text $text,
+# chdir'd into $cwd first (the project-anchored root resolution the ROOT
+# section below exercises). Moved above AC6 (spec sec 2.8(c) item 3) so
+# AC6 can chdir into $root too, rather than setting CLAUDE_PROJECT_DIR.
+sub _cont_ask {
+    my ($cwd, $env, $text) = @_;
+    local %ENV = %ENV;
+    for my $k (keys %$env) {
+        if (defined $env->{$k}) { $ENV{$k} = $env->{$k} }
+        else                    { delete $ENV{$k} }
+    }
+    my $here = getcwd();
+    chdir $cwd or die "chdir $cwd: $!";
+    my $out = `"$^X" "$CONT" ask --text "$text" 2>&1`;
+    chdir $here or die "chdir back: $!";
+    return $out // '';
+}
+
 # ── AC6 — the halting verb is gone ────────────────────────────────────────
 #
 # MIGRATED (reason DEL, package 16 batch E1): butler-continuity is on the
@@ -227,15 +252,18 @@ PAYLOAD_EOF`;
 # begin with, so nothing here needed it in the first place.
 {
     my $root = new_project();
-    my $cont = "$Bin/../../scripts/butler-continuity.pl";
-    my $out = `CLAUDE_PROJECT_DIR='$root' $^X '$cont' await-operator --reason 'x' 2>&1`;
-    isnt($? >> 8, 0,
+    my $here = getcwd();
+    chdir $root or die "chdir $root: $!";
+    my $out = `"$^X" "$CONT" await-operator --reason 'x' 2>&1`;
+    my $rc_await = $? >> 8;
+    chdir $here or die "chdir back: $!";
+    isnt($rc_await, 0,
          'AC6 CANONICAL: await-operator is REMOVED. A retired escape hatch that still works '
        . 'is not retired, and this one ended turns for questions -- the exact halt being '
        . 'designed out');
 
     # ...and `ask` is what replaced it: it records and returns, never permitting a stop.
-    my $q = `CLAUDE_PROJECT_DIR='$root' $^X '$cont' ask --text 'A or B?' 2>&1`;
+    my $q = _cont_ask($root, {}, 'A or B?');
     is($? >> 8, 0, 'AC6 ask succeeds');
     like($q, qr/queued/i, 'AC6 and reports the question queued');
     like($q, qr/\(\d+\s+waiting\)/, 'AC6 with a count the statusline also shows');
@@ -262,10 +290,11 @@ PAYLOAD_EOF`;
     like($q, qr/And a fourth in the same call\?/,
          'AC7 CANONICAL: and multiple questions in ONE call are all captured -- the payload '
        . 'nests them in an array, which is why this is not read with a scalar path');
+    ok(no_legacy($root), 'AC7: no legacy questions.md was written');
 }
 
 # ═══════════════════════════════════════════════════════════════════════
-# NEW — butler-continuity's questions_path: PROJECT-ANCHORED ROOT RESOLUTION.
+# NEW — butler-continuity's ask verb: PROJECT-ANCHORED ROOT RESOLUTION.
 # MIGRATED from runstate-root-resolution.t (DELETED by this package; spec
 # §5.1's own migration table names this file, or a sibling, as the target).
 #
@@ -276,10 +305,13 @@ PAYLOAD_EOF`;
 # not carry CLAUDE_PROJECT_DIR (only a hook always does), so a driver's own
 # `ask` call and a hook's read landed on DIFFERENT roots -- a wrong answer
 # anchored to the project is recoverable, one anchored to the install is a
-# different repo's state file entirely. Spec §2.4 lifts _resolve_project_
-# root() into butler-continuity itself, ladder and comment block together:
-#   $CLAUDE_PROJECT_DIR > $BP_PROJECT_ROOT > git toplevel
-#     > walk up from cwd for a dir holding .ccpraxis-local-data > cwd
+# different repo's state file entirely. Package 09 (Decision 108) re-points
+# this at the almanac decision store's own rule (Almanac::Store DC8): walk up
+# from cwd for the nearest ancestor holding .ccpraxis-local-data or .git;
+# else $CLAUDE_PROJECT_DIR; else cwd itself. The walk wins over
+# CLAUDE_PROJECT_DIR, deliberately (see ROOT-C below). No child in this
+# section runs with $ORIG2 (this file's own process cwd, i.e. the real repo)
+# as its cwd.
 # ═══════════════════════════════════════════════════════════════════════
 {
     my $ORIG2 = getcwd();
@@ -293,20 +325,6 @@ PAYLOAD_EOF`;
     my $in_repo2 = ($? == 0 && defined $top2 && length $top2);
     chdir $ORIG2 or BAIL_OUT("cannot chdir back to $ORIG2");
 
-    sub _cont_ask {
-        my ($cwd, $env, $text) = @_;
-        local %ENV = %ENV;
-        for my $k (keys %$env) {
-            if (defined $env->{$k}) { $ENV{$k} = $env->{$k} }
-            else                    { delete $ENV{$k} }
-        }
-        my $here = getcwd();
-        chdir $cwd or die "chdir $cwd: $!";
-        my $out = `"$^X" "$CONT" ask --text "$text" 2>&1`;
-        chdir $here or die "chdir back: $!";
-        return $out // '';
-    }
-
     my %CLEAR2 = (CLAUDE_PROJECT_DIR => undef, BP_PROJECT_ROOT => undef);
 
     # ---- A. resolution anchors to the project found by walking up from cwd
@@ -315,58 +333,53 @@ PAYLOAD_EOF`;
             if $in_repo2;
 
         _cont_ask($proj2, \%CLEAR2, 'root-resolution A fixture');
-        my $qpath = "$proj2/.ccpraxis-local-data/.subagent-guard/questions.md";
-        (my $qpath_n = $qpath) =~ s{\\}{/}g;
-        ok(-f $qpath, 'ROOT-A: butler-continuity ask (no CLAUDE_PROJECT_DIR/BP_PROJECT_ROOT, cwd '
-                    . 'inside the project) writes questions.md under the project it was run from');
+        my $recsA = filed($proj2);
+        my ($recA) = grep { defined $_->{fields}{title} && $_->{fields}{title} eq 'root-resolution A fixture' } @$recsA;
+        ok(defined $recA, 'ROOT-A: butler-continuity ask (no CLAUDE_PROJECT_DIR/BP_PROJECT_ROOT, cwd '
+                    . 'inside the project) files it under the project it was run from');
 
         my ($guess) = ($INSTALL_GUESS2 =~ s{\\}{/}gr);
-        unlike($qpath_n, qr/^\Q$guess\E/,
+        my $recA_path = defined $recA ? $recA->{path} : '';
+        (my $recA_path_n = $recA_path) =~ s{\\}{/}g;
+        unlike($recA_path_n, qr/^\Q$guess\E/,
             'ROOT-A: ...and NEVER under the install root the old three-levels-up guess produced');
     }
 
-    # ---- BP_PROJECT_ROOT wins over the git and walk-up legs
-    {
-        my $other2 = abs_path(tempdir(CLEANUP => 1));
-        _cont_ask($ORIG2, { %CLEAR2, BP_PROJECT_ROOT => $other2 }, 'root-resolution BPPR fixture');
-        ok(-f "$other2/.ccpraxis-local-data/.subagent-guard/questions.md",
-           'ROOT-BPPR: BP_PROJECT_ROOT wins over the git and walk-up legs');
-    }
-
-    # ---- D. BP_PROJECT_ROOT-only (no CLAUDE_PROJECT_DIR): the hook and
-    #      butler-continuity::questions_path must still agree. Redteam
-    #      MEDIUM-3: this is the one leg ROOT-BPPR (script only) and ROOT-B/C
-    #      (CLAUDE_PROJECT_DIR set) never exercised together on the HOOK.
+    # ---- D. no CLAUDE_PROJECT_DIR: the writer (butler-continuity) and the
+    #      reader (the guard hook) must still land on the SAME project.
+    #      Redteam MEDIUM-3, re-pointed: BP_PROJECT_ROOT is no longer an
+    #      input to either side (Decision 108); both resolve by the cwd
+    #      walk alone.
   SKIP: {
         skip 'system temp dir is inside a git repository; walk-up leg not isolable', 2
             if $in_repo2;
 
         my $proj4 = abs_path(tempdir(CLEANUP => 1));
         make_path("$proj4/.ccpraxis-local-data");
+        my $sub4 = "$proj4/sub";
+        make_path($sub4);
 
-        # writer: butler-continuity, BP_PROJECT_ROOT set, no CLAUDE_PROJECT_DIR
-        my $wout4 = _cont_ask($ORIG2, { %CLEAR2, BP_PROJECT_ROOT => $proj4 },
-                               'ROOT-D writer question');
+        # writer: butler-continuity, cwd inside a project subdirectory, %CLEAR2
+        my $wout4 = _cont_ask($sub4, \%CLEAR2, 'ROOT-D writer question');
         like($wout4, qr/queued/i, 'ROOT-D setup: the writer\'s ask call queues');
 
-        # reader: the HOOK itself, BP_PROJECT_ROOT set, no CLAUDE_PROJECT_DIR --
-        # run_guard always sets CLAUDE_PROJECT_DIR, so invoke the guard
-        # directly here to isolate the BP_PROJECT_ROOT-only leg.
+        # reader: the HOOK itself, no CLAUDE_PROJECT_DIR and no
+        # BP_PROJECT_ROOT, payload cwd $proj4.
         my $state4 = arm_state($proj4);
         my $payload4 = JSON::PP->new->canonical->encode({
             session_id => 'sess-q', cwd => $proj4, tool_name => 'AskUserQuestion',
             tool_input => { questions => [ { question => 'ROOT-D reader question' } ] },
         });
-        `env -u CLAUDE_PROJECT_DIR BP_PROJECT_ROOT='$proj4' BUTLER_STATE_DIR='$state4' bash "$GUARD" <<'PAYLOAD_EOF' 2>&1
+        `env -u CLAUDE_PROJECT_DIR -u BP_PROJECT_ROOT BUTLER_STATE_DIR='$state4' bash "$GUARD" <<'PAYLOAD_EOF' 2>&1
 $payload4
 PAYLOAD_EOF`;
 
-        my $q4 = queue_contents($proj4);
-        like($q4, qr/ROOT-D writer question/,
-            'ROOT-D: the writer (butler-continuity, BP_PROJECT_ROOT-only) and the reader '
-          . '(the guard hook, BP_PROJECT_ROOT-only) land on the SAME questions.md');
-        like($q4, qr/ROOT-D reader question/,
-            'ROOT-D: ...and the hook\'s own append under BP_PROJECT_ROOT-only lands there too');
+        my @titles4 = map { $_->{fields}{title} } @{ filed($proj4) };
+        ok((grep { $_ eq 'ROOT-D writer question' } @titles4),
+            'ROOT-D: the writer (butler-continuity, cwd-walk only) and the reader '
+          . '(the guard hook, cwd-walk only) land on the SAME project');
+        ok((grep { $_ eq 'ROOT-D reader question' } @titles4),
+            'ROOT-D: ...and the hook\'s own filing under the cwd walk lands there too');
     }
 
     # ---- B. the round-trip that actually failed live: writer (no
@@ -399,14 +412,17 @@ PAYLOAD_EOF`;
             'ROOT-B: ...and the reader\'s own append is in the SAME file too, not a sibling one');
     }
 
-    # ---- C. CLAUDE_PROJECT_DIR still wins over the git and walk-up legs
+    # ---- C, inverted (Decision 108, Almanac::Store DC8): the cwd walk wins
+    #      over CLAUDE_PROJECT_DIR, not the reverse.
     {
         my $hookroot2 = abs_path(tempdir(CLEANUP => 1));
         _cont_ask($proj2, { CLAUDE_PROJECT_DIR => $hookroot2, BP_PROJECT_ROOT => undef },
                   'root-resolution CPD fixture');
-        ok(-f "$hookroot2/.ccpraxis-local-data/.subagent-guard/questions.md",
-           'ROOT-C: CLAUDE_PROJECT_DIR still wins over the git and walk-up legs -- exactly what '
-         . 'a hook (which always carries it) relies on');
+        my @titles_cpd = map { $_->{fields}{title} } @{ filed($proj2) };
+        ok((grep { $_ eq 'root-resolution CPD fixture' } @titles_cpd),
+           'ROOT-C: the cwd walk wins over CLAUDE_PROJECT_DIR (Almanac::Store DC8)');
+        ok(!-d "$hookroot2/.ccpraxis-local-data/almanac",
+           'ROOT-C: ...and nothing was filed under CLAUDE_PROJECT_DIR');
     }
 }
 

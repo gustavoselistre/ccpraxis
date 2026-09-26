@@ -17,6 +17,9 @@
 # block below TERMs then KILLs anything left standing, routed through exit()
 # so END always runs.
 #
+# Queue assertions re-pointed at the almanac decision store by package 09
+# (Decision 108); reason codes below.
+#
 # Runs standalone: perl, given this file's own path under plugins/butler/tests/t/
 use strict;
 use warnings;
@@ -43,6 +46,17 @@ require "$S/BpHook.pm";   # package 03 -- real and already implemented
     eval { require $COPM; 1 }
         or diag("BpHook::ContinuityOffCheck did not load (expected until this package is "
               . "implemented): $@");
+}
+
+require "$Bin/../../../almanac/scripts/almanac-decision.pl";
+
+# filed($root) -- the almanac decision store's own records for $root, per
+# package 09 (Decision 108). Returns [] rather than dying when the store has
+# never been opened for $root at all.
+sub filed {
+    my ($root) = @_;
+    return [] unless -d "$root/.ccpraxis-local-data/almanac/decision";
+    return Almanac::Decision::list_decisions(root => $root);
 }
 
 # ---------------------------------------------------------------------------
@@ -214,14 +228,19 @@ sub spawn_cmd {
     my $pid = fork();
     die "fork: $!" unless defined $pid;
     if ($pid == 0) {
+        my %eo = %$env_over;
+        my $cwd = delete $eo{':cwd'};   # pseudo-key; never exported as env
         delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
         $ENV{BUTLER_STATE_DIR}               = $CURRENT_STATE_BASE;
         $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR} = $LEGACY;
         $ENV{CLAUDE_PROJECT_DIR}             = $PROJECT;
         $ENV{CCPRAXIS_NO_WAKELOCK}           = 1;
-        for my $k (keys %$env_over) {
-            if (defined $env_over->{$k}) { $ENV{$k} = $env_over->{$k} }
-            else                         { delete $ENV{$k} }
+        for my $k (keys %eo) {
+            if (defined $eo{$k}) { $ENV{$k} = $eo{$k} }
+            else                 { delete $ENV{$k} }
+        }
+        if (defined $cwd) {
+            chdir($cwd) or POSIX::_exit(125);
         }
         open(STDOUT, '>', $outfile) or POSIX::_exit(126);
         open(STDERR, '>', $errfile) or POSIX::_exit(126);
@@ -743,38 +762,43 @@ sub reasons_log_lines {
 }
 
 # ===========================================================================
-# V12 -- ask writes the legacy-queue line shape, pinned literally.
+# V12: ask files a pending decision
+# V12: an embedded newline is flattened in the filed title
 #
-# Formerly this compared butler-continuity's output against a live
-# subprocess ask on the old continuity CLI (masked for the [ISO] stamp). That
-# CLI is on the deletion list and gone (package 16 batch E1); its comparator
-# role is retired, code DEL, and the line shape it used to prove is pinned directly
-# instead -- "- [ISO] <flattened text>", one line per queued question, with an
-# embedded newline flattened to a single space (unweakened: same two cases,
-# same masking, same assertions-per-case; only the second-process comparator
-# is gone).
+# Package 09 (Decision 108) re-points ask at the almanac decision store; the
+# line shape it used to prove is retired along with the legacy queue. The
+# store record itself is now the oracle instead: exactly one filed record,
+# with the exact title and the id ask printed, and no legacy questions.md.
 # ===========================================================================
 {
     my $proj_a = "$TMPROOT/askproj-a";
     make_path("$proj_a/.ccpraxis-local-data");
 
-    my ($outA, $errA, $rcA) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_a }, 'ask', '--text', 'q one');
+    my ($outA, $errA, $rcA) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_a, ':cwd' => $proj_a }, 'ask', '--text', 'q one');
     is($rcA, 0, 'V12: butler-continuity ask exits 0') or diag("stderr: $errA");
+    like($outA, qr/^queued pending decision (\S+) \(1 waiting\) in /, 'V12: stdout matches the pinned shape');
+    my ($idA) = $outA =~ /^queued pending decision (\S+) /;
 
-    my $qa = slurp("$proj_a/.ccpraxis-local-data/.subagent-guard/questions.md");
-    (my $qa_masked = $qa) =~ s/\[\d{4}-\d\d-\d\dT[\d:.]+Z\]/[ISO]/g;
-    is($qa_masked, "- [ISO] q one\n",
-        'V12: butler-continuity ask writes the pinned legacy-queue line shape');
+    my $recsA = filed($proj_a);
+    is(scalar(@$recsA), 1, 'V12: ask files a pending decision (exactly one record)');
+    if (@$recsA) {
+        is($recsA->[0]{fields}{title}, 'q one', 'V12: the filed title is "q one"');
+        is($recsA->[0]{fields}{status}, 'unanswered', 'V12: the filed record is unanswered');
+        is($recsA->[0]{id}, $idA, 'V12: the filed id is the one ask printed');
+    }
+    ok(!-e "$proj_a/.ccpraxis-local-data/.subagent-guard/questions.md",
+       'V12: ask writes no legacy questions.md');
 
     # embedded newline
     my $proj_c = "$TMPROOT/askproj-c";
     make_path("$proj_c/.ccpraxis-local-data");
-    run_cmd({ CLAUDE_PROJECT_DIR => $proj_c }, 'ask', '--text', "line one\nline two");
+    run_cmd({ CLAUDE_PROJECT_DIR => $proj_c, ':cwd' => $proj_c }, 'ask', '--text', "line one\nline two");
 
-    my $qc = slurp("$proj_c/.ccpraxis-local-data/.subagent-guard/questions.md");
-    (my $qc_masked = $qc) =~ s/\[\d{4}-\d\d-\d\dT[\d:.]+Z\]/[ISO]/g;
-    is($qc_masked, "- [ISO] line one line two\n",
-        'V12: an embedded newline is flattened to a single space in the pinned line shape');
+    my $recsC = filed($proj_c);
+    is(scalar(@$recsC), 1, 'V12: an embedded newline is flattened in the filed title (one record)');
+    is($recsC->[0]{fields}{title}, 'line one line two',
+        'V12: an embedded newline is flattened to a single space in the filed title')
+        if @$recsC;
 }
 
 # ===========================================================================
