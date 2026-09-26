@@ -183,6 +183,13 @@ my $HOST_BASELINE = {
     # director does its own orchestration. Schema: "Disable the Workflows
     # feature (also via CLAUDE_CODE_DISABLE_WORKFLOWS)".
     disableWorkflows               => JSON::PP::true,
+    # DELIBERATE DECLARATION, operator request 2026-09-27: turn off agent view
+    # (claude agents, --bg, /background, the attach/stop/logs subcommands, the
+    # daemon). A Left arrow on an empty prompt backgrounded a live session, and
+    # the re-attached renderer lost mouse reporting. A trace of claude.exe
+    # 2.1.282 found the gate only in the CLI dispatcher and agent-view UI, never
+    # in Task/Bash/Monitor/SendMessage/resume.
+    disableAgentView               => JSON::PP::true,
     editorMode                     => 'vim',
     effortLevel                    => 'high',
     enabledPlugins => {
