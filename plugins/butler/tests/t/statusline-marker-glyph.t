@@ -27,6 +27,7 @@ use FindBin qw($Bin);
 use File::Temp qw(tempdir tempfile);
 use JSON::PP qw(encode_json);
 use Encode qw(encode);
+use Cwd ();
 
 my $STATUSLINE = "$Bin/../../../../scripts/statusline.pl";
 my $STATUSLINE_SRC = "$Bin/../../../../scripts/statusline.pl"; # same file, read as source below
@@ -71,6 +72,42 @@ make_git_absent();
 
 my $TMPROOT = tempdir(CLEANUP => 1);
 
+# THE HYGIENE SCRUB (hook-continuity-remake package 10, spec section 4).
+# statusline.pl now resolves a project root from workspace.current_dir by
+# walking up to the first ancestor holding .ccpraxis-local-data or .git, and
+# reads that project's almanac stores. A bare '/w/proj-alpha' is no longer
+# inert for that walk (and the operator's own home directory carries a
+# .ccpraxis-local-data), so every current_dir here lives under $FAKE_ROOT, a
+# tempdir with its own .git: the walk stops at an EMPTY project. The spawn's
+# process cwd is that same scratch dir, never the repo checkout.
+my $FAKE_ROOT = tempdir(CLEANUP => 1);
+$FAKE_ROOT =~ s{\\}{/}g;
+mkdir "$FAKE_ROOT/.git" or die "fixture setup: cannot mkdir $FAKE_ROOT/.git: $!";
+my $DEFAULT_CWD = "$FAKE_ROOT/w/proj-alpha";
+my @SCRUB_ENV = qw(CLAUDE_PROJECT_DIR ALMANAC_HOME ALMANAC_SURFACE);
+
+# Every rendered stdout of this file's PRE-EXISTING fixtures is kept, so AC-21
+# (below) can assert none of them renders a continuity badge glyph.
+my @ALL_OUTPUTS;
+
+# The real repo's almanac store, listed before any render and compared at the
+# end: this file must never write it.
+my $REAL_STORE = "$Bin/../../../../.ccpraxis-local-data/almanac";
+sub almanac_listing {
+    my ($root) = @_;
+    my @out;
+    return \@out unless -d $root;
+    require File::Find;
+    no warnings 'once';
+    File::Find::find({ no_chdir => 1, wanted => sub {
+        my @st = stat($_);
+        (my $rel = $File::Find::name) =~ s{\A\Q$root\E}{};
+        push @out, join("\t", $rel, (-d $_ ? 'd' : 'f'), ($st[7] // -1), ($st[9] // -1));
+    } }, $root);
+    return [ sort @out ];
+}
+my $REAL_STORE_BEFORE = almanac_listing($REAL_STORE);
+
 # THE BADGE WORD, declared once (re-pointed 2026-08-25 -- it was the literal
 # 'WATCHED'). Mirrors t/151's own declaration; every claim here is about WHEN
 # and WHERE the badge renders, never what it spells.
@@ -84,7 +121,7 @@ sub payload_for {
     my (%opt) = @_;
     my %p = (
         model          => { display_name => 'Claude Sonnet 5', id => 'claude-sonnet-5' },
-        workspace      => { current_dir  => $opt{current_dir} // '/w/proj-alpha' },
+        workspace      => { current_dir  => $opt{current_dir} // $DEFAULT_CWD },
         context_window => { used_percentage => 10, context_window_size => 200_000 },
     );
     $p{session_id} = $opt{session_id} if exists $opt{session_id};
@@ -106,12 +143,18 @@ sub run_statusline {
     local %ENV = %ENV;
     $ENV{PATH} = "$SHIM_DIR:$ENV{PATH}";
     $ENV{HOME} = $opt{home} // tempdir(CLEANUP => 1);
+    $ENV{USERPROFILE} = $ENV{HOME};
+    delete $ENV{$_} for @SCRUB_ENV;
     if (defined $opt{cdir}) { $ENV{BUTLER_STATE_DIR} = $opt{cdir} }
     else                    { delete $ENV{BUTLER_STATE_DIR} }
     if ($opt{sandbox}) { $ENV{CCPRAXIS_SANDBOX} = '1' } else { delete $ENV{CCPRAXIS_SANDBOX} }
 
+    my $prev_cwd = Cwd::getcwd();
+    chdir($FAKE_ROOT) or die "fixture setup: cannot chdir to $FAKE_ROOT: $!";
     my $out = `timeout 20 perl "$STATUSLINE" < "$inpath" 2>/dev/null`;
     my $rc  = $? >> 8;
+    chdir($prev_cwd) or die "fixture teardown: cannot chdir back to $prev_cwd: $!";
+    push @ALL_OUTPUTS, (defined($out) ? $out : '');
     return (defined($out) ? $out : '', $rc);
 }
 
@@ -255,7 +298,7 @@ my $GLYPH_UNWATCHED_BYTES = encode('UTF-8', chr(0x25CB)); # hollow -- nothing wa
 # number can never stand in for the rule.
 # ===========================================================================
 {
-    my ($out, $rc) = run_statusline(payload_for(current_dir => '/w/proj-alpha'), sandbox => 0);
+    my ($out, $rc) = run_statusline(payload_for(current_dir => $DEFAULT_CWD), sandbox => 0);
     is($rc, 0, 'AC6 setup (host, cwd present): exits 0');
     ok(index($out, $BADGE) < 0, 'AC6: the badge is no longer a WORD anywhere in the output');
     my @rows = split /\n/, $out;
@@ -263,7 +306,7 @@ my $GLYPH_UNWATCHED_BYTES = encode('UTF-8', chr(0x25CB)); # hollow -- nothing wa
         'AC6 (host, cwd present): the merged status row plus the path row');
 }
 {
-    my ($out, $rc) = run_statusline(payload_for(current_dir => '/w/proj-alpha'), sandbox => 1);
+    my ($out, $rc) = run_statusline(payload_for(current_dir => $DEFAULT_CWD), sandbox => 1);
     is($rc, 0, 'AC6 setup (sandbox, cwd present): exits 0');
     my @rows = split /\n/, $out;
     is(scalar(@rows), 1,
@@ -291,7 +334,7 @@ my $GLYPH_UNWATCHED_BYTES = encode('UTF-8', chr(0x25CB)); # hollow -- nothing wa
 # visible, it is visible in exactly one place, and it costs no rows. That is
 # now stronger than it has ever been -- it costs no COLUMNS either.
 # ===========================================================================
-for my $case ([ '/w/proj-alpha', 'path row present' ], [ '', 'no path row' ]) {
+for my $case ([ $DEFAULT_CWD, 'path row present' ], [ '', 'no path row' ]) {
     my ($cwd, $label) = @$case;
     my $cdir = tempdir(CLEANUP => 1);
     plant_marker($cdir, 'sess-ac7');
@@ -477,10 +520,38 @@ for my $sb (0, 1) {
     delete $ENV{USERPROFILE};
     delete $ENV{BUTLER_STATE_DIR};
     delete $ENV{CCPRAXIS_SANDBOX};
+    delete $ENV{$_} for @SCRUB_ENV;
+    my $prev_cwd = Cwd::getcwd();
+    chdir($FAKE_ROOT) or die "fixture setup: cannot chdir to $FAKE_ROOT: $!";
     my $out = `timeout 20 perl "$STATUSLINE" < "$inpath" 2>/dev/null`;
     my $rc  = $? >> 8;
+    chdir($prev_cwd) or die "fixture teardown: cannot chdir back to $prev_cwd: $!";
+    push @ALL_OUTPUTS, (defined($out) ? $out : '');
     is($rc, 0, 'Edge case: no crash when the continuity dir is unresolvable (HOME/USERPROFILE/override all unset)');
     ok(index($out, $BADGE) < 0, 'Edge case: no badge when the continuity dir is unresolvable');
 }
+
+# ===========================================================================
+# AC-21 (hook-continuity-remake package 10) -- the NEGATIVE half only. None
+# of this file's fixtures plants an off/<sid> or silence/<sid> record, so no
+# render above may show the agent-off badge (U+2205) or the silenced badge
+# (U+2016). Asserted over every stdout collected by run_statusline and the
+# edge case, as raw bytes.
+# ===========================================================================
+{
+    my $silenced  = encode('UTF-8', chr(0x2016));
+    my $agent_off = encode('UTF-8', chr(0x2205));
+    ok(scalar(@ALL_OUTPUTS) >= 20,
+        'AC-21 (precondition): the pre-existing fixtures above were all collected (' . scalar(@ALL_OUTPUTS) . ' renders)');
+    my @sil = grep { index($ALL_OUTPUTS[$_], $silenced)  >= 0 } 0 .. $#ALL_OUTPUTS;
+    my @off = grep { index($ALL_OUTPUTS[$_], $agent_off) >= 0 } 0 .. $#ALL_OUTPUTS;
+    is(scalar(@sil), 0, 'AC-21: no pre-existing fixture in this file renders the silenced badge U+2016')
+        or diag('  offending render(s): ' . join(', ', map { $_ + 1 } @sil));
+    is(scalar(@off), 0, 'AC-21: no pre-existing fixture in this file renders the agent-off badge U+2205')
+        or diag('  offending render(s): ' . join(', ', map { $_ + 1 } @off));
+}
+
+is_deeply(almanac_listing($REAL_STORE), $REAL_STORE_BEFORE,
+    'hygiene: the real repo\'s .ccpraxis-local-data/almanac listing is unchanged by this file');
 
 done_testing();

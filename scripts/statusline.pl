@@ -91,6 +91,9 @@ my %THEME_ATTR = (
   'text.muted' => '2',
   'text.primary' => '',
 );
+my %THEME_BG = (
+  'overlay.warn' => [59,10,10],
+);
 # <<< END GENERATED FROM Theme.pm <<<
 
 # rgb($role) -> the truecolor SGR string for a semantic role, or '' for an
@@ -102,6 +105,16 @@ sub rgb {
     return '' unless ref($t) eq 'ARRAY';
     my ($r, $g, $b) = @$t;
     return "\033[38;2;$r;$g;${b}m";
+}
+
+# bgrgb($role) -> the truecolor BACKGROUND SGR for a role that declares one
+# (%THEME_BG), or '' for a role without a background. rgb()'s sibling.
+sub bgrgb {
+    my ($role) = @_;
+    my $t = defined($role) ? $THEME_BG{$role} : undef;
+    return '' unless ref($t) eq 'ARRAY';
+    my ($r, $g, $b) = @$t;
+    return "\033[48;2;$r;$g;${b}m";
 }
 
 my $R       = "\033[0m";
@@ -133,6 +146,8 @@ my %GLYPH_COLS = (
     0x29C9 => 1,
     # The todos icon (2026-08-26), same reasoning.
     0x22EE => 1,
+    # The notes icon (package 10). East-Asian-WIDE, so two columns.
+    0x2630 => 2,
 );
 
 # row_cost($fragment) -> the budget a rendered fragment consumes.
@@ -292,6 +307,324 @@ sub spawn_detached {
     { no warnings 'exec'; exec { $argv[0] } @argv; }
     CORE::exit(127);
 }
+
+# ── Almanac counters (generated) ─────────────────────────────
+# The counting code for todos, notes, the tasklist and pending decisions. It
+# cannot be imported (this file loads nothing from the repo) and must not
+# spawn (a subprocess per render costs ~292 ms on the Windows host), so it is
+# GENERATED next to the almanac modules and carried here byte for byte. A
+# test regenerates it and compares; edit the generator, never this block.
+# >>> BEGIN GENERATED FROM gen-statusline-counters.pl -- DO NOT EDIT BY HAND >>>
+# ALMANAC COUNTERS -- generated from plugins/almanac/scripts/gen-statusline-counters.pl.
+# Regenerate: perl plugins/almanac/scripts/gen-statusline-counters.pl
+#
+# The one shared accessor for almanac counts, restated from Almanac::Store,
+# Almanac::GlobalCounts and almanac-task.pl because this file may import
+# nothing. Every public sub wraps its body in eval and degrades to the
+# "unavailable" value (undef); nothing here ever dies to its caller, spawns,
+# or writes. Paths are byte strings throughout.
+#
+#   almanac_counts(cwd => $dir, sandbox => 0|1) -> {
+#       project => { todo, note, task, decision } | undef,
+#       global  => { todo, note } | undef }
+#   almanac_focus(cwd => $dir, session => $sid) -> undef | { name, current }
+my $ALMANAC_SNAPSHOT_NAME = 'almanac-global-counts.json';
+# Frontmatter already read this render, keyed by the record dir's identity
+# (device and inode where the platform has them, else its path) plus the
+# entry name. A focused tasklist is often the project itself under another
+# spelling of its path, and a file open is the dominant cost of a render, so
+# its task files are read once, not twice.
+my $ALMANAC_FM_SEEN = {};
+my $ALMANAC_DIR_KEY = {};
+# _alm_bytes($s) -> $s as UTF-8 bytes. A JSON-decoded path is a character
+# string; the filesystem wants the bytes.
+sub _alm_bytes {
+    my ($s) = @_;
+    return '' unless defined $s && !ref($s);
+    $s = "$s";
+    utf8::encode($s) if utf8::is_utf8($s);
+    return $s;
+}
+sub _alm_is_abs {
+    my ($p) = @_;
+    return 0 unless defined $p && length $p;
+    return 1 if substr($p, 0, 1) eq '/';
+    return ($p =~ m{\A[A-Za-z]:(?:/|\z)}) ? 1 : 0;
+}
+# _alm_is_id($id) -> 1 when $id is a record id (Almanac::Store's grammar).
+sub _alm_is_id {
+    my ($id) = @_;
+    return 0 unless defined $id && !ref($id);
+    return 0 unless length($id) <= 128 && $id =~ /\A[A-Za-z0-9][A-Za-z0-9._-]*\z/;
+    return 0 if index($id, '..') >= 0;
+    return 0 if $id =~ /\A(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])\z/i;
+    return 1;
+}
+# _alm_project_root($cwd) -> the project root, or undef. Mirrors
+# Almanac::Store::resolve_project_root textually (Cwd is not allowed here):
+# the nearest ancestor holding .ccpraxis-local-data or .git, else a non-empty
+# CLAUDE_PROJECT_DIR, else the start. A relative start is never walked, so
+# the process cwd is never consulted; a relative result is no project.
+sub _alm_project_root {
+    my ($cwd) = @_;
+    my $start = _alm_bytes($cwd);
+    $start =~ tr{\\}{/};
+    my $project;
+    if (_alm_is_abs($start)) {
+        my $dir = $start;
+        $dir =~ s{/+\z}{} unless $dir =~ m{\A(?:[A-Za-z]:)?/\z};
+        while (length $dir) {
+            if (-d "$dir/.ccpraxis-local-data" || -e "$dir/.git") { $project = $dir; last }
+            last if $dir =~ m{\A[A-Za-z]:/?\z} || $dir eq '/';
+            my $idx = rindex($dir, '/');
+            last if $idx < 0;
+            my $parent = substr($dir, 0, $idx);
+            $parent = '/' if $parent eq '';
+            $parent = "$parent/" if $parent =~ m{\A[A-Za-z]:\z};
+            last if $parent eq $dir;
+            $dir = $parent;
+        }
+    }
+    if (!defined $project) {
+        my $cpd = $ENV{CLAUDE_PROJECT_DIR};
+        $project = (defined $cpd && length $cpd) ? $cpd : $start;
+        $project =~ tr{\\}{/};
+    }
+    $project =~ s{/+\z}{};
+    return undef unless _alm_is_abs($project);
+    return $project;
+}
+# _alm_home() -> ALMANAC_HOME, else HOME, else USERPROFILE; undef if none.
+sub _alm_home {
+    for my $h ($ENV{ALMANAC_HOME}, $ENV{HOME}, $ENV{USERPROFILE}) {
+        next unless defined $h && length $h;
+        my $v = $h;
+        $v =~ tr{\\}{/};
+        $v =~ s{/+\z}{};
+        return $v;
+    }
+    return undef;
+}
+# _alm_record_names($dir) -> the entries of $dir that name a record. A
+# missing or unreadable dir has none.
+sub _alm_record_names {
+    my ($dir) = @_;
+    my @names;
+    opendir(my $dh, $dir) or return @names;
+    while (defined(my $e = readdir($dh))) {
+        next unless $e =~ /\A(.+)\.md\z/s;
+        push @names, $e if _alm_is_id($1);
+    }
+    closedir($dh);
+    return @names;
+}
+sub _alm_dir_key {
+    my ($dir) = @_;
+    my $k = $ALMANAC_DIR_KEY->{$dir};
+    return $k if defined $k;
+    my @st = stat($dir);
+    $k = (@st && $st[1]) ? "inode:$st[0]:$st[1]" : "path:$dir";
+    $ALMANAC_DIR_KEY->{$dir} = $k;
+    return $k;
+}
+# almanac_parse_record($bytes) -> \%fields, or undef when Almanac::Record
+# would refuse the bytes (almanac-records Decision 38: this parser accepts
+# exactly what Almanac::Record::check accepts). Field values are decoded
+# characters, exactly as Almanac::Record::parse returns them. Refused:
+# invalid UTF-8 (strict: no surrogate, noncharacter or code point past
+# U+10FFFF), a first line that is not exactly "---", no closing "---", a CR
+# on either delimiter or any field line, an empty front matter, a line that
+# is not "key: value" (one colon, one space), a duplicate key, and a value
+# carrying C0 (less TAB), DEL, C1, U+2028 or U+2029. A value is never
+# trimmed, so "status: open " is not "open".
+sub almanac_parse_record {
+    my ($bytes) = @_;
+    return undef unless defined $bytes && !ref($bytes);
+    my $text = "$bytes";
+    if ($text =~ /[^\x00-\x7f]/) {
+        return undef if utf8::is_utf8($text);
+        return undef unless utf8::decode($text);
+        return undef if $text =~ /[^\x{0}-\x{10FFFF}]/;
+        return undef if $text =~ /[\x{D800}-\x{DFFF}\x{FDD0}-\x{FDEF}\x{FFFE}\x{FFFF}\x{1FFFE}\x{1FFFF}\x{2FFFE}\x{2FFFF}\x{3FFFE}\x{3FFFF}\x{4FFFE}\x{4FFFF}\x{5FFFE}\x{5FFFF}\x{6FFFE}\x{6FFFF}\x{7FFFE}\x{7FFFF}\x{8FFFE}\x{8FFFF}\x{9FFFE}\x{9FFFF}\x{AFFFE}\x{AFFFF}\x{BFFFE}\x{BFFFF}\x{CFFFE}\x{CFFFF}\x{DFFFE}\x{DFFFF}\x{EFFFE}\x{EFFFF}\x{FFFFE}\x{FFFFF}\x{10FFFE}\x{10FFFF}]/;
+    }
+    my @l = split /\n/, $text, -1;
+    return undef unless @l && $l[0] eq '---';
+    my $closing;
+    for my $i (1 .. $#l) {
+        if ($l[$i] =~ /\A---\r?\z/) { $closing = $i; last }
+    }
+    return undef unless defined $closing && $closing >= 2 && $l[$closing] eq '---';
+    my %fields;
+    for my $i (1 .. $closing - 1) {
+        return undef unless $l[$i] =~ /\A([A-Za-z0-9_]+): (.*)\z/;
+        my ($k, $v) = ($1, $2);
+        return undef if exists $fields{$k};
+        return undef if $v =~ /[\x00-\x08\x0A-\x1F\x7F-\x9F\x{2028}\x{2029}]/;
+        $fields{$k} = $v;
+    }
+    return \%fields;
+}
+# _alm_frontmatter($dir, $entry) -> almanac_parse_record's fields for that
+# file, or 0 when it cannot be read, exceeds 1048576 bytes, or is refused.
+sub _alm_frontmatter {
+    my ($dir, $entry) = @_;
+    my $path = "$dir/$entry";
+    my $key = _alm_dir_key($dir) . "/$entry";
+    my $seen = $ALMANAC_FM_SEEN->{$key};
+    return $seen if defined $seen;
+    my $fm = 0;
+    if (open(my $fh, '<:raw', $path)) {
+        # Read in 8 KiB steps: one read() with the whole cap as its length
+        # would allocate that much for every record, and records are small.
+        my $bytes = '';
+        my $n = 0;
+        while (1) {
+            my $got = read($fh, $bytes, 8192, length $bytes);
+            if (!defined $got) { $n = undef; last }
+            $n += $got;
+            last if $got < 8192 || $n > 1048576;
+        }
+        close($fh);
+        if (defined $n && $n <= 1048576) {
+            my $f = almanac_parse_record($bytes);
+            $fm = $f if $f;
+        }
+    }
+    $ALMANAC_FM_SEEN->{$key} = $fm;
+    return $fm;
+}
+# _alm_count($dir, @statuses) -> the records in $dir that parse and whose
+# status is one of @statuses; with no statuses, every record that parses.
+sub _alm_count {
+    my ($dir, @statuses) = @_;
+    my %want = map { ($_ => 1) } @statuses;
+    my $n = 0;
+    for my $e (_alm_record_names($dir)) {
+        my $fm = _alm_frontmatter($dir, $e);
+        next unless $fm;
+        if (@statuses) {
+            next unless defined $fm->{status};
+            next unless $want{ $fm->{status} };
+        }
+        $n++;
+    }
+    return $n;
+}
+sub _alm_nonneg_int {
+    my ($v) = @_;
+    return 0 unless defined $v && !ref($v);
+    return ("$v" =~ /\A\d+\z/) ? 1 : 0;
+}
+# _alm_snapshot($path) -> { todo, note } or undef. One attempt, never a
+# retry: Almanac::GlobalCounts::_read_snapshot_once's checks, in its order.
+sub _alm_snapshot {
+    my ($path) = @_;
+    return undef unless -f $path;
+    my @st = stat($path);
+    return undef unless @st && defined $st[7] && $st[7] >= 1 && $st[7] <= 4096;
+    open(my $fh, '<:raw', $path) or return undef;
+    my $bytes = '';
+    my $n = read($fh, $bytes, 4097);
+    close($fh);
+    return undef unless defined $n && $n >= 1 && $n <= 4096;
+    my $d = eval { JSON::PP->new->decode($bytes) };
+    return undef unless ref($d) eq 'HASH';
+    return undef unless defined $d->{schema} && !ref($d->{schema}) && "$d->{schema}" eq '1';
+    my $at = $d->{generated_at};
+    return undef unless defined $at && !ref($at) && $at =~ /\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\z/;
+    my $todo = $d->{todo};
+    return undef unless ref($todo) eq 'HASH';
+    for my $k (qw(open done total)) {
+        return undef unless _alm_nonneg_int($todo->{$k});
+    }
+    my $note = $d->{note};
+    return undef unless ref($note) eq 'HASH' && _alm_nonneg_int($note->{total});
+    return { todo => 0 + $todo->{open}, note => 0 + $note->{total} };
+}
+sub almanac_counts {
+    my (%o) = @_;
+    my ($project, $global);
+    eval {
+        my $root = _alm_project_root($o{cwd});
+        if (defined $root) {
+            my $ad = "$root/.ccpraxis-local-data/almanac";
+            $project = {
+                todo     => _alm_count("$ad/todo", 'open'),
+                note     => _alm_count("$ad/note"),
+                task     => _alm_count("$ad/task", 'pending', 'doing', 'blocked'),
+                decision => _alm_count("$ad/decision", 'unanswered'),
+            };
+        }
+        1;
+    } or $project = undef;
+    eval {
+        my $home = _alm_home();
+        if (defined $home && $o{sandbox}) {
+            $global = _alm_snapshot("$home/.claude/$ALMANAC_SNAPSHOT_NAME");
+        }
+        elsif (defined $home) {
+            my $v = "$home/.claude/claude-code-vault/almanac";
+            $global = { todo => _alm_count("$v/todo", 'open'), note => _alm_count("$v/note") };
+        }
+        1;
+    } or $global = undef;
+    return { project => $project, global => $global };
+}
+# _alm_text($chars) -> a decoded field value with C0 and DEL removed.
+sub _alm_text {
+    my ($s) = @_;
+    $s = '' unless defined $s;
+    $s =~ s/[\x00-\x1f\x7f]//g;
+    return $s;
+}
+sub _alm_focus {
+    my (%o) = @_;
+    my $sid = $o{session};
+    return undef unless _alm_is_id($sid);
+    my $root = _alm_project_root($o{cwd});
+    return undef unless defined $root;
+    my $fm = _alm_frontmatter("$root/.ccpraxis-local-data/almanac/task-focus", "$sid.md");
+    return undef unless $fm && defined $fm->{tasklist};
+    my $tl = $fm->{tasklist};
+    $tl =~ tr{\\}{/};
+    $tl =~ s{/+\z}{};
+    return undef unless length $tl;
+    my $base = $tl;
+    $base =~ s{\A.*/}{}s;
+    my $name = _alm_text($base);
+    return undef unless length $name;
+    my $current;
+    # The value is decoded text; the filesystem wants its bytes. A relative
+    # tasklist would resolve against the process cwd, so it names only.
+    my $tl_bytes = _alm_bytes($tl);
+    return { name => $name, current => $current } unless _alm_is_abs($tl_bytes);
+    my $dir = "$tl_bytes/.ccpraxis-local-data/almanac/task";
+    my @doing;
+    for my $e (_alm_record_names($dir)) {
+        my $t = _alm_frontmatter($dir, $e);
+        next unless $t && defined $t->{status} && $t->{status} eq 'doing';
+        (my $id = $e) =~ s/\.md\z//;
+        push @doing, [ $t->{rank}, $id, $t->{title} ];
+    }
+    @doing = sort {
+        (defined $a->[0] && defined $b->[0]) ? (($a->[0] cmp $b->[0]) || ($a->[1] cmp $b->[1]))
+      : defined $a->[0] ? -1
+      : defined $b->[0] ? 1
+      : ($a->[1] cmp $b->[1])
+    } @doing;
+    if (@doing && defined $doing[0][2]) {
+        $current = _alm_text($doing[0][2]);
+        $current = undef unless length $current;
+    }
+    return { name => $name, current => $current };
+}
+sub almanac_focus {
+    my (%o) = @_;
+    my $focus;
+    eval { $focus = _alm_focus(%o); 1 } or $focus = undef;
+    return $focus;
+}
+# <<< END GENERATED FROM gen-statusline-counters.pl <<<
 
 # ── Model ────────────────────────────────────────────────────
 my $display  = $data->{model}{display_name} // '';
@@ -487,7 +820,54 @@ if (length $sid) {
     }
 }
 
-# ── Pending questions ────────────────────────────────────────
+# ── Silenced / agent-disarmed badge (Decision 7) ─────────────
+# The lead glyph says whether a Stop gate is armed. It cannot say WHY one is
+# not, and two of those reasons are worth seeing: an agent disarmed this
+# session (off/<sid> with "actor":"agent"), or it is silenced
+# (silence/<sid>). Both files live under the same root as armed/<sid>, so the
+# badge costs two bounded reads and no subprocess.
+#
+# The silence test is BpHook::take_silence's own acceptance rule (session_id,
+# by, a reason of two or more words), so the badge never claims a silence the
+# gate would ignore. An agent disarm outranks a silence: disarming deletes the
+# silence file, so both at once is a stale leftover, and "off" is the fact.
+# -- continuity-badge:begin --
+# _badge_record($path) -> the decoded hash, or undef. One read of at most
+# 4096 bytes, so a record that starts past that point never decodes.
+sub _badge_record {
+    my ($path) = @_;
+    return undef unless -f $path;
+    open(my $fh, '<:raw', $path) or return undef;
+    my $buf = '';
+    my $n = read($fh, $buf, 4096);
+    close($fh);
+    return undef unless defined $n && $n > 0;
+    # Decoded as UTF-8, exactly as BpHook::_read_json does, so the reason's
+    # words are split on the same characters the Stop gate splits on.
+    my $rec = eval { JSON::PP->new->utf8->decode($buf) };
+    return (ref($rec) eq 'HASH') ? $rec : undef;
+}
+my $badge_glyph = '';
+if (length $sid) {
+    my $state = _state_dir();
+    if (defined $state) {
+        my $off = _badge_record("$state/off/$sid");
+        my $actor = $off ? $off->{actor} : undef;
+        if (defined $actor && !ref($actor) && $actor eq 'agent') {
+            $badge_glyph = "\x{2205}";
+        } elsif (my $sil = _badge_record("$state/silence/$sid")) {
+            my ($s_sid, $s_by, $s_why) = @{$sil}{qw(session_id by reason)};
+            my @words = (defined $s_why && !ref($s_why)) ? grep { length } split(/\s+/, $s_why) : ();
+            $badge_glyph = "\x{2016}"
+                if defined $s_sid && !ref($s_sid) && $s_sid eq $sid
+                && defined $s_by && !ref($s_by) && $s_by eq 'butler-continuity'
+                && @words >= 2;
+        }
+    }
+}
+# -- continuity-badge:end --
+
+# ── Pending decisions, and every other almanac count ─────────
 #
 # A COUNT, BECAUSE THE ALTERNATIVE WAS STOPPING. Unattended work used to halt
 # the moment an agent wanted to ask something -- hours of idle for an answer
@@ -497,76 +877,18 @@ if (length $sid) {
 # losing them is that the operator can SEE there are some waiting without
 # going to look.
 #
-# Package 09 (Decision 108) re-points this at the almanac decision store.
-# The read below mirrors Almanac::Store::resolve_project_root by hand
-# (AC-S3 forbids importing it: this file may load nothing from the repo) and
-# never absorbs the legacy queue -- that happens only on the next real store
-# open (ask/questions/the guard). Package 10 keeps its own accessor design
-# and exactly-one-reader rule, and may later replace this read.
-my $pending_questions = 0;
+# Package 10 routes this, and the todo/note/tasklist counters below, through
+# the ONE generated accessor above. This is its only call site; the counters
+# segment reuses the same result.
+my $almanac = { project => undef, global => undef };
 {
     # -- pending-decisions:begin --
-    # 1. project: mirror Almanac::Store::resolve_project_root (cannot be
-    #    imported, AC-S3): walk up from $cwd (workspace.current_dir, '\'
-    #    folded to '/') to the first dir with -d .ccpraxis-local-data or
-    #    -e .git; else $ENV{CLAUDE_PROJECT_DIR} if non-empty; else $cwd.
-    #    Parent step stops at 'X:/' and '/'. Stats only.
-    my $start = defined $cwd ? $cwd : '';
-    $start =~ tr{\\}{/};
-    my $project;
-    {
-        my $dir = $start;
-        while (length $dir) {
-            if (-d "$dir/.ccpraxis-local-data" || -e "$dir/.git") { $project = $dir; last }
-            last if $dir =~ m{\A[A-Za-z]:/?\z} || $dir eq '/';
-            my $idx = rindex($dir, '/');
-            last if $idx < 0;
-            my $parent = substr($dir, 0, $idx);
-            $parent = '/' if $parent eq '';
-            $parent = "$parent/" if $parent =~ m{\A[A-Za-z]:\z};
-            last if $parent eq $dir;
-            $dir = $parent;
-        }
-    }
-    if (!defined $project) {
-        my $cpd = $ENV{CLAUDE_PROJECT_DIR};
-        $project = (defined $cpd && length $cpd) ? $cpd : $start;
-    }
-    $project =~ s{/\z}{} if length($project) > 1;
-
-    # 2. dir = "<project>/.ccpraxis-local-data/almanac/decision"; opendir or
-    #    leave 0.
-    my $dir = "$project/.ccpraxis-local-data/almanac/decision";
-    if (opendir(my $dh, $dir)) {
-        # 3. for each entry matching /\A[A-Za-z0-9][A-Za-z0-9._-]*\.md\z/
-        #    that is -f: open '<:raw'; line 1 must be '---' (after stripping
-        #    \r); read at most 64 more lines, stopping at the closing '---';
-        #    count it iff one frontmatter line matches
-        #    /^status:[ \t]*unanswered[ \t]*$/. Unreadable file -> skip.
-        while (defined(my $entry = readdir($dh))) {
-            next unless $entry =~ /\A[A-Za-z0-9][A-Za-z0-9._-]*\.md\z/;
-            my $path = "$dir/$entry";
-            next unless -f $path;
-            open(my $fh, '<:raw', $path) or next;
-            my $first = <$fh>;
-            unless (defined $first) { close $fh; next }
-            $first =~ s/\r?\n\z//;
-            unless ($first eq '---') { close $fh; next }
-            my $found = 0;
-            for (1 .. 64) {
-                my $l = <$fh>;
-                last unless defined $l;
-                $l =~ s/\r?\n\z//;
-                last if $l eq '---';
-                $found = 1 if $l =~ /^status:[ \t]*unanswered[ \t]*$/;
-            }
-            close $fh;
-            $pending_questions++ if $found;
-        }
-        closedir $dh;
-    }
+    $almanac = almanac_counts(cwd => $workspace, sandbox => $SANDBOX_ON);
     # -- pending-decisions:end --
 }
+my $alm_project = ref($almanac) eq 'HASH' && ref($almanac->{project}) eq 'HASH' ? $almanac->{project} : {};
+my $alm_global  = ref($almanac) eq 'HASH' && ref($almanac->{global})  eq 'HASH' ? $almanac->{global}  : {};
+my $pending_decisions = $alm_project->{decision} // 0;
 
 # ── ...and where it goes ─────────────────────────────────────
 #
@@ -590,12 +912,18 @@ my $marker  = ($watched ? $OK : $FAINT)
             . ($watched ? $GLYPH_WATCHED : $GLYPH_UNWATCHED)
             . "${R}$WORD_COLOR{$env} ${word}${R}";
 
-# Pending questions ride immediately after the continuity glyph, because they
-# are the same subject: this session is watched, and N things are waiting to be
-# asked when it stops. "?3" is three columns for a fact that otherwise costs a
-# halted run to discover. Silent at zero -- a "?0" would spend a column saying
-# nothing, which is the mistake the badge itself was reduced from a word to fix.
-$marker .= "${R} ${WARN}?${pending_questions}${R}" if $pending_questions > 0;
+# The Decision 7 badge follows the word: why this session is NOT watched, when
+# the reason is an agent's disarm or a silence. Nothing at all -- not even a
+# space -- when neither applies.
+$marker .= "${R} ${WARN}${badge_glyph}${R}" if length $badge_glyph;
+
+# Pending decisions ride in the marker field too, because they are the same
+# subject: this session is watched, and N things are waiting to be asked when
+# it stops. A flag and a digit, on the one background Theme declares, for a
+# fact that otherwise costs a halted run to discover. Silent at zero -- a
+# zero count would spend columns saying nothing.
+$marker .= "${R} " . bgrgb('overlay.warn') . rgb('overlay.warn') . "\x{2691}${pending_decisions}${R}"
+    if $pending_decisions > 0;
 
 # ── Git (with background fetch every 30 min) ────────────────
 my $git_str = '';
@@ -656,19 +984,25 @@ eval {
         push @parts, "${MUTED}\x{29C9} ${R}${PRIMARY}${n}${R}" if $n > 0;
     }
 
-    # Todos: non-archived ~/.claude/claude-code-vault/todos/*.md (global)
-    my $todo_dir = "$ENV{HOME}/.claude/claude-code-vault/todos";
-    if (-d $todo_dir) {
-        opendir(my $dh, $todo_dir) or die;
-        my $n = grep { /\.md$/ && !/^README\.md$/ && -f "$todo_dir/$_" } readdir($dh);
-        closedir($dh);
-        # AN ICON, NOT THE WORD -- the same call the blueprints count got, and
-        # the operator picked U+22EE (vertical ellipsis, "items continuing
-        # down") from ten offered. Chosen partly BECAUSE it contrasts with
-        # U+29C9 above: two box-shaped glyphs side by side would read as a
-        # matched pair rather than two different counts. Declared in Theme.pm
-        # and in %GLYPH_COLS above.
-        push @parts, "${MUTED}\x{22EE} ${R}${PRIMARY}${n}${R}" if $n > 0;
+    # The almanac counters, from the one accessor call above. Each reads
+    # "<glyph> P·G": the project count, then the global one after a dot.
+    # A zero or unavailable side is omitted along with its dot, and a
+    # counter with nothing on either side is omitted entirely.
+    #
+    # Todos keep U+22EE (vertical ellipsis, "items continuing down"), the
+    # operator's pick from ten offered, chosen partly BECAUSE it contrasts
+    # with U+29C9 above. Notes are U+2630, the tasklist U+25A3 (project
+    # only: tasks have no global store). All are declared in Theme.pm and,
+    # where not one column, in %GLYPH_COLS above.
+    for my $c (['todo', "\x{22EE}", 1], ['note', "\x{2630}", 1], ['task', "\x{25A3}", 0]) {
+        my ($kind, $glyph, $has_global) = @$c;
+        my $p = $alm_project->{$kind} // 0;
+        my $g = $has_global ? ($alm_global->{$kind} // 0) : 0;
+        next unless $p > 0 || $g > 0;
+        my $seg = "${MUTED}${glyph}${R} ";
+        $seg .= "${PRIMARY}${p}${R}" if $p > 0;
+        $seg .= "${FAINT}\x{00B7}${R}${MUTED}${g}${R}" if $g > 0;
+        push @parts, $seg;
     }
 
     # Double space between segments groups them as distinct categories.
@@ -962,6 +1296,21 @@ if (row_cost($single) <= $cols) {
 # /project -- one fixed mount, the same string every session, in a container
 # that by construction holds one project. On the host it is the answer to "where
 # am I", and there it can be anywhere.
+#
+# THE FOCUSED TASKLIST gets a row of its own when this session has one:
+# "U+25A3 <tasklist name> U+00B7 <current task>", after the status row(s) and before the
+# path row, so on the host the path stays last. The current task is the first
+# task in `doing`, which may be any length, so the row is right-elided to the
+# terminal width rather than capped below it.
+my $focus = almanac_focus(cwd => $workspace, session => $sid);
+if (ref($focus) eq 'HASH' && defined $focus->{name} && length $focus->{name}) {
+    my $trow = "${MUTED}\x{25A3}${R} ${PRIMARY}$focus->{name}${R}";
+    $trow .= "${FAINT} \x{00B7} ${R}${PRIMARY}$focus->{current}${R}"
+        if defined $focus->{current} && length $focus->{current};
+    my $fitted = fit_head($trow, $cols);
+    push @rows, $fitted if length $fitted;
+}
+
 my $path_row = $SANDBOX_ON ? '' : path_row($cwd);
 push @rows, $path_row if length $path_row;
 print join("\n", @rows);
