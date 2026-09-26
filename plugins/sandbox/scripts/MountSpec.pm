@@ -13,10 +13,12 @@ package MountSpec;
 use strict;
 use warnings;
 use Exporter qw(import);
+use Fcntl qw(O_WRONLY O_CREAT O_EXCL);
+use JSON::PP ();
 
 our @EXPORT_OK = qw(winify_path v_to_mount convert_v_to_mount
     claude_home_create_args parse_create_args parse_inspect_lines
-    audit_claude_home);
+    audit_claude_home ensure_global_counts_file);
 
 our $WINDOWS_FAMILY = $^O =~ /^(MSWin32|cygwin|msys)$/;
 
@@ -110,6 +112,13 @@ sub claude_home_create_args {
         die "MountSpec::claude_home_create_args: missing or empty required option '$key'\n"
             unless defined $opt{$key} && length $opt{$key};
     }
+    # global_counts is OPTIONAL -- absent/undef keeps the output identical to
+    # today (spec 2.5 B1 regression guard). Present but empty is the same
+    # silently-empty-source hazard the three required options already refuse.
+    if (exists $opt{global_counts}
+        && !(defined $opt{global_counts} && length $opt{global_counts})) {
+        die "MountSpec::claude_home_create_args: missing or empty required option 'global_counts'\n";
+    }
     my ($claude_data, $launcher_dir, $statusline) =
         @opt{qw(claude_data launcher_dir statusline)};
 
@@ -119,12 +128,79 @@ sub claude_home_create_args {
     # ~/.claude.json while the config-dir resolver yields cwd-relative
     # paths, so credentials would land in a project working tree. The
     # literal is the regression guard.
-    return (
+    my @args = (
         '-e', 'CLAUDE_CONFIG_DIR=/root/.claude',
         '-v', "$claude_data:/root/.claude",
         '-v', "$launcher_dir:/root/.claude/.launcher:ro",
         '-v', "$statusline:/root/.claude/statusline.pl:ro",
     );
+
+    if (defined $opt{global_counts} && length $opt{global_counts}) {
+        my $gc = $opt{global_counts};
+        my ($ok, $reason) = ensure_global_counts_file($gc);
+        if ($ok) {
+            push @args, '-v', "$gc:/root/.claude/almanac-global-counts.json:ro";
+        } else {
+            print STDERR "MountSpec: global counts snapshot not mounted ($reason): $gc\n";
+        }
+    }
+
+    return @args;
+}
+
+# ensure_global_counts_file($p) -> (1, 'exists'|'created') | (0, $reason)
+#
+# Never creates a parent directory, never renames, never overwrites. Checked
+# in this order (spec 2.5): a claude-code-vault path segment (case-
+# insensitive, split on / or \) refuses without touching disk; an existing
+# plain file is left untouched; an existing non-file (e.g. podman's
+# auto-created mountpoint directory) is refused; otherwise a fresh zero-count
+# seed is created with O_EXCL, so a lost EEXIST race still resolves to
+# (1,'exists') rather than clobbering whatever won the race.
+sub ensure_global_counts_file {
+    my ($p) = @_;
+    my @segments = split(m{[\\/]}, (defined $p ? $p : ''));
+    return (0, 'vault_path') if grep { lc($_) eq 'claude-code-vault' } @segments;
+
+    if (-e $p) {
+        return (1, 'exists') if -f $p;
+        return (0, 'not_a_file');
+    }
+
+    my $ok = sysopen(my $fh, $p, O_WRONLY | O_CREAT | O_EXCL);
+    if ($ok) {
+        binmode($fh);
+        # Check both print and close (review S2): an unnoticed failure here
+        # (full disk, I/O error) would leave a 0-byte/truncated file while
+        # still reporting 'created' -- the reader already treats that file
+        # as invalid (no counters), but every later launch would then take
+        # the 'exists' branch and never re-seed it. Spec 2.5 forbids
+        # removing the partial file, so it is left in place either way.
+        my $printed = print {$fh} _global_counts_seed_bytes();
+        my $closed  = close($fh);
+        return (1, 'created') if $printed && $closed;
+        return (0, 'create_failed');
+    }
+    return (1, 'exists') if -f $p;
+    return (0, 'create_failed');
+}
+
+sub _global_counts_now_iso {
+    my @t = gmtime(time);
+    return sprintf('%04d-%02d-%02dT%02d:%02d:%02dZ',
+                   $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
+}
+
+# The seed bytes are produced LOCALLY with JSON::PP (core) -- this module
+# must not import any Almanac:: module (spec 2.5, cross-plugin refusal).
+sub _global_counts_seed_bytes {
+    my %doc = (
+        generated_at => _global_counts_now_iso(),
+        note         => { total => 0 },
+        schema       => 1,
+        todo         => { done => 0, open => 0, total => 0 },
+    );
+    return JSON::PP->new->canonical(1)->encode(\%doc) . "\n";
 }
 
 # Parse a podman argv into the normalized shape used by audit_claude_home.

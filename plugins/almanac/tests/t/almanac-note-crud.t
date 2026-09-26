@@ -349,7 +349,7 @@ ok(-f $NOTE_PL, 'almanac-note.pl exists at plugins/almanac/scripts/almanac-note.
             qr/^\s*use\s+File::Basename\b/,    qr/^\s*use\s+File::Path\b/,
             qr/^\s*use\s+JSON::PP\b/,          qr/^\s*use\s+Encode\b/,
             qr/^\s*use\s+Almanac::Store\b/,    qr/^\s*use\s+Almanac::Record\b/,
-            qr/^\s*use\s+Almanac::Lock\b/,
+            qr/^\s*use\s+Almanac::Lock\b/, qr/^\s*use\s+Almanac::GlobalCounts\b/,
         );
         my @bad_imports = grep { my $l = $_; !grep { $l =~ $_ } @allowed } @uses;
         unless (ok(@bad_imports == 0, 'AC-47: the file imports only from the §2.0 allowlist')) {
