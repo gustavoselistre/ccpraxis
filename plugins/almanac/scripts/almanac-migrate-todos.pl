@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 # almanac-migrate-todos.pl -- one-shot host-side migration of legacy vault
-# todos (scripts/todo-sync.pl's todos/ directory) into global almanac todo
+# todos (the retired todo plugin's todos/ directory) into global almanac todo
 # records (blueprint almanac-records, package 11-migrate-todos). See
 # specs/11-migrate-todos-spec.md for the full contract; this file implements
 # it and adds nothing beyond it. Runs in-process through Almanac::Store --

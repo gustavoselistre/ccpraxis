@@ -104,7 +104,7 @@ This is a fixed list of known failures, not a mechanism for enforcing rules you 
 
 Most of what accumulates around a project should not ship with it. Blueprints, todos, session notes and project-specific instructions are yours, not the codebase's, and committing them to a repo other people pull is the wrong answer. They go to a **vault** instead: a private git repository you create and control, synced with three-way merge and a pre-push secret scan, which never deletes a local file it has never held.
 
-`/todo:create` writes a note without derailing what you are doing, and `/todo:resume` picks one back up later. They ride along in the vault, so the note you left on one machine is there on the next. `/steward:setup-project` is what enrols a project: it finds the Claude files worth keeping, proposes a name, and either registers them fresh or links the project back to a slug an earlier machine already pushed, which is how a clone on new hardware gets its notes back.
+`/steward:setup-project` is what enrols a project: it finds the Claude files worth keeping, proposes a name, and either registers them fresh or links the project back to a slug an earlier machine already pushed, which is how a clone on new hardware gets its notes back.
 
 Two more of steward's commands are worth knowing about. `/steward:usage-audit` reads every transcript on the machine — the host plus each project's sandbox home, nested subagent transcripts included — separates what you spent talking to Claude from what unattended runs spent on your behalf, and prices the total against Anthropic's list rates and several cheaper providers. If a week disappeared, that report says where. And `/steward:ccpraxis-extend` is the single door for changing ccpraxis itself: it works out whether you're asking for something new or a change to something that exists, does the work, and then wires it in — the plugin registration, the settings entry, the skill link. That wiring is the part that's easy to skip by hand, and skipping it leaves a skill sitting on disk that nothing ever loads.
 
@@ -212,13 +212,13 @@ plan described above), then restart Claude Code.
 | `/steward:usage-audit` | Price what you actually consumed, here and in every sandbox |
 | `/steward:ccpraxis-extend` | Add to or change ccpraxis, wired in properly |
 
-The rest, including `/todo` and `/almanac`, are listed with every other surface in [`docs/reference.md`](docs/reference.md).
+The rest, including `/almanac`, are listed with every other surface in [`docs/reference.md`](docs/reference.md).
 
 ---
 
 ## Layout and documentation
 
-Plugins live under `plugins/<name>/` (`sandbox`, `backpack`, `blueprint`, `butler`, `steward`, `todo`, `almanac`); skills under `skills/`; the `CLAUDE.md` and `settings.json` this installs to `~/.claude/` under `global-config/`.
+Plugins live under `plugins/<name>/` (`sandbox`, `backpack`, `blueprint`, `butler`, `steward`, `almanac`); skills under `skills/`; the `CLAUDE.md` and `settings.json` this installs to `~/.claude/` under `global-config/`.
 
 | Page | For |
 |---|---|

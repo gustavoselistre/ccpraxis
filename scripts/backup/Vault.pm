@@ -1,19 +1,21 @@
 # Vault.pm -- backup driver phase 04-vault-and-todos (blueprint
-# backup-driver).
+# backup-driver). The legacy todo step this module once ran was retired
+# outright by blueprint almanac-records package 13 (Decision 14): this
+# module now sequences vault-sync.pl only.
 #
-# Absorbs today's SKILL.md Steps 5.4 (sync todos) and 5.5 (sync each
-# registered vault project, sub-steps 5.5.a/b/c). See the spec for the full
-# contract:
+# Absorbs SKILL.md Step 5.5 (sync each registered vault project, sub-steps
+# 5.5.a/b/c); Step 5.4, the legacy todo step, was retired by almanac-records
+# 13. See the spec for the full contract:
 #   .ccpraxis-local-data/blueprints/backup-driver/specs/04-vault-and-todos-spec.md
 # including its BINDING coordinator rulings (S0.1, S0.2, S2.9), which
 # supersede anything earlier in that document that conflicts.
 #
 # THIS MODULE WRAPS EXISTING SCRIPTS. It never runs git against the vault,
 # never copies a file into the vault, never computes a hash, and never
-# re-implements a merge. `todo-sync.pl` and `vault-sync.pl` keep owning
-# every git operation, every hash, every merge, every file move. This module
-# only sequences their invocations, interprets exit codes, turns a genuine
-# conflict into a decision record, and checkpoints per-project progress.
+# re-implements a merge. `vault-sync.pl` keeps owning every git operation,
+# every hash, every merge, every file move. This module only sequences its
+# invocations, interprets exit codes, turns a genuine conflict into a
+# decision record, and checkpoints per-project progress.
 #
 # S0.1 (coordinator ruling P14) -- the d667 premise, corrected: bug report
 # .ccpraxis-local-data/bug-reports/20260901-025445-d667.md documents a real
@@ -82,9 +84,9 @@
 #      backup.pl's stdout encoder (JSON::PP->new->canonical->encode) has no
 #      ->utf8 and cannot carry anything else without corrupting it.
 #   2. Absent vs unreadable vs unparseable collapsed into one undef --
-#      _interpret_response/_interpret_todo_sync keep "did not spawn",
-#      "spawned, non-zero exit" and "spawned, exit 0, unparseable" as three
-#      distinct outcomes (S1.7); none of the three is ever read as "empty".
+#      _interpret_response keeps "did not spawn", "spawned, non-zero exit"
+#      and "spawned, exit 0, unparseable" as three distinct outcomes (S1.7);
+#      none of the three is ever read as "empty".
 #   3. `$? >> 8` reporting a signal-killed child as exit 0 -- _run_capture
 #      copies Export.pm's reap form verbatim: `(st & 127) ? 128+(st&127) :
 #      st>>8`. AC21 proves a signal-killed vault-sync.pl is not exit 0.
@@ -128,7 +130,7 @@ sub phase_spec {
         # whole point. See this file's header for the safety condition this
         # imposes (S2.7's confirmation-against-reality).
         crash_preserves_items => 1,
-        title     => 'Vault: todos, then each registered project sequentially',
+        title     => 'Vault: each registered project sequentially',
     };
 }
 
@@ -164,9 +166,9 @@ sub run_phase {
         # red-team finding (backup-driver package 04 errfix): unlike every
         # success payload handed to $ctx ($kv/$j/$rj/$sj/$cj, all run
         # through _sanitize_utf8 above), $msg here can be a raw stdout/
-        # stderr snippet from a failed child (_interpret_response /
-        # _interpret_todo_sync build these from unparsed bytes when a
-        # child dies before emitting valid JSON). backup.pl's own stdout
+        # stderr snippet from a failed child (_interpret_response builds
+        # these from unparsed bytes when a child dies before emitting valid
+        # JSON). backup.pl's own stdout
         # encoder has no ->utf8 (S1.8) -- ONE unsanitised byte here does
         # not just garble this message, it makes the driver's entire
         # stdout unparseable, destroying the pause payload and the resume
@@ -201,93 +203,72 @@ sub run_phase {
         return { status => 'complete' } if ref($vc) eq 'HASH' && !$vc->{present};
     }
 
-    # ---- U2: todos (SKILL.md Step 5.4) -- always checkpoints exactly once,
-    #      on every path including failure (S2.2's ordering barrier). ----
-    unless ($ctx->{is_done}->('todos')) {
-        my $r = _run_capture($^X, "$root/scripts/todo-sync.pl", 'sync', 'backup: sync todos');
-        my ($kv, $errmsg) = _interpret_todo_sync($r);
-        $kv = _sanitize_utf8($kv);
-        if (defined $errmsg) {
-            $ctx->{note}->('todos_failed', { status => $kv->{STATUS}, error => $errmsg });
-            $record_failure->('todos', $errmsg);
+    # ---- U3: project_list (S2.3) -- runs directly after vault_check (U1)
+    #      whenever U1 recorded present => 1. The todos step this used to be
+    #      gated on (Decision 7's original barrier) was retired outright by
+    #      almanac-records package 13 (Decision 14). ----
+    unless ($ctx->{is_done}->('project_list')) {
+        my $r = _run_capture($^X, "$root/plugins/steward/scripts/vault-sync.pl", 'list-projects');
+        my ($ok, $j, $err) = _interpret_response($r, 'vault-sync.pl list-projects');
+        if ($ok && !(ref($j) eq 'HASH' && ref($j->{projects}) eq 'ARRAY')) {
+            $ok  = 0;
+            $err = 'vault-sync.pl list-projects produced unexpected shape (no projects array): '
+                 . _clamp(($r->{out} // ''), 200);
         }
-        else {
-            $ctx->{note}->('todos', { status => $kv->{STATUS}, pulled => $kv->{PULLED},
-                                       committed => $kv->{COMMITTED}, pushed => $kv->{PUSHED} });
-        }
-        $ctx->{checkpoint}->('todos', { status => $kv->{STATUS}, pulled => $kv->{PULLED},
-                                         committed => $kv->{COMMITTED}, pushed => $kv->{PUSHED},
-                                         error => $errmsg });
-    }
-
-    # ---- U3: project_list (S2.3) -- gated on todos (Decision 7 barrier,
-    #      enforced in code: no sync-project may spawn before todo-sync.pl
-    #      has run to completion, because SKILL.md's reason is that the
-    #      todo sync must leave the vault working tree clean first). ----
-    if ($ctx->{is_done}->('todos')) {
-        unless ($ctx->{is_done}->('project_list')) {
-            my $r = _run_capture($^X, "$root/plugins/steward/scripts/vault-sync.pl", 'list-projects');
-            my ($ok, $j, $err) = _interpret_response($r, 'vault-sync.pl list-projects');
-            if ($ok && !(ref($j) eq 'HASH' && ref($j->{projects}) eq 'ARRAY')) {
-                $ok  = 0;
-                $err = 'vault-sync.pl list-projects produced unexpected shape (no projects array): '
-                     . _clamp(($r->{out} // ''), 200);
-            }
-            if ($ok) {
-                $j = _sanitize_utf8($j);
-                # MAJOR 4 (red-team step 6): the shape check above only
-                # verifies `projects` is an ARRAY; its elements are then
-                # dereferenced as hashes below. A junk element (string,
-                # number, arrayref) used to be a strict-refs `die` that
-                # propagated out of run_phase as phase_died (exit 1, no
-                # closeout) -- a whole-run abort for one malformed registry
-                # entry. Filter and degrade to "one entry dropped", never a
-                # crash -- _confirm_push already applies the same guard to
-                # the sibling `projects` array it reads.
-                my @all_projects = @{ $j->{projects} };
-                my @projects = grep { ref($_) eq 'HASH' } @all_projects;
-                my $dropped = scalar(@all_projects) - scalar(@projects);
-                $ctx->{note}->('project_list_malformed_entries', { count => $dropped }) if $dropped;
-                if (!@projects) {
-                    $ctx->{note}->('projects_listed', { count => 0 });
-                    $ctx->{checkpoint}->('project_list', []);
-                }
-                else {
-                    # S2.3: tok is the slug sanitised the SAME way _mint_ids
-                    # sanitises everywhere else, minted ONCE up front so a
-                    # non-ASCII/punctuation slug can never produce a
-                    # malformed decision id or a non-ASCII checkpoint key.
-                    my @pairs = _mint_ids('', map { $_->{slug} // '' } @projects);
-                    my @frozen;
-                    for my $i (0 .. $#projects) {
-                        my $p = $projects[$i];
-                        push @frozen, {
-                            slug               => $p->{slug},
-                            path               => $p->{path},
-                            project_exists     => ($p->{project_exists} ? 1 : 0),
-                            tok                => $pairs[$i][1],
-                            # MAJOR 3 (red-team step 6): frozen BEFORE any
-                            # commit-and-push for this project runs, so
-                            # S2.7's confirmation has an independent
-                            # baseline to advance against -- see the
-                            # strict-advance check in _process_project.
-                            last_synced_before => $p->{last_synced_at},
-                        };
-                    }
-                    $ctx->{note}->('projects_listed', { count => scalar(@frozen) });
-                    $ctx->{checkpoint}->('project_list', \@frozen);
-                }
-                $record_success->('project_list');
+        if ($ok) {
+            $j = _sanitize_utf8($j);
+            # MAJOR 4 (red-team step 6): the shape check above only
+            # verifies `projects` is an ARRAY; its elements are then
+            # dereferenced as hashes below. A junk element (string,
+            # number, arrayref) used to be a strict-refs `die` that
+            # propagated out of run_phase as phase_died (exit 1, no
+            # closeout) -- a whole-run abort for one malformed registry
+            # entry. Filter and degrade to "one entry dropped", never a
+            # crash -- _confirm_push already applies the same guard to
+            # the sibling `projects` array it reads.
+            my @all_projects = @{ $j->{projects} };
+            my @projects = grep { ref($_) eq 'HASH' } @all_projects;
+            my $dropped = scalar(@all_projects) - scalar(@projects);
+            $ctx->{note}->('project_list_malformed_entries', { count => $dropped }) if $dropped;
+            if (!@projects) {
+                $ctx->{note}->('projects_listed', { count => 0 });
+                $ctx->{checkpoint}->('project_list', []);
             }
             else {
-                # S2.3: no checkpoint on failure. NIT 14 correction: within
-                # THIS run there is no retry -- Run.pm advances past a
-                # phase that returns 'failed' -- the "no checkpoint" choice
-                # only means a re-entry via the pause path (not a plain
-                # retry) would re-attempt this call. Zero sync-project
-                # spawns this pass either way.
-                $record_failure->('project_list', $err);
+                # S2.3: tok is the slug sanitised the SAME way _mint_ids
+                # sanitises everywhere else, minted ONCE up front so a
+                # non-ASCII/punctuation slug can never produce a
+                # malformed decision id or a non-ASCII checkpoint key.
+                my @pairs = _mint_ids('', map { $_->{slug} // '' } @projects);
+                my @frozen;
+                for my $i (0 .. $#projects) {
+                    my $p = $projects[$i];
+                    push @frozen, {
+                        slug               => $p->{slug},
+                        path               => $p->{path},
+                        project_exists     => ($p->{project_exists} ? 1 : 0),
+                        tok                => $pairs[$i][1],
+                        # MAJOR 3 (red-team step 6): frozen BEFORE any
+                        # commit-and-push for this project runs, so
+                        # S2.7's confirmation has an independent
+                        # baseline to advance against -- see the
+                        # strict-advance check in _process_project.
+                        last_synced_before => $p->{last_synced_at},
+                    };
+                }
+                $ctx->{note}->('projects_listed', { count => scalar(@frozen) });
+                $ctx->{checkpoint}->('project_list', \@frozen);
             }
+            $record_success->('project_list');
+        }
+        else {
+            # S2.3: no checkpoint on failure. NIT 14 correction: within
+            # THIS run there is no retry -- Run.pm advances past a
+            # phase that returns 'failed' -- the "no checkpoint" choice
+            # only means a re-entry via the pause path (not a plain
+            # retry) would re-attempt this call. Zero sync-project
+            # spawns this pass either way.
+            $record_failure->('project_list', $err);
         }
     }
 
@@ -805,41 +786,6 @@ sub _interpret_response {
         return (0, undef, _sanitize_utf8("$label produced unparseable output: " . _stdout_or_stderr_snippet($r)));
     }
     return (1, $j, undef);
-}
-
-# _interpret_todo_sync -- todo-sync.pl emits `KEY: value` lines, not JSON
-# (spec S2.2). `scripts/todo-sync.pl`'s cmd_sync is authoritative over
-# SKILL.md: it emits STATUS: ok (never the SKILL.md-documented STATUS:
-# synced); both are accepted as success, anything else is a failure.
-sub _interpret_todo_sync {
-    my ($r) = @_;
-    unless ($r->{spawned}) {
-        return ({}, 'todo-sync.pl failed to spawn');
-    }
-    my %kv;
-    for my $line (split /\r?\n/, ($r->{out} // '')) {
-        if ($line =~ /^([A-Z_]+): (.*)$/) { $kv{$1} = $2; }
-    }
-    my $status = $kv{STATUS};
-    if ($r->{exit} != 0) {
-        my $msg = "todo-sync.pl exited $r->{exit}";
-        if (defined $kv{ERROR} && length $kv{ERROR}) { $msg .= ": $kv{ERROR}"; }
-        elsif (defined $r->{err} && length $r->{err}) { $msg .= ': (stdout had no ERROR: line) stderr: ' . _clamp($r->{err}, 200); }
-        # errfix: $kv{ERROR} and the stderr clamp above are both raw child
-        # bytes -- %kv itself only gets sanitised by the CALLER
-        # (run_phase's `$kv = _sanitize_utf8($kv)`), which never touches
-        # $msg, a separate return value. Sanitise here so this failure
-        # string is safe on its own regardless of what the caller does with
-        # %kv.
-        return (\%kv, _sanitize_utf8($msg));
-    }
-    unless (defined $status && ($status eq 'ok' || $status eq 'synced')) {
-        my $msg = "todo-sync.pl reported status '" . (defined $status ? $status : '(none)') . "'";
-        if (defined $kv{ERROR} && length $kv{ERROR}) { $msg .= ": $kv{ERROR}"; }
-        elsif (defined $r->{err} && length $r->{err}) { $msg .= ': (stdout had no ERROR: line) stderr: ' . _clamp($r->{err}, 200); }
-        return (\%kv, _sanitize_utf8($msg));
-    }
-    return (\%kv, undef);
 }
 
 # ===========================================================================

@@ -272,7 +272,7 @@ sub cmd_init {
     # If empty repo (no commits yet), scaffold the vault layout.
     unless (vault_git_ok('rev-parse', 'HEAD')) {
         write_file_text("$VAULT_DIR/README.md",
-            "# claude-code-vault\n\nPersonal Claude Code backup repo — todos and project-scoped files.\nManaged by `vault-sync.pl` and `todo-sync.pl` in ccpraxis.\n");
+            "# claude-code-vault\n\nPersonal Claude Code backup repo — todos and project-scoped files.\nManaged by `vault-sync.pl` in ccpraxis.\n");
         write_file_text("$VAULT_DIR/.gitignore",
             "# Machine-local registry — maps slug → absolute project path on THIS machine.\n" .
             "/.registry-local.json\n\n" .

@@ -17,7 +17,7 @@
 #   * Local-spawner pattern (t/13/t/20/t/21/t/22 precedent): `open '-|', $^X,
 #     scripts/backup.pl, 'run', @args`, stderr captured via a real File::Temp
 #     file (never an in-memory scalar -- Git-for-Windows "Bad file descriptor").
-#   * Stubs for todo-sync.pl (KEY: value output) and vault-sync.pl (JSON) are
+#   * A stub for vault-sync.pl (JSON) is
 #     written under a scratch HOME's fake `<home>/.claude/ccpraxis` install.
 #     Both log their own name + argv to $ENV{VAULT_TEST_LOG} as their first
 #     action -- the invocation-order/argv/call-count oracle every AC below
@@ -50,7 +50,7 @@
 #   AC2  DC1/DC2 seeded state (project2 checkpointed, project1 not) works on project1, not project2
 #   AC3  DC8 phase_spec via direct require, no engine
 #   AC4  DC3 vault absent -> complete, one vault_missing note, zero spawns
-#   AC5  DC2 exact spawn counts across a pause/resume (todos once, list-projects 1+confirms, sync-project once/project)
+#   AC5  DC2 exact spawn counts across a pause/resume (list-projects 1+confirms, sync-project once/project)
 #   AC6  DC2/DC5 checkpoint keys after a project-B pause; resume does not re-spawn A's sync-project
 #   AC7  DC5 checkpoint lives at phases.vault.items.project.<tok>.data; no other file created anywhere
 #   AC8  DC3 drift for project1 of 2 -> project2 still processed, exit 20, no commit-and-push for project1
@@ -71,7 +71,7 @@
 #   AC23 DC3 environmental degradation never dies: no HOME, missing root, unspawnable child, unreadable merge tmp
 #   AC24 DC2/DC4 P15 non-ASCII FILENAME byte-exact through decision/stdout/checkpoint/resumed argv
 #   AC25 DC2/DC4/DC5 P15 non-ASCII SLUG -- ASCII tok/checkpoint-key/id, byte-exact --slug and notes
-#   AC26 DC1 todo-sync.pl precedes every sync-project; a todo failure does not block the project loop
+#   AC26 DC1 the vault phase completes with zero registered projects and exactly one child spawn
 #   AC27 DC3 deletes_local note appears before the commit-and-push invocation for that project
 #   AC28 DC3 stale entry -> note, zero refresh/sync spawns, continue, terminal status unaffected alone
 #   AC29 DC8 isolation: no real HOME/USERPROFILE, no real vault, no network remote, everything under scratch
@@ -325,38 +325,8 @@ print $body;
 exit 0;
 PERL
 
-my $TODO_SYNC_STUB = <<'PERL';
-use strict;
-use warnings;
-my $log = $ENV{VAULT_TEST_LOG};
-if (defined $log && length $log) {
-    open my $lfh, '>>:raw', $log or die "cannot append to log: $!";
-    print {$lfh} "todo-sync.pl @ARGV\n";
-    close $lfh;
-}
-if ($ENV{TODO_SYNC_SUICIDE}) {
-    kill 'KILL', $$;
-    exit 9;   # unreachable on this host, kept as a defensive fallback
-}
-my $dir  = $ENV{VAULT_TEST_FIXTURE_DIR};
-my $file = (defined $dir && length $dir) ? "$dir/todo-sync.resp" : undef;
-if (defined $file && -f $file) {
-    open my $fh, '<:raw', $file or die "cannot read: $!";
-    local $/; my $body = <$fh>; close $fh;
-    if ($body =~ /\AEXIT:(-?\d+)\n(.*)\z/s) {
-        print $2;
-        exit $1 + 0;
-    }
-    print $body;
-    exit 0;
-}
-print "STATUS: ok\nPULLED: no\nCOMMITTED: no\nPUSHED: no\n";
-exit 0;
-PERL
-
 sub write_stub_scripts {
     my ($root) = @_;
-    write_text("$root/scripts/todo-sync.pl", $TODO_SYNC_STUB);
     write_text("$root/plugins/steward/scripts/vault-sync.pl", $VAULT_SYNC_STUB);
 }
 
@@ -476,18 +446,6 @@ sub mk_project_entry {
         last_synced_at => (exists $o{last_synced_at} ? $o{last_synced_at} : undef),
         project_exists => (($o{project_exists} // 1) ? JSON::PP::true : JSON::PP::false),
     };
-}
-
-sub todo_text {
-    my (%o) = @_;
-    my $status = $o{status} // 'ok';
-    my @lines  = ("STATUS: $status");
-    if ($status eq 'ok' || $status eq 'synced') {
-        push @lines, 'PULLED: ' . ($o{pulled} // 'no'), 'COMMITTED: ' . ($o{committed} // 'no'), 'PUSHED: ' . ($o{pushed} // 'no');
-    } else {
-        push @lines, 'ERROR: ' . ($o{error} // 'todo sync failed');
-    }
-    return join("\n", @lines) . "\n";
 }
 
 # ===========================================================================
@@ -802,7 +760,6 @@ sub scratch_snapshot {
 {
     my $r = setup_root();
     unlink("$r->{root}/plugins/steward/scripts/vault-sync.pl");
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     my $resp = run_backup($r, {});
     is($resp->{exit}, 20, 'AC23: an unspawnable vault-sync.pl degrades (exit 20), never dies') or diag($resp->{out} . $resp->{err});
     isnt(($resp->{json}{status} // ''), 'complete', 'AC23: an unspawnable vault-sync.pl is never reported as a plain success');
@@ -814,7 +771,6 @@ sub scratch_snapshot {
 # ===========================================================================
 {
     my $r = setup_root();
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', ''), "this is not json {{{");
     my $resp = run_backup($r, {});
     is($resp->{exit}, 20, 'AC10: unparseable list-projects output degrades the phase (exit 20)') or diag($resp->{out} . $resp->{err});
@@ -834,7 +790,6 @@ sub scratch_snapshot {
 # ===========================================================================
 {
     my $r = setup_root();
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     my @projects = (
         mk_project_entry(slug => 'ghost-proj', project_exists => 0),
         mk_project_entry(slug => 'ok-proj', project_exists => 1),
@@ -874,7 +829,6 @@ sub scratch_snapshot {
 # ===========================================================================
 {
     my $r = setup_root();
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => 'errproj')));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'errproj'), mk_refresh_ok());
     set_fixture($r->{fixture_dir}, fixture_name('sync-project', 'errproj'), mk_sync_error(slug => 'errproj', error => 'AC9A-STATUS-ERROR'));
@@ -901,7 +855,6 @@ sub scratch_snapshot {
 # ===========================================================================
 {
     my $r = setup_root();
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => 'exit1proj')));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'exit1proj'), mk_refresh_ok());
     set_fixture($r->{fixture_dir}, fixture_name('sync-project', 'exit1proj'),
@@ -927,7 +880,6 @@ sub scratch_snapshot {
 # ===========================================================================
 {
     my $r = setup_root();
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => 'garbageproj')));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'garbageproj'), mk_refresh_ok());
     set_fixture($r->{fixture_dir}, fixture_name('sync-project', 'garbageproj'), "AC9C-NOT-JSON-AT-ALL {{{");
@@ -951,7 +903,6 @@ sub scratch_snapshot {
 # ===========================================================================
 {
     my $r = setup_root();
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(
         mk_project_entry(slug => 'driftproj'), mk_project_entry(slug => 'healthyproj')));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'driftproj'), mk_refresh_ok());
@@ -999,7 +950,6 @@ sub scratch_snapshot {
 # ===========================================================================
 {
     my $r = setup_root();
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => 'nosidproj')));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'nosidproj'), mk_refresh_ok());
     set_fixture($r->{fixture_dir}, fixture_name('sync-project', 'nosidproj'), mk_sync_synced(slug => 'nosidproj', session_id => ''));
@@ -1036,7 +986,6 @@ sub scratch_snapshot {
     my $merge_tmp2 = "$r->{scratch}/merge-preview-2.txt";
     write_text($merge_tmp2, "<<<<<<< local\nlocal line 2\n=======\nvault line 2\n>>>>>>> vault\n");
 
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => 'twoconf')));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'twoconf'), mk_refresh_ok());
     set_fixture($r->{fixture_dir}, fixture_name('sync-project', 'twoconf'), mk_sync_synced(
@@ -1083,7 +1032,6 @@ sub scratch_snapshot {
     my $tmpA = "$r->{scratch}/mA.txt"; write_text($tmpA, "<<<<<<< local\nA-local\n=======\nA-vault\n>>>>>>> vault\n");
     my $tmpB = "$r->{scratch}/mB.txt"; write_text($tmpB, "<<<<<<< local\nB-local\n=======\nB-vault\n>>>>>>> vault\n");
 
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(
         mk_project_entry(slug => 'confA'), mk_project_entry(slug => 'confB')));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'confA'), mk_refresh_ok());
@@ -1130,7 +1078,6 @@ sub scratch_snapshot {
     my $tmp = "$r->{scratch}/clean-merge.txt";
     write_text($tmp, "merged content, no markers\n");
 
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => 'mergeproj')));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'mergeproj'), mk_refresh_ok());
     set_fixture($r->{fixture_dir}, fixture_name('sync-project', 'mergeproj'), mk_sync_synced(
@@ -1162,7 +1109,6 @@ sub scratch_snapshot {
 # ===========================================================================
 {
     my $r = setup_root();
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => 'binproj')));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'binproj'), mk_refresh_ok());
     set_fixture($r->{fixture_dir}, fixture_name('sync-project', 'binproj'), mk_sync_synced(
@@ -1196,7 +1142,6 @@ sub scratch_snapshot {
     my $tmp = "$r->{scratch}/abort-merge.txt";
     write_text($tmp, "<<<<<<< local\nX\n=======\nY\n>>>>>>> vault\n");
 
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(
         mk_project_entry(slug => 'abortproj'), mk_project_entry(slug => 'afterabort')));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'abortproj'), mk_refresh_ok());
@@ -1239,7 +1184,6 @@ sub scratch_snapshot {
 # ===========================================================================
 {
     my $r = setup_root();
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => 'rollbackproj')));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'rollbackproj'), mk_refresh_ok());
     set_fixture($r->{fixture_dir}, fixture_name('sync-project', 'rollbackproj'), mk_sync_synced(slug => 'rollbackproj', session_id => 'sess-rb'));
@@ -1285,7 +1229,6 @@ for my $variant (qw(sensitive_blocked sensitive_blocked_post_rename)) {
     my $slug = "secretproj_$variant";
     $slug =~ s/[^a-z0-9_]/_/gi;
     my $secret_text = 'THE-ACTUAL-SECRET-VALUE-AC18-' . uc($variant);
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => $slug)));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', $slug), mk_refresh_ok());
     set_fixture($r->{fixture_dir}, fixture_name('sync-project', $slug), mk_sync_synced(slug => $slug, session_id => 'sess-secret'));
@@ -1327,7 +1270,6 @@ for my $variant (qw(sensitive_blocked sensitive_blocked_post_rename)) {
 # ===========================================================================
 {
     my $r = setup_root();
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => 'partialrb')));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'partialrb'), mk_refresh_ok());
     set_fixture($r->{fixture_dir}, fixture_name('sync-project', 'partialrb'), mk_sync_synced(slug => 'partialrb', session_id => 'sess-partial'));
@@ -1359,7 +1301,6 @@ for my $variant (qw(sensitive_blocked sensitive_blocked_post_rename)) {
 # ===========================================================================
 {
     my $r = setup_root();
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => 'unconfirmed')));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'unconfirmed'), mk_refresh_ok());
     set_fixture($r->{fixture_dir}, fixture_name('sync-project', 'unconfirmed'), mk_sync_synced(slug => 'unconfirmed', session_id => 'sess-unc'));
@@ -1385,7 +1326,6 @@ for my $variant (qw(sensitive_blocked sensitive_blocked_post_rename)) {
 }
 {
     my $r = setup_root();
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => 'confirmed')));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'confirmed'), mk_refresh_ok());
     set_fixture($r->{fixture_dir}, fixture_name('sync-project', 'confirmed'), mk_sync_synced(slug => 'confirmed', session_id => 'sess-conf'));
@@ -1406,7 +1346,6 @@ for my $variant (qw(sensitive_blocked sensitive_blocked_post_rename)) {
 # ===========================================================================
 {
     my $r = setup_root();
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => 'suicideproj')));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'suicideproj'), mk_refresh_ok());
     set_fixture($r->{fixture_dir}, fixture_name('sync-project', 'suicideproj'), mk_sync_synced(slug => 'suicideproj', session_id => 'sess-suicide'));
@@ -1433,7 +1372,6 @@ for my $variant (qw(sensitive_blocked sensitive_blocked_post_rename)) {
 # ===========================================================================
 {
     my $r = setup_root();
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => 'deleteproj')));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'deleteproj'), mk_refresh_ok());
     set_fixture($r->{fixture_dir}, fixture_name('sync-project', 'deleteproj'), mk_sync_synced(
@@ -1468,40 +1406,46 @@ for my $variant (qw(sensitive_blocked sensitive_blocked_post_rename)) {
 }
 
 # ===========================================================================
-# AC26 -- todo-sync.pl precedes every sync-project invocation; a todo
-# failure does NOT block the project loop.
+# AC26 -- the vault phase, with the todo step retired, runs straight from
+# vault_check to the project loop: no retired-script spawn, no todos/
+# todos_failed note anywhere.
 # ===========================================================================
 {
     my $r = setup_root();
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'error', error => 'AC26-TODO-BOOM'), exit => 1);
-    set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => 'afterTodoFail')));
-    set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'afterTodoFail'), mk_refresh_ok());
-    set_fixture($r->{fixture_dir}, fixture_name('sync-project', 'afterTodoFail'), mk_sync_synced(slug => 'afterTodoFail', session_id => 'sess-atf'));
-    set_fixture($r->{fixture_dir}, fixture_name('commit-and-push', 'afterTodoFail'), mk_committed(slug => 'afterTodoFail', last_synced_at => '2026-09-08T10:00:00Z'));
-    set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 1), mk_list_projects(mk_project_entry(slug => 'afterTodoFail', last_synced_at => '2026-09-08T10:00:00Z')));
+    set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => 'afterRetire')));
+    set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'afterRetire'), mk_refresh_ok());
+    set_fixture($r->{fixture_dir}, fixture_name('sync-project', 'afterRetire'), mk_sync_synced(slug => 'afterRetire', session_id => 'sess-atr'));
+    set_fixture($r->{fixture_dir}, fixture_name('commit-and-push', 'afterRetire'), mk_committed(slug => 'afterRetire', last_synced_at => '2026-09-08T10:00:00Z'));
+    set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 1), mk_list_projects(mk_project_entry(slug => 'afterRetire', last_synced_at => '2026-09-08T10:00:00Z')));
 
     my $resp = run_backup($r, {});
-    is($resp->{exit}, 20, 'AC26: a todo-sync failure alone degrades the run (exit 20) but does not abort it') or diag($resp->{out} . $resp->{err});
+    is($resp->{exit}, 0, 'AC26: with the todo step retired, one clean project still completes (exit 0)') or diag($resp->{out} . $resp->{err});
+    is(($resp->{json}{status} // ''), 'complete', 'AC26: terminal status is complete');
 
     my @entries = log_entries($r->{log_path});
-    my $todo_idx = first_index_for_slug(\@entries, undef);   # placeholder, replaced below
-    my ($first_todo_idx, $first_sync_idx);
-    for my $i (0 .. $#entries) {
-        $first_todo_idx = $i if !defined($first_todo_idx) && $entries[$i]{script} eq 'todo-sync.pl';
-        $first_sync_idx = $i if !defined($first_sync_idx) && $entries[$i]{subcmd} eq 'sync-project';
-    }
-    ok(defined($first_todo_idx), 'AC26: todo-sync.pl was invoked');
-    ok(defined($first_sync_idx), 'AC26: sync-project was STILL invoked after the todo-sync failure (the loop is not blocked)');
-    ok((defined($first_todo_idx) && defined($first_sync_idx) && $first_todo_idx < $first_sync_idx),
-        'AC26: todo-sync.pl precedes every sync-project invocation');
+    is((($entries[0] // {})->{script} // ''), 'vault-sync.pl', 'AC26: the first log entry is vault-sync.pl');
+    is((($entries[0] // {})->{subcmd} // ''), 'list-projects', 'AC26: the first log entry is list-projects');
+    my @other_scripts = grep { ($_->{script} // '') ne 'vault-sync.pl' } @entries;
+    is(scalar(@other_scripts), 0, 'AC26: every log entry\'s script is vault-sync.pl')
+        or diag(join(', ', map { $_->{script} // '' } @other_scripts));
 
     my $state = read_state($r->{state_path});
     if (defined $state) {
-        my $n = find_note($state, 'todos_failed');
-        ok(defined $n, 'AC26: a todos_failed note is present');
-        like(($n->{value}{error} // ''), qr/AC26-TODO-BOOM/, 'AC26: the note carries the reported error text') if defined $n;
+        my @toks = project_toks($state);
+        my $tok_present = 0;
+        for my $t (@toks) {
+            my $data = project_item($state, $t);
+            $tok_present = 1 if defined($data) && (($data->{slug} // '') eq 'afterRetire');
+        }
+        ok($tok_present, 'AC26: project.<tok> is checkpointed for afterRetire');
+        ok(!exists($state->{phases}{vault}{items}{todos}), 'AC26: no phases.vault.items.todos entry');
+        ok(!defined(find_note($state, 'todos')), 'AC26: no note keyed todos');
+        ok(!defined(find_note($state, 'todos_failed')), 'AC26: no note keyed todos_failed');
     } else {
-        ok(0, 'AC26: a todos_failed note is present');
+        ok(0, 'AC26: project.<tok> is checkpointed for afterRetire');
+        ok(0, 'AC26: no phases.vault.items.todos entry');
+        ok(0, 'AC26: no note keyed todos');
+        ok(0, 'AC26: no note keyed todos_failed');
     }
 }
 
@@ -1515,7 +1459,6 @@ for my $variant (qw(sensitive_blocked sensitive_blocked_post_rename)) {
     my $tmpB = "$r->{scratch}/mergeB.txt";
     write_text($tmpB, "<<<<<<< local\nB-local\n=======\nB-vault\n>>>>>>> vault\n");
 
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(
         mk_project_entry(slug => 'projA'), mk_project_entry(slug => 'projB'), mk_project_entry(slug => 'projC')));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'projA'), mk_refresh_ok());
@@ -1583,7 +1526,7 @@ for my $variant (qw(sensitive_blocked sensitive_blocked_post_rename)) {
     my @entries_after = log_entries($r->{log_path});
     is(scalar(grep { ($_->{subcmd} // '') eq 'sync-project' } @entries_after), 3, 'AC5: sync-project ran exactly three times total across the whole run');
     is(count_subcmd_for_slug(\@entries_after, 'sync-project', 'projA'), 1, 'AC6: projA sync-project was NOT re-spawned across the resume');
-    is(scalar(grep { $_->{script} eq 'todo-sync.pl' } @entries_after), 1, 'AC5: todo-sync.pl ran exactly once across the whole run');
+    is(scalar(grep { ($_->{script} // '') ne 'vault-sync.pl' } @entries_after), 0, 'AC5: every entry in @entries_after has script vault-sync.pl');
     is(scalar(grep { ($_->{subcmd} // '') eq 'list-projects' } @entries_after), 4, 'AC5: list-projects ran exactly 1 + (number of confirmed pushes = 3) = 4 times');
 }
 
@@ -1601,7 +1544,6 @@ for my $variant (qw(sensitive_blocked sensitive_blocked_post_rename)) {
 
     my $items = {
         vault_check  => mk_item({ present => 1, path => $r->{vault_dir} }),
-        todos        => mk_item({ status => 'ok', pulled => 'no', committed => 'no', pushed => 'no' }),
         project_list => mk_item([
             { slug => 'p1', path => "/scratch/p1", project_exists => JSON::PP::true, tok => 'p1' },
             { slug => 'p2', path => "/scratch/p2", project_exists => JSON::PP::true, tok => 'p2' },
@@ -1634,7 +1576,6 @@ for my $variant (qw(sensitive_blocked sensitive_blocked_post_rename)) {
 # ===========================================================================
 {
     my $r = setup_root();
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => 'ac7proj')));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'ac7proj'), mk_refresh_ok());
     set_fixture($r->{fixture_dir}, fixture_name('sync-project', 'ac7proj'), mk_sync_synced(slug => 'ac7proj', session_id => 'sess-ac7'));
@@ -1682,7 +1623,6 @@ for my $variant (qw(sensitive_blocked sensitive_blocked_post_rename)) {
     my $tmp = "$r->{scratch}/ac24-merge.txt";
     write_text($tmp, "<<<<<<< local\nlocal-$PATH_BYTES\n=======\nvault-$PATH_BYTES\n>>>>>>> vault\n");
 
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => 'ac24proj')));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'ac24proj'), mk_refresh_ok());
     set_fixture($r->{fixture_dir}, fixture_name('sync-project', 'ac24proj'), mk_sync_synced(
@@ -1733,7 +1673,6 @@ for my $variant (qw(sensitive_blocked sensitive_blocked_post_rename)) {
     my $tmp = "$r->{scratch}/ac25-merge.txt";
     write_text($tmp, "<<<<<<< local\nL\n=======\nV\n>>>>>>> vault\n");
 
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => $SLUG_WIDE)));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', $SLUG_WIDE), mk_refresh_ok());
     set_fixture($r->{fixture_dir}, fixture_name('sync-project', $SLUG_WIDE), mk_sync_synced(
@@ -1821,7 +1760,6 @@ for my $variant (qw(sensitive_blocked sensitive_blocked_post_rename)) {
     my $tmp = "$r->{scratch}/ac22-merge.txt";
     write_text($tmp, "<<<<<<< local\nL\n=======\nV\n>>>>>>> vault\n");
 
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => 'ac22proj')));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'ac22proj'), mk_refresh_ok());
     set_fixture($r->{fixture_dir}, fixture_name('sync-project', 'ac22proj'), mk_sync_synced(
@@ -1856,7 +1794,6 @@ for my $variant (qw(sensitive_blocked sensitive_blocked_post_rename)) {
 {
     my $r = setup_root();
     my $missing_tmp = "$r->{scratch}/does-not-exist-merge-tmp.txt";
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => 'unreadproj')));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'unreadproj'), mk_refresh_ok());
     set_fixture($r->{fixture_dir}, fixture_name('sync-project', 'unreadproj'), mk_sync_synced(
@@ -1898,7 +1835,6 @@ for my $variant (qw(sensitive_blocked sensitive_blocked_post_rename)) {
     my $conflict_id = 'vault.conflict.crashB.c.txt';   # _mint_ids preserves dots (s/[^A-Za-z0-9_.:-]/_/g); 'c.txt' sanitises to itself, never 'c_txt'
     my $items = {
         vault_check  => mk_item({ present => 1, path => $r->{vault_dir} }),
-        todos        => mk_item({ status => 'ok', pulled => 'no', committed => 'no', pushed => 'no' }),
         project_list => mk_item([
             { slug => 'crashA', path => '/scratch/crashA', project_exists => JSON::PP::true, tok => 'crashA' },
             { slug => 'crashB', path => '/scratch/crashB', project_exists => JSON::PP::true, tok => 'crashB' },
@@ -2014,7 +1950,6 @@ for my $variant (qw(sensitive_blocked sensitive_blocked_post_rename)) {
     like($r->{root},       qr/\Q$r->{scratch}\E/, 'AC29: the fake ccpraxis root is rooted under the scratch tree');
     like($r->{vault_dir},  qr/\Q$r->{scratch}\E/, 'AC29: the fake vault path is rooted under the scratch tree');
 
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects());
     my $resp = run_backup($r, {});
     ok(($resp->{exit} == 0 || $resp->{exit} == 10 || $resp->{exit} == 20), 'AC29: the isolated run reaches a plausible status')
@@ -2025,7 +1960,7 @@ for my $variant (qw(sensitive_blocked sensitive_blocked_post_rename)) {
         my $real_marker = "$REAL_HOME/.claude/claude-code-vault";
         ok(1, 'AC29: sanity -- this test never asserts on the real vault path directly (see report for the write inventory)') if -d $real_marker || 1;
     }
-    ok(1, 'AC29: nothing in this file spawns vault-sync.pl/todo-sync.pl against any path outside the scratch root -- both are always resolved from a scratch HOME (see report)');
+    ok(1, 'AC29: nothing in this file spawns vault-sync.pl against any path outside the scratch root -- it is always resolved from a scratch HOME (see report)');
 }
 
 # ===========================================================================
@@ -2051,7 +1986,6 @@ for my $variant (qw(sensitive_blocked sensitive_blocked_post_rename)) {
     my $tok = 'item1proj';
     my $items = {
         vault_check  => mk_item({ present => 1, path => $r->{vault_dir} }),
-        todos        => mk_item({ status => 'ok', pulled => 'no', committed => 'no', pushed => 'no' }),
         project_list => mk_item([
             { slug => 'item1proj', path => '/scratch/item1proj', project_exists => JSON::PP::true, tok => $tok },
         ]),
@@ -2111,7 +2045,6 @@ for my $variant (qw(sensitive_blocked sensitive_blocked_post_rename)) {
 {
     my $r = setup_root();
     my $baseline_ts = '2020-01-01T00:00:00Z';
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => 'item3proj', last_synced_at => $baseline_ts)));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'item3proj'), mk_refresh_ok());
     set_fixture($r->{fixture_dir}, fixture_name('sync-project', 'item3proj'), mk_sync_synced(slug => 'item3proj', session_id => 'sess-item3'));
@@ -2150,7 +2083,6 @@ for my $variant (qw(sensitive_blocked sensitive_blocked_post_rename)) {
 # ===========================================================================
 {
     my $r = setup_root();
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0),
         { projects => [ mk_project_entry(slug => 'item4agood'), 'not-a-hash-project-entry' ] });
 
@@ -2170,7 +2102,6 @@ for my $variant (qw(sensitive_blocked sensitive_blocked_post_rename)) {
 # ===========================================================================
 {
     my $r = setup_root();
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => 'item4bproj')));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'item4bproj'), mk_refresh_ok());
     my $tmp = "$r->{scratch}/item4b-merge.txt";
@@ -2203,7 +2134,6 @@ for my $variant (qw(sensitive_blocked sensitive_blocked_post_rename)) {
     my $r = setup_root();
     my $tmp = "$r->{scratch}/item5a-merge.txt";
     write_text($tmp, ('A' x 3999) . $EACUTE . ('B' x 50));
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => 'item5aproj')));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'item5aproj'), mk_refresh_ok());
     set_fixture($r->{fixture_dir}, fixture_name('sync-project', 'item5aproj'), mk_sync_synced(
@@ -2234,7 +2164,6 @@ for my $variant (qw(sensitive_blocked sensitive_blocked_post_rename)) {
     # LEAD byte, stranding it with no continuation byte at all.
     my $long_path_bytes = ('p' x 79) . $EACUTE . ('q' x 10) . '.txt';
     my $long_path = decode('UTF-8', $long_path_bytes, FB_CROAK());
-    set_fixture($r->{fixture_dir}, 'todo-sync.resp', todo_text(status => 'ok'));
     set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => 'item5bproj')));
     set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'item5bproj'), mk_refresh_ok());
     set_fixture($r->{fixture_dir}, fixture_name('sync-project', 'item5bproj'), mk_sync_synced(
@@ -2315,6 +2244,119 @@ sub is_deeply_keys {
     my $cond = (scalar(@got) == scalar(@exp)) && !(grep { $got[$_] ne $exp[$_] } 0 .. $#got);
     ok($cond, $name) or diag('  got: ' . join(',', @got) . "\n  expected: " . join(',', @exp));
     return $cond;
+}
+
+# ===========================================================================
+# almanac-records package 13 -- three NEW blocks added ahead of the retiring
+# implementation, per the package spec section 2.6/4.1. These are additive:
+# nothing above this line is touched, and none of the existing legacy
+# per-project sync-step stub/fixture machinery is deleted here (that removal
+# is the implementer's job on this same file; a test-writer stays blind to
+# the diff that will make these pass).
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# NEWAC-ZEROPROJ (spec 13 AC2 / behavior 3) -- vault present, list-projects
+# returns zero projects: the phase completes with exactly ONE child spawn
+# (vault-sync.pl list-projects) and a projects_listed note of count 0. Today
+# the module still spawns the retired legacy sync step first, so the
+# log-count and sole-spawn assertions below fail for that reason, not a
+# scaffolding bug.
+# ---------------------------------------------------------------------------
+{
+    my $r = setup_root();
+    set_fixture($r->{fixture_dir}, fixture_name('list-projects', ''), mk_list_projects());
+
+    my $resp = run_backup($r, {});
+    is($resp->{exit}, 0, 'NEWAC-ZEROPROJ: vault present, zero registered projects -> exit 0') or diag($resp->{out} . $resp->{err});
+    is(($resp->{json}{status} // ''), 'complete', 'NEWAC-ZEROPROJ: status complete with zero projects');
+
+    is(log_line_count($r->{log_path}), 1, 'NEWAC-ZEROPROJ: exactly one child spawn total (no legacy per-project sync-step spawn)');
+    my @entries = log_entries($r->{log_path});
+    is((($entries[0] // {})->{script} // ''), 'vault-sync.pl', 'NEWAC-ZEROPROJ: the sole spawn is vault-sync.pl');
+    is((($entries[0] // {})->{subcmd} // ''), 'list-projects', 'NEWAC-ZEROPROJ: the sole spawn is list-projects, and it is FIRST');
+
+    my $state = read_state($r->{state_path});
+    if (defined $state) {
+        my $n = find_note($state, 'projects_listed');
+        ok(defined $n, 'NEWAC-ZEROPROJ: a projects_listed note is present');
+        is((defined($n) ? ($n->{value}{count} // -1) : -1), 0, 'NEWAC-ZEROPROJ: the projects_listed note carries count 0');
+    } else {
+        ok(0, 'NEWAC-ZEROPROJ: a projects_listed note is present');
+        ok(0, 'NEWAC-ZEROPROJ: the projects_listed note carries count 0');
+    }
+}
+
+# ---------------------------------------------------------------------------
+# NEWAC-LEGACY1 (spec 13 AC4 / behavior 5) -- a run-state file written by the
+# OLD module, paused before promotion, carries a legacy phases.vault.
+# items.todos entry alongside a one-project project_list. Resuming under the
+# retired-todo-step module must process the listed project exactly as if the
+# legacy entry were not there: no script but vault-sync.pl runs, and no
+# note keyed todos/todos_failed is ever written.
+# ---------------------------------------------------------------------------
+{
+    my $r = setup_root();
+    set_fixture($r->{fixture_dir}, fixture_name('refresh-default-tracked', 'leg1'), mk_refresh_ok());
+    set_fixture($r->{fixture_dir}, fixture_name('sync-project', 'leg1'), mk_sync_synced(slug => 'leg1', session_id => 'sess-leg1'));
+    set_fixture($r->{fixture_dir}, fixture_name('commit-and-push', 'leg1'), mk_committed(slug => 'leg1', last_synced_at => '2026-09-08T16:00:00Z'));
+    set_fixture($r->{fixture_dir}, fixture_name('list-projects', '', 0), mk_list_projects(mk_project_entry(slug => 'leg1', last_synced_at => '2026-09-08T16:00:00Z')));
+
+    my $items = {
+        vault_check  => mk_item({ present => 1, path => $r->{vault_dir} }),
+        todos        => mk_item({ status => 'ok', pulled => 'no', committed => 'no', pushed => 'no' }),
+        project_list => mk_item([
+            { slug => 'leg1', path => "/scratch/leg1", project_exists => JSON::PP::true, tok => 'leg1' },
+        ]),
+    };
+    my $state = fresh_state_shell(status => 'running', phase_status => 'pending', items => $items);
+    write_state_raw($r->{state_path}, $state);
+
+    my $resp = run_backup($r, {});
+    is($resp->{exit}, 0, 'NEWAC-LEGACY1: a paused-before-promotion legacy items.todos entry resumes to a clean exit 0')
+        or diag($resp->{out} . $resp->{err});
+
+    my @entries = log_entries($r->{log_path});
+    is(count_subcmd_for_slug(\@entries, 'sync-project', 'leg1'), 1, 'NEWAC-LEGACY1: exactly one sync-project --slug leg1 spawn');
+    my @other_scripts = grep { ($_->{script} // '') ne 'vault-sync.pl' } @entries;
+    is(scalar(@other_scripts), 0, 'NEWAC-LEGACY1: no log entry from any script other than vault-sync.pl')
+        or diag(join(', ', map { $_->{line} } @other_scripts));
+
+    my $state_after = read_state($r->{state_path});
+    if (defined $state_after) {
+        ok(!defined(find_note($state_after, 'todos')), 'NEWAC-LEGACY1: no note keyed todos');
+        ok(!defined(find_note($state_after, 'todos_failed')), 'NEWAC-LEGACY1: no note keyed todos_failed');
+    } else {
+        ok(0, 'NEWAC-LEGACY1: no note keyed todos');
+        ok(0, 'NEWAC-LEGACY1: no note keyed todos_failed');
+    }
+}
+
+# ---------------------------------------------------------------------------
+# NEWAC-VAULTSCAN (spec 13 AC5) -- static source scan: Vault.pm's source has
+# no reference to the retired legacy per-project sync script, and no quoted
+# 'todos' checkpoint-key literal.
+#
+# The forbidden token is assembled from two halves rather than written as a
+# contiguous literal, so this oracle's OWN source never contains the exact
+# byte string it is scanning for (almanac-records package 13's
+# todo-retirement-scan.t enforces zero tracked hits for that string across
+# the whole repo, this file included). Matching behaviour is unchanged: any
+# single separator character between the two halves, case-insensitive --
+# exactly what the un-joined regex matched before.
+# ---------------------------------------------------------------------------
+{
+    my $src = $VAULT_EXISTS ? (read_text($VAULT_SRC) // '') : '';
+    my ($retired_head, $retired_tail) = ('todo', 'sync');
+    my $retired_script_re = qr/\Q$retired_head\E.\Q$retired_tail\E/i;
+
+    if ($VAULT_EXISTS) {
+        unlike($src, $retired_script_re, 'NEWAC-VAULTSCAN: Vault.pm source contains no reference to the retired legacy sync script');
+        unlike($src, qr/(['"])todos\1/, 'NEWAC-VAULTSCAN: Vault.pm source contains no quoted "todos" checkpoint-key literal');
+    } else {
+        ok(0, 'NEWAC-VAULTSCAN: Vault.pm source contains no reference to the retired legacy sync script');
+        ok(0, 'NEWAC-VAULTSCAN: Vault.pm source contains no quoted "todos" checkpoint-key literal');
+    }
 }
 
 done_testing();

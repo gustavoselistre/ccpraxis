@@ -56,7 +56,7 @@
 #   AC7  *.pl token set subset of {backup.pl, claude-binary-backup.pl}; every
 #        claude-binary-backup.pl occurrence is after the
 #        '## Snapshot/revert mode' heading
-#   AC8  each of the eleven retired script names is absent
+#   AC8  each of the ten retired script names is absent
 #   AC9  no line inside a fenced code block begins with `git`
 #   AC10 Run.pm loaded at runtime via require(); @Backup::Run::DECISION_KINDS
 #        read directly, never hard-coded (see header note above)
@@ -426,12 +426,12 @@ my @REQUIRED_HEADINGS = (
         ok(0, "AC7: every claude-binary-backup.pl occurrence is after '$heading' (heading not found)");
     }
 
-    # AC8: each of the eleven retired script names is absent.
+    # AC8: each of the ten retired script names is absent.
     my @RETIRED = (
         'sync-export.pl', 'sensitive-check.pl', 'ccpraxis-helpers.pl',
         'json-diff.pl', 'filter-diff.pl', 'save-preference.pl',
         'lint-readme-paths.pl', 'gen-readme-tree.pl', 'vault-sync.pl',
-        'todo-sync.pl', 'check-plugins.pl',
+        'check-plugins.pl',
     );
     for my $script (@RETIRED) {
         unlike($SKILL_CONTENT, qr/\Q$script\E/, "AC8: retired script '$script' is absent from SKILL.md");
