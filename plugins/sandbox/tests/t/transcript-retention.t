@@ -178,6 +178,11 @@ my $HOST_BASELINE = {
     agentPushNotifEnabled         => JSON::PP::true,
     attribution                   => { commit => '', pr => '' },
     autoScrollEnabled              => JSON::PP::false,
+    # DELIBERATE DECLARATION, operator request 2026-09-27: turn off Claude Code's
+    # Workflows feature (the Workflow tool), which ccpraxis does not use. butler's
+    # director does its own orchestration. Schema: "Disable the Workflows
+    # feature (also via CLAUDE_CODE_DISABLE_WORKFLOWS)".
+    disableWorkflows               => JSON::PP::true,
     editorMode                     => 'vim',
     effortLevel                    => 'high',
     enabledPlugins => {
