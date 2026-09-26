@@ -42,7 +42,7 @@ Two deliberate exceptions: the `butler` and `blueprint` plugins each carry a sma
 - `/butler:drive-solo` — drive one blueprint, a named set, or all audited blueprints to done in one interactive session (host or sandbox) as a thin loop over the perl director `bp-drive-next.pl`, with a flat worker layer; `/butler:reporter` observes/relays a run, `/butler:status` reports. Both execute verbs are start-or-continue (no resume verb)
 
 **Extending ccpraxis**
-- `/steward:ccpraxis-extend` — single entrypoint to add a new skill/plugin or change an existing one; decides the shape (packaging rule) and wires it in. `host-only`.
+- `/steward:ccpraxis-extend` — single entrypoint to add a new skill/plugin or change an existing one; decides the shape (packaging rule) and wires it in. Operates on the current checkout (a ccpraxis clone); refuses elsewhere and inside the live install.
 
 **Sandbox**
 - `/sandbox:setup` — confirm `.ccpraxis-local-data/claude-home/` state and direct the user to run `claude-sandbox` from a terminal. `host-only`.
@@ -186,7 +186,7 @@ Available skills for this sandbox:
   [ ] chrome-devtools (plugin:chrome-devtools-mcp)
 ```
 
-- Skills with `host-only: true` in their YAML frontmatter are excluded (e.g. `/steward:backup`, `/steward:ccpraxis-extend`, `/sandbox:setup`, `/steward:update`)
+- Skills with `host-only: true` in their YAML frontmatter are excluded (e.g. `/steward:backup`, `/steward:setup-project`, `/sandbox:setup`, `/steward:update`)
 - Both custom skills and plugin skills (and MCP servers) are discovered automatically
 - Selections are saved per project in `.ccpraxis-local-data/claude-home/.launcher/selected-skills.json` and pre-loaded on the next launch
 
