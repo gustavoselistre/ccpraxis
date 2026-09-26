@@ -173,24 +173,27 @@ my $gc_path = "$claude_data/almanac-global-counts.json";
 # audit_claude_home reports zero violations. On Windows the source is drive
 # form.
 #
-# The drive-form sub-check needs a global_counts PATH that is itself in
-# single-drive-letter-mount POSIX form (/c/...) BEFORE winify_path ever
-# touches it -- that is what winify_path converts (a bare "/c/..." ->
-# "C:/..."), not an arbitrary path. File::Temp's own tempdir() is NOT
-# reliably in that form: its base directory follows $ENV{TMPDIR}/$TEMP/$TMP,
-# and under a stripped environment (e.g. `env -i PATH=... HOME=...`, this
-# suite's own documented way to hide the container CLI for AC22) those are
-# all gone and File::Temp falls back to MSYS's internal /tmp, which is not a
-# drive mount at all -- winify_path is then a correct no-op, and the
-# assertion below would fail for a FIXTURE reason, not a real one. In
-# production the equivalent value is "${CLAUDE_HOST_CONFIG}/almanac-global-
-# counts.json", and CLAUDE_HOST_CONFIG is already winified by the launcher
-# before MountSpec ever sees it -- so anchoring this fixture under
-# $ENV{HOME} (which Git-for-Windows always sets to a /c/... path, and which
-# the stripped-environment invocation above deliberately preserves) is the
-# equivalent starting point for this test, independent of TMPDIR/TEMP/TMP.
-my $ac16_base = (defined $ENV{HOME} && length $ENV{HOME}) ? tempdir(DIR => $ENV{HOME}, CLEANUP => 1)
-                                                            : tempdir(CLEANUP => 1);
+# The drive-form sub-check needs a global_counts PATH that is ALREADY a
+# genuine Windows drive-letter path (winify_path is a documented no-op on
+# one -- MountSpec.pm's own winify_path only rewrites a bare single-letter
+# POSIX "/c/..." form to "C:/...", and passes an already-"C:/..." string
+# through unchanged). This used to anchor under $ENV{HOME} on the theory
+# that Git-for-Windows always sets HOME to a /c/... path -- but
+# scripts/run-tests.pl's per-file sandbox (package 21-test-sandbox,
+# Decision 120(c)/package 36) deliberately anchors the sandboxed HOME at a
+# SHORT path under MSYS's own internal /tmp (its own header: "the shorter
+# MSYS /tmp alias _short_tmp_base() prefers for HOME"), which is not a
+# drive mount at all -- exactly the "winify_path is then a correct no-op"
+# failure this comment used to warn about, now actually hit. TEMP/TMP,
+# unlike HOME, are DELIBERATELY kept as a genuine Windows drive-letter path
+# by that same sandbox (its own header: "a file in this suite needs
+# $ENV{TEMP} itself to stay a genuine Windows drive-letter path"), so this
+# fixture anchors there instead -- independent of HOME, and correct both
+# under the runner's sandbox and a bare `perl this.t` run.
+my $native_temp_ac16 = $ENV{TEMP} // $ENV{TMP};
+my $ac16_base = (defined $native_temp_ac16 && length $native_temp_ac16)
+    ? tempdir(DIR => $native_temp_ac16, CLEANUP => 1)
+    : tempdir(CLEANUP => 1);
 $ac16_base =~ s{\\}{/}g;
 my $gc_path_ac16 = "$ac16_base/almanac-global-counts.json";
 {

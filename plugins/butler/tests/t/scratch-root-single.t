@@ -264,7 +264,19 @@ my (@warnings_seen, $STEWARDTEST_LOAD_ERR, $TESTSANDBOX_OK, $TESTSANDBOX_LOAD_ER
     eval { require StewardTest; 1 } or $STEWARDTEST_LOAD_ERR = $@;
     $TESTSANDBOX_OK = eval {
         require TestSandbox;
-        TestSandbox->import(qw(new_temp_dir create_probe_container podman_run_capture cleanup_all));
+        # Deliberately no ->import(...) call: every use of TestSandbox in this
+        # file is fully qualified (TestSandbox::new_temp_dir() etc., see below),
+        # and TestSandbox's own import() (Decision 120(a), package 36) calls
+        # Test::More's plan(skip_all=>...) + exits the whole process when the
+        # CLI is present but the runtime is unreachable AND a runtime-talking
+        # symbol was requested. That is safe for a file that imports at its very
+        # top, before any assertion has run; it is NOT safe here, where this
+        # `require` happens well after nine assertions above already printed
+        # "ok" lines, and where this file wants its OWN localized skip()s around
+        # exactly the container-dependent checks (see the SKIP: block below)
+        # rather than a whole-file skip. Not calling ->import() avoids invoking
+        # that logic at all, while `require`'s own pre-existing die-with-no-CLI
+        # behavior (used to set $TESTSANDBOX_OK below) is unchanged.
         1;
     };
     $TESTSANDBOX_LOAD_ERR = $@ unless $TESTSANDBOX_OK;
@@ -533,22 +545,32 @@ SKIP: {
         ok($wrote, 'AC2/AC3 (container / mnt/c reachability): fixture file written under TestSandbox::new_temp_dir()')
             or diag($@);
 
-        my $container = eval { TestSandbox::create_probe_container(mounts => ['-v', "$sandbox_dir:/mnt/probe"]) };
-        my $create_err = $@;
-        if (defined $container) {
-            my ($rc, $out) = TestSandbox::podman_run_capture('exec', $container, 'cat', '/mnt/probe/marker.txt');
-            is($rc, 0, 'AC2/AC3 (container / mnt/c reachability): `cat` of the mounted marker file exits 0')
-                or diag($out);
-            like($out, qr/\Q$nonce\E/,
-                'AC2/AC3 (container / mnt/c reachability): the file written under TestSandbox::new_temp_dir() '
-              . 'is visible BY CONTENT inside a probe container bind-mounting it');
-            unlike($out, qr/zqx-should-never-appear-[0-9a-f]{8}/,
-                'counter-fixture: an unrelated nonce that was never written does not spuriously appear');
-            TestSandbox::cleanup_all();
-        } else {
-            fail("AC2/AC3 (container / mnt/c reachability): create_probe_container() died: $create_err");
-            fail('(cat check skipped: no container)');
-            fail('(counter-fixture skipped: no container)');
+        # Decision 120(a): a bounded reachability probe, not just CLI presence,
+        # gates these three -- on this host's normal state (podman on PATH,
+        # machine STOPPED), `create_probe_container()` would otherwise die with
+        # a raw podman connection-refused error, reported as a genuine
+        # assertion failure rather than the clean skip this actually is.
+        SKIP: {
+            skip(TestSandbox::container_unreachable_reason(), 3)
+                unless TestSandbox::container_runtime_reachable();
+
+            my $container = eval { TestSandbox::create_probe_container(mounts => ['-v', "$sandbox_dir:/mnt/probe"]) };
+            my $create_err = $@;
+            if (defined $container) {
+                my ($rc, $out) = TestSandbox::podman_run_capture('exec', $container, 'cat', '/mnt/probe/marker.txt');
+                is($rc, 0, 'AC2/AC3 (container / mnt/c reachability): `cat` of the mounted marker file exits 0')
+                    or diag($out);
+                like($out, qr/\Q$nonce\E/,
+                    'AC2/AC3 (container / mnt/c reachability): the file written under TestSandbox::new_temp_dir() '
+                  . 'is visible BY CONTENT inside a probe container bind-mounting it');
+                unlike($out, qr/zqx-should-never-appear-[0-9a-f]{8}/,
+                    'counter-fixture: an unrelated nonce that was never written does not spuriously appear');
+                TestSandbox::cleanup_all();
+            } else {
+                fail("AC2/AC3 (container / mnt/c reachability): create_probe_container() died: $create_err");
+                fail('(cat check skipped: no container)');
+                fail('(counter-fixture skipped: no container)');
+            }
         }
     } else {
         fail('AC2/AC3 (container / mnt/c reachability): cannot test -- new_temp_dir() died');
@@ -1009,12 +1031,21 @@ SKIP: {
 }
 
 # ---- Row 7: absolute, non-ASCII, pre-created -> succeeds, verbatim --------
+# Decision 120(b): this used to rely on $ENV{USERPROFILE} itself containing a
+# non-ASCII byte (the real, ambient username on this host). Under
+# scripts/run-tests.pl's per-file sandbox (package 21-test-sandbox),
+# USERPROFILE (and TEMP/TMP) are replaced with a throwaway ASCII path, so
+# that assumption no longer holds -- this fixture now builds its OWN
+# non-ASCII subdirectory under the sandbox/native temp root instead of
+# depending on the ambient environment's real value.
 {
-    my $userprofile_win = fwd($ENV{USERPROFILE});
-    my $nonascii_dir = fwd(tempdir(DIR => $userprofile_win, CLEANUP => 1));
+    my $native_temp = fwd($ENV{TEMP} // $ENV{TMP});
+    my $base_dir = fwd(tempdir(DIR => $native_temp, CLEANUP => 1));
+    my $nonascii_dir = "$base_dir/Andr\x{e9}";
+    mkdir($nonascii_dir) or die "fixture: mkdir $nonascii_dir: $!";
     like($nonascii_dir, qr/[^\x00-\x7f]/,
-        'fixture sanity: the row-7 override directory genuinely contains a non-ASCII byte (it is a real '
-      . 'subdirectory of $ENV{USERPROFILE}, not a fabricated string)');
+        'fixture sanity: the row-7 override directory genuinely contains a non-ASCII byte (built by this '
+      . 'fixture under the temp root, not relying on $ENV{USERPROFILE}\'s ambient value)');
 
     my ($out, $exit) = run_perl_child(inc => $HOSTCAPS_INC, env => { CCPRAXIS_SCRATCH_ROOT => $nonascii_dir },
                                        code => child_snippet(undef, $HC_EXPR));
