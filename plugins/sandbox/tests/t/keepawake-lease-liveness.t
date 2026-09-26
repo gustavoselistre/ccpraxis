@@ -839,6 +839,11 @@ SKIP: {
         unless $^O =~ /^(MSWin32|msys|cygwin)$/;
     skip "keep-awake.ps1 not found at $SCRIPT", 6
         unless -f $SCRIPT;
+    # Quarantined (host-wake-and-suspend Decision 18): the host hard-froze on
+    # 2026-09-26 within seconds of this block suspending a process, so it only
+    # runs when explicitly requested, never in an unattended sweep.
+    skip 'AC7 suspends a process with NtSuspendProcess; set CCPRAXIS_TEST_SUSPEND_PROCESS=1 to run it', 6
+        unless ($ENV{CCPRAXIS_TEST_SUSPEND_PROCESS} // '') eq '1';
 
     my ($owner7_winpid, $owner7_fh, $owner7_dir) = spawn_owner();
     unless (defined $owner7_winpid) {
