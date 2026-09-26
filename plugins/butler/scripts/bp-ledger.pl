@@ -53,7 +53,12 @@
 # one-line discipline.
 #
 # Core Perl only: strict, warnings, Getopt::Long, Fcntl(:flock), JSON::PP, B. No
-# other module may be loaded on any path (latency constraint, §2.5).
+# other module may be loaded on any path (latency constraint, §2.5) -- with ONE
+# named exception: `set-checks` (27-ledger-set-checks) `require`s bp-checks.pl,
+# from this file's own directory, INSIDE that op only, to reuse BpChecks::parse_table
+# / BpChecks::missing / BpChecks::_fm rather than re-implement the checks-table
+# vocabulary a second time. bp-checks.pl in turn pulls in core File::Basename /
+# File::Spec. No other verb's load path is affected.
 use strict;
 use warnings;
 use Getopt::Long qw(GetOptionsFromArray);
@@ -1871,6 +1876,140 @@ sub op_set_write_set  { return _op_set_scope_field('write_set',  'set-write-set'
 sub op_set_test_paths { return _op_set_scope_field('test_paths', 'set-test-paths', @_) }
 
 # =====================================================================================
+# `set-checks` (27-ledger-set-checks, Decision 106) -- REPLACE the ledger's frontmatter
+# `checks:` field wholesale, the same `_op_set_scope_field` model set-write-set /
+# set-test-paths already use: refuse on done/dropped, require every ADDED check to be
+# named verbatim (bounded token) in the given blueprint Decision, refuse when the new
+# set still omits a check the package's write_set implies per BpChecks::missing.
+#
+# Decision 106 SUPERSEDES this package's own spec §2.3 ("table UNION a fixed eight-name
+# list"): there is NO fixed built-in list. Vocabulary comes from the blueprint's live
+# checks-table alone (BpChecks::parse_table) -- a table with rows constrains every
+# requested name to those rows; a blueprint with no live table (absent, or only inside
+# an HTML comment) imposes no vocabulary constraint at all, so any well-formed name is
+# accepted, exactly as `create` already accepts any name today.
+# =====================================================================================
+
+sub _check_name_shape_error {
+    my ($name) = @_;
+    return "is empty" if $name eq '';
+    return "contains ':', '|', or a newline" if $name =~ /[:|\r\n]/;
+    return "contains whitespace" if $name =~ /\s/;
+    return undef;
+}
+
+# Detects the list form of the ledger's own `checks:` field (scalar key line followed
+# by `- item` lines) -- refused outright (spec 2.5 step 7) rather than half-rewritten,
+# because replace_first_key_line touches only the key line and would leave the old
+# list items merged in alongside the new scalar value.
+sub _ledger_checks_is_list_form {
+    my ($B) = @_;
+    return 0 unless $B =~ /\A---\s*\n(.*?)\n---/s;
+    my @FML = split(/\n/, $1, -1);
+    for my $n (0 .. $#FML) {
+        if ($FML[$n] =~ /^checks:\s*(?:.*?)\s*$/) {
+            return (($n + 1) <= $#FML && $FML[$n + 1] =~ /^\s+-\s*(?:.*?)\s*$/) ? 1 : 0;
+        }
+    }
+    return 0;
+}
+
+sub op_set_checks {
+    my @args = @_;
+    my %opt = (check => []);
+    my $ok;
+    { local $SIG{__WARN__} = sub { };
+      $ok = GetOptionsFromArray(\@args, \%opt, 'ledger=s', 'check=s@', 'decision=s'); }
+    arg_error('set-checks', 'unrecognised option') unless $ok;
+    arg_error('set-checks', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
+    arg_error('set-checks', 'missing required --ledger') unless defined $opt{ledger};
+    arg_error('set-checks', 'missing required --decision') unless defined $opt{decision};
+    arg_error('set-checks', 'missing required --check (repeatable)') unless @{ $opt{check} };
+    arg_error('set-checks', "--decision '$opt{decision}' is not a positive integer")
+        unless $opt{decision} =~ /\A[1-9][0-9]*\z/;
+
+    for my $c (@{ $opt{check} }) {
+        my $err = _check_name_shape_error($c);
+        arg_error('set-checks', "--check '$c' $err") if defined $err;
+    }
+
+    my $refusal = _rescope_refusal_reason($opt{ledger});
+    arg_error('set-checks', $refusal) if defined $refusal;
+
+    my $bp = op_create_dirname(op_create_dirname($opt{ledger})) . '/blueprint.md';
+    open(my $bfh, '<:raw', $bp)
+        or arg_error('set-checks', "cannot read the blueprint for this ledger ($bp): $!");
+    my $bp_bytes = do { local $/; <$bfh> };
+    close $bfh;
+    my $dtext = _decision_text($bp_bytes // '', $opt{decision});
+    arg_error('set-checks', "Decision $opt{decision} not found in $bp") unless defined $dtext;
+
+    # Normalise separators before deriving the directory: __FILE__ may arrive with
+    # Windows backslashes, and op_create_dirname must not be handed a raw __FILE__
+    # (turn-cap-consistency.t C9 -- separators normalised first, same idiom bp-checks.pl
+    # itself already uses before its own dirname() call).
+    (my $self_file = __FILE__) =~ s{\\}{/}g;
+    my $checks_pl = op_create_dirname($self_file) . '/bp-checks.pl';
+    eval { require $checks_pl; 1 }
+        or io_error('set-checks', $checks_pl, "cannot load: " . ($@ || 'unknown error'));
+
+    my $rows = BpChecks::parse_table($bp_bytes // '');
+
+    my $cur_B;
+    {
+        open(my $lfh, '<:raw', $opt{ledger}) or arg_error('set-checks', "cannot read $opt{ledger}: $!");
+        local $/;
+        $cur_B = <$lfh>;
+        close $lfh;
+        $cur_B = '' unless defined $cur_B;
+    }
+    arg_error('set-checks',
+        "frontmatter checks: is in list form; set-checks only replaces the scalar colon-delimited form")
+        if _ledger_checks_is_list_form($cur_B);
+    my %existing = map { ($_ => 1) } ledger_field_segments($cur_B, 'checks');
+
+    my (@new, %seen);
+    for my $c (@{ $opt{check} }) { push @new, $c unless $seen{$c}++ }
+
+    # Both the vocabulary check (Decision 106: table-rows-only, no fixed list) and the
+    # Decision-naming check apply ONLY to ADDED names -- a name already in the ledger's
+    # existing checks: field needs neither re-validating nor re-naming, exactly as
+    # set-write-set/set-test-paths treat their own added-vs-removed paths.
+    my %known = @$rows ? (map { ($_->{check} => 1) } @$rows) : ();
+    for my $c (@new) {
+        next if $existing{$c};
+        if (@$rows && !$known{$c}) {
+            arg_error('set-checks',
+                "'$c' is not a row of the blueprint's live checks-table and there is no fixed check "
+              . 'list (Decision 106)');
+        }
+        arg_error('set-checks', "Decision $opt{decision} does not name '$c' (verbatim) -- record the "
+            . 're-scope in blueprint.md first (bp-blueprint.pl add-decision)')
+            unless $dtext =~ /(?<![A-Za-z0-9_-])\Q$c\E(?![A-Za-z0-9_-])/;
+    }
+
+    my $ws = BpChecks::_fm($cur_B, 'write_set');
+    if (defined $ws && length $ws && @$rows) {
+        my $miss = BpChecks::missing($rows, $ws, join(':', @new));
+        if (@$miss) {
+            arg_error('set-checks',
+                "the package's write set implies '$miss->[0]'; audit would fail if it were dropped");
+        }
+    }
+
+    my $entry = '- ' . iso_now() . " ${EMDASH} checks replaced per Decision $opt{decision}: " . join(':', @new);
+
+    run_op('set-checks', $opt{ledger}, sub {
+        my ($B) = @_;
+        return (undef, 'no frontmatter block to update') unless $B =~ /\A---\s*\n(.*?)\n---/s;
+        my ($fs, $fe) = ($-[1], $+[1]);
+        my $new = replace_first_key_line($B, $fs, $fe, 'checks', 'checks: ' . join(':', @new));
+        return (undef, 'checks: key not found in frontmatter') unless defined $new;
+        return splice_insert_entry($new, qr/^##\s+Decisions & attempt log\b/m, $entry);
+    });
+}
+
+# =====================================================================================
 # `set-section` (22-ledger-rescope, Decision 84) -- replace the BODY of exactly one of
 # Scope / Done criteria / Inputs / Out of scope, leaving the frontmatter byte-
 # identical (unlike every other mutating verb here, which is free to bump
@@ -2970,6 +3109,7 @@ my %DISPATCH = (
     'widen-write-set'  => \&op_widen_write_set,
     'set-write-set'    => \&op_set_write_set,
     'set-test-paths'   => \&op_set_test_paths,
+    'set-checks'       => \&op_set_checks,
     'set-section'      => \&op_set_section,
     'rotate'           => \&op_rotate,
     'validate'         => \&op_validate,
