@@ -31,6 +31,7 @@ ccpraxis -- dispatcher for ccpraxis host-side tools
   ccpraxis usage-audit  <args>   usage-audit.pl          (token spend across transcripts)
   ccpraxis binary       <args>   claude-binary-backup.pl (binary snapshots / restore)
   ccpraxis sensitive    <args>   sensitive-check.pl      (secret scan)
+  ccpraxis internals    <args>   ccpraxis-helpers.pl claude-internals (undocumented-internals signature check)
 
 Anything after the subcommand is passed through unchanged.
 EOF
@@ -43,6 +44,7 @@ case "${1:-}" in
   usage-audit) shift; SCRIPT="$STEWARD/usage-audit.pl" ;;
   binary)      shift; SCRIPT="$STEWARD/claude-binary-backup.pl" ;;
   sensitive)   shift; SCRIPT="$STEWARD/sensitive-check.pl" ;;
+  internals)   shift; SCRIPT="$STEWARD/ccpraxis-helpers.pl"; set -- claude-internals "$@" ;;
   ''|-h|--help|help) usage ;;
   *) echo "ccpraxis: unknown subcommand '$1'" >&2; usage ;;
 esac

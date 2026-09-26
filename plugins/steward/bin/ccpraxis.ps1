@@ -43,6 +43,7 @@ function Show-Usage {
     Write-Host "  ccpraxis usage-audit  <args>   usage-audit.pl          (token spend across transcripts)"
     Write-Host "  ccpraxis binary       <args>   claude-binary-backup.pl (binary snapshots / restore)"
     Write-Host "  ccpraxis sensitive    <args>   sensitive-check.pl      (secret scan)"
+    Write-Host "  ccpraxis internals    <args>   ccpraxis-helpers.pl claude-internals (undocumented-internals signature check)"
     Write-Host ""
     Write-Host "Anything after the subcommand is passed through unchanged."
     exit 2
@@ -60,6 +61,7 @@ switch ($sub) {
     'usage-audit' { $script = "$steward\usage-audit.pl" }
     'binary'      { $script = "$steward\claude-binary-backup.pl" }
     'sensitive'   { $script = "$steward\sensitive-check.pl" }
+    'internals'   { $script = "$steward\ccpraxis-helpers.pl"; $rest = @('claude-internals') + $rest }
     'help'        { Show-Usage }
     '-h'          { Show-Usage }
     '--help'      { Show-Usage }
