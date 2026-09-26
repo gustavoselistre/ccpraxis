@@ -20,6 +20,9 @@ use JSON::PP;
 use File::Temp qw(tempdir);
 use File::Path qw(make_path);
 
+# spend-token-report Decision 16: never let this test reach a live fetch.
+$ENV{CCPRAXIS_SPEND_NO_FETCH} = 1;
+
 my $SPEND_PL = "$Bin/../../scripts/bp-spend.pl";
 ok(eval { require $SPEND_PL; 1 }, 'bp-spend.pl loads as a module') or BAIL_OUT("require: $@");
 
