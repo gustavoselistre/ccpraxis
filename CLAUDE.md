@@ -195,8 +195,10 @@ trap: `plugins/sandbox/docs/working-on-ccpraxis.md`.
 ## Guidance notes — read on demand
 
 Claude Code's built-in auto-memory is **disabled** (`autoMemoryEnabled: false` in every settings
-layer, plus a `permissions.deny` on the memory path). Durable guidance lives here instead, read only
-when the trigger applies:
+layer, plus a `permissions.deny` on the memory path). A durable fact is an almanac note
+(`plugins/almanac/scripts/almanac-note.pl create`), never a memory; existing memory files are
+migrated by `plugins/almanac/scripts/almanac-migrate-memories.pl`. The guidance files below predate
+notes and are read only when the trigger applies:
 
 | note | read it when |
 |---|---|

@@ -1,0 +1,156 @@
+#!/usr/bin/env perl
+# reminder-chart-tasklist.pl -- fires on the 20th (40th, 60th, ...) main-
+# thread PostToolUse call of a session, emitting additionalContext, while
+# the session is armed (butler continuity) or has a focused almanac
+# tasklist. Package 15-harness-tasks-and-reminder (blueprint
+# almanac-records), round 3 per Decision 28: the ticket CLAIM itself now
+# happens entirely inside the registration's own bash
+# (plugins/almanac/hooks/hooks.json) -- builtins only, no perl, no
+# subprocess -- and this script is exec'd from there ONLY when the claimed
+# number is a multiple of 20. It is invoked as:
+#
+#     reminder-chart-tasklist.pl <N> <session_id>
+#
+# with the ORIGINAL PostToolUse payload still on STDIN (needed for cwd).
+# <N> and <session_id> are bash's own findings, already validated there
+# (digits only; the session id pattern) -- this script re-validates both
+# defensively but never trusts bash's claim of "N is a multiple of 20"
+# blindly for anything beyond deciding to run at all: it fails open on any
+# malformed argument exactly like every other unexpected condition.
+#
+# ONE PROCESS, NEVER BLOCKS, ALWAYS EXITS 0. Almanac::Lock is never required
+# directly by this file (review M-1): it is only ever loaded transitively,
+# exactly once, via almanac-task.pl's own use of Almanac::Store on this
+# firing call, so there is no second load under a different %INC key and no
+# "Subroutine redefined" warning on stderr. Every require of a repo file
+# sits inside eval. Never system, exec, backticks, qx, fork or a piped open.
+#
+# TICKET MODEL (Decision 28), the half owned by this file: the bash claim
+# leaves a numbered empty file in "<H>/.claude/almanac-state/chart-
+# reminder/<sid>.t/" for every call, and a persisted ".watermark" (a
+# write-if-greater ratchet) so that after THIS call deletes the tickets it
+# just counted, the NEXT claim (bash again) still resumes from the right
+# global number. This file both reads and advances that watermark; bash
+# only ever reads it (see hooks.json's registration for the claim side).
+use strict;
+use warnings;
+
+_run();
+exit 0;
+
+sub _run {
+    my ($n_arg, $sid) = @ARGV;
+    return unless defined $n_arg && $n_arg =~ /\A[0-9]+\z/;
+    my $n = $n_arg + 0;
+    return unless $n > 0 && $n % 20 == 0;
+    return unless defined $sid && $sid =~ /\A[A-Za-z0-9_-]{1,128}\z/;
+
+    binmode(STDIN, ':raw');
+    my $raw = do { local $/; <STDIN> };
+
+    my $home = _first_nonempty($ENV{ALMANAC_HOME}, $ENV{HOME}, $ENV{USERPROFILE});
+    return unless defined $home && length $home;
+    $home =~ s{\\}{/}g;
+    return unless $home =~ m{\A(?:/|[A-Za-z]:/)};
+
+    my $root = _plugin_root();
+    my $tdir = "$home/.claude/almanac-state/chart-reminder/$sid.t";
+
+    my $payload = (defined $raw && length $raw)
+        ? eval { require JSON::PP; JSON::PP->new->decode($raw) }
+        : undef;
+    my $cwd = (ref $payload eq 'HASH') ? $payload->{cwd} : undef;
+    if (defined $cwd) {
+        $cwd =~ s{\\}{/}g;
+        utf8::encode($cwd) if utf8::is_utf8($cwd);
+    }
+
+    my $gate = _armed($sid, $root) || _focused($sid, $cwd, $root);
+    _emit($n, $root) if $gate;
+
+    _advance_watermark($tdir, $n);
+    _delete_range($tdir, $n - 19, $n);
+    return;
+}
+
+sub _first_nonempty {
+    for my $v (@_) {
+        return $v if defined $v && length $v;
+    }
+    return undef;
+}
+
+sub _plugin_root {
+    my $self = $0;
+    $self =~ s{\\}{/}g;
+    (my $dir = $self) =~ s{/[^/]+\z}{};
+    (my $root = $dir) =~ s{/hooks\z}{};
+    return $root;
+}
+
+sub _read_watermark {
+    my ($dir) = @_;
+    if (open(my $fh, '<:raw', "$dir/.watermark")) {
+        local $/;
+        my $c = <$fh>;
+        close $fh;
+        return $1 + 0 if defined $c && $c =~ /\A(\d+)/;
+    }
+    return 0;
+}
+
+# _advance_watermark($dir, $n) -- write-if-greater, so two firing calls for
+# two different batches racing on the same ".watermark" land correctly
+# whichever order they run in (the higher $n always wins). Best-effort: a
+# lost race here costs nothing this package's tests observe (R-4 only checks
+# the final ticket count and which N values fired), and adding a lock would
+# reintroduce exactly the flock sidecar Decision 28 removes.
+sub _advance_watermark {
+    my ($dir, $n) = @_;
+    return unless -d $dir;
+    return if _read_watermark($dir) >= $n;
+    my $tmp = "$dir/.watermark.tmp.$$";
+    if (open(my $fh, '>:raw', $tmp)) {
+        print {$fh} "$n\n";
+        close $fh;
+        rename($tmp, "$dir/.watermark") or unlink($tmp);
+    }
+    return;
+}
+
+sub _delete_range {
+    my ($dir, $from, $to) = @_;
+    for my $i ($from .. $to) {
+        unlink "$dir/$i";
+    }
+    return;
+}
+
+sub _armed {
+    my ($sid, $root) = @_;
+    my $loaded = eval { require "$root/../butler/scripts/BpHook.pm"; 1 };
+    return 0 unless $loaded;
+    my $armed = eval { BpHook::is_armed($sid) };
+    return $armed ? 1 : 0;
+}
+
+sub _focused {
+    my ($sid, $cwd, $root) = @_;
+    return 0 unless defined $cwd && length $cwd;
+    my $loaded = eval { require "$root/scripts/almanac-task.pl"; 1 };
+    return 0 unless $loaded;
+    my $tasklist = eval { Almanac::Task::focused(session => $sid, cwd => $cwd) };
+    return defined($tasklist) ? 1 : 0;
+}
+
+sub _emit {
+    my ($n, $root) = @_;
+    my $text = "Tool call $n in this session: chart your tasklist. Record where the work stands in the almanac tasklist before continuing.\n"
+             . "  perl $root/scripts/almanac-task.pl focus | list | add --title '<step>' | status <id> doing|blocked|done";
+    my %out = (hookSpecificOutput => { hookEventName => 'PostToolUse', additionalContext => $text });
+    my $line = eval { require JSON::PP; JSON::PP->new->encode(\%out) };
+    return unless defined $line;
+    binmode(STDOUT, ':raw');
+    print STDOUT $line, "\n";
+    return;
+}
