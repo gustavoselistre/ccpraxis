@@ -295,8 +295,285 @@ my $VALIDATION_RE = qr/
 # matching too.
 my $INTERP_EVAL_RE = qr/(^|[;&|\s])(perl|node|python3?)[[:space:]]+(-[^\s]+[[:space:]]+)*-[A-Za-z]*[eEc]\b/;
 
+# 34-runner-redirect-operands sec 2.2 -- a shell/interpreter/eval word
+# anywhere in a command's non-body text means the heredoc body(ies) may be
+# consumed as a real script (stdin, a pipe after the terminator, or a
+# captured-then-eval'd copy), so blanking is disabled for the whole command
+# (D2, deliberately coarse/global -- spec sec 2.2).
+my $SHELLISH_RE = qr/(^|[;&|\s(\x60'"])(?:[^\s;&|'"]*\/)?
+                     (?:(?:ba|z|k|da|fi)?sh|pwsh|powershell|perl|node|python3?|ruby|eval|source|\.)
+                     (?=[\s;&|)'"]|$)/x;
+
+# 34-runner-redirect-operands review M-1 -- the D2-widening half of
+# $SHELLISH_RE: a plain interpreter-runs-a-file mention (perl/node/python/
+# ruby with a script argument) does not widen the window on its own (that
+# is Decision 114's still-valid case, AC-21/23); eval/source/./a bare shell
+# DOES, because it can consume a heredoc body as a script.
+my $SHELLISH_NARROW_RE = qr/(^|[;&|\s(\x60'"])(?:[^\s;&|'"]*\/)?
+                     (?:(?:ba|z|k|da|fi)?sh|pwsh|powershell|eval|source|\.)
+                     (?=[\s;&|)'"]|$)/x;
+
+# A command-text line that ends in a pipe/&&/||  -- or has more '(' than
+# ')' -- leaves its statement open past that line, so whatever consumes a
+# heredoc's body may sit on a LATER line than its own terminator
+# (`cat <<'EOF' |` ... `EOF` ... `bash`; `x=$(cat <<'EOF'` ... `EOF` ...
+# `); eval "$x"`). Checked only up to the last terminator (review M-1).
+my $LINE_LEFT_OPEN_RE = qr/(?:\|\||&&|\|&|\|)[ \t]*$/;
+
+# REDIR_OP -- spec sec 2.1 "REDIRECT DROP". Alternatives listed longest
+# first within each digit-optional/no-digit group so a token like "&>>" is
+# never partially matched as "&>" with a stray ">" left over.
+my $REDIR_OP = qr/^(?:[0-9]*(?:<<<|<<-|>>|>\||>&|<<|<&|<>|>|<)|&>>|&>)/;
+
+# OPENER (spec sec 2.2, narrowed by 34-runner-redirect-operands review M-2)
+# -- the heredoc-word alternatives are tried quoted-forms-first
+# (single/double/backslash all -> quoted=1), then the bare form
+# (quoted=0); the lookahead after the word requires end-of-line,
+# whitespace, or one of ; & | < > ). The quoted/backslash WORD class is
+# [A-Za-z0-9_]+, matching Shell::strip_noise's own delimiter grammar
+# exactly (not the wider [A-Za-z0-9_.-]+ the spec originally gave) -- a
+# delimiter strip_noise cannot parse (e.g. <<'END-DOC') must stay
+# unrecognised here too, or its body silently falls back to today's
+# (safe) behaviour instead of a phantom blank (M-2).
+my $HEREDOC_OPENER_RE = qr/^<<(-)?[ \t]*
+    (?:'([A-Za-z0-9_]+)'
+      |"([A-Za-z0-9_]+)"
+      |\\([A-Za-z0-9_]+)
+      |([A-Za-z_][A-Za-z0-9_]*))
+    (?=[\s;&|<>)]|$)/x;
+
+# _drop_redirects(@tok) -> @kept -- spec sec 2.1 "REDIRECT DROP". Pure,
+# private. Walks tokens left to right; a token that IS (wholly or partly) a
+# redirect operator drops itself, and drops the next token too when the
+# operator consumed the whole token (its target is then a separate token).
+sub _drop_redirects {
+    my (@tok) = @_;
+    my @kept;
+    my $i = 0;
+    while ($i < @tok) {
+        my $t = $tok[$i];
+        if ($t =~ $REDIR_OP) {
+            my $rest = substr($t, length($&));
+            $i += ($rest eq '') ? 2 : 1;
+            next;
+        }
+        push @kept, $t;
+        $i++;
+    }
+    return @kept;
+}
+
+# _try_heredoc_opener($line, $pos) -> ($newpos, \%opener) | (undef, undef).
+# Pure, private. $line must have "<<" at $pos.
+sub _try_heredoc_opener {
+    my ($line, $pos) = @_;
+    my $rest = substr($line, $pos);
+    if ($rest =~ $HEREDOC_OPENER_RE) {
+        my $dash = $1 ? 1 : 0;
+        my ($word, $quoted);
+        if    (defined $2) { $word = $2; $quoted = 1; }
+        elsif (defined $3) { $word = $3; $quoted = 1; }
+        elsif (defined $4) { $word = $4; $quoted = 1; }
+        elsif (defined $5) { $word = $5; $quoted = 0; }
+        return ($pos + length($&), { word => $word, dash => $dash, quoted => $quoted });
+    }
+    return (undef, undef);
+}
+
+# _blank_data_heredocs_impl($cmd) -> $text. May die (caught by the
+# _blank_data_heredocs wrapper); pure otherwise, never touches the
+# filesystem. Implements the scanner/OPENER/data-heredoc rules of spec
+# sec 2.2 exactly.
+sub _blank_data_heredocs_impl {
+    my ($cmd) = @_;
+    my @lines = split /\n/, $cmd, -1;
+    my $n = scalar @lines;
+    my @is_body = (0) x $n;
+    my @recorded;
+    my $quote = 'none';
+    my @pending;
+    my $i = 0;
+    my $abort = 0;
+
+    OUTER: while ($i < $n) {
+        my $line = $lines[$i];
+        my $len = length($line);
+        my $pos = 0;
+        LINE: while ($pos < $len) {
+            my $c = substr($line, $pos, 1);
+            if ($quote eq 'squote') {
+                $quote = 'none' if $c eq "'";
+                $pos++;
+                next LINE;
+            }
+            if ($quote eq 'dquote') {
+                if ($c eq '\\') { $pos += 2; next LINE; }
+                $quote = 'none' if $c eq '"';
+                $pos++;
+                next LINE;
+            }
+            # quote eq 'none'
+            if ($c eq "'") { $quote = 'squote'; $pos++; next LINE; }
+            if ($c eq '"') { $quote = 'dquote'; $pos++; next LINE; }
+            if ($c eq '\\') {
+                if ($pos == $len - 1) {
+                    if (@pending) { $abort = 1; last LINE; }
+                    $pos++;
+                    next LINE;
+                }
+                $pos += 2;
+                next LINE;
+            }
+            if ($c eq '#') {
+                my $prev = $pos == 0 ? '' : substr($line, $pos - 1, 1);
+                if ($pos == 0 || $prev =~ /[;&|\s(]/) {
+                    $pos = $len;
+                    next LINE;
+                }
+                $pos++;
+                next LINE;
+            }
+            if (substr($line, $pos, 3) eq '<<<') {
+                $pos += 3;
+                next LINE;
+            }
+            if (substr($line, $pos, 2) eq '<<') {
+                my ($newpos, $opener) = _try_heredoc_opener($line, $pos);
+                if (defined $opener) {
+                    push @pending, $opener;
+                    $pos = $newpos;
+                    next LINE;
+                }
+                # S-3 fail-safe: this "<<"/"<<-" LOOKED like it was trying
+                # to open a heredoc (quote, backslash, or word character
+                # right after it) but no valid opener parsed (e.g.
+                # <<E"OF", <<'END DOC', <<"$X", <<'EOF'x). Silently skipping
+                # 2 chars and continuing to scan the intended body as
+                # ordinary command lines risks a later, unrelated line
+                # being read as a phantom terminator and blanking real
+                # command text -- abort instead (review S-3).
+                my $probe = substr($line, $pos + 2);
+                $probe =~ s/^-//;
+                $probe =~ s/^[ \t]*//;
+                if ($probe =~ /^['"\\]/ || $probe =~ /^[A-Za-z0-9_]/) {
+                    $abort = 1;
+                    last LINE;
+                }
+                $pos += 2;
+                next LINE;
+            }
+            $pos++;
+        }
+        last OUTER if $abort;
+        $i++;
+        if (@pending && $quote eq 'none') {
+            my $cursor = $i;
+            for my $h (@pending) {
+                my $body_start = $cursor;
+                my $term_idx;
+                for (my $j = $cursor; $j < $n; $j++) {
+                    my $term = $lines[$j];
+                    $term =~ s/^\t+// if $h->{dash};
+                    if ($term eq $h->{word}) { $term_idx = $j; last; }
+                }
+                if (!defined $term_idx) { $abort = 1; last; }
+                for my $k ($body_start .. $term_idx - 1) { $is_body[$k] = 1; }
+                push @recorded, { %$h, body_start => $body_start, body_end => $term_idx };
+                $cursor = $term_idx + 1;
+            }
+            $i = $cursor unless $abort;
+        }
+        last OUTER if $abort;
+    }
+    $abort = 1 if $quote ne 'none' || @pending;
+
+    return $cmd unless @recorded;
+
+    # D2 (global): no line of the command text (every line that is not a
+    # recorded body line) may match $SHELLISH_RE. Decision 115 (review
+    # M-1) supersedes Decision 114's plain terminator-bounded window: that
+    # bound assumed nothing after the last terminator can consume a
+    # heredoc body, which is false for `eval`/`source`/`.`/a shell word, an
+    # interpreter's -e/-E/-c, or a statement left open across the
+    # terminator (a trailing pipe/&&/||, or an unbalanced paren) --
+    # `x=$(cat <<'EOF' ... EOF); eval "$x"` and `cat <<'EOF' | ... EOF
+    # bash` both still run the body. The window widens to the WHOLE
+    # command when either of those holds; otherwise it stays bounded to
+    # the last terminator (keeps AC-21/23 -- a plain, unrelated
+    # `perl scripts/run-tests.pl <file>` line after the heredoc closes
+    # does not widen).
+    my $last_term = 0;
+    for my $h (@recorded) { $last_term = $h->{body_end} if $h->{body_end} > $last_term; }
+
+    my $widen = 0;
+    for my $li (0 .. $n - 1) {
+        next if $is_body[$li];
+        if ($lines[$li] =~ $SHELLISH_NARROW_RE
+            || BpHook::Guards::Common::line_match($INTERP_EVAL_RE, $lines[$li]))
+        {
+            $widen = 1;
+            last;
+        }
+    }
+    if (!$widen) {
+        for my $li (0 .. $last_term) {
+            next if $is_body[$li];
+            my $l = $lines[$li];
+            my $opens  = () = $l =~ /\(/g;
+            my $closes = () = $l =~ /\)/g;
+            if ($l =~ $LINE_LEFT_OPEN_RE || $opens > $closes) {
+                $widen = 1;
+                last;
+            }
+        }
+    }
+    my $d2_end = $widen ? ($n - 1) : $last_term;
+    for my $li (0 .. $d2_end) {
+        next if $is_body[$li];
+        return $cmd if $lines[$li] =~ $SHELLISH_RE;
+    }
+
+    my @out = @lines;
+    for my $h (@recorded) {
+        my $body = join("\n", @lines[$h->{body_start} .. $h->{body_end} - 1]);
+        my $has_backtick_or_sub = ($body =~ /\x60|\$\(/) ? 1 : 0;
+        next unless $h->{quoted} || !$has_backtick_or_sub; # D1
+        for my $k ($h->{body_start} .. $h->{body_end} - 1) { $out[$k] = ''; }
+    }
+    return join("\n", @out);
+}
+
+# 34-runner-redirect-operands review S-2 -- one heredoc scan per command,
+# reused across the (up to) two callers within one guard invocation
+# (_validation_shaped and _is_full_sweep_runner commonly share the same
+# $cmd). Bounded to a handful of entries: one hook process only ever
+# blanks a small, fixed number of distinct command strings (never
+# unbounded, since it exits after run()).
+my %BLANK_CACHE;
+
+# Above this many bytes the per-character scan cost is not worth paying;
+# skip blanking and treat the whole command as command text (fails safe --
+# the pre-package-34 behaviour for any input this large).
+my $BLANK_MAX_BYTES = 65536;
+
+# _blank_data_heredocs($cmd) -> $text. Spec sec 2.2. Never dies: any
+# internal error returns $cmd unchanged. undef -> undef, '' -> ''.
+sub _blank_data_heredocs {
+    my ($cmd) = @_;
+    return $cmd unless defined $cmd;
+    return $cmd if index($cmd, '<<') < 0; # fast path
+    return $cmd if length($cmd) > $BLANK_MAX_BYTES; # S-2 size cap
+    return $BLANK_CACHE{$cmd} if exists $BLANK_CACHE{$cmd};
+    my $out = eval { _blank_data_heredocs_impl($cmd) };
+    $out = $cmd unless defined $out;
+    %BLANK_CACHE = () if scalar(keys %BLANK_CACHE) > 8;
+    $BLANK_CACHE{$cmd} = $out;
+    return $out;
+}
+
 sub _validation_shaped {
     my ($cmd) = @_;
+    my $H = _blank_data_heredocs($cmd);
     my $vtext;
     # 24-interlock-scope-review S-3: cap the strip_noise walk the same way
     # GB-a's own _match_text_and_reason does; over the cap, match raw (the
@@ -305,18 +582,26 @@ sub _validation_shaped {
     my $max = _digits_or_default($ENV{BP_GUARD_MAX_STRIP_BYTES}, 8000);
     $max = 8000 unless $max > 0;
     if (length($cmd) > $max) {
-        $vtext = $cmd;
+        $vtext = $H;
     }
     else {
         my $stripped = BpHook::Guards::Shell::strip_noise($cmd);
-        my $probe = (defined $stripped && length $stripped) ? $stripped : $cmd;
-        if (BpHook::Guards::Common::is_shell_or_eval_invocation($cmd)
+        my $probe = (defined $stripped && length $stripped) ? $stripped : $H;
+        if (BpHook::Guards::Common::is_shell_or_eval_invocation($H)
             || BpHook::Guards::Common::line_match(qr/\x60|\$\(|\(/, $probe)
-            || (BpHook::Guards::Common::line_match(qr/<</, $cmd)
-                && BpHook::Guards::Common::line_match(qr/\x60|\$\(/, $cmd))
-            || BpHook::Guards::Common::line_match($INTERP_EVAL_RE, $cmd))
+            || (BpHook::Guards::Common::line_match(qr/<</, $H)
+                && BpHook::Guards::Common::line_match(qr/\x60|\$\(/, $H))
+            || BpHook::Guards::Common::line_match($INTERP_EVAL_RE, $H)
+            # 34-runner-redirect-operands review M-1: _blank_data_heredocs
+            # left a "<<" heredoc UNBLANKED (D1/D2 said its body is real
+            # command text, e.g. a body piped into a shell with no
+            # backtick/$( of its own) -- Shell::strip_noise does not know
+            # about D1/D2 and unconditionally blanks a quoted heredoc's
+            # body, so trusting $probe here would silently lose exactly
+            # the text D2 says must stay live. Match raw instead.
+            || (index($H, '<<') >= 0 && $H eq $cmd))
         {
-            $vtext = $cmd;
+            $vtext = $H;
         }
         else {
             $vtext = $probe;
@@ -664,22 +949,67 @@ sub _resolve_named_ledger {
     return $r;
 }
 
-# _is_full_sweep_runner($cmd) -> true iff $cmd invokes scripts/run-tests.pl
-# with no path operand, with --fast, or with two-or-more path operands
-# (24-interlock-scope-review S-1). Write-set scoping approximates what a
+# _is_full_sweep_runner($cmd) -> true iff ANY run-tests.pl invocation, in
+# any separator-delimited segment on any line, invokes it with no path
+# operand, with --fast, or with two-or-more path operands
+# (24-interlock-scope-review S-1; 34-runner-redirect-operands DC6/spec
+# sec 2.1 -- every invocation is classified, on the heredoc-blanked text,
+# with redirects already dropped). Write-set scoping approximates what a
 # run WRITES; a full or multi-plugin sweep also READS every other
 # in-flight worker's half-written files, so it is denied by presence of
 # any live writer alone, regardless of write-set overlap.
+my $RUNNER_SEPARATOR_RE = qr/(?:;|(?<![<>])&(?!>)|(?<!>)\|)/;
+
+
+# 34-runner-redirect-operands review M-3 -- a redirect glued directly onto
+# the runner token (no space: "run-tests.pl&>log", "run-tests.pl>log",
+# "run-tests.pl>|log") must be split off BEFORE _drop_redirects runs, or it
+# survives as the runner token's own trailing text and is unshifted back
+# into @tail afterwards, uncoupled from the drop -- which then always
+# fail-opens it into a single-operand (never full-sweep) reading no matter
+# what the operator is.
+sub _split_glued_redirect {
+    my (@tok) = @_;
+    my @out;
+    for my $t (@tok) {
+        if ($t =~ m{^(.*(?:^|/)run-tests\.pl)([<>&|].*)$}) {
+            my ($head, $tail) = ($1, $2);
+            if ($tail =~ $REDIR_OP) {
+                push @out, $head, $tail;
+                next;
+            }
+        }
+        push @out, $t;
+    }
+    return @out;
+}
+
 sub _is_full_sweep_runner {
     my ($cmd) = @_;
     return 0 unless defined $cmd;
-    return 0 unless $cmd =~ m{(?:^|[;&|]|[\x20\t])(?:perl[\x20\t]+(?:-[^\s;&|]+[\x20\t]+)*)?(?:[^\s;&|]*\/)?run-tests\.pl\b(.*)$};
-    my $tail = defined $1 ? $1 : '';
-    $tail =~ s/[;&|].*$//s;
-    return 1 if $tail =~ /(^|\s)--fast\b/;
-    my @args = grep { length && $_ !~ /^--?/ } split /\s+/, $tail;
-    return 1 if @args == 0;
-    return 1 if @args >= 2;
+    return 0 if index($cmd, 'run-tests.pl') < 0; # fast path: one index call
+    my $text = _blank_data_heredocs($cmd);
+    $text =~ s/\\\n/ /g;
+    for my $line (split /\n/, $text) {
+        for my $seg (split $RUNNER_SEPARATOR_RE, $line) {
+            next unless defined $seg;
+            my @tok = grep { length } split /\s+/, $seg;
+            @tok = _split_glued_redirect(@tok);
+            my @kept = _drop_redirects(@tok);
+            my $k;
+            for my $idx (0 .. $#kept) {
+                if ($kept[$idx] =~ m{(?:^|/)run-tests\.pl\b}) { $k = $idx; last; }
+            }
+            next unless defined $k;
+            my @tail = @kept[$k + 1 .. $#kept];
+            my $rem;
+            if ($kept[$k] =~ m{(?:^|/)run-tests\.pl(.*)$}) { $rem = $1; }
+            unshift @tail, $rem if defined $rem && length $rem;
+            return 1 if grep { /^--fast\b/ } @tail;
+            my @args = grep { $_ !~ /^--?/ } @tail;
+            return 1 if @args == 0 || @args >= 2;
+        }
+    }
     return 0;
 }
 
@@ -813,15 +1143,29 @@ sub _gb_d {
                                     $cmd_line,
                                 ];
                             }
-                            # S-1: a full/multi-plugin sweep reads every
-                            # in-flight worker's files regardless of write-set
-                            # overlap, so it is denied by mere presence of a
-                            # live writer.
-                            if ($full_sweep || write_sets_overlap($caller_ws, $w_resolved->{write_set})) {
+                            # 34-runner-redirect-operands sec 2.4: overlap
+                            # wins over the full-sweep text when both are
+                            # true against the same writer (keeps today's
+                            # output for every case where the overlap claim
+                            # is true).
+                            if (write_sets_overlap($caller_ws, $w_resolved->{write_set})) {
                                 my $bpname  = _sanitize($w_resolved->{blueprint}, 64);
                                 my $pkgname = _sanitize($w_resolved->{package}, 64);
                                 return [
                                     "BLOCKED (validation interlock): package $pkgname of blueprint $bpname has a write-capable worker ($role_writer) in flight whose write set overlaps yours; this run could report a false red.",
+                                    $cmd_line,
+                                ];
+                            }
+                            # S-1: a full/multi-plugin sweep reads every
+                            # in-flight worker's files regardless of write-set
+                            # overlap, so it is denied by mere presence of a
+                            # live writer.
+                            if ($full_sweep) {
+                                my $bpname  = _sanitize($w_resolved->{blueprint}, 64);
+                                my $pkgname = _sanitize($w_resolved->{package}, 64);
+                                return [
+                                    'BLOCKED (validation interlock): a multi-file or full sweep reads every in-flight worker\'s files, so it is denied while any write-capable worker is live.',
+                                    "Live writer: $role_writer, package $pkgname of blueprint $bpname. Name exactly one test file to get write-set scoping instead.",
                                     $cmd_line,
                                 ];
                             }
