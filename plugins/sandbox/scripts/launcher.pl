@@ -6958,6 +6958,14 @@ sub _keepawake_start {
     }
     my $win_ps1 = winify_path($ps1);
     my $win_pid = winify_path($pidfile);
+    # The helper's owner is THIS launcher, named by its WINDOWS pid so the helper
+    # can tell a quiet owner from a gone one (keep-awake.ps1 -OwnerWinPid,
+    # Decision 16). Read in the parent, before fork: $$ is an MSYS pid, a
+    # different namespace that keep-awake.ps1 must never be handed. When it
+    # cannot be read, omit the flag -- the helper then runs on its bounded
+    # fallback lease rather than trusting a wrong identity.
+    my $owner_winpid = _keepawake_owner_winpid();
+    my @owner_args = defined $owner_winpid ? ('-OwnerWinPid', $owner_winpid) : ();
     my $pid = fork();
     if (!defined $pid) {
         log_ev('keepawake_start_failed', { reason => "fork: $!" });
@@ -6971,11 +6979,28 @@ sub _keepawake_start {
         open(STDERR, '>', '/dev/null');
         local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
         exec('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
-             '-WindowStyle', 'Hidden', '-File', $win_ps1, '-PidFile', $win_pid)
+             '-WindowStyle', 'Hidden', '-File', $win_ps1, '-PidFile', $win_pid,
+             @owner_args)
             or do { POSIX::_exit(127); };
     }
-    log_ev('keepawake_started', { pid => $pid });
+    log_ev('keepawake_started', { pid => $pid,
+        owner_winpid => (defined $owner_winpid ? $owner_winpid : 'none') });
     return $pid;
+}
+
+# _keepawake_owner_winpid() -> positive WINDOWS pid of this process | undef.
+# Cygwin/MSYS exposes the native pid at /proc/<msys-pid>/winpid (measured on
+# this host: MSYS 1183523 -> WINPID 99496). Anything that is not a positive
+# integer -- no /proc, unreadable, garbage -- is undef, never a guess.
+sub _keepawake_owner_winpid {
+    my $f = "/proc/$$/winpid";
+    return undef unless -r $f;
+    open(my $fh, '<', $f) or return undef;
+    my $v = <$fh>;
+    close $fh;
+    return undef unless defined $v;
+    $v =~ s/\s+//g;
+    return ($v =~ /^\d+$/ && $v > 0) ? $v : undef;
 }
 
 # _keepawake_stop($child_pid, $pidfile) — kill our helper child (releases the
