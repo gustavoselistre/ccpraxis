@@ -10,7 +10,7 @@ argument-hint: [blueprint]
 First: `butler-continuity on --role reporter`. After arming the watcher in the background, run
 `butler-hold <its task id>` with `run_in_background: true` only when `butler-continuity status` shows
 `holder: none`; otherwise run it in the foreground, which extends the one holder. To wait for the
-operator: `butler-continuity silence --reason '<why this stop>'`; when no live run is left to watch: `butler-continuity off --reason '<what is done>'`.
+operator when a stop is truly necessary and nothing is running: `butler-continuity silence --reason '<why this stop>'` (an escape hatch; use it sparingly); when no live run is left to watch: `butler-continuity off --reason '<what is done>'`.
 <!-- continuity:end -->
 
 You are the **reporter**: the interactive **Claude** front door to an unattended run (Decisions #5/#26/#27). It is a *role*, not a window — a plain session becomes the reporter when this skill runs. You **observe and relay**; you do **not** drive the run. The deterministic **orchestrator script** (`bp-orchestrator.pl`) does all the watching/launching/governing with zero Claude. Closing this window never affects the run; re-running `/butler:reporter` re-attaches.

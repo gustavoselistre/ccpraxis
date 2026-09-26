@@ -42,6 +42,10 @@ $SIG{HUP}  = sub { $SIGNALLED = 1 };
 # which runs under the top-level eval at the bottom of this file.
 
 use constant HOLD_DEFAULT => 3000;
+# QUIET below is 2 x TICK_DEFAULT. BpHook.pm's $HELD_QUIET_SECONDS (running_work,
+# spec 38 sec 2.2) duplicates this 60 s window on purpose -- it judges the same
+# holder record from the gate side, when no /proc read on this process is
+# possible. Keep the two numbers equal if either changes.
 use constant TICK_DEFAULT => 30;
 use constant TAIL_BYTES   => 8 * 1024 * 1024;
 
@@ -236,6 +240,78 @@ sub finished_status_in_tail {
     return $last;
 }
 
+# last_event_in_tail($tail, $id) -> 'live' | 'terminal' | undef (spec 38
+# sec 2.1). The kind of the LAST event for $id in the tail's byte order:
+# a <task-id>$id</task-id> notification (its first <status> within 2000
+# bytes on the same line; 'running' is live, anything else terminal), or a
+# SendMessage resume marker `resumedAgentId":"$id"` in its plain or
+# JSON-escaped form (live). A resume writes no notification, so without
+# this a stale `stopped` stays the latest status and the resumed id is
+# pruned while it works (bug 20260926-101917-85c6).
+#
+# Linear, like resolve_output_path_in_tail (red-team H2): a line without
+# $id is skipped by index(); each `resumedAgentId` is found by index() and
+# checked by one anchored match at its own position, never by a regex that
+# can backtrack across the line.
+sub last_event_in_tail {
+    my ($tail, $id) = @_;
+    return undef unless defined $tail && length $tail;
+    my $open_tag = "<task-id>$id</task-id>";
+    my $marker   = 'resumedAgentId';
+    my $mlen     = length $marker;
+    my $resume_re = qr/\G\\?"\s*:\s*\\?"\Q$id\E\\?"/;
+    my $last;
+    for my $line (split /\n/, $tail) {
+        next if index($line, $id) < 0;
+        my ($best_pos, $best_kind) = (-1, undef);
+        my $pos = index($line, $open_tag);
+        if ($pos >= 0) {
+            my $window_end = $pos + length($open_tag) + 2000;
+            $window_end = length($line) if $window_end > length($line);
+            my $window = substr($line, $pos, $window_end - $pos);
+            if ($window =~ /<status>([^<]*)<\/status>/) {
+                ($best_pos, $best_kind) = ($pos, ($1 eq 'running' ? 'live' : 'terminal'));
+            }
+        }
+        my $from = 0;
+        while (1) {
+            my $m = index($line, $marker, $from);
+            last if $m < 0;
+            $from = $m + $mlen;
+            pos($line) = $from;
+            if ($line =~ /$resume_re/gc) {
+                ($best_pos, $best_kind) = ($m, 'live') if $m > $best_pos;
+            }
+        }
+        $last = $best_kind if defined $best_kind;
+    }
+    return $last;
+}
+
+# subagent_paths($record, $id) -> (agent-<id>.jsonl, agent-<id>.meta.json)
+# under <dirname(transcript_path)>/<sid>/subagents, or () without a
+# transcript path. Either existing makes <id> a subagent item.
+sub subagent_paths {
+    my ($record, $id) = @_;
+    my $tp  = $record->{transcript_path};
+    my $sid = $record->{session_id};
+    return () unless defined $tp && length $tp && defined $sid;
+    (my $tpn = $tp) =~ s{\\}{/}g;
+    my $sdir = dirname($tpn) . "/$sid/subagents";
+    return ("$sdir/agent-$id.jsonl", "$sdir/agent-$id.meta.json");
+}
+
+# file_stat($path) -> (size, mtime) | () -- hi-res mtime where the platform
+# gives one; a vanished or unreadable file is simply absent.
+sub file_stat {
+    my ($path) = @_;
+    my $b = to_bytes_path($path);
+    return () unless defined $b && -e $b;
+    my @s = Time::HiRes::stat($b);
+    return () unless @s && defined $s[9];
+    return ($s[7], $s[9]);
+}
+
 sub resolve_output_path_in_tail {
     # A linear index()-based scan (red-team H2 / review m3): the previous
     # lazy regex backtracked from every '/' in the tail, which cost minutes
@@ -278,10 +354,25 @@ sub resolve_output_path_in_tail {
     return $found;
 }
 
-# item_status($record, $id, $tail) -> {status=>'finished'|'running'|'unknown', mtime=>epoch?}
+# %SEEN -- path => [size, mtime] as of the last evaluation, in memory only
+# (spec 38 sec 2.1). A change since then is growth even when the mtime's
+# resolution hides it.
+my %SEEN;
+
+# item_status($record, $id, $tail, $seen) -> {status=>'finished'|'running'|'unknown', mtime=>epoch?}
+#
+# A subagent item (subagents/agent-<id>.jsonl or .meta.json exists) is
+# judged from real activity: finished only when its last event is terminal
+# AND no activity file grew within QUIET (2 ticks). A task item keeps the
+# notification-status rule exactly (spec 38 sec 2.1).
 sub item_status {
-    my ($record, $id, $tail) = @_;
+    my ($record, $id, $tail, $seen) = @_;
+    $seen = \%SEEN unless ref $seen eq 'HASH';
     $tail = read_tail($record->{transcript_path}) unless defined $tail;
+
+    my ($jsonl, $meta) = subagent_paths($record, $id);
+    my $is_subagent = (defined $jsonl && (-e to_bytes_path($jsonl) || -e to_bytes_path($meta))) ? 1 : 0;
+    return subagent_status($record, $id, $tail, $seen, $jsonl, $meta) if $is_subagent;
 
     if (defined $tail) {
         my $st = finished_status_in_tail($tail, $id);
@@ -323,13 +414,49 @@ sub item_status {
     return { status => 'unknown' };
 }
 
+sub subagent_status {
+    my ($record, $id, $tail, $seen, $jsonl, $meta) = @_;
+    my $quiet = 2 * tick_seconds();
+    my $now = time();
+
+    my @activity;
+    push @activity, $jsonl;
+    my $outputs = (ref $record->{outputs} eq 'HASH') ? $record->{outputs} : {};
+    push @activity, $outputs->{$id} if defined $outputs->{$id} && length $outputs->{$id};
+
+    my ($growing, $newest) = (0, undef);
+    for my $f (@activity) {
+        my ($size, $mtime) = file_stat($f);
+        next unless defined $mtime;
+        $growing = 1 if $mtime >= $now - $quiet;
+        my $prev = $seen->{$f};
+        $growing = 1 if ref $prev eq 'ARRAY' && ($prev->[0] != $size || $prev->[1] != $mtime);
+        $seen->{$f} = [$size, $mtime];
+        $newest = $mtime if !defined $newest || $mtime > $newest;
+    }
+
+    my $last = last_event_in_tail($tail, $id);
+    return { status => 'finished' } if defined $last && $last eq 'terminal' && !$growing;
+    return { status => 'running', mtime => int($newest) } if defined $newest;
+
+    my ($msize, $mmtime) = file_stat($meta);
+    return { status => 'running', mtime => int($mmtime) } if defined $mmtime;
+
+    my $found_now = defined $tail ? resolve_output_path_in_tail($tail, $id) : undef;
+    if (defined $found_now) {
+        my ($osize, $omtime) = file_stat($found_now);
+        return { status => 'running', mtime => int($omtime) } if defined $omtime;
+    }
+    return { status => 'unknown' };
+}
+
 sub all_finished {
-    my ($record) = @_;
+    my ($record, $seen) = @_;
     my $items = (ref $record->{items} eq 'ARRAY') ? $record->{items} : [];
     return 0 unless @$items;
     my $tail = read_tail($record->{transcript_path});
     for my $id (@$items) {
-        my $st = item_status($record, $id, $tail);
+        my $st = item_status($record, $id, $tail, $seen);
         return 0 unless $st->{status} eq 'finished';
     }
     return 1;
@@ -719,7 +846,7 @@ sub end_report {
             : ();
     my $tail = read_tail($record->{transcript_path});
     for my $id (@ids) {
-        my $st = item_status($record, $id, $tail);
+        my $st = item_status($record, $id, $tail, \%SEEN);
         if ($st->{status} eq 'finished') {
             push @lines, "$id finished";
         }
@@ -813,7 +940,7 @@ while (1) {
     my $t1 = time();
     my $items_ref = (ref $rp->{items} eq 'ARRAY') ? $rp->{items} : [];
     my $tail = read_tail($rp->{transcript_path});
-    my @finished_ids = grep { item_status($rp, $_, $tail)->{status} eq 'finished' } @$items_ref;
+    my @finished_ids = grep { item_status($rp, $_, $tail, \%SEEN)->{status} eq 'finished' } @$items_ref;
     my $deadline_due = ($t1 >= $rp->{deadline});
 
     next unless @finished_ids || $deadline_due || !@$items_ref;
@@ -853,7 +980,7 @@ while (1) {
 
     my $items2 = (ref $rp2->{items} eq 'ARRAY') ? $rp2->{items} : [];
     my $tail2 = read_tail($rp2->{transcript_path});
-    my @finished2 = grep { item_status($rp2, $_, $tail2)->{status} eq 'finished' } @$items2;
+    my @finished2 = grep { item_status($rp2, $_, $tail2, \%SEEN)->{status} eq 'finished' } @$items2;
 
     my $prune_write_failed = 0;
     if (@finished2) {

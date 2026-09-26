@@ -57,10 +57,11 @@ Run these as plain Bash tool calls, arguments in single quotes.
   or said "keep going". Do not self-arm for one interactive answer.
 - **Off** (`butler-continuity off --reason '<what is done>'`) is right only when all work is done
   or the operator ended it. It stays off until an explicit `on`; a later director call does not
-  re-arm it.
-- **Silence** (`butler-continuity silence --reason '<why this stop>'`) lets one stop through, to
-  report or to wait for the operator. The gate applies again next stop. Silence never replaces a
-  holder while work is running.
+  re-arm it. A persistent process nobody is waiting on (a dev server, `tail -f`) is not work to hold; if nothing else is pending, off with a reason is the right move.
+- **Silence** (`butler-continuity silence --reason '<why this stop>'`) is an escape hatch: use it
+  sparingly, only when a stop is truly necessary, e.g. to talk with an operator who is present or to
+  wait for the operator's answer. It lets one stop through; the gate applies again next stop. It is
+  not offered while work is running, and refuses then: hold the work instead.
 - **A reason** is at least two words and says what is done (off) or why this stop (silence). Quote
   it in single quotes; it is logged for the operator.
 - **Holder:** `butler-hold <id> [<id> ...]` with `run_in_background: true`, but only when

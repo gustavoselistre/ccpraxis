@@ -402,10 +402,14 @@ $SIG{$_} = sub { exit 1 } for qw(TERM INT HUP);
         my $bg_running_subagent = {background_tasks => [{id=>'x1', type=>'subagent', status=>'running'}]};
         is(H('holder_live', 'A', $bg_running_subagent), 1, 'A7: live with a running x1 background task');
         is(H('holder_live', 'A', {}), 1, 'A7: live without a background_tasks array at all');
-        is(H('holder_live', 'A', {background_tasks => [{id=>'x2', type=>'subagent', status=>'running'}]}), 0,
-           'A7: not live when the only running id is x2');
-        is(H('holder_live', 'A', {background_tasks => [{id=>'x1', type=>'subagent', status=>'completed'}]}), 0,
-           'A7: not live when x1 is completed');
+        # Decision 131: on the non-coordinator path there is no
+        # background_tasks cross-check at all -- a live own holder with
+        # non-empty items is live whatever background_tasks says, whether the
+        # held id reads completed, is absent, or only unheld ids (x2) run.
+        is(H('holder_live', 'A', {background_tasks => [{id=>'x2', type=>'subagent', status=>'running'}]}), 1,
+           'A7: Decision 131 -- still live when the only running id is x2 (unheld)');
+        is(H('holder_live', 'A', {background_tasks => [{id=>'x1', type=>'subagent', status=>'completed'}]}), 1,
+           'A7: Decision 131 -- still live when x1 is completed');
 
         is(H('holder_live', 'B', $bg_running_subagent), 0, 'A7: not live for B with no record');
         write_json_file("$continuity/holder/B.json",

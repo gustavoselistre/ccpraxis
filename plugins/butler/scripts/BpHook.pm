@@ -404,6 +404,7 @@ sub disarm {
         : undef;
     unlink("$root/armed/$sid");
     unlink("$root/silence/$sid");
+    unlink("$root/running/$sid");
     unlink("$root/holder/$sid.json");
     revoke_stop_token($sid);
     my $rec = { session_id => $sid, actor => $actor, reason => _decode_maybe($reason), at => _iso_now() };
@@ -498,43 +499,177 @@ sub holder_live {
     my $is_coord = ($role eq 'coordinator') ? 1 : 0;
 
     my $items = (ref $h->{items} eq 'ARRAY') ? $h->{items} : [];
-    my %item_set = map { (defined $_ ? ($_ => 1) : ()) } @$items;
 
-    my $bg = (ref $p eq 'HASH') ? $p->{background_tasks} : undef;
-    if (ref $bg eq 'ARRAY') {
+    if ($is_coord) {
+        my %item_set = map { (defined $_ ? ($_ => 1) : ()) } @$items;
+        my $bg = (ref $p eq 'HASH') ? $p->{background_tasks} : undef;
+        return 0 unless ref $bg eq 'ARRAY';
         my $found = 0;
         for my $entry (@$bg) {
             next unless ref $entry eq 'HASH';
             next unless defined $entry->{status} && $entry->{status} eq 'running';
             next unless defined $entry->{id} && $item_set{$entry->{id}};
-            if ($is_coord) {
-                next unless defined $entry->{type} && $entry->{type} eq 'subagent';
-            }
+            next unless defined $entry->{type} && $entry->{type} eq 'subagent';
             $found = 1;
             last;
         }
-        return 0 unless $found;
-    }
-    else {
-        return 0 if $is_coord;
+        return $found ? 1 : 0;
     }
 
-    unless ($is_coord) {
-        my $pid = $h->{pid};
-        return 0 unless defined $pid && "$pid" =~ /^[1-9][0-9]{0,9}$/;
-        if (-r '/proc/self/cmdline') {
-            my $fp = $h->{fp};
-            return 0 unless defined $fp && length $fp;
-            return 0 if $fp eq sha1_hex('');
-            my $cmdline = _read_bytes("/proc/$pid/cmdline");
-            return 0 unless defined $cmdline && length $cmdline;
-            return 0 unless sha1_hex($cmdline) eq $fp;
-        }
-        else {
-            return 0 unless kill(0, $pid);
+    # Non-coordinator (Decision 130 M1+S3, extended by Decision 131): a live
+    # holder process (pid+fp) whose record still holds items IS the
+    # evidence -- no background_tasks cross-check at all. This holds even
+    # when the held id reads completed, is absent from the payload, or only
+    # unheld work is running: the fixed holder already prunes finished
+    # items and holds a resumed agent on its own. An empty items record
+    # never counts, another session's holder never counts (holder($sid) is
+    # already scoped to this sid), and a dead holder never passes.
+    return 0 unless @$items;
+    return 0 unless _holder_proc_alive($h);
+    return 1;
+}
+
+# _holder_proc_alive($h) -> 1|0 -- holder_live's step 3, shared with
+# running_work (spec 38 sec 2.2): the record's pid is alive and, where
+# /proc exists, its cmdline still hashes to the record's fp, so a recycled
+# pid never reads as the holder. Same MSYS pid namespace as the writer.
+sub _holder_proc_alive {
+    my ($h) = @_;
+    return 0 unless ref $h eq 'HASH';
+    my $pid = $h->{pid};
+    return 0 unless defined $pid && "$pid" =~ /^[1-9][0-9]{0,9}$/;
+    if (-r '/proc/self/cmdline') {
+        my $fp = $h->{fp};
+        return 0 unless defined $fp && length $fp;
+        return 0 if $fp eq sha1_hex('');
+        my $cmdline = _read_bytes("/proc/$pid/cmdline");
+        return 0 unless defined $cmdline && length $cmdline;
+        return sha1_hex($cmdline) eq $fp ? 1 : 0;
+    }
+    return kill(0, $pid) ? 1 : 0;
+}
+
+# ------------------------------------------------------------ running work -
+
+# butler-hold's QUIET window (2 x its default 30 s tick, see TICK_DEFAULT
+# and its cross-reference comment in butler-hold.pl): a held item whose
+# activity file changed this recently is running work (Decision 129), but
+# ONLY when the holder is dead (Decision 130, M1+S3) -- while the holder
+# process is alive, holder_live's non-empty-items check is itself the live
+# evidence, so a live holder never needs this window and G8 allows before
+# running_work is even reached for its own tracked ids.
+my $HELD_QUIET_SECONDS = 60;
+
+# running_work($sid, $p) -> list of {id, type} (spec 38 sec 2.2, Decision
+# 129, amended by Decision 130 M1+S3). The union of (a) the Stop payload's
+# running background_tasks, in payload order, and (b) -- only when the
+# holder is dead -- the ids a holder record for this session holds whose
+# activity file (subagents/agent-<id>.jsonl beside the payload's
+# transcript, or the record's cached .output) changed within QUIET: a
+# SendMessage-resumed agent may be missing from background_tasks. While the
+# holder is alive, its own items are not added here at all (holder_live
+# already covers them for G8); adding them here too would let a live
+# holder's ids leak into the RUNNING text once the holder later dies mid-
+# item, which is not a case this window needs to solve. Deduped by id. With
+# a live holder, (a) drops every non-subagent entry, because the holder is
+# itself a running shell task and the gate must never tell the agent to
+# hold its own holder. Stats and at most one JSON read and one /proc read;
+# never a process.
+sub running_work {
+    my ($sid, $p) = @_;
+    return () unless defined $sid && $sid =~ $SID_RE && ref $p eq 'HASH';
+    my $h = holder($sid);
+    my $holder_alive = (ref $h eq 'HASH' && _holder_proc_alive($h)) ? 1 : 0;
+    my (@work, %have);
+
+    my $bg = $p->{background_tasks};
+    if (ref $bg eq 'ARRAY') {
+        for my $e (@$bg) {
+            next unless ref $e eq 'HASH';
+            next unless _is_plain_string($e->{status}) && $e->{status} eq 'running';
+            my $id = $e->{id};
+            next unless _is_plain_string($id) && $id =~ $AGENT_RE;
+            my $type = _is_plain_string($e->{type}) ? $e->{type} : 'task';
+            next if $holder_alive && $type ne 'subagent';
+            next if $have{$id}++;
+            push @work, { id => $id, type => $type };
         }
     }
-    return 1;
+
+    if (!$holder_alive && ref $h eq 'HASH' && ref $h->{items} eq 'ARRAY') {
+        my $tp = _is_plain_string($p->{transcript_path}) && length $p->{transcript_path}
+            ? $p->{transcript_path} : $h->{transcript_path};
+        my $sdir;
+        if (_is_plain_string($tp) && length $tp) {
+            $sdir = dirname(_to_bytes($tp)) . "/$sid/subagents";
+        }
+        my $outputs = (ref $h->{outputs} eq 'HASH') ? $h->{outputs} : {};
+        my $cutoff = time() - $HELD_QUIET_SECONDS;
+        for my $id (@{ $h->{items} }) {
+            next unless _is_plain_string($id) && $id =~ $AGENT_RE;
+            next if $have{$id};
+            my @files;
+            push @files, "$sdir/agent-$id.jsonl" if defined $sdir;
+            push @files, _to_bytes($outputs->{$id}) if _is_plain_string($outputs->{$id}) && length $outputs->{$id};
+            my $fresh = 0;
+            for my $f (@files) {
+                my $mt = (stat($f))[9];
+                if (defined $mt && $mt >= $cutoff) { $fresh = 1; last }
+            }
+            next unless $fresh;
+            my $is_agent = (defined $sdir && (-e "$sdir/agent-$id.jsonl" || -e "$sdir/agent-$id.meta.json")) ? 1 : 0;
+            $have{$id} = 1;
+            push @work, { id => $id, type => ($is_agent ? 'subagent' : 'task') };
+        }
+    }
+    return @work;
+}
+
+# _valid_work(\@work) -> arrayref of clean {id, type}; invalid entries dropped.
+sub _valid_work {
+    my ($work) = @_;
+    my @out;
+    return \@out unless ref $work eq 'ARRAY';
+    for my $e (@$work) {
+        next unless ref $e eq 'HASH';
+        next unless _is_plain_string($e->{id}) && $e->{id} =~ $AGENT_RE;
+        my $type = _is_plain_string($e->{type}) && length $e->{type} ? $e->{type} : 'task';
+        push @out, { id => $e->{id}, type => $type };
+    }
+    return \@out;
+}
+
+# running/<sid> exists iff the latest armed, non-coordinator Stop of the
+# session was denied while work was running (spec 38 sec 2.2). The Stop
+# gate writes it; `butler-continuity silence` reads it.
+sub set_running_snapshot {
+    my ($sid, $work) = @_;
+    return 0 unless defined $sid && $sid =~ $SID_RE;
+    my $root = state_dir();
+    return 0 unless defined $root;
+    my $clean = _valid_work($work);
+    return 0 unless @$clean;
+    return _write_json_atomic("$root/running/$sid",
+        { session_id => $sid, at => _iso_now(), work => $clean }) ? 1 : 0;
+}
+
+sub clear_running_snapshot {
+    my ($sid) = @_;
+    return 0 unless defined $sid && $sid =~ $SID_RE;
+    my $root = state_dir();
+    return 0 unless defined $root;
+    return unlink("$root/running/$sid") ? 1 : 0;
+}
+
+sub running_snapshot {
+    my ($sid) = @_;
+    return undef unless defined $sid && $sid =~ $SID_RE;
+    my $root = state_dir();
+    return undef unless defined $root;
+    my $d = _read_json("$root/running/$sid");
+    return undef unless ref $d eq 'HASH' && _is_plain_string($d->{session_id}) && $d->{session_id} eq $sid;
+    my $clean = _valid_work($d->{work});
+    return @$clean ? $clean : undef;
 }
 
 # --------------------------------------------------------------- reasons ---
@@ -609,6 +744,7 @@ sub gc_sessions {
         unlink("$root/armed/$sid");
         unlink("$root/off/$sid");
         unlink("$root/silence/$sid");
+        unlink("$root/running/$sid");
         unlink("$root/holder/$sid.json");
         revoke_stop_token($sid);
         flock($lockfh, LOCK_UN);

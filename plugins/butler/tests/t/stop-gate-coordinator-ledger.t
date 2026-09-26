@@ -389,13 +389,18 @@ sub spawn_tagged_sleeper {
     close $fh;
     my $res = run_gate(payload_json($sid, background_tasks => [{ id => 'Q', type => 'subagent', status => 'running' }]),
         BUTLER_STATE_DIR => $root);
-    is($res->{rc}, 2, 'C8(d): armed, live own holder, but held id T1 not running in background_tasks -> exit 2');
-    like($res->{err}, qr/Continuity is on for this session/, 'C8(d): the continuity text (not the coordinator text -- BP_LEDGER unset)');
+    # Decision 131: on the non-coordinator path a live own holder allows the
+    # Stop whether the held id reads completed, is absent, or only unheld
+    # work runs -- no background_tasks cross-check at all (unlike the
+    # coordinator path, which keeps it; see C8(a)-(c) above). Q running but
+    # T1 (the actually held id) absent from background_tasks used to deny;
+    # it now allows.
+    is($res->{rc}, 0, 'C8(d): Decision 131 -- armed, live own holder, held id T1 not in background_tasks -> exit 0 anyway');
+    is($res->{err}, '', 'C8(d): Decision 131 -- exit 0 means no denial text at all');
 
-    # RV-M1 positive control: the SAME record, with T1 (the actually-held
-    # item) reported running -> exit 0. This proves the fixture's pid/fp are
-    # genuinely live (not a fork/exec-race false match), so C8(d)'s deny
-    # above is caused by the held-id rule, not by a stale fingerprint.
+    # RV-M1 positive control retained: the SAME record, with T1 (the
+    # actually-held item) reported running -> exit 0 too, for the same
+    # Decision 131 reason (a live holder never needs the cross-check).
     my $res_ctrl = run_gate(payload_json($sid, background_tasks => [{ id => 'T1', type => 'subagent', status => 'running' }]),
         BUTLER_STATE_DIR => $root);
     is($res_ctrl->{rc}, 0, 'C8(d) RV-M1 positive control: same record, T1 actually running -> exit 0 (fixture is live)');
@@ -403,6 +408,40 @@ sub spawn_tagged_sleeper {
     kill('TERM', $pid) if kill(0, $pid);
     waitpid($pid, 0);
     @KILL_PIDS = grep { $_ != $pid } @KILL_PIDS;
+}
+{
+    # (d-dead) C8(d)'s original intent kept as a DEAD-holder variant: once
+    # the holder process is gone, holder_live is 0 and the non-coordinator
+    # path falls through to running_work/the continuity deny text (not the
+    # coordinator text -- BP_LEDGER unset), same as before Decision 131.
+    my $sid = next_sid();
+    my $root = fresh_state_root();
+    local %ENV = %ENV;
+    $ENV{BUTLER_STATE_DIR} = $root; $ENV{HOME} = $FAKE_HOME; $ENV{USERPROFILE} = $FAKE_HOME;
+    BpHook::arm($sid, role => 'manual', by => 'arm-on-entry');
+    my $pid = spawn_tagged_sleeper();
+    my $fp = do {
+        require Digest::SHA;
+        if ($HAVE_PROC_CMDLINE) {
+            open my $cfh, '<:raw', "/proc/$pid/cmdline"; local $/; my $c = $cfh ? <$cfh> : ''; close $cfh if $cfh;
+            Digest::SHA::sha1_hex(defined $c ? $c : '');
+        } else { '' }
+    };
+    make_path(state_dir_of($root) . "/holder");
+    open my $fh, '>:raw', state_dir_of($root) . "/holder/$sid.json" or die $!;
+    print {$fh} JSON::PP->new->utf8->canonical->encode(
+        { session_id => $sid, token => 'aaaaaaaa', pid => $pid, fp => $fp, items => ['T1'], deadline => int(time() + 1800) });
+    close $fh;
+    kill('KILL', $pid);
+    waitpid($pid, 0);
+    my $dead_deadline = time() + 5;
+    1 while kill(0, $pid) && time() < $dead_deadline;
+    @KILL_PIDS = grep { $_ != $pid } @KILL_PIDS;
+
+    my $res = run_gate(payload_json($sid, background_tasks => [{ id => 'Q', type => 'subagent', status => 'running' }]),
+        BUTLER_STATE_DIR => $root);
+    is($res->{rc}, 2, 'C8(d-dead): armed, DEAD own holder, held id T1 not running in background_tasks -> exit 2');
+    like($res->{err}, qr/Continuity is on for this session/, 'C8(d-dead): the continuity text (not the coordinator text -- BP_LEDGER unset)');
 }
 {
     # (e) the "no new refusal" half: a terminal, fresh ledger is allowed

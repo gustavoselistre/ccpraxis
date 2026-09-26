@@ -28,7 +28,7 @@ require "$Bin/BpHook.pm"
 require "$Bin/BpContinuityLease.pm"
     unless grep { m{(?:^|/)BpContinuityLease\.pm$} } keys %INC;
 
-my $USAGE = q{usage: butler-continuity on [--role driver|reporter] | off [--reason '<why>'] [--token T] | silence --reason '<why>' [--token T] | status | ask --text '<question>' | questions | answer --id <id> --answer '<text>'};
+my $USAGE = q{usage: butler-continuity on [--role driver|reporter] | off [--reason '<why>'] [--token T] | silence --reason '<why>' [--token T] (escape hatch: use sparingly) | status | ask --text '<question>' | questions | answer --id <id> --answer '<text>'};
 
 # Almanac::Decision -- loaded lazily, only for ask/questions/answer (Decision
 # 108, spec sec 2.3). No spawn; a missing almanac plugin is a legible refusal.
@@ -354,6 +354,55 @@ if ($verb eq 'silence') {
     unless (BpHook::is_armed($SID)) {
         out("continuity is off for this session; nothing to silence.\n");
         exit 0;
+    }
+    # Spec 38 sec 2.4 (Decision 128), amended by Decision 130 S1: refuse
+    # whenever running work is present at invocation, not only when the
+    # last Stop was denied with work running. That covers a silence run
+    # BEFORE any Stop, or after a Stop a live holder allowed (which clears
+    # the snapshot): BpHook::running_work reads the same evidence G11 does
+    # (background_tasks is unavailable here, so only the holder's own dead-
+    # holder freshness window applies), with no subprocess. A silence now
+    # would end the turn with nothing waiting on that work; explain, and
+    # point at hold, instead of setting it.
+    my $running = BpHook::running_snapshot($SID);
+    unless ($running) {
+        my @work = BpHook::running_work($SID, {});
+        $running = \@work if @work;
+    }
+    if ($running) {
+        my @ids   = map { $_->{id} } @$running;
+        my @shown = @ids > 8 ? @ids[0 .. 7] : @ids;
+        my $more  = @ids > 8 ? ', and ' . (@ids - 8) . ' more' : '';
+        binmode(STDERR, ':raw');
+        print STDERR _bytes(join('',
+            "butler-continuity: not silenced: work is still running in this session (" . join(', ', @shown) . "$more), as of the last stop.\n",
+            "A silence would end the turn with nothing waiting on that work. Hold it instead, as a background Bash tool call; the holder wakes this session when it finishes:\n",
+            "  butler-hold " . join(' ', @shown) . "\n",
+            "If that work is no longer needed and everything is done: butler-continuity off --reason '<what is done>'\n"));
+        exit 1;
+    }
+    # Decision 130 S1 / Decision 133: running_work({}) never surfaces a
+    # holder's own held items while its process is alive (they are
+    # holder_live's evidence, not running_work's -- see BpHook.pm's
+    # running_work comment), so a silence called before any Stop, with a
+    # live holder still holding non-empty items, would otherwise slip
+    # through undetected. Check the same pid+fp liveness holder_live uses
+    # (reused directly, as butler-continuity's own status verb already
+    # does). Unlike the two cases above, this work is already held -- the
+    # Stop gate already allows the turn to end while the holder runs -- so
+    # the hold-it-instead text is wrong here; say the turn can simply end.
+    my $h = BpHook::holder($SID);
+    if (ref $h eq 'HASH' && ref $h->{items} eq 'ARRAY' && @{ $h->{items} } && BpHook::holder_live($SID, {})) {
+        my @ids = grep { defined $_ && length $_ } @{ $h->{items} };
+        if (@ids) {
+            my @shown = @ids > 8 ? @ids[0 .. 7] : @ids;
+            my $more  = @ids > 8 ? ', and ' . (@ids - 8) . ' more' : '';
+            binmode(STDERR, ':raw');
+            print STDERR _bytes(join('',
+                "butler-continuity: not silenced: " . join(', ', @shown) . "$more already held; no silence needed.\n",
+                "The Stop gate allows the turn to end while the holder runs, so the turn can simply end.\n"));
+            exit 1;
+        }
     }
     my $reason = sanitize_text($flags{reason});
     my $ok = BpHook::set_silence($SID, reason => $reason);
