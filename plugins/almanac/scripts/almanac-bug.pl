@@ -1181,8 +1181,7 @@ unless (caller) {
 
         printf "skipped %d non-report file(s) in bug-reports/ (no almanac frontmatter)\n",
                scalar @skipped if @skipped;
-        print "checked $n report(s)\n";
-        print "checked $m almanac record(s)\n";
+        print "checked $n report(s)\nchecked $m almanac record(s)\n";
         if ($unsealed_count) {
             print "unsealed $unsealed_count almanac record(s) -- written before sealing existed, or their "
                 . "seal was removed; not verifiable until their next sanctioned write\n";
