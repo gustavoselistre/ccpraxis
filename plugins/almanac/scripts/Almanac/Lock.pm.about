@@ -1,0 +1,1 @@
+Bounded exclusive flock on a sidecar <file>.lock, polled to a deadline; never unlinks a lock file

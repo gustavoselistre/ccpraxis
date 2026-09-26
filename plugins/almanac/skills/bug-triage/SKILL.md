@@ -1,6 +1,6 @@
 ---
 name: bug-triage
-description: Collect and triage ccpraxis bug reports filed from every project on this machine, and move them through reviewing → taken → resolved/declined. Use when working ON ccpraxis and the user asks what bugs have been reported, wants to review the queue, or says "collect the bug reports", "what's been filed", "triage the bugs". Host-side, ccpraxis-repo work.
+description: Collect and triage ccpraxis bug reports filed from every project on this machine, and move them through reviewing → taken → resolved/declined. Use when working ON ccpraxis and the user asks what bugs have been reported, wants to review the queue, or says "collect the bug reports", "what's been filed", "triage the bugs". Host-side, ccpraxis-repo work. Skip for filing a new report, which is /almanac:bug-report.
 allowed-tools: Bash, Read, Grep, Glob, Edit, Write
 ---
 
@@ -13,15 +13,15 @@ never have to guess project paths from Claude Code's lossy slugs.
 ## See the queue
 
 ```bash
-A=plugins/almanac/scripts/almanac-bug.pl
-perl $A collect                    # every project
-perl $A collect --status open      # just the untriaged
-perl $A collect --json             # for processing
-perl $A verify                     # frozen bodies still match their digests?
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" bug collect
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" bug collect --status open
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" bug collect --json
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" bug verify
 ```
 
-`collect` re-reads each file from disk rather than trusting the index, and flags any report whose
-body no longer matches the sha256 recorded when it froze.
+`collect` (with no filter) walks this project and every project registered for backup; `--status
+open` narrows to the untriaged; `--json` is for processing. `verify` reports whether frozen bodies
+still match their digests, by re-reading each file from disk rather than trusting the index.
 
 ## The states
 
@@ -32,10 +32,10 @@ open  ->  reviewing  ->  taken  ->  resolved | declined
 ```
 
 ```bash
-perl $A set-status <id> --to reviewing
-perl $A set-status <id> --to taken
-perl $A set-status <id> --to resolved --note "fixed in <sha>"
-perl $A set-status <id> --to declined --note "<why>"
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" bug set-status <id> --to reviewing
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" bug set-status <id> --to taken
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" bug set-status <id> --to resolved --note "fixed in <sha>"
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" bug set-status <id> --to declined --note "<why>"
 ```
 
 Leaving `open` **freezes the body** and records its digest. From then on the filer cannot revise it
@@ -76,10 +76,7 @@ Then, in the same pass:
 - **Remember promotion.** A fix in this clone is inert until merged into `~/.claude/ccpraxis`. The
   reporter's sandbox is serving the *live install*, so until you promote, their next run hits the
   same defect and may re-file it.
-- Then `set-status <id> --to resolved --note "<sha>"`.
+- Then `bug set-status <id> --to resolved --note "<sha>"`.
 
-## Do not edit report files directly
-
-A PreToolUse hook denies Edit/Write on `bug-reports/`. Use the verbs. If you find yourself wanting
-to hand-edit a report, what you actually want is either `set-status … --to open` (hand it back) or a
-follow-up report.
+Filing a new report, rather than triaging existing ones, is /almanac:bug-report; see
+`plugins/almanac/skills/bug-report/SKILL.md`.
