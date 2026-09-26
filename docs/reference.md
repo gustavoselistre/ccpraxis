@@ -35,14 +35,11 @@ Two deliberate exceptions: the `butler` and `blueprint` plugins each carry a sma
 - `/steward:setup-project` — bootstrap a project for vault backup (orphan discovery, slug pick, initial sync). `host-only`.
 - `/refresh` — re-read all CLAUDE.md files and summarize key rules.
 
-**Planning and todos**
+**Planning**
 - `/blueprint:create` — author a durable multi-package blueprint (interrogate → decompose → auditor gate)
 - `/blueprint:manage` — list, view, audit, archive, or delete blueprints (the blueprint plugin is plan-only)
 - `/butler:dispatch-fleet` — execute a blueprint as a headless fleet: start the deterministic, token-free orchestrator script that drives detached coordinator agents and auto-resumes across usage/token limits (sandbox-only)
 - `/butler:drive-solo` — drive one blueprint, a named set, or all audited blueprints to done in one interactive session (host or sandbox) as a thin loop over the perl director `bp-drive-next.pl`, with a flat worker layer; `/butler:reporter` observes/relays a run, `/butler:status` reports. Both execute verbs are start-or-continue (no resume verb)
-- `/todo:create` — save a todo note
-- `/todo:manage` — CRUD for personal todos
-- `/todo:resume` — load a todo and work on it
 
 **Extending ccpraxis**
 - `/steward:ccpraxis-extend` — single entrypoint to add a new skill/plugin or change an existing one; decides the shape (packaging rule) and wires it in. `host-only`.

@@ -427,8 +427,8 @@ unless ($no_vault) {
     # in the vault, and for months it was not: `git status` there listed
     # reports/ as untracked, so every report this script had ever produced sat
     # on one machine while the skill's own description said it "writes a dated
-    # report into the vault". Nothing else committed it -- todo-sync.pl owns
-    # todos/, vault-sync.pl owns projects/, and reports/ had no owner at all.
+    # report into the vault". Nothing else committed it -- vault-sync.pl owns
+    # projects/, and reports/ had no owner at all.
     #
     # Only when the report went to the default vault location: an explicit
     # --out elsewhere is the caller's to manage.

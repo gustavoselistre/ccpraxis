@@ -67,7 +67,7 @@ my @exclude_tree_fallback = (
 );
 
 # Drive-letter form for native git's -C arg when MSYS arg-conversion is off
-# (mirrors git_path in vault-sync.pl / todo-sync.pl). No-op on POSIX/Linux paths.
+# (mirrors git_path in vault-sync.pl). No-op on POSIX/Linux paths.
 sub git_path { my $p = shift; return $p unless defined $p; $p =~ s{^/([a-zA-Z])/}{uc($1) . ":/"}e; return $p; }
 
 # Files git would NOT commit, as {abs_path => 1}. One batched `git check-ignore`

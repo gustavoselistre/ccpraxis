@@ -185,7 +185,7 @@ sub build_extract_argv {
 # Cwd::abs_path returns on this host's Git-for-Windows perl) to the
 # forward-slash Windows form (C:/Development/ccpraxis) that native git.exe
 # accepts directly -- matching the repo's own winify_path/git_path
-# convention (plugins/sandbox/scripts/MountSpec.pm, scripts/todo-sync.pl).
+# convention (plugins/sandbox/scripts/MountSpec.pm, plugins/steward/scripts/vault-sync.pl).
 # Required precisely BECAUSE $ENV{MSYS2_ARG_CONV_EXCL} is set above: with
 # conversion disabled, a bare /c/... argv element reaches git.exe
 # unconverted, and this repo's native git.exe cannot resolve it ("fatal:

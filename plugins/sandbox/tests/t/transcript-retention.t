@@ -188,7 +188,6 @@ my $HOST_BASELINE = {
         'frontend-design@claude-plugins-official'  => JSON::PP::true,
         'sandbox@ccpraxis-local'                   => JSON::PP::true,
         'steward@ccpraxis-local'                   => JSON::PP::true,
-        'todo@ccpraxis-local'                      => JSON::PP::true,
     },
     env => {
         CLAUDE_AUTO_BACKGROUND_TASKS               => '1',
@@ -255,7 +254,7 @@ my $HOST_BASELINE = {
             'Skill(steward:audit)', 'Skill(steward:backup)',
             'Skill(steward:ccpraxis-extend)', 'Skill(steward:setup-project)',
             'Skill(steward:update)', 'Skill(steward:usage-audit)',
-            'Skill(todo:create)', 'Skill(todo:manage)', 'Skill(todo:resume)',
+            # Skill(todo:*) removed: almanac-records 13, Decision 14.
             'Bash(find *)', 'Bash(grep *)', 'Bash(wc *)', 'Bash(awk *)', 'Bash(echo *)',
             'Bash(claude --version)', 'Bash(where claude*)', 'Bash(which claude*)',
             'Bash(git add *)', 'Bash(git commit *)', 'Bash(git rm *)',
@@ -466,18 +465,7 @@ sub assert_baseline_preserved {
                                        # three surfaces (host payload, its live
                                        # mirror, and the container blueprint) so a
                                        # sandbox is not left with the old cap.
-        'env.CLAUDE_CODE_ENABLE_TODO_TOOLS' => 1,
-                                       # 2026-09-10 -- Claude Code withdrew the
-                                       # todo/task tools (TaskCreate/Get/Update/
-                                       # List, TodoWrite) from Opus 4.8, Sonnet 5,
-                                       # Fable 5 and newer; its own changelog names
-                                       # CLAUDE_CODE_ENABLE_TODO_TOOLS=1 as the way
-                                       # back. Operator wants them on both sides,
-                                       # so it is declared on the same three
-                                       # surfaces as the subagent cap above (host
-                                       # payload, its live mirror, and the
-                                       # container blueprint) -- a sandbox must not
-                                       # be left without a tool the host has.
+        # env todo-tools switch removed on both surfaces, almanac-records 13 / Decision 23.
         'enabledPlugins.almanac@ccpraxis-local' => 1,
                                        # 2026-09-10 (34a84b9) -- almanac shipped
                                        # complete and unregistered: no entry in
