@@ -200,7 +200,7 @@ SKIP: {
     ok(_has_high_byte("x" . chr(0xE9)), 'counter-fixture: the high-byte scan fires on bytes that actually have one');
 
     # AC-7.3: only the permitted core modules are used/required.
-    my %permitted = map { $_ => 1 } qw(strict warnings Digest::SHA File::Path File::Spec);
+    my %permitted = map { $_ => 1 } qw(strict warnings Digest::SHA File::Path File::Spec JSON::PP);
     my @bad_uses;
     for my $l (@lines) {
         if ($l =~ /^\s*(?:use|require)\s+([A-Za-z0-9_:]+)/) {
@@ -208,16 +208,16 @@ SKIP: {
             push @bad_uses, $mod unless $permitted{$mod};
         }
     }
-    is_deeply(\@bad_uses, [], 'AC-7.3: WtProfile.pm uses/requires only strict/warnings/Digest::SHA/File::Path/File::Spec');
+    is_deeply(\@bad_uses, [], 'AC-7.3: WtProfile.pm uses/requires only strict/warnings/Digest::SHA/File::Path/File::Spec/JSON::PP');
     my @synth_use_hits;
-    for my $l ("use JSON::PP;\n", "use strict;\n") {
+    for my $l ("use Data::Dumper;\n", "use strict;\n") {
         if ($l =~ /^\s*(?:use|require)\s+([A-Za-z0-9_:]+)/) {
             my $mod = $1;
             push @synth_use_hits, $mod unless $permitted{$mod};
         }
     }
-    is_deeply(\@synth_use_hits, ['JSON::PP'],
-              'counter-fixture: the non-core-module scan fires on "use JSON::PP" and ignores permitted "use strict"');
+    is_deeply(\@synth_use_hits, ['Data::Dumper'],
+              'counter-fixture: the non-core-module scan fires on "use Data::Dumper" (still forbidden) and ignores permitted "use strict"');
 }
 
 # ---------------------------------------------------------------------------
@@ -364,7 +364,7 @@ SKIP: {
 # AC-3 -- idempotent write under an injected root
 # ===========================================================================
 SKIP: {
-    skip('WtProfile.pm not loaded', 27) unless $WTPROFILE_LOADED;
+    skip('WtProfile.pm not loaded', 33) unless $WTPROFILE_LOADED;
 
     # contract sec-2.2: fragment_path(undef) / fragment_path('') return undef,
     # no I/O.
@@ -374,7 +374,7 @@ SKIP: {
     # AC-3.1 + AC-3.2(b) -- missing intermediate directories
     my $root1 = tempdir(CLEANUP => 1);
     my $deep  = File::Spec->catdir($root1, 'a', 'b', 'c');
-    my $res1  = WtProfile::ensure_fragment($deep);
+    my $res1  = WtProfile::ensure_fragment($deep, { settings_path => undef });
     is($res1->{ok}, 1, 'AC-3.1: ensure_fragment(deep missing path) returns ok=1');
     is($res1->{action}, 'wrote', 'AC-3.1: first write on missing intermediate dirs reports action="wrote"');
     my $created_path = WtProfile::fragment_path($deep);
@@ -390,14 +390,14 @@ SKIP: {
 
     # AC-3.3 -- idempotence, asserted by mtime
     my $root3 = tempdir(CLEANUP => 1);
-    my $res3a = WtProfile::ensure_fragment($root3);
+    my $res3a = WtProfile::ensure_fragment($root3, { settings_path => undef });
     is($res3a->{ok}, 1, 'AC-3.3: first ensure_fragment call on a fresh root succeeds');
     my $path3 = WtProfile::fragment_path($root3);
     my $t = time() - 10_000;
     utime($t, $t, $path3) or die "test fixture: utime failed for AC-3.3: $!";
     my $mtime_before = (stat($path3))[9];
     is($mtime_before, $t, 'AC-3.3 fixture: utime set mtime to the distinct past value (sanity check on this filesystem)');
-    my $res3b = WtProfile::ensure_fragment($root3);
+    my $res3b = WtProfile::ensure_fragment($root3, { settings_path => undef });
     is($res3b->{ok}, 1, 'AC-3.3: second ensure_fragment call returns ok=1');
     is($res3b->{action}, 'unchanged', 'AC-3.3: second call with identical content reports action="unchanged"');
     my $mtime_after = (stat($path3))[9];
@@ -410,12 +410,12 @@ SKIP: {
 
     # AC-3.4 -- drift self-heals
     my $root4 = tempdir(CLEANUP => 1);
-    WtProfile::ensure_fragment($root4);
+    WtProfile::ensure_fragment($root4, { settings_path => undef });
     my $path4 = WtProfile::fragment_path($root4);
     open(my $gfh, '>:raw', $path4) or die "test fixture: cannot write garbage for AC-3.4: $!";
     print $gfh "garbage\n";
     close $gfh;
-    my $res4 = WtProfile::ensure_fragment($root4);
+    my $res4 = WtProfile::ensure_fragment($root4, { settings_path => undef });
     is($res4->{ok}, 1, 'AC-3.4: ensure_fragment on drifted content returns ok=1');
     is($res4->{action}, 'wrote', 'AC-3.4: drifted content triggers action="wrote" (self-heal)');
     my $bytes4 = _slurp_raw($path4);
@@ -429,7 +429,7 @@ SKIP: {
     # fixture is the one case that distinguishes "compares sizes" from
     # "compares bytes": same length as fragment_json(), one word altered.
     my $root4b = tempdir(CLEANUP => 1);
-    WtProfile::ensure_fragment($root4b);
+    WtProfile::ensure_fragment($root4b, { settings_path => undef });
     my $path4b = WtProfile::fragment_path($root4b);
     my $wanted4b = WtProfile::fragment_json();
     (my $same_size_tampered = $wanted4b) =~ s/hidden/HIDDEN/;
@@ -438,7 +438,7 @@ SKIP: {
     open(my $gfh2, '>:raw', $path4b) or die "test fixture: cannot write same-size tampered content for AC-3.4: $!";
     print $gfh2 $same_size_tampered;
     close $gfh2;
-    my $res4b = WtProfile::ensure_fragment($root4b);
+    my $res4b = WtProfile::ensure_fragment($root4b, { settings_path => undef });
     is($res4b->{ok}, 1, 'AC-3.4 (same-size drift): ensure_fragment on same-size-different-content returns ok=1');
     is($res4b->{action}, 'wrote', 'AC-3.4 (same-size drift): same-size-different-content triggers action="wrote", not "unchanged"');
     my $bytes4b = _slurp_raw($path4b);
@@ -451,10 +451,12 @@ SKIP: {
         [$res4, $root4, 'wrote (AC-3.4)'],
     ) {
         my ($res, $root_for_case, $label) = @$case;
-        is_deeply([sort keys %$res], ['action', 'ok', 'path'],
-                  "AC-3.5: success return ($label) has exactly the keys ok/action/path");
+        is_deeply([sort keys %$res], ['action', 'appearance', 'appearance_reason', 'ok', 'path'],
+                  "AC-3.5: success return ($label) has exactly the keys action/appearance/appearance_reason/ok/path");
         is($res->{path}, WtProfile::fragment_path($root_for_case),
            "AC-3.5: success return ($label) path matches fragment_path(root)");
+        is($res->{appearance}, 'fallback', "AC-3.5: success return ($label) appearance=\"fallback\" (settings_path => undef)");
+        is($res->{appearance_reason}, 'settings_not_found', "AC-3.5: success return ($label) appearance_reason=\"settings_not_found\"");
     }
 }
 
@@ -465,7 +467,7 @@ SKIP: {
     skip('WtProfile.pm not loaded', 12) unless $WTPROFILE_LOADED;
 
     my $root = tempdir(CLEANUP => 1);
-    WtProfile::ensure_fragment($root);
+    WtProfile::ensure_fragment($root, { settings_path => undef });
     my $path  = WtProfile::fragment_path($root);
     my $bytes = _slurp_raw($path);
 
@@ -511,7 +513,7 @@ SKIP: {
             my $res;
             my $eval_ok = eval {
                 local $SIG{__WARN__} = sub { push @w, @_ };
-                $res = WtProfile::ensure_fragment($root_arg);
+                $res = WtProfile::ensure_fragment($root_arg, { settings_path => undef });
                 1;
             };
             return ($eval_ok, $res, \@w, $@);
@@ -539,7 +541,7 @@ SKIP: {
         my $res5;
         my $eval_ok2 = eval {
             local $SIG{__WARN__} = sub { push @w2, @_ };
-            $res5 = WtProfile::ensure_fragment($bad_dir);
+            $res5 = WtProfile::ensure_fragment($bad_dir, { settings_path => undef });
             1;
         };
         return ($eval_ok2, $res5, \@w2, $@);
@@ -566,7 +568,7 @@ SKIP: {
         my $res6;
         my $eval_ok3 = eval {
             local $SIG{__WARN__} = sub { push @w3, @_ };
-            $res6 = WtProfile::ensure_fragment($root6);
+            $res6 = WtProfile::ensure_fragment($root6, { settings_path => undef });
             1;
         };
         return ($eval_ok3, $res6, \@w3, $@);
@@ -586,7 +588,7 @@ SKIP: {
     # ensure_fragment() call under the same stream capture.
     my $root7 = tempdir(CLEANUP => 1);
     my ($ret4, $out4, $err4) = _capture_streams(sub {
-        my $res7 = WtProfile::ensure_fragment($root7);
+        my $res7 = WtProfile::ensure_fragment($root7, { settings_path => undef });
         return ($res7);
     });
     my ($res7) = @{$ret4};
