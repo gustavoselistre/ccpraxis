@@ -169,9 +169,13 @@ sub ps_available {
     return $_PS_AVAILABLE = 0;
 }
 
-# spawn($pid_file) -> pid | undef. DIES if the helper is missing or fork fails.
+# spawn($pid_file, \%owner?) -> pid | undef. DIES if the helper is missing or
+# fork fails. %owner keys: owner_winpid, owner_desc -- see owner_desc_clean and
+# winpid_of. Never pass $$, getppid() or a fork return value as owner_winpid:
+# those are MSYS pids/pseudo-pids, meaningless to the helper's -OwnerWinPid.
 sub spawn {
-    my ($pid_f) = @_;
+    my ($pid_f, $owner) = @_;
+    $owner //= {};
     return undef unless $^O =~ /^(MSWin32|msys|cygwin)$/;
 
     # A TEST MUST NEVER SPAWN A REAL, IMMORTAL OS WAKE-LOCK.
@@ -224,11 +228,18 @@ sub spawn {
         # which, and a gap in HOLD lines is itself evidence.
         my $log_f = $pid_f;
         $log_f =~ s{keepawake\.pid$}{keepawake.log};
+        my @extra;
+        if (defined $owner->{owner_winpid} && $owner->{owner_winpid} =~ /^[1-9]\d*$/) {
+            push @extra, '-OwnerWinPid', $owner->{owner_winpid};
+        }
+        my $clean_desc = owner_desc_clean($owner->{owner_desc});
+        push @extra, '-OwnerDesc', $clean_desc if defined $clean_desc;
         exec('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
              '-WindowStyle', 'Hidden', '-File', winify($ps1),
              '-PidFile', winify_out($pid_f),
              '-LeaseSeconds', '900',
-             '-LogFile', winify_out($log_f))
+             '-LogFile', winify_out($log_f),
+             @extra)
             or POSIX::_exit(127);
     }
     # The parent writes NOTHING. Writing perl's fork return value here is the
@@ -238,11 +249,236 @@ sub spawn {
     return $pid;
 }
 
-sub kill_pid {
+# winpid_of($msys_pid) -> positive int | undef -- reads /proc/<pid>/winpid, the
+# only reliable way to map an MSYS pid to the Windows pid Windows tools accept.
+# Never falls back to the MSYS pid; returns undef off Windows.
+sub winpid_of {
     my ($pid) = @_;
+    return undef unless defined $pid && $pid =~ /^\d+$/;
+    return undef unless $^O =~ /^(MSWin32|msys|cygwin)$/;
+    open(my $fh, '<', "/proc/$pid/winpid") or return undef;
+    my $line = <$fh>;
+    close $fh;
+    return undef unless defined $line;
+    $line =~ s/\s+//g;
+    return ($line =~ /^[1-9]\d*$/) ? $line : undef;
+}
+
+sub self_winpid { return winpid_of($$) }
+
+# owner_desc_clean($s) -> string | undef -- sanitises an owner description so
+# neither MSYS2 argv conversion nor Windows argv quoting can alter it: no ':',
+# '/', space or quote survive. ASCII by construction (audit finding 22).
+sub owner_desc_clean {
+    my ($s) = @_;
+    return undef unless defined $s && length $s;
+    $s =~ s/[^A-Za-z0-9._,=#+-]/_/g;
+    return substr($s, 0, 100);
+}
+
+# _production_image_of($winpid) -> image name | undef (undef = no such process)
+sub _production_image_of {
+    my ($winpid) = @_;
+    return undef unless defined $winpid && $winpid =~ /^\d+$/;
+    my $out = do {
+        local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
+        `tasklist /FI "PID eq $winpid" /FO CSV /NH 2>&1`;
+    };
+    return undef unless defined $out;
+    for my $line (split /\r?\n/, $out) {
+        next unless length $line;
+        my @f = $line =~ /"([^"]*)"/g;
+        next unless @f >= 2;
+        return $f[0] if $f[1] eq $winpid;
+    }
+    return undef;
+}
+
+# _production_taskkill($winpid, $tree_flag) -- both streams captured and
+# discarded; never redirected to NUL (house rule), nothing reaches the
+# caller's STDOUT/STDERR because hooks call this path (AC-8).
+sub _production_taskkill {
+    my ($winpid, $tree) = @_;
+    return unless defined $winpid && $winpid =~ /^\d+$/;
+    my @cmd = ('taskkill.exe', '/PID', $winpid, '/F');
+    push @cmd, '/T' if $tree;
+    local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
+    my $cmdline = join(' ', map { qq{"$_"} } @cmd);
+    my $out = `$cmdline 2>&1`;
+    return;
+}
+
+# _production_cmdline_of($winpid) -> command line string | undef
+#
+# The reused-pid guard (S1): tasklist alone answers "is SOME powershell.exe
+# running at this pid", which a reused pid satisfies for an operator's own
+# PowerShell terminal or Claude Code's own tool process. This asks Windows for
+# the full command line so stop_helper can also require that it is actually
+# running keep-awake.ps1 against THIS pid file, before ever calling taskkill.
+# One CIM query, on this rare release path only -- never inside a hot loop.
+sub _production_cmdline_of {
+    my ($winpid) = @_;
+    return undef unless defined $winpid && $winpid =~ /^\d+$/;
+    # [Console]::OutputEncoding=UTF8 is load-bearing, not decoration: without it
+    # PowerShell writes its captured stdout in the console's active codepage
+    # (measured: single-byte, non-UTF-8), and a path containing a non-ASCII
+    # byte (CLAUDE.md: "Andre" with an accented e, this very host's home dir)
+    # comes back mangled. Comparing that against the UTF-8 path we already hold
+    # then always mismatches -- silently turning every reused-pid guard into
+    # 'not-ours' for paths under this account. Measured directly, not guessed.
+    my $out = do {
+        local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
+        `powershell.exe -NoProfile -Command "[Console]::OutputEncoding=[Text.Encoding]::UTF8; (Get-CimInstance Win32_Process -Filter 'ProcessId=$winpid').CommandLine" 2>&1`;
+    };
+    return undef unless defined $out;
+    $out =~ s/^\s+//; $out =~ s/\s+$//;
+    return length($out) ? $out : undef;
+}
+
+# stop_helper($winpid, %seams) -> 'gone' | 'not-ours' | 'still-alive' | 'invalid'
+#
+# Liveness is answered ONLY by Windows tools here -- no kill( at all. See the
+# header: perl's kill(0,$pid) cannot validate a native Windows pid at all, and
+# this is the path a Stop-gate hook reaches, so it must never print anything.
+#
+# %seams: image_of, taskkill, wait_seconds (existing); cmdline_of, pid_f (new,
+# S1). The command-line identity check only runs when a caller supplies
+# pid_f -- the path to the keepawake.pid file this winpid was read from --
+# so existing callers/tests that never had a pid file to check against (unit
+# tests seeding only image_of/taskkill) keep today's image-only behaviour.
+# Every PRODUCTION caller (kill_pid, replace) always has a pid_f and always
+# passes it, so the reused-pid guard is live everywhere it matters: a Stop
+# gate release, a settled apply(), and replace's make-before-break swap.
+sub stop_helper {
+    # image_of defaults to _production_image_of (tasklist), taskkill defaults
+    # to _production_taskkill (taskkill.exe). Liveness here comes only from
+    # those two Windows tools; perl's own signal-based liveness call is never
+    # used in this body.
+    my ($winpid, %seams) = @_;
+    return 'invalid' unless defined $winpid && $winpid =~ /^[1-9]\d*$/;
+    my $image_of   = $seams{image_of}   // \&_production_image_of;
+    my $taskkill   = $seams{taskkill}   // \&_production_taskkill;
+    my $cmdline_of = $seams{cmdline_of} // \&_production_cmdline_of;
+    my $wait_seconds = defined $seams{wait_seconds} ? $seams{wait_seconds} : 10;
+
+    my $img = $image_of->($winpid);
+    return 'gone' unless defined $img;
+    return 'not-ours' unless lc($img) eq 'powershell.exe';
+
+    if (defined $seams{pid_f}) {
+        my $cmd = $cmdline_of->($winpid);
+        my $want = lc(winify_out($seams{pid_f}));
+        return 'not-ours'
+            unless defined $cmd
+                && lc($cmd) =~ /keep-awake\.ps1/
+                && index(lc($cmd), $want) >= 0;
+    }
+
+    $taskkill->($winpid, 0);
+    my $deadline = time() + $wait_seconds;
+    while (time() < $deadline) {
+        return 'gone' unless defined $image_of->($winpid);
+        select(undef, undef, undef, 0.25);
+    }
+    return 'gone' unless defined $image_of->($winpid);
+
+    $taskkill->($winpid, 1);
+    my $deadline2 = time() + 2;
+    while (time() < $deadline2) {
+        return 'gone' unless defined $image_of->($winpid);
+        select(undef, undef, undef, 0.25);
+    }
+    return defined $image_of->($winpid) ? 'still-alive' : 'gone';
+}
+
+sub kill_pid {
+    my ($pid, $pid_f) = @_;
     return unless defined $pid && $pid =~ /^\d+$/ && $pid > 0;
+    if ($^O =~ /^(MSWin32|msys|cygwin)$/) {
+        return stop_helper($pid, defined $pid_f ? (pid_f => $pid_f) : ());
+    }
     kill('KILL', $pid);
     waitpid($pid, 0);
+    return 'gone';
+}
+
+# _log_has_asserted($log_file, $pid) -> 0|1
+#
+# Reads the helper's OWN keepawake.log and looks for its "pid=$pid ASSERTED"
+# line -- the confirmation that SetThreadExecutionState actually returned
+# success for THAT pid (keep-awake.ps1's Write-KaLog at :249), not merely that
+# the process exists or that its pid file has been overwritten. Best effort:
+# a missing or unreadable log reads as "not yet".
+sub _log_has_asserted {
+    my ($log_f, $pid) = @_;
+    return 0 unless defined $log_f && defined $pid && length $pid;
+    open my $fh, '<', $log_f or return 0;
+    my $text = do { local $/; <$fh> };
+    close $fh;
+    return 0 unless defined $text;
+    return $text =~ /\bpid=\Q$pid\E\s+ASSERTED\b/ ? 1 : 0;
+}
+
+# replace($dir, \%opts) -> 'replaced' | 'none' | 'refused' | 'timeout'
+#
+# Starts a NEW helper without claiming or unlinking keepawake.pid -- the new
+# helper overwrites it with its own pid unconditionally (Set-Content). The old
+# helper is stopped only once BOTH of these hold, so the wake-lock itself is
+# never dropped mid-swap (Decision 17(2), MUST-FIX M1: "started" is not
+# "holding" -- the pid file is written before Add-Type/SetThreadExecutionState
+# even run, so killing $old on pid-change alone can leave nothing holding the
+# lock at all if the new helper then fails ASSERT):
+#   1. keepawake.pid names something other than $old (the new helper is up), and
+#   2. that new helper's own keepawake.log has logged its ASSERTED line (the
+#      new helper actually holds the wake-lock).
+# If the new helper never asserts within `grace`, $old is left running (it is
+# the ONLY thing holding the lock) and the failed new helper is killed instead.
+sub replace {
+    my ($dir, $opts) = @_;
+    $opts //= {};
+    my $pid_f = "$dir/keepawake.pid";
+    my $log_f = $pid_f;
+    $log_f =~ s{keepawake\.pid$}{keepawake.log};
+    my $spawn   = $opts->{spawn}         // \&spawn;
+    my $killp   = $opts->{kill_pid}      // \&kill_pid;
+    my $alive   = $opts->{pid_alive}     // \&_pid_alive;
+    my $log     = $opts->{log}           // sub { };
+    my $grace   = defined $opts->{grace} ? $opts->{grace} : $STARTING_GRACE_SECONDS;
+    my $asserted = $opts->{log_has_asserted} // \&_log_has_asserted;
+
+    my $old = -e $pid_f ? _read_pid($pid_f) : undef;
+    return 'none' unless defined $old && $alive->($old);
+
+    my %owner = (owner_winpid => $opts->{owner_winpid}, owner_desc => $opts->{owner_desc});
+    my $new_pid = eval { $spawn->($pid_f, \%owner) };
+    if ($@ || !defined $new_pid) {
+        $log->("WARN keepawake replace refused old=$old");
+        return 'refused';
+    }
+
+    my $deadline = time() + $grace;
+    my $cur;
+    while (time() < $deadline) {
+        my $r = _read_pid($pid_f);
+        if (defined $r && "$r" ne "$old") { $cur = $r; last; }
+        select(undef, undef, undef, 0.25);
+    }
+    unless (defined $cur) {
+        $log->("WARN keepawake replace timeout old=$old");
+        return 'timeout';
+    }
+
+    while (time() < $deadline) {
+        if ($asserted->($log_f, $cur)) {
+            eval { $killp->($old, $pid_f) };
+            $log->("keepawake replaced old=$old new=$cur");
+            return 'replaced';
+        }
+        select(undef, undef, undef, 0.25);
+    }
+    eval { $killp->($cur, $pid_f) };
+    $log->("WARN keepawake replace assert-timeout old=$old new=$cur");
+    return 'timeout';
 }
 
 # _pid_alive($pid) -> 0|1
@@ -316,6 +552,7 @@ sub apply {
     my $ps_ok = $opts->{powershell_available} // \&ps_available;
     my $log   = $opts->{log}                  // sub { };
     my $pid_f = "$dir/keepawake.pid";
+    my %owner = (owner_winpid => $opts->{owner_winpid}, owner_desc => $opts->{owner_desc});
 
     if (should_be_on($phase)) {
         # ORDER IS LOAD-BEARING: idempotence FIRST, availability probe second.
@@ -398,7 +635,7 @@ sub apply {
         }
         close $claim;
 
-        my $started = eval { $spawn->($pid_f) };
+        my $started = eval { $spawn->($pid_f, \%owner) };
         $log->("WARN keepawake spawn failed: $@") if $@;
 
         # A CLAIM NOBODY WILL FILL MUST NOT SURVIVE THE CALL THAT MADE IT.
@@ -429,8 +666,13 @@ sub apply {
             # synthetic pid; adding the check silently broke both. Changing that
             # contract needs to be a decision, not a side effect of a perf fix.
             if (defined $pid) {
-                eval { $killp->($pid) };
+                my $r = eval { $killp->($pid, $pid_f) };
                 $log->("WARN keepawake kill failed: $@") if $@;
+                if (defined $r && $r =~ /^(?:gone|not-ours|still-alive|invalid)$/) {
+                    my $msg = "keepawake stop winpid=$pid result=$r";
+                    $msg = "WARN $msg" if $r eq 'still-alive' || $r eq 'not-ours';
+                    $log->($msg);
+                }
             }
             unlink $pid_f;
         }
