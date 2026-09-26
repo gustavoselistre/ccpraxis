@@ -198,6 +198,13 @@ my $HOST_BASELINE = {
         CLAUDE_CODE_NEW_INIT                       => '1',
         CLAUDE_CODE_NO_FLICKER                     => '1',
         CLAUDE_CODE_SCROLL_SPEED                   => '3',
+        # DELIBERATE DECLARATION, operator-approved 2026-09-26: the env override
+        # for Claude Code's internal tengu_ticklish_whisper flag (read from the
+        # claude.exe 2.1.282 source). When auto mode hits 3 consecutive
+        # classifier blocks in the main session, the prompt then auto-denies
+        # after 120s instead of halting an unattended run. It is undocumented, so
+        # re-check it on every Claude Code update.
+        CLAUDE_CODE_TICKLISH_WHISPER               => '1',
         CLAUDE_CODE_USE_POWERSHELL_TOOL            => '1',
         DISABLE_AUTOUPDATER                        => '1',
         DISABLE_INSTALL_GITHUB_APP_COMMAND         => '1',
@@ -261,6 +268,19 @@ my $HOST_BASELINE = {
             'Bash(perl ~/.claude/ccpraxis/scripts/*)',
             'Bash(perl ~/.claude/ccpraxis/plugins/steward/scripts/*)',
             'Bash(bash ~/.claude/ccpraxis/plugins/steward/scripts/*)',
+            # DELIBERATE DECLARATION: commit 29cd74c, approved by the operator on
+            # 2026-09-26 ("sounds good to me, go ahead"). Routine read-only and
+            # test commands, allowed outright so they never reach the auto-mode
+            # classifier, whose blocks escalate to a prompt that halts unattended
+            # runs. Every entry reads or runs this repo's own tests; none writes
+            # outside the repo, deletes, pushes or installs anything.
+            'Bash(perl scripts/run-tests.pl *)',
+            'Bash(BP_VALIDATE_LEDGER=* perl scripts/run-tests.pl *)',
+            'Bash(perl -c *)',
+            'Bash(git diff *)', 'Bash(git log *)', 'Bash(git show *)',
+            'Bash(git status *)', 'Bash(git ls-files *)',
+            'Bash(ls *)', 'Bash(cat *)', 'Bash(head *)', 'Bash(tail *)',
+            'Bash(sed -n *)', 'Bash(sha256sum *)',
             'WebFetch', 'WebSearch',
         ],
         ask                          => [],
