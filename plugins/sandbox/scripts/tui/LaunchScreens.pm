@@ -1075,6 +1075,16 @@ sub session_card_cache_size {
 sub _card_cache_key {
     my ($card, $cols) = @_;
     $card = {} unless ref $card eq 'HASH';
+    # package 07-host-session-fork: append the badges too. Without this, a
+    # host original and its fork -- identical timestamps and messages --
+    # would collide on one cache entry and render each other's badge.
+    my $badges = (ref $card->{badges} eq 'ARRAY') ? $card->{badges} : [];
+    my $badge_key = join("\x1f", map {
+        my $b = $_;
+        ref($b) eq 'HASH'
+            ? ((defined($b->{role}) ? $b->{role} : '') . "\x1f" . (defined($b->{text}) ? $b->{text} : ''))
+            : '';
+    } @$badges);
     return join("\x1e", _int($cols, 80),
         defined($card->{started})    ? $card->{started}    : '',
         defined($card->{active})     ? $card->{active}     : '',
@@ -1082,6 +1092,7 @@ sub _card_cache_key {
         defined($card->{first})      ? $card->{first}      : '',
         defined($card->{last})       ? $card->{last}       : '',
         defined($card->{kind_label}) ? $card->{kind_label} : '',
+        $badge_key,
     );
 }
 
@@ -1249,7 +1260,28 @@ sub session_pick_model {
         next unless ref $r eq 'HASH';
         next unless defined $r->{uuid};
         my $card = (ref $r->{card} eq 'HASH') ? $r->{card} : {};
-        my $item = { kind => 'row', id => "$r->{uuid}", group => 'sessions', card => $card,
+        # package 07-host-session-fork: a host row's item id is "host:<uuid>"
+        # so the launcher can spawn select-session.pl --fork on it; every
+        # other row (sandbox, fork) keeps its bare uuid.
+        #
+        # red-team S1 (defense in depth): a non-host row's `uuid` field is
+        # content this module cannot fully trust (S1's spoof plants
+        # `"sessionId":"host:<real host uuid>"` in a sandbox-writable file,
+        # which SessionIndex's id fallback then hands straight through as
+        # the row's `uuid`). If that literal string were used verbatim as a
+        # non-host item id, it would ALREADY start with "host:" and be
+        # indistinguishable from a genuine host row's item id at every
+        # downstream consumer that matches on the "host:" prefix. Any
+        # non-host row whose uuid is not itself uuid-shaped is therefore
+        # given a distinct, unambiguous id prefix instead of its bare uuid
+        # -- this can never collide with "host:<uuid>" and never fires for
+        # a real sandbox/fork row, whose uuid is always a v4 uuid.
+        my $is_host = defined($r->{origin}) && $r->{origin} eq 'host';
+        my $uuid_shaped = "$r->{uuid}" =~ /\A[0-9A-Za-z]{8}-[0-9A-Za-z]{4}-[0-9A-Za-z]{4}-[0-9A-Za-z]{4}-[0-9A-Za-z]{12}\z/;
+        my $id = $is_host        ? "host:$r->{uuid}"
+               : $uuid_shaped    ? "$r->{uuid}"
+               :                   "row:$r->{uuid}";
+        my $item = { kind => 'row', id => $id, group => 'sessions', card => $card,
                      display => "$r->{uuid}", disabled => 0, selected => 0 };
         if ($r->{is_butler}) { push @butler_items, $item }
         else                 { push @user_items,   $item }
