@@ -428,6 +428,16 @@ sub _byte_id {
 
 sub _record_path { return "$_[0]->{dir}/" . _byte_id($_[1]) . ".md" }
 
+# seal_path_for($record_path) -> "$record_path.seal", after the same
+# backslash-to-forward-slash normalisation Almanac::Lock::lock_path_for
+# applies -- so a seal path derived from either spelling of the record path
+# converges on the same string.
+sub seal_path_for {
+    my ($record_path) = @_;
+    (my $p = $record_path) =~ s{\\}{/}g;
+    return "$p.seal";
+}
+
 # Id grammar (S2.6): \A[A-Za-z0-9][A-Za-z0-9._-]*\z, max 128 chars, no / or \
 # (already excluded by the character class) and no ".." sequence. Checked
 # BEFORE any path is built -- the only thing standing between a caller id
@@ -444,10 +454,25 @@ sub _validate_id {
     return 1;
 }
 
-# ids() -> \@ids -- a directory listing, on purpose (no index, S6). A
-# directory entry counts as a record iff it matches the id grammar followed
-# by exactly ".md" and is a plain file; every sidecar/journal/temp name in
-# S2.1's ignore list fails that match by construction.
+# _record_id_for($dir, $entry) -> $id | undef -- the ONE predicate for "is
+# this directory entry a record". An entry counts as a record iff it matches
+# the id grammar followed by exactly ".md" and is a plain file; every
+# sidecar/journal/temp name in S2.1's ignore list (.lock, .lock.holder,
+# .seal, .store.lock*, .reorder-journal.json, *.tmp.*) fails this match by
+# construction. Shared by ids() and record_files_in() so there is exactly
+# one definition of "record", never two independently-maintained copies.
+sub _record_id_for {
+    my ($dir, $entry) = @_;
+    return undef unless $entry =~ /\A([A-Za-z0-9][A-Za-z0-9._-]*)\.md\z/;
+    my $id = $1;
+    return undef if length($id) > 128;
+    return undef if $id =~ /\.\./;
+    return undef if $id =~ /\A(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])\z/i;
+    return undef unless -f "$dir/$entry";
+    return $id;
+}
+
+# ids() -> \@ids -- a directory listing, on purpose (no index, S6).
 sub ids {
     my ($self) = @_;
     $self->_require_readable('ids');
@@ -457,16 +482,29 @@ sub ids {
     opendir(my $dh, $dir) or _die(kind => 'io', path => $dir, errno => "$!");
     my @out;
     while (defined(my $entry = readdir($dh))) {
-        next unless $entry =~ /\A([A-Za-z0-9][A-Za-z0-9._-]*)\.md\z/;
-        my $id = $1;
-        next if length($id) > 128;
-        next if $id =~ /\.\./;
-        next if $id =~ /\A(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])\z/i;
-        next unless -f "$dir/$entry";
-        push @out, $id;
+        my $id = _record_id_for($dir, $entry);
+        push @out, $id if defined $id;
     }
     closedir $dh;
     return [ sort @out ];
+}
+
+# record_files_in($dir) -> \@paths -- sorted absolute paths of the records in
+# $dir, using exactly the predicate ids() uses. Never dies: a missing
+# directory yields (). Used by almanac-bug.pl's verify (package 09, S2.2) to
+# discover records without going through a Store handle (verify walks
+# directories found by shape, across possibly many stores).
+sub record_files_in {
+    my ($dir) = @_;
+    return () unless defined $dir && -d $dir;
+    opendir(my $dh, $dir) or return ();
+    my @out;
+    while (defined(my $entry = readdir($dh))) {
+        my $id = _record_id_for($dir, $entry);
+        push @out, "$dir/$entry" if defined $id;
+    }
+    closedir $dh;
+    return sort @out;
 }
 
 sub exists {
@@ -860,6 +898,10 @@ sub delete {
         # (S1.1 / AC-44). This module contains no unlink of a path ending
         # .lock or .lock.holder, anywhere, on any path.
         unlink($path) or _die(kind => 'io', path => $path, errno => "$!");
+        # The .seal goes too (package 09, S2.2) -- best-effort, its absence
+        # is not an error.
+        my $seal_path = seal_path_for($path);
+        unlink($seal_path) if -e $seal_path;
         1;
     };
     my $err = $@;
@@ -901,13 +943,117 @@ sub _write_record {
         unlink $tmp;
         _die(kind => 'io', path => $tmp, errno => "$!");
     }
+
+    # Package 09 (S2.2, layer three): the seal is written BEFORE the rename,
+    # atomically, while $path still holds whatever bytes preceded this write
+    # (or nothing, on a create). A crash between here and the rename leaves a
+    # seal whose line 1 matches no record bytes and whose line 2 (the "old"
+    # digest) still matches $path -- the record stays verifiably intact.
+    #
+    # FIX-BATCH (post-review 09, S6): line 2 is written ONLY when the bytes it
+    # would record were themselves already verified -- check_seal($path)
+    # returned 'intact' (a sanctioned write covers them) or 'unsealed' (no
+    # seal ever claimed them, so there is nothing to launder). If the
+    # existing seal already says 'tampered'/'bad_seal'/'unreadable', a crash
+    # between this seal write and the rename must NOT let the two-line seal
+    # verify those already-bad bytes as intact -- that would launder an
+    # out-of-band write into a clean state. A successful (non-crashing)
+    # update also does a read-modify-write of the CURRENT bytes either way;
+    # omitting line 2 here means it carries forward as a freshly single-line
+    # sealed record, not as a false 'intact' for content nobody sanctioned.
+    my $new_digest = Digest::SHA::sha256_hex($bytes);
+    my $seal_path  = seal_path_for($path);
+    my $old_digest;
+    if (-f $path) {
+        my $pre_check = check_seal($path);
+        if ($pre_check->{state} eq 'intact' || $pre_check->{state} eq 'unsealed') {
+            my $d = $pre_check->{digest};
+            $old_digest = $d if defined $d && $d ne $new_digest;
+        }
+    }
+    my $seal_body = defined $old_digest ? "$new_digest\n$old_digest\n" : "$new_digest\n";
+    unless (_write_seal_atomic($seal_path, $seal_body)) {
+        unlink $tmp;
+        _die(kind => 'io', path => $seal_path, errno => "$!");
+    }
+
     $ON_BEFORE_RENAME->($path, $tmp, $verb) if ref $ON_BEFORE_RENAME eq 'CODE';
     my ($ok, $rerr2) = Almanac::Lock::rename_with_retry($tmp, $path);
     unless ($ok) {
         unlink $tmp;
         _die(kind => 'io', path => $path, errno => (ref $rerr2 eq 'HASH' ? $rerr2->{errno} : "$rerr2"));
     }
-    return Digest::SHA::sha256_hex($bytes);
+
+    # Best-effort final reseal: one line, the new digest alone. A failure
+    # here is not an error -- the two-line seal already written above still
+    # verifies the new bytes (line 1), so nothing is left unverifiable.
+    _write_seal_atomic($seal_path, "$new_digest\n");
+
+    return $new_digest;
+}
+
+# _write_seal_atomic($seal_path, $body) -> 1 | 0 -- temp file plus
+# Almanac::Lock::rename_with_retry, the same atomic-write discipline
+# _write_record uses for the record itself. Runs inside the caller's
+# existing record lock; acquires none of its own.
+sub _write_seal_atomic {
+    my ($seal_path, $body) = @_;
+    my $tmp = "$seal_path.tmp." . _tmp_nonce();
+    CORE::open(my $fh, '>:raw', $tmp) or return 0;
+    my $printed = print {$fh} $body;
+    my $closed  = close($fh);
+    unless ($printed && $closed) {
+        unlink $tmp;
+        return 0;
+    }
+    my ($ok, $rerr) = Almanac::Lock::rename_with_retry($tmp, $seal_path);
+    unless ($ok) {
+        unlink $tmp;
+        return 0;
+    }
+    return 1;
+}
+
+# check_seal($record_path) -> \%result -- a pure read. Never dies, takes no
+# lock, writes nothing (S2.2).
+sub check_seal {
+    my ($record_path) = @_;
+    my $bytes;
+    if (CORE::open(my $fh, '<:raw', $record_path)) {
+        local $/;
+        $bytes = <$fh>;
+        close $fh;
+    }
+    return { state => 'unreadable', digest => undef, sealed => [] } unless defined $bytes;
+    my $digest = Digest::SHA::sha256_hex($bytes);
+
+    my $seal_path = seal_path_for($record_path);
+    return { state => 'unsealed', digest => $digest, sealed => [] } unless -f $seal_path;
+
+    my $raw;
+    if (CORE::open(my $sfh, '<:raw', $seal_path)) {
+        local $/;
+        $raw = <$sfh>;
+        close $sfh;
+    }
+    return { state => 'bad_seal', digest => $digest, sealed => [] } unless defined $raw;
+
+    my @lines = split(/\n/, $raw, -1);
+    pop @lines if @lines && $lines[-1] eq '';   # trailing split artefact from the final \n
+    return { state => 'bad_seal', digest => $digest, sealed => [] } unless @lines == 1 || @lines == 2;
+    for my $l (@lines) {
+        return { state => 'bad_seal', digest => $digest, sealed => [] }
+            unless $l =~ /\A[0-9a-f]{64}\z/;
+    }
+    # Reconstruct and compare byte-for-byte: the format is exactly one or two
+    # 64-lowercase-hex lines, each terminated by \n, and nothing else.
+    my $expected = join('', map { "$_\n" } @lines);
+    return { state => 'bad_seal', digest => $digest, sealed => [] } unless $expected eq $raw;
+
+    if (grep { $_ eq $digest } @lines) {
+        return { state => 'intact', digest => $digest, sealed => \@lines };
+    }
+    return { state => 'tampered', digest => $digest, sealed => \@lines };
 }
 
 sub _tmp_nonce {

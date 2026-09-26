@@ -133,6 +133,24 @@ sub known_projects {
 }
 sub reports_dir { my ($root) = @_; return "$root/.ccpraxis-local-data/bug-reports" }
 
+# _almanac_type_dirs($almanac_root) -> @dirs -- directory DISCOVERY, not a
+# type list (package 09, S2.3): every subdirectory of $almanac_root whose
+# name matches the store-type grammar ^[a-z][a-z0-9-]*$. A missing root is
+# silently skipped -- the container case for the global root. Never dies.
+sub _almanac_type_dirs {
+    my ($almanac_root) = @_;
+    return () unless defined $almanac_root && -d $almanac_root;
+    opendir(my $dh, $almanac_root) or return ();
+    my @out;
+    for my $e (readdir($dh)) {
+        next unless $e =~ /\A[a-z][a-z0-9-]*\z/;
+        my $full = "$almanac_root/$e";
+        push @out, $full if -d $full;
+    }
+    closedir $dh;
+    return sort @out;
+}
+
 # canonical_root(path) -> a value two SPELLINGS of one directory converge on,
 # so a dedupe keyed on it treats them as the same root.
 #
@@ -503,11 +521,58 @@ sub list_reports_in {
     return ();
 }
 
+# PACKAGE 09 (report 20260917-040452-f500): the original new_id keyed only on
+# the clock to the second plus $$ & 0xffff -- 10,000 generations inside one
+# process-second yielded ONE distinct id, not "occasionally collides". That
+# never bit hand-paced bug filing, but package 09 writes records
+# programmatically, which removes the pacing that hid it.
+#
+# ID_BASE is minted once (mixing pid and a random draw, so two concurrent
+# processes still diverge) and ID_SEQ increments on every call, so up to
+# 65,536 ids within one process in one second are distinct. The SHAPE is
+# unchanged (YYYYMMDD-HHMMSS-<4 hex>) -- 61 live reports, commit messages and
+# cross-report citations already depend on it, and new ids are additive: an
+# existing legacy id is never rewritten or reparsed by this function.
+#
+# TWO GENERATORS, DELIBERATELY (ledger item 3, parity decision). Almanac::Record
+# has its own new_id with an 8-hex tail (pid4hex + seq4hex) -- a different
+# shape. They are NOT unified: bug ids stay 4-hex because
+# plugins/butler/tests/t/tooling-bug-filing.t:457 pins
+# ^\d{8}-\d{6}-[0-9a-f]{4}$ for a report filed through almanac-bug.pl, and
+# nothing reads a bug id and a store id through one shared grammar -- verify
+# treats both as opaque file names, and bug reports and store records never
+# share a directory. Kept as two generators, not merged into one.
+our $ID_BASE = ($$ ^ int(rand(0x10000))) & 0xffff;
+our $ID_SEQ  = 0;
 sub new_id {
     my ($now) = @_;
     my @t = gmtime($now // time);
+    my $tail = ($ID_BASE + $ID_SEQ++) & 0xffff;
     return sprintf('%04d%02d%02d-%02d%02d%02d-%04x',
-                   $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0], ($$ & 0xffff));
+                   $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0], $tail);
+}
+
+# claim_report_path($dir, $now) -> ($path, $lock) | (undef, $err)
+#
+# Mints a fresh id, takes its per-record lock, and confirms no file already
+# sits at that path -- up to 64 attempts -- so `file` can never rename over
+# an existing report. Creates $dir before the loop. The caller releases the
+# returned lock once it has written the report (or on any early exit).
+sub claim_report_path {
+    my ($dir, $now) = @_;
+    _mkpath($dir) or return (undef, { message => "could not create the directory $dir" });
+    for (1 .. 64) {
+        my $id   = new_id($now);
+        my $path = "$dir/$id.md";
+        my ($lock, $err) = Almanac::Lock->acquire($path, verb => 'file');
+        return (undef, $err) unless $lock;
+        if (-e $path) {
+            $lock->release;
+            next;
+        }
+        return ($path, $lock);
+    }
+    return (undef, { message => 'no free report id' });
 }
 
 sub can_transition {
@@ -660,9 +725,6 @@ unless (caller) {
         die "almanac-bug file: --body or --body-file is required (a report with no body is noise)\n"
             unless defined $body && $body =~ /\S/;
         my $now = time;
-        my $id  = AlmanacBug::new_id($now);
-        my $dir = AlmanacBug::reports_dir($root);
-        my $path = "$dir/$id.md";
         my $severity = $o{severity} // 'unknown';
         # Order matters (spec §2.3): the one-line check fires before the enum
         # check, so a multi-line payload dies "must be one line", not "must be
@@ -671,6 +733,14 @@ unless (caller) {
         _reject_untrimmed('file', 'severity', $severity) unless ref $severity;
         die "almanac-bug file: --severity must be one of: " . join(', ', @AlmanacBug::SEVERITIES) . "\n"
             unless !ref $severity && AlmanacBug::valid_severity($severity);
+
+        my $dir = AlmanacBug::reports_dir($root);
+        my ($path, $lock) = AlmanacBug::claim_report_path($dir, $now);
+        unless (defined $path) {
+            print STDERR "almanac-bug file: could not claim a report id: $lock->{message}\n";
+            exit 2;
+        }
+        (my $id = $path) =~ s{.*/}{}; $id =~ s{\.md$}{};
         my %f = (
             id => $id, title => $title, status => 'open',
             severity => $severity,
@@ -678,8 +748,9 @@ unless (caller) {
             project  => $root,
             created_at => AlmanacBug::_iso($now), updated_at => AlmanacBug::_iso($now),
         );
-        AlmanacBug::_write_atomic($path, AlmanacBug::_render(\%f, $body))
-            or die "almanac-bug file: could not write $path\n";
+        my $wrote = AlmanacBug::_write_atomic($path, AlmanacBug::_render(\%f, $body));
+        $lock->release;
+        die "almanac-bug file: could not write $path\n" unless $wrote;
 
         print "$path\n";
         exit 0;
@@ -1014,11 +1085,111 @@ unless (caller) {
             my ($ok, $note) = AlmanacBug::verify($rep);
             push @bad, ($rep->{fields}{id} . ": $note") unless $ok;
         }
+
+        # Package 09 (S2.3): the same three-layer doctrine, widened to every
+        # almanac record store. require()d here only -- almanac-bug.pl has no
+        # other reason to load Almanac::Store, and this keeps that load out
+        # of every other verb's startup cost.
+        require Almanac::Store;
+
+        # Roots: the caller's own root plus every project known_projects()
+        # reports, deduped by canonical_root -- exactly all_report_paths'
+        # own root set (S2.3).
+        my %seen_root;
+        my @project_roots;
+        for my $r ($root, AlmanacBug::known_projects()) {
+            my $c = AlmanacBug::canonical_root($r);
+            next if $seen_root{$c}++;
+            push @project_roots, $r;
+        }
+
+        my $home = $ENV{ALMANAC_HOME} // $ENV{HOME} // $ENV{USERPROFILE} // '.';
+        $home =~ s{\\}{/}g; $home =~ s{/+$}{};
+
+        my @store_dirs;
+        for my $r (@project_roots) {
+            (my $base = $r) =~ s{\\}{/}g; $base =~ s{/+$}{};
+            push @store_dirs, AlmanacBug::_almanac_type_dirs("$base/.ccpraxis-local-data/almanac");
+        }
+        push @store_dirs, AlmanacBug::_almanac_type_dirs("$home/.claude/claude-code-vault/almanac");
+
+        my %seen_record;
+        my @records;
+        for my $d (@store_dirs) {
+            for my $rp (Almanac::Store::record_files_in($d)) {
+                next if $seen_record{$rp}++;
+                push @records, $rp;
+            }
+        }
+
+        my $m = 0;
+        my $unsealed_count = 0;
+        my @almanac_bad;
+        for my $rp (sort @records) {
+            (my $type_dir = $rp) =~ s{/[^/]+\z}{};
+            my $type = $type_dir; $type =~ s{.*/}{};
+            (my $rid = $rp) =~ s{.*/}{}; $rid =~ s{\.md\z}{};
+
+            my $result = Almanac::Store::check_seal($rp);
+            my $state  = $result->{state};
+
+            if ($state eq 'tampered' || $state eq 'unreadable') {
+                # Locked re-check (S2.3, edge cases): an unlocked read can pair
+                # a seal and a record from different moments. The final state
+                # comes from the re-check, taken under the record's own lock.
+                # Also covers a concurrent DELETE: check_seal's first pass can
+                # observe the record mid-removal and report unreadable for a
+                # record that is not tampered at all, just gone -- the same
+                # false-positive class the re-check already exists to remove.
+                my ($lock, $lock_err) = Almanac::Lock->acquire($rp, verb => 'verify', timeout_ms => 2000);
+                if ($lock) {
+                    $result = Almanac::Store::check_seal($rp);
+                    $state  = $result->{state};
+                    $lock->release;
+                } else {
+                    $state = 'busy';
+                }
+            }
+
+            # Still unreadable after the locked re-check, and the file is
+            # simply gone: a sanctioned delete landed between the directory
+            # listing and this check. Not tampering -- skip it, uncounted.
+            if ($state eq 'unreadable' && !-e $rp) {
+                next;
+            }
+
+            $m++;
+            if ($state eq 'unsealed') {
+                $unsealed_count++;
+            }
+            elsif ($state eq 'tampered') {
+                push @almanac_bad,
+                    "$type/$rid: TAMPERED: digest $result->{digest} matches no sealed digest -- $rp";
+            }
+            elsif ($state eq 'bad_seal') {
+                push @almanac_bad,
+                    "$type/$rid: BAD SEAL: " . Almanac::Store::seal_path_for($rp) . " is not one or two sha256 lines -- $rp";
+            }
+            elsif ($state eq 'unreadable') {
+                push @almanac_bad, "$type/$rid: UNREADABLE -- $rp";
+            }
+            elsif ($state eq 'busy') {
+                push @almanac_bad,
+                    "$type/$rid: UNVERIFIED: record is locked by another writer; re-run verify -- $rp";
+            }
+        }
+
         printf "skipped %d non-report file(s) in bug-reports/ (no almanac frontmatter)\n",
                scalar @skipped if @skipped;
         print "checked $n report(s)\n";
+        print "checked $m almanac record(s)\n";
+        if ($unsealed_count) {
+            print "unsealed $unsealed_count almanac record(s) -- written before sealing existed, or their "
+                . "seal was removed; not verifiable until their next sanctioned write\n";
+        }
         print "  $_\n" for @bad;
-        exit(@bad ? 2 : 0);
+        print "  $_\n" for @almanac_bad;
+        exit((@bad || @almanac_bad) ? 2 : 0);
     }
 
     print STDERR <<'USAGE';
