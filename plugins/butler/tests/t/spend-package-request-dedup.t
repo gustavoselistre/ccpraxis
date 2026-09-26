@@ -24,6 +24,11 @@ use File::Path qw(make_path);
 use Test::More;
 use JSON::PP;
 
+# spend-token-report Decision 27.2: derive-package/derive-blueprint now fetch
+# fresh pricing in the CLI verb (Decision 25), so every test that reaches
+# them must guard against a live fetch.
+$ENV{CCPRAXIS_SPEND_NO_FETCH} = 1;
+
 my $SPEND_PL = "$Bin/../../scripts/bp-spend.pl";
 ok(-f $SPEND_PL, 'bp-spend.pl exists') or BAIL_OUT('nothing to test');
 
