@@ -8,6 +8,7 @@
    "autoMemoryEnabled" : false,
    "autoScrollEnabled" : false,
    "cleanupPeriodDays" : 180,
+   "disableWorkflows" : true,
    "editorMode" : "vim",
    "effortLevel" : "high",
    "enabledPlugins" : {
