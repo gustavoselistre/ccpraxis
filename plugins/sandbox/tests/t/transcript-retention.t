@@ -20,6 +20,24 @@
 #   A5 : CLAUDE_CODE_SKIP_PROMPT_HISTORY is absent from both env blocks
 #   A6 : the container file is the one the launcher actually installs
 #   A7 : struck — no assertion, slot retained (see bottom of file)
+#
+# 02-disable-builtin-tasks (operator-ui-tweaks), derived from
+#   .ccpraxis-local-data/blueprints/operator-ui-tweaks/specs/02-disable-builtin-tasks-spec.md
+# AC-3/AC-4 pin that CLAUDE_CODE_TODO_REMINDER_MODE is set to 'off' in both
+# live settings.json files' env blocks. A4(a) pins baseline preservation for
+# both baselines below. AC-5 through AC-9 pin things already true of the repo
+# (the key is absent from live env blocks under other names, this file's own
+# DELIBERATE DECLARATION comments, and %permitted_additions).
+#   AC-3 : host env.CLAUDE_CODE_TODO_REMINDER_MODE is exactly 'off'
+#   AC-4 : container env.CLAUDE_CODE_TODO_REMINDER_MODE is exactly 'off'
+#   AC-5 : CLAUDE_CODE_ENABLE_TASKS (and CLAUDE_CODE_ENABLE_TODO_TOOLS) are
+#          absent from both env blocks
+#   AC-6 : neither file has a top-level todoFeatureEnabled key
+#   AC-7 : $HOST_BASELINE's CLAUDE_CODE_TODO_REMINDER_MODE entry is preceded
+#          by a DELIBERATE DECLARATION comment
+#   AC-8 : $CONTAINER_BASELINE's entry is preceded by the same
+#   AC-9 : %permitted_additions carries no env.CLAUDE_CODE_TODO_REMINDER_MODE
+#          entry (the key is declared in-baseline, not permitted-as-extra)
 
 use strict;
 use warnings;
@@ -128,6 +146,49 @@ ok(!exists $container_data->{env}{CLAUDE_CODE_SKIP_PROMPT_HISTORY},
     'A5: container env block does not set CLAUDE_CODE_SKIP_PROMPT_HISTORY');
 
 # =====================================================================
+# AC-3/AC-4 (02-disable-builtin-tasks spec §2/§4) — host and container
+# env.CLAUDE_CODE_TODO_REMINDER_MODE is exactly the string 'off'. is(), not
+# ok(): claude.exe 2.1.282's D.enum(["baseline","off"]) match is
+# case-sensitive after a trim, so 'Off'/'OFF'/'0' would silently resolve to
+# undefined and re-arm both reminders (spec §1.2, §5).
+# =====================================================================
+
+is($host_data->{env}{CLAUDE_CODE_TODO_REMINDER_MODE}, 'off',
+    "AC-3: host env.CLAUDE_CODE_TODO_REMINDER_MODE is exactly 'off'");
+is($container_data->{env}{CLAUDE_CODE_TODO_REMINDER_MODE}, 'off',
+    "AC-4: container env.CLAUDE_CODE_TODO_REMINDER_MODE is exactly 'off'");
+
+# =====================================================================
+# AC-5 (spec §1.1, §2, Decision 3(2)) — CLAUDE_CODE_ENABLE_TASKS (and its
+# sibling CLAUDE_CODE_ENABLE_TODO_TOOLS, spec §3 observable behavior 3 /
+# §6) are absent from both env blocks, at any value. Setting ENABLE_TASKS
+# would flip Uw() to false, which re-enables TodoWrite via
+# isEnabled(){return!Uw()&&U$()} for every model in the czo set; ENABLE_TODO_TOOLS
+# has no effect at all (U$() only checks ===!0). Neither belongs here.
+# =====================================================================
+
+ok(!exists $host_data->{env}{CLAUDE_CODE_ENABLE_TASKS},
+    'AC-5: host env block does not set CLAUDE_CODE_ENABLE_TASKS');
+ok(!exists $container_data->{env}{CLAUDE_CODE_ENABLE_TASKS},
+    'AC-5: container env block does not set CLAUDE_CODE_ENABLE_TASKS');
+ok(!exists $host_data->{env}{CLAUDE_CODE_ENABLE_TODO_TOOLS},
+    'AC-5: host env block does not set CLAUDE_CODE_ENABLE_TODO_TOOLS');
+ok(!exists $container_data->{env}{CLAUDE_CODE_ENABLE_TODO_TOOLS},
+    'AC-5: container env block does not set CLAUDE_CODE_ENABLE_TODO_TOOLS');
+
+# =====================================================================
+# AC-6 (spec §1.3) — todoFeatureEnabled is absent from both files at the
+# top level. settings.json is a source claude.exe 2.1.282 resolves it from,
+# but no code path reads the resolved value (5-occurrence trace, spec
+# §1.3) — it would be a declared key with no observable effect.
+# =====================================================================
+
+ok(!exists $host_data->{todoFeatureEnabled},
+    'AC-6: host settings.json does not set a top-level todoFeatureEnabled');
+ok(!exists $container_data->{todoFeatureEnabled},
+    'AC-6: container settings.json does not set a top-level todoFeatureEnabled');
+
+# =====================================================================
 # A4 — every pre-existing key is preserved, checked against a captured
 # baseline (fully-qualified key paths -> scalar values), NOT a whole-file
 # byte snapshot (spec §A4: both files are under concurrent edit by other
@@ -217,6 +278,15 @@ my $HOST_BASELINE = {
         # after 120s instead of halting an unattended run. It is undocumented, so
         # re-check it on every Claude Code update.
         CLAUDE_CODE_TICKLISH_WHISPER               => '1',
+        # DELIBERATE DECLARATION, operator request 2026-09-27 (blueprint
+        # operator-ui-tweaks, package 02-disable-builtin-tasks): suppresses
+        # both the built-in "task tools haven't been used recently" reminder
+        # and the TodoWrite reminder. claude.exe 2.1.282 reads this via
+        # D.enum(["baseline","off"]) — a case-sensitive, trimmed match, so
+        # only the exact string "off" (not "Off", "OFF" or "0") is honoured;
+        # anything else silently falls back to the remote default. The key is
+        # undocumented, so re-check it on every Claude Code update.
+        CLAUDE_CODE_TODO_REMINDER_MODE             => 'off',
         CLAUDE_CODE_USE_POWERSHELL_TOOL            => '1',
         DISABLE_AUTOUPDATER                        => '1',
         DISABLE_INSTALL_GITHUB_APP_COMMAND         => '1',
@@ -341,6 +411,15 @@ my $CONTAINER_BASELINE = {
         DISABLE_LOGOUT_COMMAND                   => '0',
         DISABLE_UPGRADE_COMMAND                  => '1',
         ENABLE_PROMPT_CACHING_1H                 => '1',
+        # DELIBERATE DECLARATION, operator request 2026-09-27 (blueprint
+        # operator-ui-tweaks, package 02-disable-builtin-tasks): suppresses
+        # both the built-in "task tools haven't been used recently" reminder
+        # and the TodoWrite reminder. claude.exe 2.1.282 reads this via
+        # D.enum(["baseline","off"]) — a case-sensitive, trimmed match, so
+        # only the exact string "off" (not "Off", "OFF" or "0") is honoured;
+        # anything else silently falls back to the remote default. The key is
+        # undocumented, so re-check it on every Claude Code update.
+        CLAUDE_CODE_TODO_REMINDER_MODE           => 'off',
         # FORCE_AUTOUPDATE_PLUGINS removed (06-plugins-current-at-start,
         # Decision 11): the container is host-refresh materialized now, so
         # its own auto-updater is turned off rather than left racing the copy.
@@ -558,5 +637,70 @@ like($launcher_src,
 # assertion. The numbered slot is retained deliberately so the acceptance
 # criteria list is not silently renumbered.
 # =====================================================================
+
+# =====================================================================
+# AC-7/AC-8/AC-9 (02-disable-builtin-tasks spec §2/§4, AC-7 to AC-9) —
+# self-read checks on THIS test file's own source, not on the settings
+# files. AC-7/AC-8: each baseline's CLAUDE_CODE_TODO_REMINDER_MODE entry is
+# preceded by a comment block containing "DELIBERATE DECLARATION" (the same
+# convention as disableWorkflows/disableAgentView/CLAUDE_CODE_TICKLISH_WHISPER
+# above). AC-9: %permitted_additions carries no
+# env.CLAUDE_CODE_TODO_REMINDER_MODE entry — the key is declared in-baseline
+# (A4(a) covers it), never treated as an extra the live file is merely
+# permitted to carry.
+# =====================================================================
+
+my $self_src = slurp("$Bin/transcript-retention.t");
+my @self_lines = split /\n/, $self_src;
+
+my ($host_marker_idx)      = grep { $self_lines[$_] =~ /\$HOST_BASELINE\s*=\s*\{/ } 0 .. $#self_lines;
+my ($container_marker_idx) = grep { $self_lines[$_] =~ /\$CONTAINER_BASELINE\s*=\s*\{/ } 0 .. $#self_lines;
+
+ok(defined $host_marker_idx,      'sanity: found $HOST_BASELINE = { in this file\'s own source');
+ok(defined $container_marker_idx, 'sanity: found $CONTAINER_BASELINE = { in this file\'s own source');
+
+sub declaration_comment_ok {
+    my ($lines, $target_idx, $label) = @_;
+    my @comment_lines;
+    for (my $i = $target_idx - 1; $i >= 0; $i--) {
+        my $line = $lines->[$i];
+        last if $line !~ /^\s*#/;
+        unshift @comment_lines, $line;
+    }
+    my $block = join("\n", @comment_lines);
+    like($block, qr/DELIBERATE DECLARATION/,
+        "$label: CLAUDE_CODE_TODO_REMINDER_MODE is preceded by a DELIBERATE DECLARATION comment");
+}
+
+SKIP: {
+    skip 'AC-7: CLAUDE_CODE_TODO_REMINDER_MODE not found in $HOST_BASELINE source', 1
+        unless defined $host_marker_idx && defined $container_marker_idx;
+
+    my ($host_key_idx) = grep {
+        $_ > $host_marker_idx && $_ < $container_marker_idx
+            && $self_lines[$_] =~ /CLAUDE_CODE_TODO_REMINDER_MODE\s*=>\s*'off'/
+    } 0 .. $#self_lines;
+
+    skip 'AC-7: CLAUDE_CODE_TODO_REMINDER_MODE not found in $HOST_BASELINE source', 1
+        unless defined $host_key_idx;
+    declaration_comment_ok(\@self_lines, $host_key_idx, 'AC-7');
+}
+
+SKIP: {
+    skip 'AC-8: CLAUDE_CODE_TODO_REMINDER_MODE not found in $CONTAINER_BASELINE source', 1
+        unless defined $container_marker_idx;
+
+    my ($container_key_idx) = grep {
+        $_ > $container_marker_idx
+            && $self_lines[$_] =~ /CLAUDE_CODE_TODO_REMINDER_MODE\s*=>\s*'off'/
+    } 0 .. $#self_lines;
+
+    skip 'AC-8: CLAUDE_CODE_TODO_REMINDER_MODE not found in $CONTAINER_BASELINE source', 1
+        unless defined $container_key_idx;
+    declaration_comment_ok(\@self_lines, $container_key_idx, 'AC-8');
+}
+
+unlike($self_src, qr/'env\.CLAUDE_CODE_TODO_REMINDER_MODE'\s*=>/,
+    'AC-9: %permitted_additions carries no env.CLAUDE_CODE_TODO_REMINDER_MODE entry');
 
 done_testing();
