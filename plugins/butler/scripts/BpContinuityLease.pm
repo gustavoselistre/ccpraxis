@@ -529,7 +529,11 @@ sub active_reason {
 # handover before it finishes compiling.
 sub code_snapshot {
     my %snap;
-    my $own = Cwd::abs_path(__FILE__) // __FILE__;
+    # Separators FIRST, then abs_path -- __FILE__ can carry backslashes on
+    # Windows. Same shape as BpTurnCaps::script_dir_for; asserted repo-wide by
+    # turn-cap-consistency.t's C9.
+    (my $self = __FILE__) =~ s{\\}{/}g;
+    my $own = Cwd::abs_path($self) // $self;
     $own =~ s{\\}{/}g;
     my @st = stat($own);
     $snap{$own} = $st[9] if @st;

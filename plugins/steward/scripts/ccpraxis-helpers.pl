@@ -748,7 +748,11 @@ sub cmd_settings_export_merge {
 # unchanged. Exits with the child's exit code; the child's stdout/stderr pass
 # through untouched. Adds no JSON of its own.
 sub cmd_claude_internals {
-    my $sibling = File::Spec->catfile(dirname(__FILE__), 'claude-internals-check.pl');
+    # Separators FIRST, then dirname -- __FILE__ can carry backslashes on
+    # Windows. Same shape as BpTurnCaps::script_dir_for; asserted repo-wide by
+    # turn-cap-consistency.t's C9.
+    (my $self = __FILE__) =~ s{\\}{/}g;
+    my $sibling = File::Spec->catfile(dirname($self), 'claude-internals-check.pl');
     my $rc = system($^X, $sibling, @ARGV);
     if ($rc == -1) {
         print STDERR "ccpraxis-helpers.pl: failed to run claude-internals-check.pl: $!\n";

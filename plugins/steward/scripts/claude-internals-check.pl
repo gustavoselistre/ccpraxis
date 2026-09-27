@@ -349,7 +349,11 @@ sub main {
         exit 0;
     }
 
-    my $script_dir = dirname(__FILE__);
+    # Separators FIRST, then dirname -- __FILE__ can carry backslashes on
+    # Windows. Same shape as BpTurnCaps::script_dir_for; asserted repo-wide by
+    # turn-cap-consistency.t's C9.
+    (my $self = __FILE__) =~ s{\\}{/}g;
+    my $script_dir = dirname($self);
     my $data_path  = defined $opt->{data} ? $opt->{data} : "$script_dir/claude-internals.json";
     my $data       = load_data($data_path);
     my $entries    = $data->{entries};
