@@ -1534,11 +1534,14 @@ is_deeply(Theme::x256_rgb(196), [255, 0, 0],     'x256_rgb(196) == [255,0,0] (B-
         'status.idle' => { cp => 0x25CB, width => 1 },
         # AC-14 (hook-continuity-remake package 10, spec §2.4): the counter
         # and badge glyphs. U+2630 is East-Asian-Wide and declared 2 columns;
-        # every other one is 1. icon.todos/icon.blueprints are unchanged and
-        # deliberately not re-pinned here.
+        # every other one is 1. icon.todos is pinned since blueprint
+        # operator-ui-tweaks Decision 3(12) (package 01-statusline-counters):
+        # it changed from U+22EE to U+274F and row_cost honesty requires the
+        # width to be declared and checked. icon.blueprints stays unpinned.
         'icon.notes'      => { cp => 0x2630, width => 2 },
         'icon.tasklist'   => { cp => 0x25A3, width => 1 },
         'icon.decisions'  => { cp => 0x2691, width => 1 },
+        'icon.todos'      => { cp => 0x274F, width => 1 },
         'badge.silenced'  => { cp => 0x2016, width => 1 },
         'badge.agentoff'  => { cp => 0x2205, width => 1 },
     );

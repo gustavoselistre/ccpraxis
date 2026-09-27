@@ -485,7 +485,12 @@ sub mkdir_p_test {
 #              (BpHook::take_silence's own acceptance rule) -> U+2016 in
 #              state.warn.
 #   both -> agent-off only; neither -> nothing, not even a space.
-#   Marker field, stripped: "<lead> <WORD>[ <badge>][ U+2691 N]".
+#   Marker field, stripped: "<lead> <WORD>[ <badge>]". blueprint
+#   operator-ui-tweaks Decision 1(b) (package 01-statusline-counters) moves
+#   the U+2691 pending-decisions flag OUT of the marker field and into the
+#   front of the counters segment, so it no longer trails the badge here.
+#   No assertion below changes: 543, 584 and 611 already accept "(?: |\z)"
+#   after the badge, which holds whether or not a counters field follows.
 # ===========================================================================
 my $N_PRE_EXISTING = scalar @ALL_OUTPUTS;   # AC-21 checks exactly these
 

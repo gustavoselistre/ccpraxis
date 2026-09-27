@@ -526,7 +526,7 @@ sub write_snapshot { my ($home, $bytes) = @_; make_path("$home/.claude"); spew_r
 
 # --- glyphs and colours, as BYTES (the statusline's stdout is read raw) -----
 my $G_BLUEPRINT = encode('UTF-8', chr(0x29C9));
-my $G_TODO      = encode('UTF-8', chr(0x22EE));
+my $G_TODO      = encode('UTF-8', chr(0x274F));
 my $G_NOTE      = encode('UTF-8', chr(0x2630));
 my $G_TASK      = encode('UTF-8', chr(0x25A3));
 my $G_FLAG      = encode('UTF-8', chr(0x2691));
@@ -1683,7 +1683,7 @@ SKIP: {
     # text.faint, G text.muted (spec 2.3).
     my $todo = "$G_TODO 5${G_DOT}3";
     is(counter_seg($vis, $G_TODO), $todo,
-        'AC-1 (behaviour 1): todos render ONE glyph, the project count, a dot and the global count -- "U+22EE 5.3"')
+        'AC-1 (behaviour 1): todos render ONE glyph, the project count, a dot and the global count -- "U+274F 5.3"')
         or diag("  row 1 = [$vis]");
     my $i = index($vis, $todo);
   SKIP: {
@@ -1697,14 +1697,15 @@ SKIP: {
         ok(run_ends_with($runs->[$ig], fg_sgr('text.muted')),   'AC-1: the GLOBAL todo count is immediately preceded by the text.muted SGR');
     }
 
-    # notes (behaviour 5): project 2 + vault 1.
-    my $note = "$G_NOTE 2${G_DOT}1";
-    is(counter_seg($vis, $G_NOTE), $note, 'AC-1 (behaviour 5): notes render "U+2630 2.1" -- project 2, vault 1')
+    # notes (behaviour 5): project 2 + vault 1. No space between the glyph and
+    # the first number (Decision 1(d): the glyph is double-width).
+    my $note = "${G_NOTE}2${G_DOT}1";
+    is(counter_seg($vis, $G_NOTE), $note, 'AC-1 (behaviour 5): notes render "U+26302.1" (no space) -- project 2, vault 1')
         or diag("  row 1 = [$vis]");
     $i = index($vis, $note);
   SKIP: {
         skip('the notes segment is not on row 1', 4) if $i < 0;
-        my $ip = $i + length($G_NOTE) + 1;
+        my $ip = $i + length($G_NOTE);
         my $id = $ip + 1;
         my $ig = $id + length($G_DOT);
         ok(run_ends_with($runs->[$i],  fg_sgr('text.muted')),   'AC-1: the notes glyph is in text.muted');
@@ -1725,15 +1726,24 @@ SKIP: {
         ok(run_ends_with($runs->[$i + length($G_TASK) + 1], fg_sgr('text.primary')), 'AC-1: the task count is in text.primary');
     }
 
-    # the segment order: blueprints (absent here), todos, notes, tasklist.
-    my ($it, $in, $ik) = (index($vis, $G_TODO), index($vis, $G_NOTE), index($vis, $G_TASK));
-    ok($it >= 0 && $in > $it && $ik > $in, 'AC-1 (spec 2.3): the counters appear in the order todos, notes, tasklist');
+    # the segment order (Decision 1(a)): decisions, tasklist, todos, notes.
+    # Blueprints are absent in this fixture.
+    my ($ifl, $it, $in, $ik) = (index($vis, $G_FLAG), index($vis, $G_TODO), index($vis, $G_NOTE), index($vis, $G_TASK));
+    ok($ifl >= 0 && $ik > $ifl && $it > $ik && $in > $it,
+        'AC-1 (spec 2.3): the counters appear in the order decisions, tasklist, todos, notes');
 
-    # pending decisions (behaviour 6): 2 unanswered, 1 answered.
-    like($vis, qr/\A\Q$G_HOLLOW\E HOST \Q$G_FLAG\E2(?!\d)/,
-        'AC-11 (behaviour 6): the marker field reads "<lead> HOST U+2691 2" -- the pending-decisions count follows the word, one space apart')
+    # pending decisions (behaviour 6): 2 unanswered, 1 answered. Decision 1(b):
+    # the flag has left the marker field entirely and leads the counters
+    # segment instead.
+    is(field_at($row, 0), "$G_HOLLOW HOST",
+        'AC-11 (behaviour 6): the marker field is exactly "<lead> HOST", carrying no U+2691')
         or diag("  row 1 = [$vis]");
-    my $flag_raw = bg_sgr('overlay.warn') . fg_sgr('overlay.warn') . $G_FLAG . '2';
+    my @row_fields = sep_fields($row);
+    my $last_field = @row_fields ? $row_fields[-1] : '';
+    ok(index($last_field, "$G_FLAG 2  ") == 0,
+        'AC-11 (behaviour 6): the last field starts with U+2691, a space, 2, and the two-space join')
+        or diag("  last field = [$last_field]");
+    my $flag_raw = bg_sgr('overlay.warn') . fg_sgr('overlay.warn') . $G_FLAG . ' 2';
     ok(index($row, $flag_raw) >= 0 && $row !~ /\Q$flag_raw\E\d/,
         'AC-11 (behaviour 6): U+2691 2 is preceded by the overlay.warn background SGR and then its foreground SGR (raw bytes)');
     unlike($vis, qr/\?\d/, 'AC-11: the retired "?N" form is gone -- U+2691 replaces it');
@@ -1750,11 +1760,11 @@ SKIP: {
               'AC-3 (fixture precondition): the modules themselves count 5/3 open todos, 2/1 notes, 4 live tasks, 2 unanswered decisions');
     is(counter_seg($vis, $G_TODO), "$G_TODO $tc->{project}{open}$G_DOT$tc->{global}{open}",
         'AC-3: the rendered todo numbers equal Almanac::Todo::count open, project and global');
-    is(counter_seg($vis, $G_NOTE), "$G_NOTE $np$G_DOT$ng",
+    is(counter_seg($vis, $G_NOTE), "$G_NOTE$np$G_DOT$ng",
         'AC-3: the rendered note numbers equal the note stores\' record totals, project and global');
     is(counter_seg($vis, $G_TASK), "$G_TASK $nt",
         'AC-3: the rendered task number equals the module\'s pending+doing+blocked count');
-    like($vis, qr/\Q$G_FLAG\E\Q$dc->{project}{unanswered}\E(?!\d)/,
+    like($vis, qr/\Q$G_FLAG\E \Q$dc->{project}{unanswered}\E(?!\d)/,
         'AC-3: the rendered decision number equals Almanac::Decision::count unanswered');
 }
 
@@ -1766,22 +1776,22 @@ SKIP: {
 
     my ($out2) = render(proj => $P_FULL, home => $H_EMPTY);
     my $v2 = strip_sgr(first_line($out2));
-    is(counter_seg($v2, $G_TODO), "$G_TODO 5", 'AC-1 (behaviour 2): project 5, empty vault -> "U+22EE 5", no dot')
+    is(counter_seg($v2, $G_TODO), "$G_TODO 5", 'AC-1 (behaviour 2): project 5, empty vault -> "U+274F 5", no dot')
         or diag("  row 1 = [$v2]");
-    is(counter_seg($v2, $G_NOTE), "$G_NOTE 2", 'AC-1 (behaviour 2): project notes only -> "U+2630 2", no dot');
+    is(counter_seg($v2, $G_NOTE), "${G_NOTE}2", 'AC-1 (behaviour 2): project notes only -> "U+26302" (no space), no dot');
 
     my ($out3) = render(proj => $P_EMPTY, home => $H_FULL);
     my $v3 = strip_sgr(first_line($out3));
-    is(counter_seg($v3, $G_TODO), "$G_TODO ${G_DOT}3",
-        'AC-1/AC-2 (behaviour 3): empty project, vault 3 -> "U+22EE .3" -- a zero project count renders no project digit')
+    is(counter_seg($v3, $G_TODO), "$G_TODO 3",
+        'AC-1/AC-2 (behaviour 3): empty project, vault 3 -> "U+274F 3", dimmed, no dot -- a zero project count renders no project digit and no dot')
         or diag("  row 1 = [$v3]");
-    is(counter_seg($v3, $G_NOTE), "$G_NOTE ${G_DOT}1", 'AC-1/AC-2 (behaviour 3): "U+2630 .1"');
+    is(counter_seg($v3, $G_NOTE), "${G_NOTE}1", 'AC-1/AC-2 (behaviour 3): "U+2630 1", dimmed, no dot, no space');
     is(index($out3, $G_TASK), -1, 'AC-2 (behaviour 3): the project-only tasklist counter renders nothing at 0');
     is(index($out3, $G_FLAG), -1, 'AC-2 (behaviour 3): no pending-decisions glyph at 0');
 
     my ($out4, $rc4) = render(proj => $P_EMPTY, home => $H_EMPTY);
     is($rc4, 0, 'AC-2 setup (behaviour 4): every store empty still exits 0');
-    for my $g ([$G_TODO, 'U+22EE'], [$G_NOTE, 'U+2630'], [$G_TASK, 'U+25A3'], [$G_FLAG, 'U+2691']) {
+    for my $g ([$G_TODO, 'U+274F'], [$G_NOTE, 'U+2630'], [$G_TASK, 'U+25A3'], [$G_FLAG, 'U+2691']) {
         is(index($out4, $g->[0]), -1, "AC-2 (behaviour 4): with every store empty, $g->[1] appears nowhere -- a zero counter renders nothing");
     }
 
@@ -1801,9 +1811,9 @@ SKIP: {
     my ($out) = render(proj => $P_FULL, home => $H);
     my $v = strip_sgr(first_line($out));
     is(counter_seg($v, $G_TODO), "$G_TODO 5",
-        'AC-4 (behaviour 7): host, empty vault, a valid snapshot claiming 9 open todos -> "U+22EE 5" -- the snapshot is ignored on the host')
+        'AC-4 (behaviour 7): host, empty vault, a valid snapshot claiming 9 open todos -> "U+274F 5" -- the snapshot is ignored on the host')
         or diag("  row 1 = [$v]");
-    is(counter_seg($v, $G_NOTE), "$G_NOTE 2", 'AC-4: ...and its note total (8) is ignored too');
+    is(counter_seg($v, $G_NOTE), "${G_NOTE}2", 'AC-4: ...and its note total (8) is ignored too');
     ok(index($v, "${G_DOT}9") < 0 && index($v, "${G_DOT}8") < 0, 'AC-4: neither snapshot number renders anywhere on row 1');
 }
 
@@ -1818,11 +1828,11 @@ SKIP: {
     write_snapshot($H, snapshot_json(open => 4, done => 1, note => 2));
     my ($out, $rc) = render(proj => $P_EMPTY, home => $H, sandbox => 1);
     my $v = strip_sgr(first_line($out));
-    is(counter_seg($v, $G_TODO), "$G_TODO ${G_DOT}4",
-        'AC-5 (behaviour 8): sandbox -> the global todo count is the snapshot\'s todo.open (4), not the 7 in the vault under the same HOME')
+    is(counter_seg($v, $G_TODO), "$G_TODO 4",
+        'AC-5 (behaviour 8): sandbox -> the global todo count is the snapshot\'s todo.open (4), dimmed, no dot -- not the 7 in the vault under the same HOME')
         or diag("  row 1 = [$v]");
-    is(counter_seg($v, $G_NOTE), "$G_NOTE ${G_DOT}2", 'AC-5 (behaviour 8): the global note count is the snapshot\'s note.total (2), not the vault\'s 5');
-    ok(index($v, "${G_DOT}7") < 0 && index($v, "${G_DOT}5") < 0, 'AC-5: nothing from the vault renders in a sandbox');
+    is(counter_seg($v, $G_NOTE), "${G_NOTE}2", 'AC-5 (behaviour 8): the global note count is the snapshot\'s note.total (2), dimmed, no dot, no space -- not the vault\'s 5');
+    ok(index($v, "$G_TODO 7") < 0 && index($v, "${G_NOTE}5") < 0, 'AC-5: nothing from the vault renders in a sandbox');
 }
 
 # ---------------------------------------------------------------------------
@@ -1862,7 +1872,7 @@ SKIP: {
         is($rc, 0, "AC-6 ($label): the sandbox render exits 0");
         is(counter_seg($v, $G_TODO), "$G_TODO 5", "AC-6 ($label): no global todo count, and the project todo count still renders")
             or diag("  row 1 = [$v]");
-        is(counter_seg($v, $G_NOTE), "$G_NOTE 2", "AC-6 ($label): no global note count, and the project note count still renders");
+        is(counter_seg($v, $G_NOTE), "${G_NOTE}2", "AC-6 ($label): no global note count, and the project note count still renders");
         is(index($v, "${G_DOT}0"), -1, "AC-6 ($label): a dot-zero never renders");
     }
 
@@ -1888,7 +1898,7 @@ SKIP: {
     for my $sb (0, 1) {
         my ($out) = render(proj => $P_EMPTY, home => $H, sandbox => $sb);
         is(index($out, $G_TODO), -1,
-            'AC-7 (behaviour 10, ' . ($sb ? 'sandbox' : 'host') . '): a legacy claude-code-vault/todos/x.md with no almanac records renders no U+22EE');
+            'AC-7 (behaviour 10, ' . ($sb ? 'sandbox' : 'host') . '): a legacy claude-code-vault/todos/x.md with no almanac records renders no U+274F');
     }
     is(index($SL_RAW, 'claude-code-vault/todos'), -1, 'AC-7: statusline.pl no longer names claude-code-vault/todos anywhere');
 }
@@ -2046,7 +2056,7 @@ SKIP: {
     my ($id) = $fo =~ /^id:\s*(\S+)/m;
 
     my ($out, $rc) = render(cwd => "$P/sub/dir");
-    like(strip_sgr(first_line($out)), qr/\Q$G_FLAG\E1(?!\d)/,
+    like(strip_sgr(first_line($out)), qr/\Q$G_FLAG\E 1(?!\d)/,
         'AC-11 (behaviour 11): a decision filed through the real CLI renders U+2691 1 from <P>/sub/dir with no CLAUDE_PROJECT_DIR')
         or diag('  row 1 = [' . strip_sgr(first_line($out)) . ']');
 
@@ -2054,7 +2064,7 @@ SKIP: {
     # current_dir is an absolute path that does not exist and has no marker
     # above it, so the walk cannot reach any real directory.
     my ($outc) = render(cwd => '/ccpraxis-p10-no-such-dir/sub', env => { CLAUDE_PROJECT_DIR => $P });
-    like(strip_sgr(first_line($outc)), qr/\Q$G_FLAG\E1(?!\d)/,
+    like(strip_sgr(first_line($outc)), qr/\Q$G_FLAG\E 1(?!\d)/,
         'AC-11 (spec 2.2): with no marker on the walk, CLAUDE_PROJECT_DIR is the project root');
 
     # section 5: a relative current_dir yields no project -- never the process
@@ -2149,7 +2159,7 @@ SKIP: {
     is(counter_seg($v, $G_TODO), "$G_TODO 1",
         'section 5: a record with no frontmatter and a CRLF record are skipped for status counts -- only the one valid open todo counts')
         or diag("  row 1 = [$v]");
-    is(counter_seg($v, $G_NOTE), "$G_NOTE 1",
+    is(counter_seg($v, $G_NOTE), "${G_NOTE}1",
         'Decision 121 (S3, supersedes spec section 5): the note total counts only the valid note -- never the malformed raw.md, _under.md, a..b.md or a sidecar');
 
     # No HOME and no USERPROFILE: no global counts, project counts intact.
@@ -2161,8 +2171,8 @@ SKIP: {
 
     # ALMANAC_HOME wins over HOME.
     my ($out3) = render(proj => $P_EMPTY, home => $H_EMPTY, env => { ALMANAC_HOME => $H_FULL });
-    is(counter_seg(strip_sgr(first_line($out3)), $G_TODO), "$G_TODO ${G_DOT}3",
-        'spec 2.2: ALMANAC_HOME is consulted before HOME for the global stores');
+    is(counter_seg(strip_sgr(first_line($out3)), $G_TODO), "$G_TODO 3",
+        'spec 2.2: ALMANAC_HOME is consulted before HOME for the global stores, dimmed, no dot since the project side is 0');
 
     # Malformed and empty stdin.
     my ($bf, $bpath) = tempfile(DIR => $TMPROOT);
@@ -2221,7 +2231,7 @@ SKIP: {
                 or diag("  row 1 = [$v1]");
             if ($n == 4) {
                 is(counter_seg($v1, $G_TODO), "$G_TODO 1${G_DOT}1", "AC-16 ($surf, cols=$cols): a present todos counter is complete");
-                is(counter_seg($v1, $G_NOTE), "$G_NOTE 1${G_DOT}1", "AC-16 ($surf, cols=$cols): a present notes counter is complete");
+                is(counter_seg($v1, $G_NOTE), "${G_NOTE}1${G_DOT}1", "AC-16 ($surf, cols=$cols): a present notes counter is complete");
                 is(counter_seg($v1, $G_TASK), "$G_TASK 1",           "AC-16 ($surf, cols=$cols): a present tasklist counter is complete");
             }
 
@@ -2235,11 +2245,18 @@ SKIP: {
         }
     }
 
-    # spec 2.3: the marker field is "<lead> <WORD>[ <badge>][ U+2691 N]".
+    # spec 2.3 (Decision 1(b)): the marker field is "<lead> <WORD>[ <badge>]".
+    # U+2691 has left the marker entirely and leads the counters segment.
     my ($out) = render(proj => $P, home => $H, sid => $sid, cols => 200, state => $state);
-    like(strip_sgr(first_line($out)), qr/\A\Q$G_HOLLOW\E HOST \Q$G_AGENTOFF\E \Q$G_FLAG\E1(?!\d)/,
-        'AC-16 (spec 2.3): the marker field reads lead, word, the badge, then U+2691 N -- in that order, single spaces')
-        or diag('  row 1 = [' . strip_sgr(first_line($out)) . ']');
+    my $row1 = first_line($out);
+    is(field_at($row1, 0), "$G_HOLLOW HOST $G_AGENTOFF",
+        'AC-16 (spec 2.3): the marker field reads lead, word, then the badge -- no U+2691')
+        or diag('  row 1 = [' . strip_sgr($row1) . ']');
+    my @f16 = sep_fields($row1);
+    my $last16 = @f16 ? $f16[-1] : '';
+    ok(index($last16, "$G_FLAG 1  ") == 0,
+        'AC-16 (spec 2.3): the last field starts with U+2691, a space, 1, and the two-space join')
+        or diag("  last field = [$last16]");
 }
 
 # ---------------------------------------------------------------------------
@@ -2439,7 +2456,7 @@ SKIP: {
         make_path("$P/.ccpraxis-local-data/almanac/decision");
         spew_raw("$P/.ccpraxis-local-data/almanac/decision/d.md", $bytes);
         my ($out) = render(proj => $P, home => $H_EMPTY);
-        my $has = ($out =~ /\Q$G_FLAG\E1(?!\d)/) ? 1 : 0;
+        my $has = ($out =~ /\Q$G_FLAG\E 1(?!\d)/) ? 1 : 0;
         is($has, $want, "Decision 121 parity ($label): U+2691 renders iff Almanac::Record accepts the record as unanswered");
     }
 
@@ -2451,7 +2468,7 @@ SKIP: {
     spew_raw("$nd/broken-crlf.md", "---\r\ntitle: crlf\r\n---\r\n");
     spew_raw("$nd/broken-nospace.md", "---\ntitle:x\n---\n");
     my ($on) = render(proj => $PN, home => $H_EMPTY);
-    is(counter_seg(strip_sgr(first_line($on)), $G_NOTE), "$G_NOTE 1",
+    is(counter_seg(strip_sgr(first_line($on)), $G_NOTE), "${G_NOTE}1",
         'Decision 121 (S3): malformed notes are not counted -- only the one valid note')
         or diag('  row 1 = [' . strip_sgr(first_line($on)) . ']');
     my $HN = mk_home();
@@ -2459,8 +2476,8 @@ SKIP: {
     make_path("$HN/.claude/claude-code-vault/almanac/note");
     spew_raw("$HN/.claude/claude-code-vault/almanac/note/broken.md", "---\ntitle: never closed\n");
     my ($og) = render(proj => $P_EMPTY, home => $HN);
-    is(counter_seg(strip_sgr(first_line($og)), $G_NOTE), "$G_NOTE ${G_DOT}1",
-        'Decision 121 (S3): a malformed GLOBAL note is not counted either');
+    is(counter_seg(strip_sgr(first_line($og)), $G_NOTE), "${G_NOTE}1",
+        'Decision 121 (S3): a malformed GLOBAL note is not counted either, dimmed, no dot, no space');
 }
 
 # ---------------------------------------------------------------------------

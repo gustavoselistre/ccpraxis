@@ -144,8 +144,9 @@ my %GLYPH_COLS = (
     # disagree about it -- declared as one column, which is what a monospaced
     # terminal renders it as and what the row budget must assume.
     0x29C9 => 1,
-    # The todos icon (2026-08-26), same reasoning.
-    0x22EE => 1,
+    # The todos icon (package 01-statusline-counters, 2026-09). East-Asian
+    # neutral, one column, declared explicitly to match Theme.pm.
+    0x274F => 1,
     # The notes icon (package 10). East-Asian-WIDE, so two columns.
     0x2630 => 2,
 );
@@ -941,6 +942,14 @@ my $alm_project = ref($almanac) eq 'HASH' && ref($almanac->{project}) eq 'HASH' 
 my $alm_global  = ref($almanac) eq 'HASH' && ref($almanac->{global})  eq 'HASH' ? $almanac->{global}  : {};
 my $pending_decisions = $alm_project->{decision} // 0;
 
+# The pending-decisions flag, built here rather than inside the "Plans &
+# Todos" eval below: this way a failure in the blueprint scan (opendir ...
+# or die) can never take the flag down with it. It leads the counters field
+# now (Decision 1) rather than riding in the marker.
+my $decisions_str = '';
+$decisions_str = bgrgb('overlay.warn') . rgb('overlay.warn') . "\x{2691} ${pending_decisions}${R}"
+    if $pending_decisions > 0;
+
 # ── ...and where it goes ─────────────────────────────────────
 #
 # IT IS THE LEAD GLYPH NOW (operator, 2026-08-26). It was a word: first an
@@ -968,13 +977,9 @@ my $marker  = ($watched ? $OK : $FAINT)
 # space -- when neither applies.
 $marker .= "${R} ${WARN}${badge_glyph}${R}" if length $badge_glyph;
 
-# Pending decisions ride in the marker field too, because they are the same
-# subject: this session is watched, and N things are waiting to be asked when
-# it stops. A flag and a digit, on the one background Theme declares, for a
-# fact that otherwise costs a halted run to discover. Silent at zero -- a
-# zero count would spend columns saying nothing.
-$marker .= "${R} " . bgrgb('overlay.warn') . rgb('overlay.warn') . "\x{2691}${pending_decisions}${R}"
-    if $pending_decisions > 0;
+# Pending decisions no longer ride in the marker field (Decision 1): they now
+# lead the counters field via $decisions_str, built above next to
+# $pending_decisions, so the fit ladder can drop them last rather than first.
 
 # ── Git (with background fetch every 30 min) ────────────────
 my $git_str = '';
@@ -1031,28 +1036,37 @@ eval {
         # want any colored emoji"). U+29C9, two joined squares -- layered
         # packages, which is what a blueprint is -- chosen from four offered.
         # It is East-Asian-ambiguous width, so it is DECLARED in %GLYPH_COLS
-        # above rather than left to the fallback.
-        push @parts, "${MUTED}\x{29C9} ${R}${PRIMARY}${n}${R}" if $n > 0;
+        # above rather than left to the fallback. Two spaces after the glyph
+        # (Decision 1), matching the double-space join between segments.
+        push @parts, "${MUTED}\x{29C9}  ${R}${PRIMARY}${n}${R}" if $n > 0;
     }
 
     # The almanac counters, from the one accessor call above. Each reads
     # "<glyph> P·G": the project count, then the global one after a dot.
     # A zero or unavailable side is omitted along with its dot, and a
-    # counter with nothing on either side is omitted entirely.
+    # counter with nothing on either side is omitted entirely. A zero
+    # project side with a non-zero global side renders dimmed and without
+    # the dot (Decision 1) -- there is nothing "of the project's" to
+    # highlight, so nothing here is drawn in the bright colours.
     #
-    # Todos keep U+22EE (vertical ellipsis, "items continuing down"), the
-    # operator's pick from ten offered, chosen partly BECAUSE it contrasts
-    # with U+29C9 above. Notes are U+2630, the tasklist U+25A3 (project
-    # only: tasks have no global store). All are declared in Theme.pm and,
-    # where not one column, in %GLYPH_COLS above.
-    for my $c (['todo', "\x{22EE}", 1], ['note', "\x{2630}", 1], ['task', "\x{25A3}", 0]) {
-        my ($kind, $glyph, $has_global) = @$c;
+    # Todos are U+274F (package 01-statusline-counters; U+22EE previously),
+    # with a space before the number, same as the tasklist. Notes are
+    # U+2630, with NO space before the number -- the one counter that packs
+    # tight against its glyph. The tasklist is U+25A3 (project only: tasks
+    # have no global store). All are declared in Theme.pm and, where not one
+    # column, in %GLYPH_COLS above.
+    for my $c (['task', "\x{25A3}", 0, ' '], ['todo', "\x{274F}", 1, ' '], ['note', "\x{2630}", 1, '']) {
+        my ($kind, $glyph, $has_global, $gap) = @$c;
         my $p = $alm_project->{$kind} // 0;
         my $g = $has_global ? ($alm_global->{$kind} // 0) : 0;
         next unless $p > 0 || $g > 0;
-        my $seg = "${MUTED}${glyph}${R} ";
-        $seg .= "${PRIMARY}${p}${R}" if $p > 0;
-        $seg .= "${FAINT}\x{00B7}${R}${MUTED}${g}${R}" if $g > 0;
+        my $seg;
+        if ($p > 0) {
+            $seg = "${MUTED}${glyph}${R}${gap}${PRIMARY}${p}${R}";
+            $seg .= "${FAINT}\x{00B7}${R}${MUTED}${g}${R}" if $g > 0;
+        } else {
+            $seg = "${FAINT}${glyph}${R}${gap}${FAINT}${g}${R}";
+        }
         push @parts, $seg;
     }
 
@@ -1168,6 +1182,16 @@ $cols = 120 unless defined($cols) && $cols =~ /^\d+$/ && $cols > 0;
 #
 # The $d parameter is retained rather than removed so the ladder's shape and
 # every call site stay recognisable against the tests; it is always passed ''.
+#
+# counters($dec, $plans) -- the decisions flag and the blueprints/tasklist/
+# todos/notes list, joined by the same two-space separator that already
+# groups those segments from each other. Either half may be empty; the
+# result never has a leading, trailing, or tripled space.
+sub counters {
+    my ($dec, $plans) = @_;
+    return join('  ', grep { length } $dec, $plans);
+}
+
 sub row1 {
     my ($m, $p, $d, $g, $b) = @_;
     my $row = "${MUTED}${m}${R}";
@@ -1205,26 +1229,35 @@ sub path_row {
 # unreachable-but-correct and deleting them would make a future "put it back"
 # a rewrite instead of a one-line change. Steps 4 and 7 are no-ops while
 # $f_cwd is empty -- both are already guarded by `if (length $f_cwd)`.
-my $f_marker  = $marker;
-my $f_project = $project;
-my $f_cwd     = '';
-my $f_git     = $git_str;
-my $f_plans   = $plans_str;
-my $sep_cost  = row_cost($SEP);
+#
+# $f_decisions is carried SEPARATELY from $f_plans (Decision 3(5)): the flag
+# must keep its old survival priority, riding alongside the marker even after
+# the four counters below it are dropped at step 2. It is folded back onto
+# the marker at step 8 -- the last rung, same as when it lived inside the
+# marker outright -- so it is truncated, not silently lost, on the narrowest
+# rows.
+my $f_marker    = $marker;
+my $f_project   = $project;
+my $f_cwd       = '';
+my $f_git       = $git_str;
+my $f_decisions = $decisions_str;
+my $f_plans     = $plans_str;
+my $sep_cost    = row_cost($SEP);
 my $line1;
 
 FIT: {
-    $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, $f_plans);
+    $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, counters($f_decisions, $f_plans));
     last FIT if row_cost($line1) <= $cols;
 
-    # 2. plans, and its separator.
+    # 2. plans, and its separator. The decisions flag is unaffected -- it
+    # still rides in the counters field, now alone.
     $f_plans = '';
-    $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, $f_plans);
+    $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, counters($f_decisions, $f_plans));
     last FIT if row_cost($line1) <= $cols;
 
     # 3. git, and its separator.
     $f_git = '';
-    $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, $f_plans);
+    $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, counters($f_decisions, $f_plans));
     last FIT if row_cost($line1) <= $cols;
 
     # 4. left-elide the working directory, down to its floor.
@@ -1235,40 +1268,50 @@ FIT: {
         my $avail = $cols - $fixed;
         $avail = MIN_CWD_COLS if $avail < MIN_CWD_COLS;
         $f_cwd = fit_tail($cwd, $avail);
-        $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, $f_plans);
+        $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, counters($f_decisions, $f_plans));
         last FIT if row_cost($line1) <= $cols;
     }
 
-    # 5. right-elide the project name, down to its floor.
+    # 5. right-elide the project name, down to its floor. $fixed accounts for
+    # the decisions flag too, now that it is a field of its own rather than
+    # part of $f_marker -- the project's budget must still see the whole row.
     if (length $f_project) {
         my $fixed = row_cost($f_marker) + $sep_cost
-                  + (length($f_cwd) ? $sep_cost + row_cost($f_cwd) : 0);
+                  + (length($f_cwd) ? $sep_cost + row_cost($f_cwd) : 0)
+                  + (length($f_decisions) ? $sep_cost + row_cost($f_decisions) : 0);
         my $avail = $cols - $fixed;
         $avail = MIN_PROJECT_COLS if $avail < MIN_PROJECT_COLS;
         $f_project = fit_head($project, $avail);
-        $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, $f_plans);
+        $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, counters($f_decisions, $f_plans));
         last FIT if row_cost($line1) <= $cols;
     }
 
     # 6. the project, and its separator.
     $f_project = '';
-    $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, $f_plans);
+    $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, counters($f_decisions, $f_plans));
     last FIT if row_cost($line1) <= $cols;
 
     # 7. the working directory down to a bare marker, then gone entirely.
     if (length $f_cwd) {
         $f_cwd = fit_tail($cwd, 1);
-        $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, $f_plans);
+        $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, counters($f_decisions, $f_plans));
         last FIT if row_cost($line1) <= $cols;
         $f_cwd = '';
-        $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, $f_plans);
+        $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, counters($f_decisions, $f_plans));
         last FIT if row_cost($line1) <= $cols;
     }
 
-    # 8. the marker itself. Below the common slot the symmetry guarantee is
-    # void by declaration -- nothing can hold there -- but the budget
-    # invariant still does.
-    (my $bare = $f_marker) =~ s/\s+\z//;
+    # 8. the marker itself -- folding the decisions flag back onto it first,
+    # in exactly today's composition, so it is the first thing fit_head cuts
+    # rather than something already dropped a step earlier. Below the common
+    # slot the symmetry guarantee is void by declaration -- nothing can hold
+    # there -- but the budget invariant still does.
+    my $m8 = $f_marker;
+    if (length $f_decisions) {
+        $m8 = "${f_marker}${R} ${f_decisions}";
+        $f_decisions = '';
+    }
+    (my $bare = $m8) =~ s/\s+\z//;
     $f_marker = fit_head($bare, $cols);
     $line1 = row1($f_marker, '', '', '', '');
 }
@@ -1318,8 +1361,9 @@ my $line2 = "${MUTED}${short}${R} "
 # from the tail.
 my @tail;
 push @tail, "${ACCENT}${B}${f_project}${R}" if length $f_project;
-push @tail, $f_git   if length $f_git;
-push @tail, $f_plans if length $f_plans;
+push @tail, $f_git if length $f_git;
+my $f_counters = counters($f_decisions, $f_plans);
+push @tail, $f_counters if length $f_counters;
 
 my @segments = ("${MUTED}${f_marker}${R}", $line2);
 push @segments, $plan_full if length $plan_full;
