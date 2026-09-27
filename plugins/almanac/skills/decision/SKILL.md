@@ -1,6 +1,6 @@
 ---
 name: decision
-description: File a product decision only the operator can make, keep working, and record the answer when it comes. Use when the choice is genuinely the operator's (scope, priorities, user-visible behaviour, spending a limited budget) and other work can continue meanwhile, and use when the operator answers one or asks what is pending. Skip for technical questions you can settle from the code, the docs or a measurement, and decide those yourself with the assumption stated.
+description: File anything that needs the operator -- a manual check, a taste call, a question -- keep working, and record the answer when it comes. It shows as the statusline flag in every session of the project until answered. Use when the choice is genuinely the operator's (scope, priorities, user-visible behaviour, spending a limited budget) and other work can continue meanwhile, and use when the operator answers one or asks what is pending. Skip for technical questions you can settle from the code, the docs or a measurement, and decide those yourself with the assumption stated.
 allowed-tools: Bash, Read
 ---
 

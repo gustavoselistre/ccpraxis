@@ -145,7 +145,7 @@ sub _focused {
 
 sub _emit {
     my ($n, $root) = @_;
-    my $text = "Tool call $n in this session: chart your tasklist. Record where the work stands in the almanac tasklist before continuing.\n"
+    my $text = "Tool call $n in this session: chart your tasklist. Move your current steps through doing, blocked and done; add a task only for a new step of work.\n"
              . "  perl $root/scripts/almanac-task.pl focus | list | add --title '<step>' | status <id> doing|blocked|done";
     my %out = (hookSpecificOutput => { hookEventName => 'PostToolUse', additionalContext => $text });
     my $line = eval { require JSON::PP; JSON::PP->new->encode(\%out) };

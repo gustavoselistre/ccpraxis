@@ -8,6 +8,17 @@
 # at the time this file is written. Every assertion below is expected to
 # fail for exactly that reason -- never a harness bug in this file.
 #
+# Package 05-almanac-routing-prose (blueprint tooling-fixes), Decision 5 and
+# done criterion 1: the reminder sentence stops asking the agent to "record
+# where the work stands" (which produced status-log entries in the
+# tasklist) and instead tells it to move its current steps through doing,
+# blocked and done, and to add a task only for a new step of work. The
+# per-call "Tool call $n..." prefix and the almanac-task.pl command-line
+# hint are UNCHANGED by Decision 5, so those two anchors are still checked
+# byte-exact (see reminder_prefix/reminder_suffix); the replaced sentence
+# is checked by regex on its key clauses in assert_reminder_text(), never
+# pinned to an invented literal.
+#
 # Every subprocess gets a scrubbed environment per the spec's AC section 4:
 # ALMANAC_HOME/HOME/USERPROFILE/BUTLER_STATE_DIR pinned to fresh tempdirs,
 # CLAUDE_PROJECT_DIR a temp project, BP_*/CLAUDE_CODE_SESSION_ID unset,
@@ -56,10 +67,48 @@ sub current_R {
     return '';
 }
 
-sub reminder_text {
-    my ($n, $root) = @_;
-    return "Tool call $n in this session: chart your tasklist. Record where the work stands in the almanac tasklist before continuing.\n"
-         . "  perl $root/scripts/almanac-task.pl focus | list | add --title '<step>' | status <id> doing|blocked|done";
+# reminder_prefix($n) / reminder_suffix($root) -- the two pieces of the
+# reminder text Decision 5 leaves untouched: the per-call "Tool call $n..."
+# line opening, and the almanac-task.pl command-line hint. Kept as separate
+# subs (rather than inlined into assert_reminder_text) so a caller can build
+# qr/^\Q$prefix\E/ / qr/\Q$suffix\E\z/ anchors around whatever the (regex-
+# checked, never hardcoded) middle sentence turns out to be.
+sub reminder_prefix { my ($n) = @_; return "Tool call $n in this session: chart your tasklist." }
+sub reminder_suffix { my ($root) = @_; return "  perl $root/scripts/almanac-task.pl focus | list | add --title '<step>' | status <id> doing|blocked|done" }
+
+# assert_reminder_text($text, $n, $root, $label) -- Decision 5 / done
+# criterion 1 oracle for the reminder sentence:
+#   - $text starts with the unchanged per-call prefix and ends with the
+#     unchanged command-line suffix (the two anchors Decision 5 leaves
+#     alone);
+#   - it never contains "Record where the work stands" (done criterion 1,
+#     verbatim -- this is the retired sentence that produced status-log
+#     entries);
+#   - the replaced sentence, whatever its exact wording, tells the agent to
+#     move its current steps through doing, blocked and done (key clause 1
+#     of Decision 5), matched by a regex tolerant of "its/your/the",
+#     singular "step", and punctuation/ordering variation between the three
+#     status words;
+#   - and tells the agent to add a task only for a new step of work (key
+#     clause 2 of Decision 5), matched the same way.
+# Deliberately never pins one exact sentence: Decision 5 states the meaning
+# the new text must carry, not its bytes, and inventing a literal here would
+# make the test an echo of one implementer's phrasing rather than an oracle
+# for the decision.
+sub assert_reminder_text {
+    my ($text, $n, $root, $label) = @_;
+    $text = '' unless defined $text;
+    my $prefix = reminder_prefix($n);
+    my $suffix = reminder_suffix($root);
+    like($text, qr/^\Q$prefix\E/, "$label: starts with the unchanged 'Tool call $n...chart your tasklist.' prefix");
+    like($text, qr/\Q$suffix\E\z/, "$label: ends with the unchanged almanac-task.pl command-line hint");
+    unlike($text, qr/Record where the work stands/i,
+        "$label: no longer contains 'Record where the work stands' (done criterion 1)");
+    like($text, qr/\bmove\b[^.\n]{0,60}?\bstep(?:s)?\b[^.\n]{0,40}?\bthrough\b[^.\n]{0,60}?\bdoing\b[^.\n]{0,30}?\bblocked\b[^.\n]{0,30}?\bdone\b/is,
+        "$label: tells the agent to move its current steps through doing, blocked and done");
+    like($text, qr/\badd\b[^.\n]{0,20}?\btask\b[^.\n]{0,20}?\bonly\b[^.\n]{0,20}?\bfor\b[^.\n]{0,20}?(?:a\s+)?new\s+step\s+of\s+work\b/is,
+        "$label: tells the agent to add a task only for a new step of work");
+    return;
 }
 
 # ---------------------------------------------------------------------------
@@ -335,7 +384,7 @@ sub do_focus {
             if (ref($d) eq 'HASH') {
                 is_deeply([sort keys %$d], ['hookSpecificOutput'], "R-2: call $i -- the only top-level key is hookSpecificOutput");
                 is($d->{hookSpecificOutput}{hookEventName}, 'PostToolUse', "R-2: call $i hookEventName is PostToolUse");
-                is($d->{hookSpecificOutput}{additionalContext}, reminder_text($i, $ALM), "R-2: call $i additionalContext is exact, N=$i");
+                assert_reminder_text($d->{hookSpecificOutput}{additionalContext}, $i, $ALM, "R-2: call $i additionalContext");
             }
             push @fired, $i;
         } else {
@@ -795,8 +844,8 @@ DRIVER
     ok(defined $d, 'R-13: that line is valid UTF-8 JSON (JSON::PP->utf8->decode does not reject it)')
         or diag($@ // 'decode returned undef');
     if (defined $d) {
-        is($d->{hookSpecificOutput}{additionalContext}, decode_utf8(reminder_text(20, $niso)),
-           'R-13: the decoded additionalContext contains the non-ASCII root byte-identical, once both sides are UTF-8-decoded');
+        assert_reminder_text($d->{hookSpecificOutput}{additionalContext}, 20, decode_utf8($niso),
+           'R-13: the decoded additionalContext, non-ASCII root UTF-8-decoded on both sides');
     }
 }
 

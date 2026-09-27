@@ -37,10 +37,16 @@ perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" note create --audience external 
 ```bash
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" note show <id>
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" note edit <id> --covers "..."
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" note edit <id> --content -   <<'NOTE'
+...updated fact...
+NOTE
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" note edit <id> --content "..." --force-external
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" note promote <id> --target docs/x.md
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" note delete <id>
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" note check-pointers
 ```
+
+`edit --content` on an external target is refused unless you pass `--force-external`.
 
 A global note appears in the imported notes index `~/.claude/almanac-notes.md` once someone runs
 `perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac-migrate-memories.pl" render-index` on the host.
