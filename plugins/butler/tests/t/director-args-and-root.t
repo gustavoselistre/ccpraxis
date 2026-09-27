@@ -1,8 +1,9 @@
 #!/usr/bin/env perl
 # platform: windows
-# director-args-and-root.t — package 04-director-args-and-root (blueprint
-# never-halt). Immutable oracle, written blind to the implementation, from:
-#   .ccpraxis-local-data/blueprints/never-halt/specs/04-director-args-and-root-spec.md
+# never-halt package 04 (director args and data root). Immutable oracle,
+# written blind to the implementation, from:
+#   .ccpraxis-local-data/blueprints/never-halt/specs/
+#   (the "director args and data root" spec for that package)
 # 22 acceptance criteria (AC1..AC22), bug 0f1e.
 #
 # Everything here runs on FIXTURES ONLY: a per-file tempdir root R holds a

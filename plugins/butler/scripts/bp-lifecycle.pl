@@ -70,20 +70,21 @@
 # Exit status: 0 on success, 2 on a usage error or if any blueprint could not
 # be reconciled.
 
+package BpLifecycle;
+
 use strict;
 use warnings;
 use Getopt::Long qw(GetOptionsFromArray);
 use File::Path qw(make_path remove_tree);
-use File::Copy qw(copy);
+use File::Copy ();
 use File::Spec;
 
-# Native Windows binaries (git.exe, and anything bp-blueprint.pl shells to) get
-# argv path-mangled by MSYS otherwise; see the project CLAUDE.md. We hand back
-# only already-native or already-relative paths, so opting out is safe here.
-$ENV{MSYS2_ARG_CONV_EXCL} = '*' if $^O =~ /^(MSWin32|cygwin|msys)$/;
-
 my $SCRIPT_DIR = do {
-    my $p = $0;
+    # __FILE__, not $0: this file is now requirable (package 05,
+    # move-dir-safety), and under `require` from a test $0 is the TEST file,
+    # so a sibling require anchored on $0 would resolve against the wrong
+    # directory. __FILE__ is always this file's own path, in every mode.
+    my $p = __FILE__;
     $p =~ s{[\\/][^\\/]+\z}{};
     $p = '.' unless length $p;
     # ABSOLUTE, and that is load-bearing rather than tidy. `require` with a
@@ -397,29 +398,92 @@ sub write_registry {
 
 # ------------------------------------------------------------ archiving ------
 
+# --- move_dir seams (package 05, bug 69f8) --------------------------------
+# `our` package variables, defaulting to the real rename/copy, so production
+# behaviour is byte-identical to before this package. Never read from the
+# environment, a file, or the CLI (bp-write-guard.pl's own removed env kill
+# switch is why not: an env seam production can reach is a hazard, not a
+# convenience). Tests override with `local $BpLifecycle::RENAME_FN = sub {...}`.
+our $RENAME_FN    = sub { my ($from, $to, $phase) = @_; return rename($from, $to) };
+our $COPY_FILE_FN = sub { my ($from, $to) = @_;         return File::Copy::copy($from, $to) };
+
+my $FINAL_ATTEMPTS = 5;
+
 # Move $src to $dst. rename() is the fast path; when it fails we fall back to a
-# pure-perl copy + remove.
+# pure-perl copy + remove, staged beside $dst rather than into it (bug 69f8):
+# the old shape copied straight into $dst and, on a copy failure, removed
+# $dst outright -- if another party had filed the SAME destination in the
+# meantime (a concurrent reconcile, a manual run, an orchestrator), that
+# cleanup deleted the OTHER party's data. This never touches $dst except to
+# check it exists, and never removes anything but its own staging directory
+# (created fresh, exclusively, in step 4 below) and $src (only after the
+# staged copy has been placed).
 #
-# The fallback is not theoretical. Moving a real blueprint directory on this
-# Windows host failed with EBUSY from MSYS `mv` on every attempt while a native
-# move of the same directory succeeded immediately — a background handle (search
-# indexer / AV) on one of ~500 files is enough. Losing an archive to that would
-# be far worse than copying a few megabytes, so we degrade instead of failing,
-# and we only remove the source once the copy is verified to exist.
+# The fallback itself is not theoretical. Moving a real blueprint directory on
+# this Windows host failed with EBUSY from MSYS `mv` on every attempt while a
+# native move of the same directory succeeded immediately — a background
+# handle (search indexer / AV) on one of ~500 files is enough. Losing an
+# archive to that would be far worse than copying a few megabytes, so we
+# degrade instead of failing.
 sub move_dir {
     my ($src, $dst) = @_;
-    return (1, 'rename') if rename $src, $dst;
+
+    # 1. Nothing touched, no seam called, if $dst already exists.
+    return (0, "destination exists: $dst") if (-e $dst || -l $dst);
+
+    # 2. The fast path.
+    if ($RENAME_FN->($src, $dst, 'direct')) {
+        return (1, 'rename');
+    }
     my $rename_err = "$!";
 
-    # Copy the tree, then drop the source.
-    my $copied = eval { _copy_tree($src, $dst); 1 };
-    if (!$copied) {
-        remove_tree($dst) if -d $dst;      # never leave a half-copy behind
-        return (0, "rename failed ($rename_err) and copy failed ($@)");
+    # 3. $dst may have appeared during step 2's attempt; nothing was copied.
+    if (-e $dst || -l $dst) {
+        return (0, "destination appeared: $dst (rename failed: $rename_err); "
+                 . "nothing was copied and the source is untouched");
     }
-    unless (-d $dst) {
-        return (0, "rename failed ($rename_err) and the copy produced no destination");
+
+    # 4. Stage the copy beside $dst, never inside it.
+    my ($staging, $mkdir_err) = _make_staging($dst);
+    unless (defined $staging) {
+        return (0, "rename failed ($rename_err) and no staging directory could be "
+                 . "created beside $dst ($mkdir_err)");
     }
+
+    # 5. Copy into the staging directory. A false return OR a die from the
+    #    seam both land here; either way the staging directory is dropped and
+    #    $src/$dst are untouched.
+    my $copy_ok = eval { _copy_tree($src, $staging); 1 };
+    unless ($copy_ok) {
+        my $copy_err = $@;
+        $copy_err = '' unless defined $copy_err;
+        $copy_err =~ s/\s+\z//;
+        my $tail = _drop_staging($staging);
+        return (0, "rename failed ($rename_err) and copy failed ($copy_err)" . $tail);
+    }
+
+    # 6. Final placement: rename the staging directory into place, checking
+    #    for a party that beat us to $dst before EVERY attempt.
+    my ($placed, $appeared, $final_err) = (0, 0, undef);
+    for my $attempt (1 .. $FINAL_ATTEMPTS) {
+        if (-e $dst || -l $dst) { $appeared = 1; last; }
+        if ($RENAME_FN->($staging, $dst, 'final')) { $placed = 1; last; }
+        $final_err = "$!";
+        if (-e $dst || -l $dst) { $appeared = 1; last; }
+        select(undef, undef, undef, 0.2) unless $attempt == $FINAL_ATTEMPTS;
+    }
+    unless ($placed) {
+        my $tail = _drop_staging($staging);
+        if ($appeared) {
+            return (0, "destination appeared: $dst; the source $src was kept "
+                     . "and the staged copy discarded" . $tail);
+        }
+        return (0, "rename failed ($rename_err) and moving the staged copy into "
+                 . "place failed ($final_err); the source $src was kept and the "
+                 . "staged copy discarded" . $tail);
+    }
+
+    # 7. The copy is safely in place; only now do we touch $src.
     my $removed = eval { remove_tree($src); 1 };
     if (!$removed || -d $src) {
         # The copy is good; the source lingers. Say so plainly rather than
@@ -430,18 +494,58 @@ sub move_dir {
     return (1, 'copy+remove');
 }
 
+# Copies the CONTENTS of $src into the EXISTING directory $into. Never calls
+# make_path on $into (the caller -- _make_staging -- already created it with a
+# single exclusive mkdir) and never touches anything outside $into.
 sub _copy_tree {
-    my ($src, $dst) = @_;
-    make_path($dst) unless -d $dst;
+    my ($src, $into) = @_;
     opendir(my $dh, $src) or die "opendir $src: $!\n";
     my @entries = grep { $_ ne '.' && $_ ne '..' } readdir $dh;
     closedir $dh;
     for my $e (@entries) {
-        my ($s, $d) = ("$src/$e", "$dst/$e");
-        if (-d $s && !-l $s) { _copy_tree($s, $d) }
-        else { copy($s, $d) or die "copy $s -> $d: $!\n" }
+        my ($s, $d) = ("$src/$e", "$into/$e");
+        if (-d $s && !-l $s) {
+            mkdir($d) or die "mkdir $d: $!\n";
+            _copy_tree($s, $d);
+        } else {
+            $COPY_FILE_FN->($s, $d) or die "copy $s -> $d: $!\n";
+        }
     }
     return 1;
+}
+
+# _make_staging($dst) -> ($path) | (undef, $err). Creates a uniquely named
+# directory beside $dst (never inside it) with a single exclusive `mkdir`,
+# retrying on EEXIST up to 8 times total. Only a path THIS call's mkdir
+# returned true for is ever handed to _drop_staging.
+sub _make_staging {
+    my ($dst) = @_;
+    my $path = $dst;
+    $path =~ s{[\\/]+\z}{};             # strip trailing separators first
+    my ($parent, $base);
+    if ($path =~ m{\A(.*)[\\/]([^\\/]+)\z}) {
+        ($parent, $base) = ($1, $2);
+        $parent = '.' unless length $parent;
+    } else {
+        ($parent, $base) = ('.', $path);
+    }
+    for (1 .. 8) {
+        my $candidate = sprintf('%s/.%s.move-staging.%d.%08x',
+            $parent, $base, $$, int(rand(0xFFFFFFFF)));
+        return ($candidate) if mkdir($candidate);
+        return (undef, "$!") unless $!{EEXIST};
+    }
+    return (undef, "$!");
+}
+
+# _drop_staging($staging) -> $tail. Removes the staging directory this call
+# created; returns '' on success, else a tail naming the leftover path. Never
+# touches anything but $staging.
+sub _drop_staging {
+    my ($staging) = @_;
+    eval { remove_tree($staging, { error => \my $e }); 1 };
+    return '' unless -e $staging;
+    return "; the staging directory $staging could not be removed";
 }
 
 # --------------------------------------------------------------- reconcile ---
@@ -1031,6 +1135,12 @@ sub print_report {
 
 # -------------------------------------------------------------------- main ---
 
+unless (caller) {
+# Native Windows binaries (git.exe, and anything bp-blueprint.pl shells to) get
+# argv path-mangled by MSYS otherwise; see the project CLAUDE.md. We hand back
+# only already-native or already-relative paths, so opting out is safe here.
+$ENV{MSYS2_ARG_CONV_EXCL} = '*' if $^O =~ /^(MSWin32|cygwin|msys)$/;
+
 my @argv = @ARGV;
 my $verb = shift @argv;
 die_usage('missing subcommand; expected: reconcile') unless defined $verb;
@@ -1099,3 +1209,6 @@ elsif (!$opt{quiet}) {
 }
 
 exit(( grep { @{ $_->{errors} || [] } } @results ) ? 2 : 0);
+}
+
+1;
