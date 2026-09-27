@@ -67,8 +67,8 @@
 # nothing is lost, the blueprint stays readable, and `/blueprint:manage list`
 # still names archived ones.
 #
-# Exit status: 0 on success (including "nothing to do"), 1 on a usage error,
-# 2 if any blueprint could not be reconciled.
+# Exit status: 0 on success, 2 on a usage error or if any blueprint could not
+# be reconciled.
 
 use strict;
 use warnings;
@@ -103,6 +103,7 @@ my $BP_BLUEPRINT = "$SCRIPT_DIR/bp-blueprint.pl";
 
 require "$SCRIPT_DIR/BpState.pm";
 require "$SCRIPT_DIR/bp-write-guard.pl";   # BpWrite::guarded_write
+require "$SCRIPT_DIR/BpDataRoot.pm";       # the single, bounded data-root resolution chain (package 04)
 
 # ---------------------------------------------------------------- statuses ---
 # The six package statuses bp-blueprint.pl recognises. `dropped` is accepted as
@@ -152,33 +153,19 @@ usage: bp-lifecycle.pl reconcile (--blueprint <name|dir> | --all)
                                  [--data-dir DIR] [--archive|--no-archive]
                                  [--dry-run] [--json] [--quiet]
 USAGE
-    exit 1;
+    exit 2;
 }
 
 # ------------------------------------------------------------------ roots ----
+# BpDataRoot.pm (package 04) is the single, bounded resolution chain shared
+# with bp-drive-next.pl. Its own walk-up is bounded at the OS temp dir and at
+# the user's home dir (bug 0f1e) -- this file no longer carries its own copy.
 
-sub project_root {
-    return $ENV{BP_PROJECT_ROOT} if defined $ENV{BP_PROJECT_ROOT} && length $ENV{BP_PROJECT_ROOT};
-    my $top = `git rev-parse --show-toplevel 2>/dev/null`;
-    if (defined $top) { chomp $top; return $top if length $top && -d $top; }
-    # Walk up looking for the data dir, mirroring bp_project_root in bp-lib.sh.
-    require Cwd;
-    my $d = Cwd::getcwd();
-    while (defined $d && length $d) {
-        return $d if -d "$d/.ccpraxis-local-data";
-        my $up = File::Spec->catdir($d, File::Spec->updir());
-        $up = Cwd::abs_path($up) // '';
-        last if !length $up || $up eq $d;
-        $d = $up;
-    }
-    return Cwd::getcwd();
-}
+sub project_root { BpDataRoot::project_root() }
 
 sub data_dir {
     my ($override) = @_;
-    return $override if defined $override && length $override;
-    return $ENV{CCPRAXIS_DATA_DIR} if defined $ENV{CCPRAXIS_DATA_DIR} && length $ENV{CCPRAXIS_DATA_DIR};
-    return project_root() . '/.ccpraxis-local-data';
+    return BpDataRoot::data_dir(data_dir => $override);
 }
 
 # ------------------------------------------------------------------- io ------
@@ -1051,12 +1038,21 @@ die_usage("unknown subcommand '$verb'; expected: reconcile") unless $verb eq 're
 
 my %opt = (archive => 1);
 my $ok;
+my $getopt_warning;
 {
-    local $SIG{__WARN__} = sub { };
+    # no_auto_abbrev (Decision 7 / spec §2.6): only the exact defined long
+    # names are accepted -- `--data`, `--blue`, `--dry` are now rejected
+    # rather than silently matched as abbreviations of a longer option.
+    Getopt::Long::Configure(qw(no_auto_abbrev));
+    local $SIG{__WARN__} = sub { $getopt_warning = $_[0] unless defined $getopt_warning; };
     $ok = GetOptionsFromArray(\@argv, \%opt,
         'blueprint=s', 'all', 'data-dir=s', 'archive!', 'dry-run', 'json', 'quiet');
 }
-die_usage('unrecognised option') unless $ok;
+unless ($ok) {
+    my $msg = defined $getopt_warning ? $getopt_warning : 'unrecognised option';
+    $msg =~ s/\s+\z//;
+    die_usage($msg);
+}
 die_usage('unexpected extra arguments: ' . join(' ', @argv)) if @argv;
 die_usage('need exactly one of --blueprint or --all')
     if (defined $opt{blueprint} ? 1 : 0) + ($opt{all} ? 1 : 0) != 1;
