@@ -576,38 +576,15 @@ my ($AC9_ROOT, $AC9_ID, $AC9_TARGET);
     is(field2($r2->{err}, 'detail'), 'content_conflict', 'AC-17: ...detail: content_conflict');
 }
 
+# almanac-note-crud.t stays green through this package's own test_paths (tooling-fixes 06); no
+# assertion runs it here.
+
+# almanac-migrate-memories.t stays green through this package's own test_paths (tooling-fixes 06);
+# no assertion runs it here.
 # =============================================================================
-# AC-18 -- almanac-note-crud.t passes unmodified (this file adds no
-# assertion there and reads/edits no assertion in it -- confirmed by running
-# it as a subprocess and checking its exit code).
+# AC-19 -- global-config/CLAUDE.md contains the substring naming --content -.
 # =============================================================================
 {
-    my $CRUD_T = "$Bin/almanac-note-crud.t";
-    ok(-f $CRUD_T, 'AC-18 precondition: almanac-note-crud.t exists') or diag("expected at $CRUD_T");
-    my (undef, $outpath) = tempfile(UNLINK => 1);
-    my (undef, $errpath) = tempfile(UNLINK => 1);
-    system(qq{perl "$CRUD_T" > "$outpath" 2> "$errpath"});
-    my $rc = $? >> 8;
-    is($rc, 0, 'AC-18: almanac-note-crud.t exits 0 unmodified')
-        or diag('stdout tail: ' . substr(slurp_text($outpath) // '', -4000)
-              . "\nstderr: " . (slurp_text($errpath) // ''));
-}
-
-# =============================================================================
-# AC-19 -- almanac-migrate-memories.t passes unmodified, and global-config/
-# CLAUDE.md contains the substring naming --content -.
-# =============================================================================
-{
-    my $MIGRATE_T = "$Bin/almanac-migrate-memories.t";
-    ok(-f $MIGRATE_T, 'AC-19 precondition: almanac-migrate-memories.t exists') or diag("expected at $MIGRATE_T");
-    my (undef, $outpath) = tempfile(UNLINK => 1);
-    my (undef, $errpath) = tempfile(UNLINK => 1);
-    system(qq{perl "$MIGRATE_T" > "$outpath" 2> "$errpath"});
-    my $rc = $? >> 8;
-    is($rc, 0, 'AC-19: almanac-migrate-memories.t exits 0 unmodified')
-        or diag('stdout tail: ' . substr(slurp_text($outpath) // '', -4000)
-              . "\nstderr: " . (slurp_text($errpath) // ''));
-
     ok(-f $GLOBAL_CLAUDE_MD, 'AC-19 precondition: global-config/CLAUDE.md exists');
     my $global_text = slurp_text($GLOBAL_CLAUDE_MD);
     like($global_text // '', qr/\Qalmanac-note.pl create --global --title "..." --content -\E/,

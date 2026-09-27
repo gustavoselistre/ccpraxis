@@ -601,21 +601,7 @@ AC7: {
     ok(index($between, 'claude-internals-check.pl') >= 0, 'AC7: the Step 9 section names claude-internals-check.pl');
 }
 
-# ===========================================================================
-# AC8 — update-research.t stays green. This package does not edit that file.
-AC8: {
-    my $update_research_t = "$Bin/update-research.t";
-    ok(-f $update_research_t, 'AC8: precondition: update-research.t exists');
-    if (-f $update_research_t) {
-        my $out = `"$^X" "$update_research_t" 2>&1`;
-        my $rc  = $? >> 8;
-        is($rc, 0, 'AC8: update-research.t exits 0') or diag($out);
-        unlike($out, qr/^not ok/m, 'AC8: update-research.t reports no "not ok" line');
-    } else {
-        ok(0, 'AC8: update-research.t exits 0');
-        ok(0, 'AC8: update-research.t reports no "not ok" line');
-    }
-}
+# update-research.t stays green through this package's own test_paths (tooling-fixes 06); no assertion runs it here.
 
 # ===========================================================================
 # AC9 — the chunked scan: correct at every straddle offset, correct at the

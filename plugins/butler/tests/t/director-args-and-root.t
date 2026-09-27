@@ -1028,21 +1028,9 @@ SKIP: {
     }
 }
 
-# ═══════════════════════════════════════════════════════════════════════
-# AC21 — the five sibling suites stay green
-# ═══════════════════════════════════════════════════════════════════════
-{
-    for my $sib (qw(drive-next.t drive-next-archives-finished.t empty-scope-is-settled.t
-                    lifecycle-derived.t lifecycle-reconcile.t)) {
-        my $path = "$Bin/$sib";
-        my ($ofh, $opath) = tempfile('dar-sib-outXXXXXX', TMPDIR => 1); close $ofh;
-        my $rc = system("\"$^X\" \"$path\" > \"$opath\" 2>&1");
-        my $tap = slurp($opath) // '';
-        unlink $opath;
-        my @notok = ($tap =~ /^not ok /mg);
-        is(scalar(@notok), 0, "AC21: $sib has zero 'not ok' lines") or diag($tap);
-    }
-}
+# The five sibling suites (drive-next.t, drive-next-archives-finished.t, empty-scope-is-settled.t,
+# lifecycle-derived.t, lifecycle-reconcile.t) stay green through this package's own test_paths
+# (tooling-fixes 06); no assertion runs them here.
 
 # ═══════════════════════════════════════════════════════════════════════
 # AC22 — double-load safety

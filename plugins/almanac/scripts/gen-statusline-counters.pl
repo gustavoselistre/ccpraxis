@@ -22,7 +22,13 @@
 use strict;
 use warnings;
 use File::Basename ();
-BEGIN { unshift @INC, File::Basename::dirname(__FILE__) }
+BEGIN {
+    # Separators FIRST, then dirname -- __FILE__ can carry backslashes on
+    # Windows and dirname on a mixed-separator path misbehaves. Same shape as
+    # BpTurnCaps::script_dir_for; asserted repo-wide by turn-cap-consistency.t's C9.
+    (my $self = __FILE__) =~ s{\\}{/}g;
+    unshift @INC, File::Basename::dirname($self);
+}
 use Almanac::GlobalCounts ();
 
 if (@ARGV) {

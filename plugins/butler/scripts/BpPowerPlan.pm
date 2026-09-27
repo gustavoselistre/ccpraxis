@@ -234,8 +234,12 @@ sub _own_live_root_info {
         my $n = _norm_fs_path($env);
         return (defined $n && length $n) ? ($n, 'override') : (undef, undef);
     }
-    my $mod = Cwd::abs_path(__FILE__);
-    $mod = __FILE__ unless defined $mod;
+    # Separators FIRST, then abs_path -- __FILE__ can carry backslashes on
+    # Windows. Same shape as BpTurnCaps::script_dir_for; asserted repo-wide by
+    # turn-cap-consistency.t's C9.
+    (my $self = __FILE__) =~ s{\\}{/}g;
+    my $mod = Cwd::abs_path($self);
+    $mod = $self unless defined $mod;
     my $norm = _norm_fs_path($mod);
     return (undef, undef) unless defined $norm;
     if ($norm =~ m{\A(.*/\.claude/ccpraxis)/plugins/butler/scripts/BpPowerPlan\.pm\z}i) {
