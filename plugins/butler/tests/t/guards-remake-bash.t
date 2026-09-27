@@ -672,22 +672,35 @@ my $STALE_SECS = 180 * 60; # default CCPRAXIS_VALIDATION_STALE_MIN
 }
 
 # ===========================================================================
-# SH-7 -- bad JSON, truncated payload, {} -> exit 0, no output.
+# SH-7 -- bad JSON, {} -> exit 0, no output. The truncated-payload row is
+# AMENDED per Decision 25 (2)/(supersedes this row's old fail-open): a
+# truncated Bash payload is now denied with the over-size remedy, because a
+# real BpHook truncation only ever happens at 8 MiB, always over the new
+# 1 MiB pre-decode cap.
 # ===========================================================================
 {
     my %env = (BP_LEDGER => '/x/ledger.md');
     for my $c (
         ['not json at all'                          => 'malformed JSON'],
-        ['{"tool_input":{"command":"git checkout'    => 'truncated JSON'],
         ['{}'                                        => 'empty object'],
     ) {
         my ($raw, $label) = @$c;
-        my %e = %env;
-        $e{BP_PAYLOAD_TRUNCATED} = 1 if $label eq 'truncated JSON';
-        my $res = gb($raw, %e);
+        my $res = gb($raw, %env);
         is($res->{rc}, 0, "SH-7: $label -> exit 0");
         is($res->{out}, '', "SH-7: $label -> empty stdout");
         is($res->{err}, '', "SH-7: $label -> empty stderr");
+    }
+
+    {
+        my %e = %env;
+        $e{BP_PAYLOAD_TRUNCATED} = 1;
+        my $res = gb('{"tool_input":{"command":"git checkout', %e);
+        is($res->{rc}, 2,
+            'SH-7 (Decision 25 (2), AMENDED): truncated JSON -> denied with the over-size remedy');
+        like($res->{err}, qr/script file/i,
+            'SH-7: the truncated-payload denial names the over-size remedy')
+            or diag("stderr: $res->{err}");
+        is($res->{out}, '', 'SH-7: truncated JSON -> empty stdout');
     }
 }
 
@@ -812,6 +825,32 @@ my $STALE_SECS = 180 * 60; # default CCPRAXIS_VALIDATION_STALE_MIN
     ) {
         my ($cmd, $label) = @$c;
         is(gb(payload(cmd => $cmd), %env)->{rc}, 2, "R9-TM2: $label -> deny") or diag("cmd: $cmd");
+    }
+}
+
+# ---------------------------------------------------------------------------
+# never-halt/01 ESCALATED (reports/01-redteam.md S6): _strip_heredocs looks
+# for a heredoc operator "<<WORD" with no regard to quoting, so a QUOTED
+# '<<EOF' inside another word is wrongly treated as a real heredoc start,
+# and everything after it on later lines is dropped as a "heredoc body" and
+# never parsed at all -- including an unrelated real command on the next
+# line. The fix belongs to BpHook.pm (only a real heredoc operator may start
+# a heredoc), which is outside package 01's normal write set but was added
+# to it for this escalation. Regression lives here because this is where
+# heredoc stripping is already exercised (R9-TM2, above).
+# ---------------------------------------------------------------------------
+{
+    my $tmp = tempdir(CLEANUP => 1);
+    (my $repo = "$tmp/repo") =~ s{\\}{/}g;
+    make_path("$repo/.git");
+    my %env = (BP_LEDGER => '/x/ledger.md', CLAUDE_PROJECT_DIR => $repo);
+    for my $c (
+        [qq{grep -n '<<EOF' README.md\nrm -rf .git} => q{a quoted '<<EOF' inside a grep pattern, then rm -rf .git on the next line}],
+        [qq{echo '<<X'\ncd Y} => q{a quoted '<<X' inside an echo argument, then cd on the next line}],
+    ) {
+        my ($cmd, $label) = @$c;
+        is(gb(payload(cmd => $cmd, cwd => $repo), %env)->{rc}, 2, "never-halt/01 ESCALATED (redteam S6): $label -> deny")
+            or diag("cmd: " . $cmd);
     }
 }
 

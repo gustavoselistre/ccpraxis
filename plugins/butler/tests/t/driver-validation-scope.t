@@ -685,7 +685,7 @@ ac8_case(
 
 # ===========================================================================
 # AC-12 -- AC-1's fixture, the assignment not at the leading position
-# ("cd . &&" / "env ") -> rc 2 for each (treated as unnamed).
+# ("true &&" / "env ") -> rc 2 for each (treated as unnamed).
 # ===========================================================================
 {
     my $data_n = tempdir_n();
@@ -703,7 +703,7 @@ ac8_case(
 
     my $rel = basename($data_n) . "/blueprints/$PKG{A}{bp}/packages/$PKG{A}{pkg}.md";
     for my $cmd (
-        "cd . && BP_VALIDATE_LEDGER=$rel perl $ALPHA_T",
+        "true && BP_VALIDATE_LEDGER=$rel perl $ALPHA_T",
         "env BP_VALIDATE_LEDGER=$rel perl $ALPHA_T",
     ) {
         my $res = gb(payload(cmd => $cmd, session_id => $sid), CCPRAXIS_DATA_DIR => $data_n);

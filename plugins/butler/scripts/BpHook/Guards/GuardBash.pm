@@ -21,7 +21,9 @@ use strict;
 use warnings;
 use JSON::PP ();
 use File::Basename qw(dirname basename);
+use File::Spec ();
 use Cwd ();
+use Time::HiRes ();
 
 my $SELF_DIR;
 {
@@ -1199,10 +1201,1822 @@ sub _gb_d {
 }
 
 # ---------------------------------------------------------------------------
+# GB-h -- "hygiene": deny cd/pushd anywhere in the command, statically
+# resolvable writes/deletes/moves outside the repo root and the temp dir, and
+# deletes/moves of protected roots (.git, .ccpraxis-local-data, the repo
+# root, the home dir, or an ancestor of one). never-halt package
+# 01-worker-bash-hygiene, spec 01-worker-bash-hygiene-spec.md. Decisions 3, 4,
+# 10, 11, 14.
+#
+# Placed between GB-c and GB-d in run()'s rule list (spec sec 2.2). Never
+# spawns a process. Fails open (returns undef) on any internal error, an
+# unresolvable target, a missing/relative-without-cwd target, or an R that
+# cannot be determined for (b).
+# ---------------------------------------------------------------------------
+
+my $HYG_HINT_TEXT = 'If the operator asked for this, ask them to run it themselves with the ! prefix.';
+
+sub _hyg_is_winfam { return ($^O =~ /^(?:MSWin32|msys|cygwin)$/) ? 1 : 0 }
+
+# redteam S1: the old path-run class '[^\s;&|()\'"\x60]*' does not exclude
+# '{' / '}', so a run of braces re-scans itself from every '{' -- quadratic.
+# Excluding them here makes each run non-overlapping (linear). redteam S3:
+# on Windows-family perls, `type RM` resolves case-insensitively, so the
+# name group is matched case-insensitively there too (paired with
+# _hyg_command_name's fold).
+# redteam-3 S4: the .exe suffix itself must fold case too on a Windows-
+# family perl ("rm.EXE"), not just the verb name -- a shell there resolves
+# both case-insensitively.
+my $HYG_TRIGGER_RE = _hyg_is_winfam()
+    ? qr/(?:^|[;&|\s(){}\x60'"])(?:[^\s;&|()'"\x60{}]*\/)?(?i:cd|pushd|rm|rmdir|mv|cp|ln|touch|mkdir|tee|sed|perl|truncate)(?i:\.exe)?(?=[\s;&|()'"\x60]|$)|>/
+    : qr/(?:^|[;&|\s(){}\x60'"])(?:[^\s;&|()'"\x60{}]*\/)?(?:cd|pushd|rm|rmdir|mv|cp|ln|touch|mkdir|tee|sed|perl|truncate)(?:\.exe)?(?=[\s;&|()'"\x60]|$)|>/;
+
+sub _hyg_is_abs {
+    my ($v) = @_;
+    return 0 unless defined $v && length $v;
+    return 1 if $v =~ m{^/};
+    return 1 if _hyg_is_winfam() && $v =~ m{^[A-Za-z]:/};
+    return 0;
+}
+
+sub _hyg_fold_key {
+    my ($k) = @_;
+    return $k unless defined $k;
+    return $k unless _hyg_is_winfam();
+    (my $v = $k) =~ tr/A-Z/a-z/;
+    return $v;
+}
+
+# ---------------------------------------------------------------------------
+# Word-value / raw safety (spec sec 2.6).
+# ---------------------------------------------------------------------------
+sub _hyg_raw_safe {
+    my ($raw) = @_;
+    return 0 unless defined $raw;
+    my $len = length($raw);
+    my $i = 0;
+    my $q = 'none';
+    while ($i < $len) {
+        my $c = substr($raw, $i, 1);
+        if ($q eq 'squote') {
+            $q = 'none' if $c eq "'";
+            $i++;
+            next;
+        }
+        if ($q eq 'dquote') {
+            if ($c eq '\\' && $i + 1 < $len) { $i += 2; next }
+            return 0 if $c eq '$' || $c eq "\x60";
+            $q = 'none' if $c eq '"';
+            $i++;
+            next;
+        }
+        if ($c eq "'") { $q = 'squote'; $i++; next }
+        if ($c eq '"') { $q = 'dquote'; $i++; next }
+        if ($c eq '\\' && $i + 1 < $len) { $i += 2; next }
+        return 0 if $c eq '$' || $c eq "\x60";
+        return 0 if $c eq '*' || $c eq '?' || $c eq '[' || $c eq '{';
+        $i++;
+    }
+    return 0 if $q ne 'none';
+    return 1;
+}
+
+sub _hyg_dequote {
+    my ($raw) = @_;
+    return '' unless defined $raw;
+    my $len = length($raw);
+    my $out = '';
+    my $i = 0;
+    my $q = 'none';
+    while ($i < $len) {
+        my $c = substr($raw, $i, 1);
+        if ($q eq 'squote') {
+            if ($c eq "'") { $q = 'none'; $i++; next }
+            $out .= $c;
+            $i++;
+            next;
+        }
+        if ($q eq 'dquote') {
+            if ($c eq '\\' && $i + 1 < $len) {
+                my $nc = substr($raw, $i + 1, 1);
+                if ($nc =~ /[\$"\\\n]/ || $nc eq "\x60") { $out .= $nc; $i += 2; next }
+                $out .= $c;
+                $i++;
+                next;
+            }
+            if ($c eq '"') { $q = 'none'; $i++; next }
+            $out .= $c;
+            $i++;
+            next;
+        }
+        if ($c eq "'") { $q = 'squote'; $i++; next }
+        if ($c eq '"') { $q = 'dquote'; $i++; next }
+        if ($c eq '\\' && $i + 1 < $len) { $out .= substr($raw, $i + 1, 1); $i += 2; next }
+        $out .= $c;
+        $i++;
+    }
+    return $out;
+}
+
+# _hyg_word_from_raw($raw) -> \%word, built directly from a RAW substring
+# synthesised while splitting a redirect out of a larger word (Decision 19
+# MUST bullets 1-2). Left with literal undef -- and so unresolvable -- when
+# $raw carries an unquoted variable/glob/backtick; _hyg_resolve and the
+# Decision-19-ruling glob-prefix code below already know how to fall back
+# from raw alone in that case.
+sub _hyg_word_from_raw {
+    my ($raw) = @_;
+    return { raw => undef, literal => undef, tail => undef } unless defined $raw && length $raw;
+    return { raw => $raw, literal => undef, tail => undef } unless _hyg_raw_safe($raw);
+    my $lit = _hyg_dequote($raw);
+    my $tail;
+    if ($lit =~ m{(?:^|/)([^/]+)$}) { $tail = $1 if length $1 }
+    return { raw => $raw, literal => $lit, tail => $tail };
+}
+
+# _hyg_find_word_redirect($raw) -> ($prefix, $digits, $op, $rest) | (). Scans
+# $raw quote-aware for the first unquoted, unescaped redirect operator
+# (Decision 19 MUST bullet 1: redteam M1). At the very start of the word a
+# leading digit run is still an fd number (bash's own rule -- digits count
+# only when they are the ENTIRE word so far); anywhere later in the word,
+# any digits immediately before the operator are ordinary text and stay in
+# $prefix (an "operand"), matching real bash tokenising of e.g. "abc2>file".
+sub _hyg_find_word_redirect {
+    my ($raw) = @_;
+    return () unless defined $raw;
+    my $len = length($raw);
+    my $i = 0;
+    my $q = 'none';
+    while ($i < $len) {
+        my $c = substr($raw, $i, 1);
+        if ($q eq 'squote') { $q = 'none' if $c eq "'"; $i++; next }
+        if ($q eq 'dquote') {
+            if ($c eq '\\' && $i + 1 < $len) { $i += 2; next }
+            $q = 'none' if $c eq '"';
+            $i++;
+            next;
+        }
+        if ($c eq "'") { $q = 'squote'; $i++; next }
+        if ($c eq '"') { $q = 'dquote'; $i++; next }
+        if ($c eq '\\' && $i + 1 < $len) { $i += 2; next }
+        if ($i == 0) {
+            # redteam S5: an optional named-fd "{word}" prefix before the
+            # operator (e.g. "{fd}>file"). One-time cost at word start only
+            # (never per-character), so this substr copy is not the M3
+            # quadratic hazard.
+            my $rest = substr($raw, $i);
+            if ($rest =~ /^(\{[A-Za-z_]\w*\})?([0-9]*)(<<<|<<-|<<|<&|<>|<|>>|>\||&>>|&>|>&|>)/) {
+                my ($fdname, $digits, $op) = ($1, $2, $3);
+                my $oplen = length($fdname // '') + length($digits) + length($op);
+                return ('', $digits, $op, substr($raw, $oplen));
+            }
+        }
+        else {
+            # Decision 22 M3: a BOUNDED window (every real operator here is
+            # at most 3 chars) instead of substr($raw, $i) -- copying the
+            # rest of the word at EVERY character made this quadratic
+            # (redteam-2 M3: 400 KB -> 21.9s, 1 MB -> 238s).
+            my $window = substr($raw, $i, 3);
+            if ($window =~ /^(<<<|<<-|<<|<&|<>|<|>>|>\||&>>|&>|>&|>)/) {
+                my $op = $1;
+                return (substr($raw, 0, $i), '', $op, substr($raw, $i + length($op)));
+            }
+        }
+        $i++;
+    }
+    return ();
+}
+
+# _hyg_find_word_redirects($raw) -> ($lead, \@redirects) | (). redteam-2 S1:
+# bash ends a WORD at the FIRST unquoted redirect operator, so more than one
+# operator can appear glued in a single raw word ("a>b>c", "FOO=1>/out/f").
+# Loops _hyg_find_word_redirect over the remainder after each operator so
+# every redirect in the chain is found, not only the first; each entry's
+# eventual classification (fd-dup vs a real file target) is still decided
+# later, per redirect, by _hyg_classify_redirect.
+sub _hyg_find_word_redirects {
+    my ($raw) = @_;
+    return () unless defined $raw;
+    my @first = _hyg_find_word_redirect($raw);
+    return () unless @first;
+    my ($lead, $digits, $op, $rest) = @first;
+    my @redirs;
+    while (1) {
+        my @next = _hyg_find_word_redirect($rest);
+        if (@next) {
+            my ($target_raw, $ndigits, $nop, $nrest) = @next;
+            push @redirs, { digits => $digits, op => $op, target_raw => $target_raw };
+            ($digits, $op, $rest) = ($ndigits, $nop, $nrest);
+            next;
+        }
+        push @redirs, { digits => $digits, op => $op, target_raw => $rest };
+        last;
+    }
+    return ($lead, \@redirs);
+}
+
+# _hyg_redirect_targets_in_word($raw, $next_word) -> (\@targets, $lead,
+# $consumed_next). Classifies every redirect _hyg_find_word_redirects finds
+# in $raw into a write target (or none, for a bare fd-dup); only the LAST
+# redirect in the chain may consume $next_word (a separate following word)
+# when its own target text is empty.
+sub _hyg_redirect_targets_in_word {
+    my ($raw, $next_word) = @_;
+    return ([], $raw, 0) unless defined $raw;
+    my ($lead, $redirs) = _hyg_find_word_redirects($raw);
+    return ([], $raw, 0) unless $redirs && @$redirs;
+    my @targets;
+    my $consumed_next = 0;
+    for my $j (0 .. $#$redirs) {
+        my $r = $redirs->[$j];
+        my ($is_output, $fd_dup, $shape_op, $classified_rest) = _hyg_classify_redirect($r->{op}, $r->{target_raw});
+        next if $fd_dup;
+        my $is_last = ($j == $#$redirs);
+        my $target_word;
+        if (length($classified_rest)) {
+            $target_word = _hyg_word_from_raw($classified_rest);
+        }
+        elsif ($is_last && defined $next_word) {
+            $target_word = $next_word;
+            $consumed_next = 1;
+        }
+        if ($is_output && defined $target_word) {
+            my $shape = ($shape_op eq '>>' || $shape_op eq '&>>') ? '>>' : '>';
+            push @targets, { kind => 'write', shape => $shape, word => $target_word };
+        }
+    }
+    return (\@targets, $lead, $consumed_next);
+}
+
+# _hyg_classify_redirect($op, $rest_raw) -> ($is_output, $fd_dup, $shape,
+# $rest_raw). redteam S5: ">&" (not ">&N"/">&-") is a real output redirect to
+# a file, and "<>" (read-write, creates the file) counts as output too. A
+# bare ">&" with the target glued right after it (">&file", no space) has
+# its target under the leading '&'; a bare "&" with nothing after it (a
+# separate following word is the real target) is left for the caller.
+sub _hyg_classify_redirect {
+    my ($op, $rest_raw) = @_;
+    if ($op eq '>&') {
+        # a bare fd number/dash right after ">&" is a descriptor dup, never
+        # a file target ('>&2', '>&-', '>&1-'); anything else (a path) is a
+        # real output target.
+        return (1, 1, $op, $rest_raw) if $rest_raw =~ /^(?:[0-9]+-?|-)$/;
+        return (1, 0, $op, $rest_raw);
+    }
+    return (1, 0, $op, $rest_raw) if $op eq '<>';
+    my $is_output = ($op =~ /^(?:>>|>\||&>>|&>|>)$/) ? 1 : 0;
+    return ($is_output, 0, $op, $rest_raw);
+}
+
+# _hyg_rewrite_clobber_redirect($text) -> $text with every unquoted ">|"
+# rewritten to "> " (redteam S4). BpHook::_segments splits unconditionally
+# on a bare "|", so an unrewritten ">|" is torn into two "commands" and its
+# target is lost; converting it to a plain ">" first (before _segments ever
+# sees it) keeps the target parseable and only gives up the no-clobber-
+# override semantics, which this rule has no way to represent anyway.
+sub _hyg_rewrite_clobber_redirect {
+    my ($t) = @_;
+    return $t unless defined $t && index($t, '>|') >= 0;
+    my $len = length($t);
+    my $out = '';
+    my $i = 0;
+    my $q = 'none';
+    while ($i < $len) {
+        my $c = substr($t, $i, 1);
+        if ($q eq 'squote') { $out .= $c; $q = 'none' if $c eq "'"; $i++; next }
+        if ($q eq 'dquote') {
+            if ($c eq '\\' && $i + 1 < $len) { $out .= $c . substr($t, $i + 1, 1); $i += 2; next }
+            $out .= $c;
+            $q = 'none' if $c eq '"';
+            $i++;
+            next;
+        }
+        if ($c eq "'") { $q = 'squote'; $out .= $c; $i++; next }
+        if ($c eq '"') { $q = 'dquote'; $out .= $c; $i++; next }
+        if ($c eq '\\' && $i + 1 < $len) { $out .= $c . substr($t, $i + 1, 1); $i += 2; next }
+        if ($c eq '>' && $i + 1 < $len && substr($t, $i + 1, 1) eq '|') { $out .= '> '; $i += 2; next }
+        $out .= $c;
+        $i++;
+    }
+    return $out;
+}
+
+# _hyg_raw_value_and_flags($raw) -> ($value, \@flags). Mirrors
+# BpHook::_tokenize_words's own per-character word-value/predictability walk
+# (BpHook.pm ~1192-1254), applied to a single already-isolated word's raw
+# text, so GB-h can recover a literal prefix or suffix around an unquoted
+# variable/glob without re-tokenising a whole segment.
+sub _hyg_raw_value_and_flags {
+    my ($raw) = @_;
+    return ('', []) unless defined $raw;
+    my $len = length($raw);
+    my $value = '';
+    my @flags;
+    my $first = 1;
+    my $i = 0;
+    while ($i < $len) {
+        my $cc = substr($raw, $i, 1);
+        if ($cc eq "'") {
+            $i++;
+            while ($i < $len && substr($raw, $i, 1) ne "'") {
+                $value .= substr($raw, $i, 1);
+                push @flags, 0;
+                $i++;
+            }
+            $i++ if $i < $len;
+            $first = 0;
+            next;
+        }
+        if ($cc eq '"') {
+            $i++;
+            while ($i < $len && substr($raw, $i, 1) ne '"') {
+                my $c2 = substr($raw, $i, 1);
+                if ($c2 eq '\\' && $i + 1 < $len) {
+                    $value .= substr($raw, $i + 1, 1);
+                    push @flags, 1;
+                    $i += 2;
+                    next;
+                }
+                my $f = ($c2 eq '$' || $c2 eq "\x60") ? 1 : 0;
+                $value .= $c2;
+                push @flags, $f;
+                $i++;
+            }
+            $i++ if $i < $len;
+            $first = 0;
+            next;
+        }
+        if ($cc eq '\\' && $i + 1 < $len) {
+            $value .= substr($raw, $i + 1, 1);
+            push @flags, 0;
+            $i += 2;
+            $first = 0;
+            next;
+        }
+        if ($cc eq '$' || $cc eq "\x60" || $cc eq '*' || $cc eq '?' || $cc eq '[' || $cc eq '{') {
+            $value .= $cc;
+            push @flags, 1;
+            $i++;
+            $first = 0;
+            next;
+        }
+        if ($cc eq '~' && $first) {
+            $value .= $cc;
+            push @flags, 1;
+            $i++;
+            $first = 0;
+            next;
+        }
+        $value .= $cc;
+        push @flags, 0;
+        $i++;
+        $first = 0;
+    }
+    return ($value, \@flags);
+}
+
+# _hyg_glob_prefix_word($raw) -> (\%word, $remainder) | (undef, $remainder).
+# Decision 19 RULING (4(c) vs 4(d)): the literal text before the FIRST
+# unquoted glob/variable character, with any trailing '/' or '/.' stripped,
+# as a fully-literal word -- so "rm -rf .git/*" can still be checked against
+# the protected-root list even though ".git/*" itself is unresolvable.
+# $remainder is the raw text from that first glob/variable character to the
+# end (redteam-2 S3: callers need it to tell a PURE match-all glob like "*"
+# from an ordinary partial one like "*.tmp"). The word half of the return is
+# undef when there is no glob/variable, or nothing precedes it.
+sub _hyg_glob_prefix_word {
+    my ($raw) = @_;
+    return (undef, undef) unless defined $raw;
+    my ($value, $flags) = _hyg_raw_value_and_flags($raw);
+    my $idx;
+    for my $k (0 .. $#$flags) { if ($flags->[$k]) { $idx = $k; last } }
+    return (undef, undef) unless defined $idx;
+    my $remainder = substr($value, $idx);
+    my $prefix = substr($value, 0, $idx);
+    my $changed = 1;
+    while ($changed) {
+        $changed = 0;
+        if ($prefix =~ s{/\.$}{}) { $changed = 1 }
+        elsif ($prefix =~ s{/$}{}) { $changed = 1 }
+    }
+    return (undef, $remainder) unless length $prefix;
+    return ({ literal => $prefix, raw => $prefix, tail => undef }, $remainder);
+}
+
+# _hyg_predictable_tail($raw) -> $tail | undef (redteam S7): the tokenizer's
+# own 'tail' field is undef whenever the value ends in '/' (no characters
+# survive after the last slash) or has no slash at all with no cwd to
+# resolve against. Recompute it here after stripping a trailing run of '/'
+# and '/.' units first, so "$X/.git/" and "rm -rf .git/" still expose
+# ".git" as their predictable last component.
+sub _hyg_predictable_tail {
+    my ($raw) = @_;
+    return undef unless defined $raw;
+    my ($value, $flags) = _hyg_raw_value_and_flags($raw);
+    my $vlen = length($value);
+    my $changed = 1;
+    while ($changed && $vlen > 0) {
+        $changed = 0;
+        if ($vlen >= 2 && substr($value, $vlen - 2, 2) eq '/.') { $vlen -= 2; $changed = 1; next }
+        if (substr($value, $vlen - 1, 1) eq '/') { $vlen -= 1; $changed = 1; next }
+    }
+    return undef unless $vlen > 0;
+    $value = substr($value, 0, $vlen);
+    $flags = [ @{$flags}[0 .. $vlen - 1] ];
+    my $lastslash = -1;
+    for (my $k = 0; $k < length($value); $k++) { $lastslash = $k if substr($value, $k, 1) eq '/' }
+    my $tailstr = ($lastslash >= 0) ? substr($value, $lastslash + 1) : $value;
+    return undef unless length $tailstr;
+    my $start = $lastslash + 1;
+    for my $k ($start .. $#$flags) { return undef if $flags->[$k] }
+    return $tailstr;
+}
+
+# _hyg_fit_tail($prefix, $path, $suffix) -> one line, at most 160 chars,
+# built so that Common::fit()'s own front-truncation never has to run on it
+# (reviewer S2: fit() cuts from the front, which throws away exactly the
+# path TAIL -- the protected component -- that path_echo kept on purpose).
+# Truncates $path from the FRONT (keeping its tail) to whatever budget is
+# left after $prefix and $suffix, instead.
+sub _hyg_fit_tail {
+    my ($prefix, $path, $suffix) = @_;
+    $prefix = '' unless defined $prefix;
+    $path   = '' unless defined $path;
+    $suffix = '' unless defined $suffix;
+    my $budget = 160 - length($prefix) - length($suffix);
+    return $prefix . $path . $suffix if $budget >= length($path);
+    return $prefix . $path . $suffix if $budget <= 3;
+    return $prefix . '...' . substr($path, -($budget - 3)) . $suffix;
+}
+
+# _hyg_resolve(\%word, $cwd_bytes, \%ctx) -> ($D, $K) | (). Spec sec 2.6.
+sub _hyg_resolve {
+    my ($word, $cwd_bytes, $ctx) = @_;
+    return () unless ref $word eq 'HASH';
+    my $value;
+    if (defined $word->{literal}) {
+        $value = BpHook::_to_bytes($word->{literal});
+    }
+    else {
+        my $raw = $word->{raw};
+        return () unless defined $raw;
+        if ($raw eq '~') {
+            return () unless defined $ctx->{home1};
+            $value = BpHook::_to_bytes($ctx->{home1});
+        }
+        elsif ($raw =~ m{^~/(.*)$}s) {
+            my $rest = $1;
+            return () unless _hyg_raw_safe($rest);
+            return () unless defined $ctx->{home1};
+            $value = BpHook::_to_bytes($ctx->{home1}) . '/' . BpHook::_to_bytes(_hyg_dequote($rest));
+        }
+        elsif (_hyg_raw_safe($raw)) {
+            $value = BpHook::_to_bytes(_hyg_dequote($raw));
+        }
+        else {
+            return ();
+        }
+    }
+    return () unless defined $value && length $value;
+
+    my $D;
+    if (_hyg_is_abs($value)) {
+        $D = BpHook::Guards::Common::resolve_path($value, undef);
+    }
+    else {
+        return () unless defined $cwd_bytes && length $cwd_bytes && _hyg_is_abs($cwd_bytes);
+        $D = BpHook::Guards::Common::resolve_path($value, $cwd_bytes);
+    }
+    return () unless defined $D;
+    my $K = BpHook::Guards::Common::canon($D);
+    $K = '' unless defined $K;
+    $K = '/' if $K eq '';
+    $K = _hyg_fold_key($K);
+    return ($D, $K);
+}
+
+sub _hyg_root_dk {
+    my ($root) = @_;
+    return () unless defined $root && length $root;
+    my $D = BpHook::Guards::Common::resolve_path($root, undef);
+    return () unless defined $D;
+    my $K = BpHook::Guards::Common::canon($D);
+    $K = '' unless defined $K;
+    $K = '/' if $K eq '';
+    $K = _hyg_fold_key($K);
+    return ($D, $K);
+}
+
+sub _hyg_never_target {
+    my ($D) = @_;
+    return 0 unless defined $D;
+    return 1 if $D =~ m{^/dev/(?:null|stdout|stderr|stdin|tty)$};
+    return 1 if $D =~ m{^/dev/fd/[0-9]+$};
+    return 0;
+}
+
+# _hyg_inside($D, $K, $root) -- "D equals root or lies under it" (spec 2.6).
+sub _hyg_inside {
+    my ($D, $K, $root) = @_;
+    return 0 unless defined $D && defined $K && defined $root && length $root;
+    my $Droot = BpHook::Guards::Common::resolve_path($root, undef);
+    return 0 unless defined $Droot;
+    my $Kroot = BpHook::Guards::Common::canon($Droot);
+    $Kroot = '' unless defined $Kroot;
+    $Kroot = '/' if $Kroot eq '';
+    $Kroot = _hyg_fold_key($Kroot);
+
+    return 1 if $Kroot eq $K;
+    if (substr($Kroot, -1) eq '/') {
+        return 1 if index($K, $Kroot) == 0;
+    }
+    else {
+        return 1 if index($K, "$Kroot/") == 0;
+    }
+
+    my @stroot = eval { stat($Droot) };
+    return 0 unless @stroot;
+    my ($rdev, $rino) = ($stroot[0], $stroot[1]);
+    return 0 unless $rdev || $rino;
+
+    # A bare DRIVE root (never bare POSIX "/", which spec sec 2.6 explicitly
+    # excludes) is the top of one physical volume: every path stat()able on
+    # that same volume shares its device number, whatever POSIX alias
+    # (/tmp, an 8.3 short name, ...) it is spelled through. A device-only
+    # match against the nearest existing ancestor of D is therefore
+    # sufficient proof of containment here, without walking or comparing
+    # inodes.
+    if (_hyg_is_winfam() && $Kroot =~ m{^[a-z]:/$} && $rdev) {
+        my $vcand = $D;
+        my $vE;
+        for (1 .. 64) {
+            if (-e $vcand) { $vE = $vcand; last }
+            my $parent = $vcand;
+            $parent =~ s{/[^/]*$}{};
+            last if $parent eq $vcand || $parent eq '';
+            $vcand = $parent;
+        }
+        if (defined $vE) {
+            my @vs = eval { stat($vE) };
+            return 1 if @vs && $vs[0] == $rdev;
+        }
+    }
+
+    # review M3 / redteam S9: spec 2.6 step 2 skips the identity fallback
+    # when "ino == 0" (native MSWin32 perl's stat() reports dev as the drive
+    # number -- nonzero -- and ino as 0), not merely when both are zero. On
+    # such a perl every existing path on the same drive would otherwise
+    # compare equal to every root via the ancestor-chain walk below.
+    return 0 unless $rino;
+
+    my $cand = $D;
+    my $E;
+    for (1 .. 64) {
+        if (-e $cand) { $E = $cand; last }
+        my $parent = $cand;
+        $parent =~ s{/[^/]*$}{};
+        last if $parent eq $cand || $parent eq '';
+        $cand = $parent;
+    }
+    return 0 unless defined $E;
+
+    my @chain = ($E);
+    my $walk = $E;
+    for (1 .. 64) {
+        my $parent = $walk;
+        $parent =~ s{/[^/]*$}{};
+        last if $parent eq $walk || $parent eq '';
+        push @chain, $parent;
+        $walk = $parent;
+    }
+    for my $anc (@chain) {
+        my @s = eval { stat($anc) };
+        next unless @s;
+        return 1 if $s[0] == $rdev && $s[1] == $rino;
+    }
+    return 0;
+}
+
+# _hyg_lexical_inside($K, $root) -- the cheap, no-stat half of _hyg_inside
+# alone (Decision 22 M3, D19 SHOULD "lexical before stat"): a pure string
+# containment test, used to try every candidate root's fast path FIRST,
+# before any of them is allowed to fall through to a stat-based walk.
+sub _hyg_lexical_inside {
+    my ($K, $root) = @_;
+    return 0 unless defined $K && defined $root && length $root;
+    my $Droot = BpHook::Guards::Common::resolve_path($root, undef);
+    return 0 unless defined $Droot;
+    my $Kroot = BpHook::Guards::Common::canon($Droot);
+    $Kroot = '' unless defined $Kroot;
+    $Kroot = '/' if $Kroot eq '';
+    $Kroot = _hyg_fold_key($Kroot);
+    return 1 if $Kroot eq $K;
+    if (substr($Kroot, -1) eq '/') { return index($K, $Kroot) == 0 ? 1 : 0 }
+    return index($K, "$Kroot/") == 0 ? 1 : 0;
+}
+
+# _hyg_root_identity($root) -> \%id | undef. Decision 22 M3: precomputes,
+# ONCE per _gb_h_impl call, everything _hyg_protected_hit needs to answer
+# "is this FIXED root (R or a home dir) at-or-under a given TARGET" without
+# re-walking the root's own ancestor chain and re-stat'ing it for every
+# target -- the report's 90s/25000-operand bottleneck (each target used to
+# re-walk R's/home's fixed chain from scratch). {K} is the root's own
+# canonical key; {ids} is the set of (dev:ino) for every ancestor in its
+# chain (an ino==0 ancestor is never added -- review M3/S9's skip, mirrored
+# here); {vdev} is the device of the root's nearest EXISTING ancestor, for
+# the same bare-drive-root shortcut _hyg_inside uses (gated, at the call
+# site, on the TARGET's key being a bare drive letter).
+sub _hyg_root_identity {
+    my ($root) = @_;
+    return undef unless defined $root && length $root;
+    my $Droot = BpHook::Guards::Common::resolve_path($root, undef);
+    return undef unless defined $Droot;
+    my $Kroot = BpHook::Guards::Common::canon($Droot);
+    $Kroot = '' unless defined $Kroot;
+    $Kroot = '/' if $Kroot eq '';
+    $Kroot = _hyg_fold_key($Kroot);
+
+    my %ids;
+    my $vdev;
+    my $cand = $Droot;
+    my $E;
+    for (1 .. 64) {
+        if (-e $cand) { $E = $cand; last }
+        my $parent = $cand;
+        $parent =~ s{/[^/]*$}{};
+        last if $parent eq $cand || $parent eq '';
+        $cand = $parent;
+    }
+    if (defined $E) {
+        my @chain = ($E);
+        my $walk = $E;
+        for (1 .. 64) {
+            my $parent = $walk;
+            $parent =~ s{/[^/]*$}{};
+            last if $parent eq $walk || $parent eq '';
+            push @chain, $parent;
+            $walk = $parent;
+        }
+        for my $anc (@chain) {
+            my @s = eval { stat($anc) };
+            next unless @s;
+            $vdev = $s[0] unless defined $vdev;
+            $ids{"$s[0]:$s[1]"} = 1 if $s[1];
+        }
+    }
+    return { D => $Droot, K => $Kroot, ids => \%ids, vdev => $vdev };
+}
+
+# ---------------------------------------------------------------------------
+# Roots (spec sec 2.7).
+# ---------------------------------------------------------------------------
+sub _hyg_root_via_git {
+    my ($cwd) = @_;
+    return undef unless defined $cwd && length $cwd;
+    my $dir = $cwd;
+    $dir =~ s{/+$}{};
+    for (1 .. 64) {
+        return $dir if -e "$dir/.git";
+        last if $dir eq '' || $dir eq '/';
+        last if $dir =~ m{^[A-Za-z]:$};
+        my $parent = $dir;
+        $parent =~ s{/[^/]*$}{};
+        $parent = '/' if $parent eq '' && $dir =~ m{^/};
+        last if $parent eq $dir;
+        $dir = $parent;
+    }
+    return undef;
+}
+
+sub _hyg_ctx {
+    my ($p) = @_;
+    my $cwd;
+    if (ref $p eq 'HASH' && defined $p->{cwd} && !ref($p->{cwd}) && length $p->{cwd}) {
+        my $c = BpHook::_to_bytes($p->{cwd});
+        $cwd = $c if _hyg_is_abs($c);
+    }
+
+    my $R;
+    for my $envname (qw(CLAUDE_PROJECT_DIR BP_PROJECT_ROOT)) {
+        last if defined $R;
+        my $v = $ENV{$envname};
+        next unless defined $v && length $v;
+        my $c = BpHook::_to_bytes($v);
+        $R = $c if _hyg_is_abs($c);
+    }
+    if (!defined $R && defined $cwd) {
+        $R = _hyg_root_via_git($cwd);
+    }
+
+    my @tmp;
+    my %seen_tmp;
+    for my $v (eval { File::Spec->tmpdir }, $ENV{TMP}, $ENV{TEMP}, $ENV{TMPDIR}) {
+        next unless defined $v && length $v;
+        my $b = BpHook::_to_bytes($v);
+        next unless _hyg_is_abs($b);
+        my $k = BpHook::Guards::Common::canon($b);
+        $k = '' unless defined $k;
+        $k = '/' if $k eq '';
+        $k = _hyg_fold_key($k);
+        next if $seen_tmp{$k}++;
+        push @tmp, $b;
+    }
+
+    my @home;
+    for my $v ($ENV{HOME}, $ENV{USERPROFILE}) {
+        next unless defined $v && length $v;
+        my $b = BpHook::_to_bytes($v);
+        push @home, $b if _hyg_is_abs($b);
+    }
+
+    # Decision 22 M3: resolve/stat R and each HOME identity ONCE per call
+    # (not once per target), de-duplicated by canonical key -- HOME and
+    # USERPROFILE are frequently the same directory.
+    my $R_id;
+    $R_id = _hyg_root_identity($R) if defined $R;
+    my @home_ids;
+    my %seen_home_key;
+    for my $h (@home) {
+        my $id = _hyg_root_identity($h);
+        next unless defined $id;
+        next if $seen_home_key{ $id->{K} }++;
+        push @home_ids, $id;
+    }
+
+    return {
+        R        => $R,
+        tmp      => \@tmp,
+        home     => \@home,
+        home1    => (@home ? $home[0] : undef),
+        cwd      => $cwd,
+        R_id     => $R_id,
+        home_ids => \@home_ids,
+    };
+}
+
+# ---------------------------------------------------------------------------
+# Home aliases, (c) only (spec sec 2.8).
+# ---------------------------------------------------------------------------
+# redteam-2 M2 helper: true iff $s carries an unquoted/unescaped glob
+# metachar, so the caller knows to leave the word raw-but-unresolved
+# (letting the Decision 19 glob-prefix check below run) instead of building
+# a fully literal path where the glob character would become ordinary text.
+sub _hyg_word_has_unquoted_glob {
+    my ($s) = @_;
+    return 0 unless defined $s && length $s;
+    return $s =~ /[*?\[{]/ ? 1 : 0;
+}
+
+# redteam-2 M2: shared constructor for every home-alias branch below. When
+# $rest has a glob character, the alias must still reach the glob-prefix
+# check (Decision 19 ruling) -- "rm -rf ~/*"/'"$HOME"/*' were being resolved
+# straight to a literal "<home>/*" path, which is neither home nor an
+# ancestor of it, so the deny never fired.
+sub _hyg_home_alias_word {
+    my ($home1, $rest) = @_;
+    $rest = '' unless defined $rest;
+    if (_hyg_word_has_unquoted_glob($rest)) {
+        return { literal => undef, raw => $home1 . $rest, tail => undef };
+    }
+    return { literal => $home1 . $rest, raw => $home1 . $rest, tail => undef };
+}
+
+sub _hyg_home_alias {
+    my ($w, $ctx) = @_;
+    return undef unless ref $w eq 'HASH';
+    my $home1 = $ctx->{home1};
+    return undef unless defined $home1;
+    my $raw = $w->{raw};
+    return undef unless defined $raw;
+
+    if ($raw eq '~' || $raw eq '~/') {
+        return { literal => $home1, raw => $home1, tail => undef };
+    }
+
+    # redteam-3 S3: "~{,.bak}" -- a bare "~" directly glued to an unquoted
+    # brace list. "~/(.*)" below requires a literal "/" first, which a
+    # brace list right after "~" never has, so this needs its own branch
+    # (checked BEFORE it) or "mv ~ ~.bak"'s brace expansion of home itself
+    # is never classified as a home alias at all.
+    if ($raw =~ /^~(\{.*)$/s) {
+        my $rest = $1;
+        return _hyg_home_alias_word($home1, $rest) if _hyg_word_has_unquoted_glob($rest);
+        return undef;
+    }
+
+    # redteam-2 M2: "~/*", "~/.*" etc -- same carve-out as the quoted/bare
+    # $HOME forms below. Kept as its own branch since a bare "~" resolves
+    # through a different path in _hyg_resolve than $HOME/${HOME}.
+    if ($raw =~ m{^~/(.*)$}s) {
+        my $rest = $1;
+        return _hyg_home_alias_word($home1, '/' . $rest) if _hyg_word_has_unquoted_glob($rest);
+        return undef;
+    }
+
+    # review M2 / redteam N4: the variable itself may be quoted while the
+    # rest of the word (a following /... or, redteam-3 S3, a following
+    # unquoted brace list) is bare, e.g. "$HOME"/x, "${USERPROFILE}"/x/..
+    # or "$HOME"{,.bak} -- recognise that shape directly, not only a
+    # wholly-quoted word.
+    if ($raw =~ /^"(\$\{?(?:HOME|USERPROFILE)\}?)"(.*)$/) {
+        my $rest = $2;
+        return _hyg_home_alias_word($home1, $rest)
+            if $rest eq '' || $rest =~ m{^/} || $rest =~ /^\{/;
+        return undef;
+    }
+    if ($raw =~ /^"(%USERPROFILE%)"(.*)$/i) {
+        my $rest = $2;
+        return _hyg_home_alias_word($home1, $rest)
+            if $rest eq '' || $rest =~ m{^[/\\]} || $rest =~ /^\{/;
+        return undef;
+    }
+
+    my $body = $raw;
+    if ($body =~ /^"(.*)"$/s) { $body = $1 }
+
+    if ($body =~ /^%USERPROFILE%(.*)$/is) {
+        my $rest = $1;
+        return _hyg_home_alias_word($home1, $rest)
+            if $rest eq '' || $rest =~ m{^[/\\]} || $rest =~ /^\{/;
+        return undef;
+    }
+    if ($body =~ /^\$\{?(?:HOME|USERPROFILE)\}?(.*)$/) {
+        my $rest = $1;
+        return _hyg_home_alias_word($home1, $rest)
+            if $rest eq '' || $rest =~ m{^/} || $rest =~ /^\{/;
+        return undef;
+    }
+    return undef;
+}
+
+# ---------------------------------------------------------------------------
+# Redirect / operand parsing (spec sec 2.5).
+# ---------------------------------------------------------------------------
+sub _hyg_scan_redirects {
+    my ($argv) = @_;
+    my @operands;
+    my @targets;
+    my $n = scalar @$argv;
+    my $i = 0;
+    while ($i < $n) {
+        my $w = $argv->[$i];
+        my $raw = $w->{raw};
+        my ($found_targets, $lead, $consumed_next) = defined $raw
+            ? _hyg_redirect_targets_in_word($raw, ($i + 1 < $n) ? $argv->[$i + 1] : undef)
+            : ([], undef, 0);
+        if (!@$found_targets) {
+            push @operands, $w;
+            $i++;
+            next;
+        }
+        # redteam M1/S1: a redirect operator glued to a preceding word (no
+        # space) still leaves that prefix as a real operand of the command;
+        # more than one redirect can be glued into the same word (S1).
+        push @operands, _hyg_word_from_raw($lead) if length($lead);
+        push @targets, @$found_targets;
+        $i += $consumed_next ? 2 : 1;
+    }
+    return (\@operands, \@targets);
+}
+
+sub _hyg_positional {
+    my ($operands, $consuming) = @_;
+    $consuming ||= {};
+    my @pos;
+    my %captured;
+    my $dd = 0;
+    my $i = 0;
+    my $n = scalar @$operands;
+    while ($i < $n) {
+        my $w = $operands->[$i];
+        my $lit = $w->{literal};
+        if (!$dd && defined $lit && $lit eq '--') { $dd = 1; $i++; next }
+        my $probe = defined $lit ? $lit : $w->{raw};
+        if (!$dd && defined $probe && $probe =~ /^-/) {
+            if (defined $lit && $consuming->{$lit}) {
+                $captured{$lit} = ($i + 1 < $n) ? $operands->[$i + 1] : undef;
+                $i += 2;
+                next;
+            }
+            $i++;
+            next;
+        }
+        push @pos, $w;
+        $i++;
+    }
+    return (\@pos, \%captured);
+}
+
+# redteam M4: every target-directory form of mv/cp/ln -- "-t DIR", "-tDIR",
+# "-rt DIR" (a short-option cluster ending in 't'), "-ftDIR", "--target-
+# directory DIR" and "--target-directory=DIR" -- must be recognised, or the
+# real SOURCE (possibly ".git") is misread as the destination and (c) never
+# sees it as a write at all.
+sub _hyg_mvcp_dest {
+    my ($operands) = @_;
+    my $dest_word;
+    my @rest;
+    my $dd  = 0;
+    my $n   = scalar @$operands;
+    my $i   = 0;
+    while ($i < $n) {
+        my $w   = $operands->[$i];
+        my $lit = $w->{literal};
+        if (!$dd && defined $lit && $lit eq '--') { $dd = 1; push @rest, $w; $i++; next }
+        # redteam-2 S2: GNU getopt_long accepts any UNAMBIGUOUS PREFIX of
+        # --target-directory ("--t", "--targ", "--target", ...), with or
+        # without an inline "=value" -- not only the full spelling.
+        if (!$dd && defined $lit && $lit =~ /^(--[A-Za-z-]+)(?:=(.*))?$/
+            && length($1) >= 3 && index('--target-directory', $1) == 0)
+        {
+            my $val = $2;
+            if (defined $val) {
+                $dest_word = { literal => $val, raw => $val, tail => undef } if length $val;
+                $i++;
+                next;
+            }
+            $dest_word = ($i + 1 < $n) ? $operands->[$i + 1] : undef;
+            $i += ($i + 1 < $n) ? 2 : 1;
+            next;
+        }
+        if (!$dd && defined $lit && $lit =~ /^-[A-Za-z]*t(.*)$/) {
+            my $remainder = $1;
+            if (length $remainder) {
+                $dest_word = { literal => $remainder, raw => $remainder, tail => undef };
+                $i++;
+                next;
+            }
+            $dest_word = ($i + 1 < $n) ? $operands->[$i + 1] : undef;
+            $i += ($i + 1 < $n) ? 2 : 1;
+            next;
+        }
+        push @rest, $w;
+        $i++;
+    }
+    my ($pos, undef) = _hyg_positional(\@rest, { '-S' => 1 });
+    return ($dest_word, $pos);
+}
+
+sub _hyg_command_name {
+    my ($w) = @_;
+    return undef unless ref $w eq 'HASH';
+    my $s = defined $w->{literal} ? $w->{literal} : $w->{tail};
+    if (!defined $s && defined $w->{raw} && _hyg_raw_safe($w->{raw})) {
+        # redteam-2 S5: the shared BpHook tokenizer marks ANY backslash
+        # escape inside double quotes as unpredictable, even one whose
+        # escaped char has no special shell meaning (a literal Windows path
+        # backslash, e.g. "C:\Git\...\rm.exe") -- GuardBash's own dequoter
+        # (_hyg_dequote) knows the narrower real rule (only \$ \` \" \\ and
+        # \newline are real escapes), so fall back to it before giving up.
+        $s = _hyg_dequote($w->{raw});
+    }
+    return undef unless defined $s;
+    (my $b = $s) =~ s{.*[/\\]}{};
+    $b =~ s/\.exe$//i;
+    # redteam S3: this host's shell resolves RM/TOUCH/etc case-
+    # insensitively on Windows-family perls (case-insensitive filesystem).
+    $b = lc($b) if _hyg_is_winfam();
+    return $b;
+}
+
+# ---------------------------------------------------------------------------
+# Simple-command reduction and shell -c / eval recursion (spec sec 2.4).
+# ---------------------------------------------------------------------------
+sub _hyg_reduce {
+    my ($words) = @_;
+    my @w = @$words;
+    my $n = scalar @w;
+    return (undef, undef, []) if $n == 0;
+
+    if (defined $w[0]{literal} && $w[0]{literal} =~ /^(\(+)(.*)$/) {
+        my $rest = $2;
+        if (length $rest) {
+            $w[0] = { literal => $rest, raw => $w[0]{raw}, tail => $w[0]{tail} };
+        }
+        else {
+            shift @w;
+            $n--;
+        }
+    }
+
+    my @prefix_targets;
+    my $i = 0;
+    my $progress = 1;
+    while ($progress && $i < $n) {
+        $progress = 0;
+        while ($i < $n && defined $w[$i]{literal} && $w[$i]{literal} =~ /^(?:\(|\{|!)$/) { $i++; $progress = 1 }
+        # redteam-2 S1: an assignment word can carry an embedded redirect with
+        # no space ("FOO=1>/out/f"); recover any real write targets from it
+        # via the same chain-aware helper the command word and argv scan use,
+        # rather than just discarding the whole word.
+        while ($i < $n && defined $w[$i]{raw} && $w[$i]{raw} =~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
+            my $raw_i = $w[$i]{raw};
+            my $next_w = ($i + 1 < $n) ? $w[$i + 1] : undef;
+            my ($targets, undef, $consumed_next) = _hyg_redirect_targets_in_word($raw_i, $next_w);
+            push @prefix_targets, @$targets;
+            $i += $consumed_next ? 2 : 1;
+            $progress = 1;
+        }
+        while ($i < $n) {
+            # review M1 / redteam M2 / redteam-2 S1: a redirect at the very
+            # start of a word in the command prefix is skipped here so the
+            # COMMAND WORD can still be found, but it must not simply
+            # vanish -- record it (and any further redirect glued after it)
+            # as targets too, so "> f", "exec > f", "FOO=1 > f" and
+            # ">a>/out/f echo" all still deny.
+            my $raw = $w[$i]{raw};
+            last unless defined $raw;
+            my ($targets, $lead, $consumed_next) = _hyg_redirect_targets_in_word($raw, ($i + 1 < $n) ? $w[$i + 1] : undef);
+            last unless @$targets && $lead eq '';
+            push @prefix_targets, @$targets;
+            $i += $consumed_next ? 2 : 1;
+            $progress = 1;
+        }
+        last unless $i < $n;
+        my $lit = $w[$i]{literal};
+        last unless defined $lit;
+        # redteam-2 S4 / redteam-3 S4: this host's shell resolves wrapper
+        # keywords (env/nice/sudo/...) case-insensitively too, on Windows-
+        # family perls -- fold before every keyword comparison below. Also
+        # strip a path prefix and a ".exe" suffix (case-insensitively) the
+        # same way _hyg_command_name does, so "/usr/bin/env" and "env.exe"
+        # are recognised as "env" too, not just a bare "env" word.
+        my $lit_fold = $lit;
+        $lit_fold =~ s{.*[/\\]}{};
+        $lit_fold =~ s/\.exe$//i;
+        $lit_fold = lc($lit_fold) if _hyg_is_winfam();
+        if ($lit_fold =~ /^(?:builtin|exec|nohup|then|do|else|elif|if|while|until)$/) {
+            $i++;
+            $progress = 1;
+            next;
+        }
+        # redteam S3: `command -p` / `time -p` unwrap to the real command
+        # exactly like the bare keyword, plus their own optional -p.
+        # redteam-3 S4: `command -- rm ...` must skip the "--" too, or it
+        # is mistaken for the real command word.
+        if ($lit_fold eq 'command' || $lit_fold eq 'time') {
+            $i++;
+            $progress = 1;
+            $i++ if $i < $n && defined $w[$i]{literal} && ($w[$i]{literal} eq '-p' || $w[$i]{literal} eq '--');
+            next;
+        }
+        if ($lit_fold eq 'env') {
+            $i++;
+            $progress = 1;
+            while ($i < $n && defined $w[$i]{literal} && $w[$i]{literal} =~ /^-/) {
+                my $opt = $w[$i]{literal};
+                if ($opt eq '--') { $i++; last }
+                elsif ($opt eq '-i' || $opt eq '--ignore-environment') { $i++ }
+                elsif ($opt eq '-u' || $opt eq '-C' || $opt eq '--unset' || $opt eq '--chdir') { $i += 2 }
+                elsif ($opt =~ /^(?:-u|--unset=|-C|--chdir=)/) { $i++ }
+                else { $i++ }
+            }
+            while ($i < $n && defined $w[$i]{raw} && $w[$i]{raw} =~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
+                my $raw_i = $w[$i]{raw};
+                my $next_w = ($i + 1 < $n) ? $w[$i + 1] : undef;
+                my ($targets, undef, $consumed_next) = _hyg_redirect_targets_in_word($raw_i, $next_w);
+                push @prefix_targets, @$targets;
+                $i += $consumed_next ? 2 : 1;
+            }
+            next;
+        }
+        if ($lit_fold eq 'timeout') {
+            $i++;
+            $progress = 1;
+            while ($i < $n && defined $w[$i]{literal} && $w[$i]{literal} =~ /^-/) {
+                my $opt = $w[$i]{literal};
+                if ($opt =~ /^(?:--kill-after=|--signal=)/) { $i++ }
+                elsif ($opt eq '-k' || $opt eq '-s' || $opt eq '--kill-after' || $opt eq '--signal') { $i++; $i++ if $i < $n }
+                else { $i++ }
+            }
+            $i++ if $i < $n;
+            next;
+        }
+        # redteam S3/redteam-2 S4: nice's own adjustment may be "-n N", "-nN"
+        # (glued digits), a bare negative/positive number, or
+        # "--adjustment[=N]".
+        if ($lit_fold eq 'nice') {
+            $i++;
+            $progress = 1;
+            while ($i < $n && defined $w[$i]{literal} && $w[$i]{literal} =~ /^-/) {
+                my $opt = $w[$i]{literal};
+                if ($opt eq '-n') { $i += 2 }
+                elsif ($opt eq '--adjustment') { $i++; $i++ if $i < $n }
+                elsif ($opt =~ /^(?:--adjustment=|-[0-9])/) { $i++ }
+                elsif ($opt =~ /^-n[0-9]+$/) { $i++ }
+                else { last }
+            }
+            next;
+        }
+        # redteam-2 S4: stdbuf's -i/-o/-e may take its value glued ("-o0")
+        # or as a separate following word ("-o 0"). redteam-3 S4: same for
+        # the long forms --input/--output/--error, glued with "=" or not.
+        if ($lit_fold eq 'stdbuf') {
+            $i++;
+            $progress = 1;
+            while ($i < $n && defined $w[$i]{literal}
+                && $w[$i]{literal} =~ /^(?:-[ioe]|--(?:input|output|error)(?:=.*)?)/) {
+                my $opt = $w[$i]{literal};
+                if ($opt =~ /^(?:-[ioe]|--(?:input|output|error))$/) { $i += 2 }
+                else { $i++ }
+            }
+            next;
+        }
+        # redteam-2 S4: sudo's own options that take a value (-u/-g/-C/-D/
+        # -h/-p/-r/-t/-U) must consume that following word too, or it is
+        # mistaken for the real command name (e.g. "sudo -u root rm ...").
+        # redteam-3 S4: same for the long forms (--user root), space-
+        # separated; a "--opt=value" glued form is already just one word.
+        if ($lit_fold eq 'sudo') {
+            $i++;
+            $progress = 1;
+            while ($i < $n && defined $w[$i]{literal} && $w[$i]{literal} =~ /^-/) {
+                my $opt = $w[$i]{literal};
+                if ($opt =~ /^-[ugCDhprtU]$/) { $i += 2 }
+                elsif ($opt =~ /^--(?:user|group|host|prompt|close-from|chdir|directory)$/) { $i += 2 }
+                else { $i++ }
+            }
+            next;
+        }
+    }
+
+    return (undef, undef, \@prefix_targets) unless $i < $n;
+    my $name_word = $w[$i];
+    my $consumed_next_for_name = 0;
+    # redteam-2 M1: a redirect glued directly onto the COMMAND-NAME word
+    # itself ("cat>f", "echo>f", "exec>f", "tee>f") is never found by the
+    # prefix loop above (its lead text is non-empty, not a bare redirect),
+    # and hyg_targets only scans argv -- so split it here: the literal
+    # prefix becomes the real name word, and the redirect(s) become targets.
+    if (defined $name_word->{raw}) {
+        my $next_w = ($i + 1 < $n) ? $w[$i + 1] : undef;
+        my ($targets, $lead, $consumed_next) = _hyg_redirect_targets_in_word($name_word->{raw}, $next_w);
+        if (@$targets && length($lead)) {
+            push @prefix_targets, @$targets;
+            $name_word = _hyg_word_from_raw($lead);
+            $consumed_next_for_name = $consumed_next;
+        }
+    }
+    my @argv = @w[$i + 1 + $consumed_next_for_name .. $n - 1];
+    return ($name_word, \@argv, \@prefix_targets);
+}
+
+sub _hyg_find_shellc_script {
+    my ($argv) = @_;
+    my $n = scalar @$argv;
+    my $ci;
+    for my $idx (0 .. $n - 1) {
+        my $lit = $argv->[$idx]{literal};
+        next unless defined $lit && $lit =~ /^-/;
+        if ($lit =~ /^-[a-zA-Z]*c[a-zA-Z]*$/) { $ci = $idx; last }
+    }
+    return undef unless defined $ci;
+    for my $idx ($ci + 1 .. $n - 1) {
+        my $w = $argv->[$idx];
+        my $lit = $w->{literal};
+        next if defined $lit && $lit =~ /^-/;
+        return $lit if defined $lit;
+        my $raw = $w->{raw};
+        return undef unless defined $raw;
+        if ($raw =~ /^'(.*)'$/s) { return $1 }
+        if ($raw =~ /^"(.*)"$/s) { return $1 }
+        return $raw;
+    }
+    return undef;
+}
+
+sub _hyg_join_eval_words {
+    my ($argv) = @_;
+    return undef unless @$argv;
+    my @parts;
+    for my $w (@$argv) {
+        if (defined $w->{literal}) { push @parts, $w->{literal} }
+        else {
+            my $raw = $w->{raw};
+            return undef unless defined $raw;
+            push @parts, _hyg_dequote($raw);
+        }
+    }
+    return join(' ', @parts);
+}
+
+# redteam-3 M2: the exception thrown by _hyg_deadline_check() below, caught
+# ONLY by _gb_h_impl (never by the outer _gb_h eval, which would otherwise
+# fail OPEN on it like any other internal error -- a deadline must fail
+# CLOSED). Not a bare string, so a real die() elsewhere can never be
+# mistaken for it.
+my $HYG_DEADLINE_MARKER = { hyg_deadline_exceeded => 1 };
+
+sub _hyg_deadline_check {
+    my ($deadline_at) = @_;
+    return unless defined $deadline_at;
+    die $HYG_DEADLINE_MARKER if Time::HiRes::time() > $deadline_at;
+}
+
+# _hyg_commands($text, $depth) -> list of [$name_word, @argv_words]. TEST
+# SEAM (spec sec 2.1): called by its package name, never through a cached
+# code ref. $deadline_at (redteam-3 M2, optional) is an absolute
+# Time::HiRes::time() value; checked at each segment's loop boundary (never
+# per character) and propagated into shell -c / eval recursion.
+sub _hyg_commands {
+    my ($text, $depth, $deadline_at) = @_;
+    $depth = 0 unless defined $depth;
+    return () if $depth > 3;
+    return () unless defined $text;
+    (my $t = $text) =~ s/\\\n//g;
+    # redteam S4: rewrite an unquoted ">|" to a plain ">" BEFORE _segments
+    # ever splits on the bare '|' it contains, or the clobber redirect's
+    # target is torn into a separate "command" and lost.
+    $t = _hyg_rewrite_clobber_redirect($t);
+    my @segs = BpHook::_segments($t);
+    my @out;
+    for my $seg (@segs) {
+        _hyg_deadline_check($deadline_at);
+        next unless defined $seg && length $seg;
+        my $words = BpHook::_tokenize_words($seg);
+        next unless ref $words eq 'ARRAY' && @$words;
+        my ($name_word, $argv, $prefix_targets) = _hyg_reduce($words);
+        $argv           ||= [];
+        $prefix_targets ||= [];
+        next unless defined $name_word || @$argv || @$prefix_targets;
+        push @out, { name => $name_word, argv => $argv, prefix_targets => $prefix_targets };
+
+        my $name = _hyg_command_name($name_word);
+        next unless defined $name;
+        if ($name =~ /^(?:sh|bash|zsh|ksh|dash)$/) {
+            my $script = _hyg_find_shellc_script($argv);
+            push @out, _hyg_commands($script, $depth + 1, $deadline_at) if defined $script;
+        }
+        elsif ($name eq 'eval') {
+            my $script = _hyg_join_eval_words($argv);
+            push @out, _hyg_commands($script, $depth + 1, $deadline_at) if defined $script;
+        }
+    }
+    return @out;
+}
+
+# hyg_targets($cmd, $deadline_at) -> list of \%t. Public: package 02 reuses
+# this. $deadline_at (redteam-3 M2, optional) is threaded into _hyg_commands
+# and re-checked once per command below.
+sub hyg_targets {
+    my ($cmd, $deadline_at) = @_;
+    my @out;
+    my @commands = _hyg_commands($cmd, 0, $deadline_at);
+    for my $entry (@commands) {
+        _hyg_deadline_check($deadline_at);
+        next unless ref $entry eq 'HASH';
+        push @out, @{ $entry->{prefix_targets} || [] };
+        my @argv = @{ $entry->{argv} || [] };
+        my ($operands, $redirects) = _hyg_scan_redirects(\@argv);
+        push @out, @$redirects;
+
+        my $name = _hyg_command_name($entry->{name});
+        next unless defined $name;
+
+        if ($name eq 'cd' || $name eq 'pushd') {
+            push @out, { kind => 'cd', shape => $name, word => undef };
+            next;
+        }
+        if ($name eq 'rm' || $name eq 'rmdir') {
+            my ($pos, undef) = _hyg_positional($operands, {});
+            push @out, map { { kind => 'delete', shape => $name, word => $_ } } @$pos;
+            next;
+        }
+        if ($name eq 'mv') {
+            my ($dest, $pos) = _hyg_mvcp_dest($operands);
+            my @sources;
+            if (!defined $dest && @$pos == 1) {
+                # redteam-2 S8: "mv .git{,.bak}" (the standard backup idiom)
+                # has only ONE positional, an unquoted brace list -- bash
+                # expands it into BOTH the move source (before the comma)
+                # and the destination (after it), so classify this single
+                # word as both instead of only the write-shaped destination
+                # heuristic below.
+                my $braw = $pos->[0]{raw};
+                if (defined $braw && $braw =~ /(?<!\\)\{[^{}]*,[^{}]*\}/) {
+                    $dest = $pos->[0];
+                    @sources = ($pos->[0]);
+                }
+            }
+            if (!defined $dest && @$pos) {
+                $dest = $pos->[-1];
+                @sources = @$pos[0 .. $#$pos - 1];
+            }
+            elsif (defined $dest && !@sources) {
+                @sources = @$pos;
+            }
+            push @out, { kind => 'write', shape => 'mv', word => $dest } if defined $dest;
+            push @out, map { { kind => 'move', shape => 'mv', word => $_ } } @sources;
+            next;
+        }
+        if ($name eq 'cp') {
+            my ($dest, $pos) = _hyg_mvcp_dest($operands);
+            $dest = $pos->[-1] if !defined $dest && @$pos;
+            push @out, { kind => 'write', shape => 'cp', word => $dest } if defined $dest;
+            next;
+        }
+        if ($name eq 'ln') {
+            my ($dest, $pos) = _hyg_mvcp_dest($operands);
+            if (!defined $dest && @$pos >= 2) { $dest = $pos->[-1] }
+            push @out, { kind => 'write', shape => 'ln', word => $dest } if defined $dest;
+            next;
+        }
+        if ($name eq 'touch') {
+            # Decision 19 false denial: --reference FILE names a READ
+            # source, never a write target.
+            my ($pos, undef) = _hyg_positional($operands, { '-d' => 1, '-t' => 1, '-r' => 1, '--reference' => 1 });
+            push @out, map { { kind => 'write', shape => 'touch', word => $_ } } @$pos;
+            next;
+        }
+        if ($name eq 'mkdir') {
+            my ($pos, undef) = _hyg_positional($operands, { '-m' => 1 });
+            push @out, map { { kind => 'write', shape => 'mkdir', word => $_ } } @$pos;
+            next;
+        }
+        if ($name eq 'tee') {
+            my ($pos, undef) = _hyg_positional($operands, {});
+            push @out, map { { kind => 'write', shape => 'tee', word => $_ } } @$pos;
+            next;
+        }
+        if ($name eq 'truncate') {
+            # Decision 19 false denial: --reference FILE is a read source.
+            my ($pos, undef) = _hyg_positional($operands, { '-s' => 1, '-r' => 1, '--reference' => 1 });
+            push @out, map { { kind => 'write', shape => 'truncate', word => $_ } } @$pos;
+            next;
+        }
+        if ($name eq 'sed') {
+            my $has_i  = 0;
+            my $has_ef = 0;
+            for my $w (@$operands) {
+                my $lit = $w->{literal};
+                next unless defined $lit && $lit =~ /^-/;
+                $has_i  = 1 if $lit =~ /^-[a-zA-Z]*i/ || $lit =~ /^--in-place/;
+                $has_ef = 1 if $lit =~ /^(?:-e|-f|--expression|--file)$/ || $lit =~ /^--expression=/ || $lit =~ /^--file=/;
+                # redteam M5: code glued directly onto -e/-f ("-e's/a/b/'")
+                # still counts as inline code, not a separate script/file.
+                $has_ef = 1 if $lit =~ /^-[ef].+/;
+            }
+            if ($has_i) {
+                my ($pos, undef) = _hyg_positional($operands, { '-e' => 1, '-f' => 1, '-l' => 1 });
+                my @files = @$pos;
+                shift @files unless $has_ef;
+                push @out, map { { kind => 'write', shape => 'sed -i', word => $_ } } @files;
+            }
+            next;
+        }
+        if ($name eq 'perl') {
+            my $has_i    = 0;
+            my $has_code = 0;
+            my $j        = 0;
+            my $m        = scalar @$operands;
+            while ($j < $m) {
+                my $lit = $operands->[$j]{literal};
+                last unless defined $lit && $lit =~ /^-/;
+                # redteam M5: -I/-M/-m take a value, either glued or as a
+                # separate following word, and must not end the switch scan.
+                if ($lit =~ /^-[IMm]/) {
+                    $j++;
+                    $j++ if $lit =~ /^-[IMm]$/ && $j < $m;
+                    next;
+                }
+                $has_i = 1 if $lit =~ /^-[pnlaswWtT0-9]*i/;
+                # code glued directly onto -e/-E ("-e's/a/b/'", "-es/a/b/")
+                # consumes nothing else -- the code is already in this word.
+                if ($lit =~ /^-[pnlaswWtTi0-9]*[eE].+/) {
+                    $has_code = 1;
+                    $j++;
+                    next;
+                }
+                if ($lit eq '-e' || $lit eq '-E' || $lit =~ /^-[pnlaswWtTi0-9]*[eE]$/) {
+                    $has_code = 1;
+                    $j += 2;
+                    next;
+                }
+                $j++;
+            }
+            if ($has_i) {
+                my @after = @$operands[$j .. $m - 1];
+                my ($pos, undef) = _hyg_positional(\@after, {});
+                my @files = @$pos;
+                shift @files unless $has_code;
+                push @out, map { { kind => 'write', shape => 'perl -i', word => $_ } } @files;
+            }
+            next;
+        }
+    }
+    return @out;
+}
+
+sub _hyg_c_lines {
+    my ($shape, $shown, $cmd_line, $hint_ok) = @_;
+    # reviewer S2/S4: build line 1 within budget HERE, keeping the path's
+    # tail (the protected component that explains the deny), so Common::
+    # fit()'s later front-truncation is a no-op and never throws it away.
+    my $prefix = "BLOCKED: $shape of a protected path (.git, .ccpraxis-local-data, the repo root, the home dir, or a parent of one): ";
+    my @lines = (
+        _hyg_fit_tail($prefix, $shown, ''),
+        'Instead: remove or move only the specific files you created inside it, by absolute path; never the directory itself.',
+        $cmd_line,
+    );
+    push @lines, $HYG_HINT_TEXT if $hint_ok;
+    return \@lines;
+}
+
+sub _hyg_protected_hit {
+    my ($D, $ctx) = @_;
+    return 0 unless defined $D;
+    my $last = $D;
+    $last =~ s{.*/}{};
+    my $last_f = _hyg_fold_key($last);
+    return 1 if $last_f eq '.git' || $last_f eq '.ccpraxis-local-data';
+
+    my @ids = grep { defined } ($ctx->{R_id}, @{ $ctx->{home_ids} || [] });
+    return 0 unless @ids;
+
+    my $K = BpHook::Guards::Common::canon($D);
+    $K = '' unless defined $K;
+    $K = '/' if $K eq '';
+    $K = _hyg_fold_key($K);
+
+    # Decision 22 M3: the cheap lexical check first, against every
+    # precomputed root -- "is R/home (fixed) at-or-under this TARGET".
+    for my $id (@ids) {
+        return 1 if $id->{K} eq $K;
+        if (substr($K, -1) eq '/') { return 1 if index($id->{K}, $K) == 0 }
+        else { return 1 if index($id->{K}, "$K/") == 0 }
+    }
+
+    # Stat-based fallback: an alias spelling (8.3, a different mount of the
+    # same volume) that only an identity check can prove. ONE stat of the
+    # TARGET here (not a repeated walk of R's/home's own fixed chain, which
+    # was the report's 90s/25000-operand bottleneck -- that chain is already
+    # precomputed once, in _hyg_root_identity via _hyg_ctx).
+    my @sD = eval { stat($D) };
+    return 0 unless @sD;
+    my ($ddev, $dino) = ($sD[0], $sD[1]);
+    if (_hyg_is_winfam() && $K =~ m{^[a-z]:/$} && $ddev) {
+        for my $id (@ids) { return 1 if defined $id->{vdev} && $id->{vdev} == $ddev }
+    }
+    # review M3/S9: ino==0 skips the identity fallback entirely, mirrored
+    # from _hyg_inside.
+    return 0 unless $dino;
+    for my $id (@ids) {
+        return 1 if $id->{ids}{"$ddev:$dino"};
+    }
+    return 0;
+}
+
+# redteam-3 S2: is $remainder (the raw text from _hyg_glob_prefix_word's
+# first unquoted glob/variable character onward) a glob that matches
+# EVERYTHING in its directory -- so a bare "*" and a brace list still count,
+# but so does "./*/" (a trailing slash stripped first) and "[!.]*"/"[^.]*"
+# (a bracket that only negates ".", which still matches every other name).
+# An ordinary partial glob like "*.tmp" must still fail this (Decision 4(d):
+# a false denial costs more than the rare case).
+sub _hyg_is_pure_match_all {
+    my ($remainder) = @_;
+    return 0 unless defined $remainder;
+    (my $r = $remainder) =~ s{/+$}{};
+    return 0 unless length $r;
+    return 1 if $r =~ /^\.?[*?]+$/;
+    return 1 if $r =~ /^\{.*\}$/;
+    return 1 if $r =~ /^\.?(?:\[!?\.?\]|\[![^\]]*\]|[*?])+$/;
+    return 0;
+}
+
+sub _hyg_check_c {
+    my ($t, $ctx, $cmd_line, $hint_ok) = @_;
+    my $w = $t->{word};
+    return undef unless ref $w eq 'HASH';
+    my $use_word = _hyg_home_alias($w, $ctx);
+    $use_word = $w unless defined $use_word;
+
+    my ($D, $K) = _hyg_resolve($use_word, $ctx->{cwd}, $ctx);
+    if (defined $D) {
+        return undef unless _hyg_protected_hit($D, $ctx);
+        return _hyg_c_lines($t->{shape}, $D, $cmd_line, $hint_ok);
+    }
+
+    # Decision 19 RULING (4(c) vs 4(d)): the target is unresolvable as a
+    # whole (an unquoted glob or variable in it), but its literal text --
+    # before that glob/variable -- may still name a protected root or lie
+    # directly inside one ("rm -rf .git/*"); the text check wins over 4(d)'s
+    # unresolvable-target allowance.
+    my ($prefix_word, $remainder) = _hyg_glob_prefix_word($use_word->{raw});
+    my $is_pure = _hyg_is_pure_match_all($remainder);
+    if (defined $prefix_word) {
+        my ($PD, undef) = _hyg_resolve($prefix_word, $ctx->{cwd}, $ctx);
+        if (defined $PD) {
+            my $plast = $PD;
+            $plast =~ s{.*/}{};
+            my $plast_f = _hyg_fold_key($plast);
+            if ($plast_f eq '.git' || $plast_f eq '.ccpraxis-local-data') {
+                # redteam-2 S3: a .git/.ccpraxis-local-data prefix keeps
+                # denying ANY glob remainder, per Decision 19's own examples
+                # (.git/*, .ccpraxis-local-data/*).
+                return _hyg_c_lines($t->{shape}, (defined $w->{raw} ? $w->{raw} : ''), $cmd_line, $hint_ok);
+            }
+            if (_hyg_protected_hit($PD, $ctx)) {
+                # redteam-2 S3 (SHOULD, false denials): the repo root/home/an
+                # ancestor of one denies only when the remainder is a PURE
+                # match-all glob (*, .*, ?*, or a brace list) -- an ordinary
+                # partial glob like "*.tmp" must still be allowed (Decision
+                # 4(d): a false denial costs more than the rare case).
+                return _hyg_c_lines($t->{shape}, (defined $w->{raw} ? $w->{raw} : ''), $cmd_line, $hint_ok)
+                    if $is_pure;
+            }
+        }
+    }
+    elsif ($is_pure && defined $ctx->{cwd}) {
+        # redteam-3 S2 (AC-51/AC-52): an EMPTY literal prefix -- the glob
+        # starts at the word's very first character ("*", "[!.]*", "~{...}"
+        # falls through here too via _hyg_home_alias above) -- is judged
+        # against the cwd ITSELF, since that is where bash will expand it.
+        # _hyg_protected_hit(D, ctx) already answers exactly "does D equal
+        # or lie ABOVE R/home" (spec's contains(D, root)), which is the
+        # right relation for "does deleting everything under cwd also take
+        # out R or a home dir".
+        my $cwdD = BpHook::Guards::Common::resolve_path($ctx->{cwd}, undef);
+        if (defined $cwdD && _hyg_protected_hit($cwdD, $ctx)) {
+            return _hyg_c_lines($t->{shape}, (defined $w->{raw} ? $w->{raw} : ''), $cmd_line, $hint_ok);
+        }
+    }
+
+    # redteam S7: recompute the predictable basename after stripping a
+    # trailing '/' or '/.' run, since the tokenizer's own 'tail' is undef
+    # for those (and for a bare word with no cwd) even though the last
+    # literal component is unambiguous.
+    my $tail = _hyg_predictable_tail($use_word->{raw});
+    $tail = $w->{tail} unless defined $tail;
+    return undef unless defined $tail;
+    my $tail_f = _hyg_fold_key($tail);
+    return undef unless $tail_f eq '.git' || $tail_f eq '.ccpraxis-local-data';
+    return _hyg_c_lines($t->{shape}, (defined $w->{raw} ? $w->{raw} : ''), $cmd_line, $hint_ok);
+}
+
+sub _hyg_check_b {
+    my ($t, $ctx, $cmd_line, $hint_ok) = @_;
+    my $w = $t->{word};
+    return undef unless ref $w eq 'HASH';
+    my ($D, $K) = _hyg_resolve($w, $ctx->{cwd}, $ctx);
+    return undef unless defined $D;
+    return undef if _hyg_never_target($D);
+
+    # Decision 22 M3 (D19 SHOULD, "lexical before stat"): try every
+    # candidate root's cheap STRING-ONLY containment test first, before any
+    # of them is allowed to fall through to a stat-based ancestor walk of
+    # the TARGET -- otherwise a target lexically inside TMP still pays R's
+    # full stat walk first (redteam-2 M3 shape 3: touch under many deep TMP
+    # paths, only one target actually outside the sandbox).
+    return undef if _hyg_lexical_inside($K, $ctx->{R});
+    for my $tmp (@{ $ctx->{tmp} }) {
+        return undef if _hyg_lexical_inside($K, $tmp);
+    }
+    # Fallback: an alias spelling (8.3, a different mount of the same
+    # volume) that only the full stat-based identity check can prove.
+    return undef if _hyg_inside($D, $K, $ctx->{R});
+    for my $tmp (@{ $ctx->{tmp} }) {
+        return undef if _hyg_inside($D, $K, $tmp);
+    }
+    my $prefix = "BLOCKED: $t->{shape} writes outside the repo and the temp dir: ";
+    my @lines = (
+        _hyg_fit_tail($prefix, $D, ''),
+        'Instead: write inside the repo or under the temp dir (TMP/TEMP, where the session scratchpad lives), by absolute path.',
+        $cmd_line,
+    );
+    push @lines, $HYG_HINT_TEXT if $hint_ok;
+    return \@lines;
+}
+
+# Decision 22 M3 RULING: replaces Decision 19's cap-abstain clause -- GB-h
+# never abstains because of BP_GUARD_MAX_STRIP_BYTES (AC-21/AC-22 stand: a
+# legitimate large command is still parsed and, if it triggers a real
+# hygiene deny, denied). Instead a command over this size is denied outright
+# with a remedy, before any of the expensive parsing below runs.
+my $HYG_MAX_CMD_BYTES = 256 * 1024;
+
+# redteam-2 S5: a quote-aware version of the old "tr/\\'\"//d" relaxed
+# trigger fallback. Deleting every backslash was right for an UNQUOTED
+# escape ("r\m" -> "rm", AC-19c) but wrong for a backslash that is a literal
+# Windows path separator inside a quoted string ('C:\...\rm.exe') -- deleting
+# THOSE glued the path into one run with no separator before the verb,
+# hiding it from the trigger. Map backslash to '/' only where it is NOT
+# acting as an escape (inside single quotes always; inside double quotes,
+# only when it does not precede one of \$ ` " \\ or a newline); elsewhere
+# (unquoted, or a real double-quote escape) consume it as bash itself would.
+sub _hyg_relaxed_trigger_text {
+    my ($cmd) = @_;
+    return '' unless defined $cmd;
+    my $len = length($cmd);
+    my $out = '';
+    my $q = 'none';
+    my $i = 0;
+    while ($i < $len) {
+        my $c = substr($cmd, $i, 1);
+        if ($q eq 'squote') {
+            if ($c eq "'") { $q = 'none'; $i++; next }
+            $out .= ($c eq '\\') ? '/' : $c;
+            $i++;
+            next;
+        }
+        if ($q eq 'dquote') {
+            if ($c eq '"') { $q = 'none'; $i++; next }
+            if ($c eq '\\' && $i + 1 < $len) {
+                my $nc = substr($cmd, $i + 1, 1);
+                if ($nc =~ /[\$"\\\n]/ || $nc eq "\x60") {
+                    # redteam-3 S4: a REAL double-quote escape of a
+                    # backslash ("\\" -> a single literal "\") is still a
+                    # Windows path separator to the trigger regex, which
+                    # only recognises "/" as a path separator -- map it to
+                    # "/" here too (unlike the OTHER real escapes -- \$ \"
+                    # \` \newline -- which stay as their literal char).
+                    $out .= ($nc eq '\\') ? '/' : $nc;
+                    $i += 2;
+                    next;
+                }
+                $out .= '/';
+                $i++;
+                next;
+            }
+            $out .= $c;
+            $i++;
+            next;
+        }
+        if ($c eq "'") { $q = 'squote'; $i++; next }
+        if ($c eq '"') { $q = 'dquote'; $i++; next }
+        if ($c eq '\\' && $i + 1 < $len) { $out .= substr($cmd, $i + 1, 1); $i += 2; next }
+        $out .= $c;
+        $i++;
+    }
+    return $out;
+}
+
+# redteam-3 M2/S1: the shared over-size remedy, also reused (Decision 23) as
+# the fail-closed message when the wall-clock deadline expires, and (S1)
+# when BpHook's own stdin read was truncated.
+sub _hyg_oversize_lines {
+    my ($cmd, $hint_ok) = @_;
+    my @lines = (
+        'BLOCKED: this Bash command is over 256 KiB, too large to parse safely for the hygiene checks.',
+        'Instead: write it to a script file in the repo or temp dir, then run that script file.',
+        'Command: ' . BpHook::Guards::Common::echo_cmd($cmd),
+    );
+    push @lines, $HYG_HINT_TEXT if $hint_ok;
+    return \@lines;
+}
+
+# Decision 26 (1): the pre-decode deny BpHook::main() calls when it has
+# already seen (from the RAW bytes alone, before any JSON decode) that this
+# Bash payload is over the raw-size cap or was truncated by its own stdin
+# read. No decoded payload exists yet at this point (that is the whole
+# point -- no decoder ever runs), so the command text is unknown and the
+# same over-size remedy is used without a command echo or the driver-only
+# hint (both need a decoded payload/role to compute safely).
+sub deny_oversize_raw {
+    my @fitted = map { BpHook::Guards::Common::fit($_) } @{ _hyg_oversize_lines(undef, 0) };
+    return BpHook::deny(@fitted);
+}
+
+# redteam-3 M2 / Decision 24: GB-h's wall-clock deadline, in seconds from its
+# own entry. BP_GUARD_DEADLINE_SECONDS may only LOWER it -- a value that
+# isn't a positive number, or is above the 5s ceiling, is ignored -- so no
+# environment can lengthen the scan past the hook's own timeout and turn a
+# slow command into an allow.
+my $HYG_DEADLINE_CEILING = 5;
+
+sub _hyg_deadline_seconds {
+    my $v = $ENV{BP_GUARD_DEADLINE_SECONDS};
+    return $HYG_DEADLINE_CEILING unless defined $v && length $v;
+    return $HYG_DEADLINE_CEILING unless $v =~ /^[0-9]+(?:\.[0-9]+)?$/;
+    return $HYG_DEADLINE_CEILING if $v <= 0 || $v > $HYG_DEADLINE_CEILING;
+    return $v + 0;
+}
+
+sub _gb_h_impl {
+    my ($p, $cmd, $ti) = @_;
+    # redteam-3 M2: work on a BYTE copy for the whole rest of this call --
+    # see BpHook::_segments's comment for why a decoded non-ASCII string
+    # makes every substr()/index() walk downstream quadratic.
+    utf8::encode($cmd) if utf8::is_utf8($cmd);
+
+    my ($mt, undef) = _match_text_and_reason($cmd);
+    my $triggered = BpHook::Guards::Common::line_match($HYG_TRIGGER_RE, $mt);
+    unless ($triggered) {
+        # redteam M3: Shell::strip_noise blanks quoted/escaped spans (that's
+        # right for GB-a/GB-c's git-verb matching), but it also blanks a
+        # quoted or backslash-escaped COMMAND NAME ("\rm", '"rm"', "r\m",
+        # "'r'm"), hiding it from the trigger even though hyg_targets (run
+        # via the real tokenizer, which DOES dequote these) classifies it
+        # correctly once we get there. Re-check a de-escaped/de-quoted copy
+        # of the raw command as a fallback trigger; the real parse below
+        # still respects quoting/escaping properly either way.
+        my $relaxed = _hyg_relaxed_trigger_text($cmd);
+        $triggered = BpHook::Guards::Common::line_match($HYG_TRIGGER_RE, $relaxed);
+    }
+    return undef unless $triggered;
+
+    my $ledger    = $ENV{BP_LEDGER};
+    my $is_ledger = defined $ledger && length $ledger;
+    my $role      = BpHook::role($p);
+    return undef unless $is_ledger || $role eq 'driver';
+
+    my $hint_ok_early = (!$is_ledger && !defined BpHook::agent_id($p)) ? 1 : 0;
+
+    # redteam-3 S1: a Bash call whose payload BpHook itself already knows was
+    # truncated (its own 8 MiB stdin cap) is never trustworthy enough to
+    # parse for real -- deny with the same remedy, instead of failing open
+    # on a garbled/incomplete command.
+    if (defined $ENV{BP_PAYLOAD_TRUNCATED} && $ENV{BP_PAYLOAD_TRUNCATED} eq '1') {
+        return _hyg_oversize_lines($cmd, $hint_ok_early);
+    }
+
+    if (length($cmd) > $HYG_MAX_CMD_BYTES) {
+        return _hyg_oversize_lines($cmd, $hint_ok_early);
+    }
+
+    my $pm = (ref $p eq 'HASH') ? $p->{permission_mode} : undef;
+    my $bypass = (defined $pm && !ref($pm) && ($pm eq 'bypassPermissions' || $pm eq 'dontAsk')) ? 1 : 0;
+
+    my $deadline_at = Time::HiRes::time() + _hyg_deadline_seconds();
+    my $ctx         = _hyg_ctx($p);
+    my $hint_ok     = (!$is_ledger && !defined BpHook::agent_id($p)) ? 1 : 0;
+    my $cmd_line    = 'Command: ' . BpHook::Guards::Common::echo_cmd($cmd);
+
+    # redteam-3 M2: the deadline is caught HERE, never by the outer _gb_h
+    # eval (which fails OPEN on any die) -- a deadline must fail CLOSED.
+    my @targets = eval { hyg_targets($cmd, $deadline_at) };
+    if (my $err = $@) {
+        return _hyg_oversize_lines($cmd, $hint_ok) if ref $err && $err == $HYG_DEADLINE_MARKER;
+        die $err; # a real internal error: let the outer _gb_h eval fail open
+    }
+
+    for my $t (@targets) {
+        if (Time::HiRes::time() > $deadline_at) { return _hyg_oversize_lines($cmd, $hint_ok) }
+        next unless $t->{kind} eq 'delete' || $t->{kind} eq 'move';
+        my $lines = _hyg_check_c($t, $ctx, $cmd_line, $hint_ok);
+        return $lines if defined $lines;
+    }
+
+    unless ($bypass) {
+        for my $t (@targets) {
+            if (Time::HiRes::time() > $deadline_at) { return _hyg_oversize_lines($cmd, $hint_ok) }
+            next unless $t->{kind} eq 'cd';
+            my @lines = (
+                "BLOCKED: $t->{shape} changes the working directory, which unattended runs never do (also inside chains, subshells and bash -c).",
+                'Instead: stay where you are and use absolute paths, git -C <dir> <verb>, or the tool\'s own path argument.',
+                $cmd_line,
+            );
+            push @lines, $HYG_HINT_TEXT if $hint_ok;
+            return \@lines;
+        }
+
+        if (defined $ctx->{R}) {
+            for my $t (@targets) {
+                if (Time::HiRes::time() > $deadline_at) { return _hyg_oversize_lines($cmd, $hint_ok) }
+                next unless $t->{kind} eq 'write' || $t->{kind} eq 'delete';
+                my $lines = _hyg_check_b($t, $ctx, $cmd_line, $hint_ok);
+                return $lines if defined $lines;
+            }
+        }
+    }
+
+    return undef;
+}
+
+sub _gb_h {
+    my ($p, $cmd, $ti) = @_;
+    my $lines = eval { _gb_h_impl($p, $cmd, $ti) };
+    return undef if $@;
+    return $lines;
+}
+
+# ---------------------------------------------------------------------------
 # run($p, @args) -> 0 | 2.
 # ---------------------------------------------------------------------------
+# Decision 25 (2): a Bash payload whose raw size (BEFORE any decode) exceeds
+# 1 MiB is denied outright with the existing over-size remedy. A real
+# BpHook truncation only ever happens at 8 MiB (_read_stdin_bulk's own cap),
+# always over this 1 MiB threshold, so the truncated-payload case below is
+# folded into the same cap rather than treated as a separate size.
+my $HYG_RAW_CAP_BYTES = 1024 * 1024;
+
 sub run {
     my ($p, @args) = @_;
+    # redteam-3 S1 / Decision 25 (2): when BpHook's own stdin read was
+    # truncated (its 8 MiB cap), BpHook::load_payload() discards the decoded
+    # payload entirely (payload() returns {}) -- so $p carries no
+    # tool_name/tool_input, and no session_id, by the time it gets here;
+    # every check below would otherwise fail OPEN on what looks like "not a
+    # Bash call". Decision 25 supersedes the old non-ledger-only scoping
+    # (guards-remake-bash.t's SH-7, amended): a truncated payload is denied
+    # in EVERY role, including a coordinator, because truncation only ever
+    # happens at 8 MiB -- always over the 1 MiB raw-size cap this same
+    # ruling adds below.
+    if (defined $ENV{BP_PAYLOAD_TRUNCATED} && $ENV{BP_PAYLOAD_TRUNCATED} eq '1') {
+        my $cmd_for_msg = (ref $p eq 'HASH' && ref $p->{tool_input} eq 'HASH') ? $p->{tool_input}{command} : undef;
+        my @fitted = map { BpHook::Guards::Common::fit($_) } @{ _hyg_oversize_lines($cmd_for_msg, 0) };
+        return BpHook::deny(@fitted);
+    }
     $p = {} unless ref $p eq 'HASH';
     return 0 unless defined $p->{tool_name} && $p->{tool_name} eq 'Bash';
     my $ti = $p->{tool_input};
@@ -1210,7 +3024,17 @@ sub run {
     my $cmd = $ti->{command};
     return 0 unless defined $cmd && !ref($cmd) && length $cmd;
 
-    for my $rule (\&_gb_a, \&_gb_b, \&_gb_c, \&_gb_d) {
+    # Decision 25 (2): the raw-size deny itself, scoped to a Bash call (never
+    # Edit/Write/other guards -- BpHook::raw_length() is payload-wide, but
+    # only THIS guard, having already confirmed tool_name eq 'Bash' above,
+    # acts on it), in every role, before any of the real parsing below.
+    my $raw_len = BpHook::raw_length();
+    if (defined $raw_len && $raw_len > $HYG_RAW_CAP_BYTES) {
+        my @fitted = map { BpHook::Guards::Common::fit($_) } @{ _hyg_oversize_lines($cmd, 0) };
+        return BpHook::deny(@fitted);
+    }
+
+    for my $rule (\&_gb_a, \&_gb_b, \&_gb_c, \&_gb_h, \&_gb_d) {
         my $lines = eval { $rule->($p, $cmd, $ti) };
         if (defined $lines) {
             my @fitted = map { BpHook::Guards::Common::fit($_) } @$lines;

@@ -22,6 +22,7 @@ package BpHook;
 use strict;
 use warnings;
 use JSON::PP ();
+use Encode ();
 use Digest::SHA qw(sha1_hex);
 use Fcntl qw(:flock O_WRONLY O_APPEND O_CREAT O_EXCL);
 use File::Basename qw(dirname);
@@ -1036,111 +1037,202 @@ sub take_stop_token {
 
 # ----------------------------------------------------------- invocations ---
 
-sub _strip_heredocs {
-    my ($text) = @_;
-    return $text unless $text =~ /<<-?/;
-    my @lines = split /\n/, $text;
-    my @out;
-    my $i = 0;
-    my $n = scalar @lines;
-    while ($i < $n) {
-        my $line = $lines[$i];
-        my @ops;
-        # R8-RTM1 (review M1): the delimiter may be preceded by whitespace
-        # (<< 'EOF', << EOF), and there may be more than one heredoc
-        # operator on one line -- collect ALL of them, in order, and
-        # consume their bodies in that same order. '<<<' (here-string, not
-        # a heredoc) is excluded by the <</<< lookaround.
-        while ($line =~ /(?<!<)<<(?!<)(-)?[ \t]*(?:'([^'\n]*)'|"([^"\n]*)"|([A-Za-z_][A-Za-z0-9_.-]*))/g) {
-            my $dash = $1;
-            my $word = defined $2 ? $2 : defined $3 ? $3 : $4;
-            push @ops, [$dash, $word] if defined $word && length $word;
-        }
-        push @out, $line;
-        $i++;
-        for my $op (@ops) {
-            my ($dash, $word) = @$op;
-            while ($i < $n) {
-                my $body = $lines[$i];
-                my $check = $body;
-                $check =~ s/^[ \t]+// if $dash;
-                if ($check eq $word) { $i++; last }
-                $i++;
-            }
-        }
-    }
-    return join("\n", @out);
-}
-
+# never-halt/01 fix-batch 3 (reports/01-redteam-3.md M1): _segments() is now
+# the ONE lexer pass over the whole text. Earlier batches computed a
+# quote-aware mask in a SEPARATE walk (_whole_text_quote_mask), used it to
+# strip heredoc bodies in a second walk (_strip_heredocs), and only THEN ran
+# the segment-splitting walk below -- three passes, two of which (the mask
+# and the heredoc strip) never knew about the OTHER's territory. An
+# apostrophe or odd quote inside a heredoc body or a "#" comment therefore
+# flipped the mask's quote state for the rest of the text, either hiding a
+# later real heredoc/command (false denial) or exposing a later quoted
+# "'<<X'" as if it were a real heredoc operator (bypass).
+#
+# Both failure directions are gone once heredoc and comment detection are
+# folded into the SAME walk that tracks quote/substitution state: a heredoc
+# operator or a comment is only ever recognised while the CURRENT frame's
+# quote state is 'none' (checked live, not from a separately-computed mask),
+# and once recognised, its body/rest-of-line is skipped WITHOUT ever being
+# fed to the quote-tracking code below -- so the odd quote inside it can
+# never desync anything.
+#
+# Quote state lives PER FRAME (not one shared scalar), so "$(" / a backtick
+# seen while the CURRENT frame is dquote (or none) opens a fresh frame whose
+# own quote state starts 'none' -- a command substitution's body is always
+# parsed for real commands, even when it sits inside an outer pair of double
+# quotes. Its matching ')'/backtick pops back to the enclosing frame, which
+# resumes with whatever quote state it had frozen at push time.
 sub _segments {
     my ($text) = @_;
-    $text = _strip_heredocs($text);
+    # never-halt/01 fix-batch 3 (M2): work on a BYTE copy. A decoded
+    # character string with even one non-ASCII character makes substr()'s
+    # per-character walk below effectively quadratic (Perl must locate each
+    # codepoint's byte offset from scratch). Every shell metacharacter this
+    # lexer looks for is ASCII, and UTF-8 continuation bytes are all at or
+    # above 0x80, so scanning bytes is equivalent -- and it makes substr()
+    # a flat O(1) index into a byte string.
+    utf8::encode($text) if utf8::is_utf8($text);
+
     my @segs;
-    my @stack = ({ closer => undef, buf => '' });
+    my @stack = ({ closer => undef, buf => '', quote => 'none' });
     my $len = length($text);
     my $i = 0;
-    my $quote = '';
+    my @pending_heredocs; # ops ('$dash, $word') queued on the CURRENT line
+
+    # Consumes, verbatim and WITHOUT ever feeding the quote/frame state
+    # machine above, the body of each queued heredoc (in textual order),
+    # advancing $i to the first line after the last body's delimiter line.
+    # Uses index()/substr() bounded by each body LINE, never the whole
+    # remaining text, so cost is proportional to the bodies' own length.
+    my $consume_pending_heredocs = sub {
+        for my $op (@pending_heredocs) {
+            my ($dash, $word) = @$op;
+            while ($i <= $len) {
+                my $nl = index($text, "\n", $i);
+                my $line_end = ($nl >= 0) ? $nl : $len;
+                my $check = substr($text, $i, $line_end - $i);
+                $check =~ s/^[ \t]+// if $dash;
+                $i = ($nl >= 0) ? $nl + 1 : $len;
+                last if $check eq $word;
+                last if $nl < 0; # unterminated heredoc: consumed to EOF
+            }
+        }
+        @pending_heredocs = ();
+    };
+
     while ($i < $len) {
         my $c = substr($text, $i, 1);
         my $frame = $stack[-1];
-        if ($quote eq "'") {
+        if ($frame->{quote} eq 'squote') {
             $frame->{buf} .= $c;
-            $quote = '' if $c eq "'";
+            $frame->{quote} = 'none' if $c eq "'";
             $i++;
             next;
         }
-        if ($quote eq '"') {
+        # redteam-3 S5: ANSI-C $'...' quoting -- backslash escapes the next
+        # character (so \' does NOT end the quote), and it ends on an
+        # unescaped "'". Entered below when "$'" is seen in 'none' state.
+        if ($frame->{quote} eq 'ansic') {
             if ($c eq '\\' && $i + 1 < $len) {
                 $frame->{buf} .= $c . substr($text, $i + 1, 1);
                 $i += 2;
                 next;
             }
+            if ($c eq "'") { $frame->{buf} .= $c; $frame->{quote} = 'none'; $i++; next }
             $frame->{buf} .= $c;
-            $quote = '' if $c eq '"';
+            $i++;
+            next;
+        }
+        if ($frame->{quote} eq 'dquote') {
+            if ($c eq '\\' && $i + 1 < $len) {
+                $frame->{buf} .= $c . substr($text, $i + 1, 1);
+                $i += 2;
+                next;
+            }
+            if ($c eq '"') {
+                $frame->{buf} .= $c;
+                $frame->{quote} = 'none';
+                $i++;
+                next;
+            }
+            if (substr($text, $i, 2) eq '$(') {
+                # never-halt/01 M1: do NOT flush the enclosing word's buf here --
+                # a quoted "$(...)" host word (e.g. "$(pwd)/.git") must stay one
+                # word. The frame's dquote state is preserved on the frame
+                # object itself, so pushing a new stack entry for the subst
+                # body and popping back to this one resumes dquote correctly.
+                push @stack, { closer => ')', buf => '', quote => 'none' };
+                $i += 2;
+                next;
+            }
+            if ($c eq "\x60") {
+                push @stack, { closer => "\x60", buf => '', quote => 'none' };
+                $i++;
+                next;
+            }
+            $frame->{buf} .= $c;
             $i++;
             next;
         }
         if (defined $frame->{closer} && $c eq $frame->{closer}) {
+            # never-halt/01 M1: the substitution body is still emitted as its
+            # own segment (parsed as a command in its own right, Decision
+            # 22 S6), but the enclosing word's buf is NOT reset by the open --
+            # so on pop, append an unpredictable placeholder (the same
+            # convention _tokenize_words already uses for $VAR/${VAR}) to the
+            # now-current frame's buf instead of starting a new segment. That
+            # keeps the host word whole and unresolvable, while any literal
+            # text after the closer (e.g. "/.git") still lands in the same
+            # word's tail.
             push @segs, $frame->{buf};
             pop @stack;
+            $stack[-1]{buf} .= '${_bp_subst}';
             $i++;
             next;
+        }
+        # M1: a REAL (unquoted) heredoc operator, recognised LIVE (only
+        # reached when the current frame's quote state is 'none') -- queue
+        # it and keep scanning the rest of the line normally (more text, or
+        # another heredoc operator, may still follow on the same line). The
+        # match is anchored with pos()/\G so it never copies the remaining
+        # text, and it cannot span a newline (every alternative excludes
+        # "\n"), so cost is bounded by the operator+delimiter text alone.
+        # The prev-char guard excludes "<<<" (a here-string, not a heredoc),
+        # mirroring the old (?<!<) lookbehind.
+        if ($c eq '<' && $i + 1 < $len && substr($text, $i + 1, 1) eq '<'
+            && !($i > 0 && substr($text, $i - 1, 1) eq '<')) {
+            pos($text) = $i;
+            if ($text =~ /\G<<(-)?[ \t]*(?:'([^'\n]*)'|"([^"\n]*)"|([A-Za-z_][A-Za-z0-9_.-]*))/gc) {
+                my $word = defined $2 ? $2 : defined $3 ? $3 : $4;
+                if (defined $word && length $word) {
+                    push @pending_heredocs, [ (defined $1 ? 1 : 0), $word ];
+                    $i = pos($text);
+                    next;
+                }
+            }
+            # not a real heredoc operator (no valid delimiter word follows)
+            # -- fall through and treat '<' as an ordinary character.
         }
         # R8-RTM1 (review M1): a '#' at word start (start of text, or right
         # after whitespace/;/|/&/() outside quotes starts a comment that
         # runs to end of line. Its text (backticks, $(...), ; and all) must
         # never be re-parsed for $( )/backtick command substitution -- skip
-        # it wholesale, unlike the default per-character walk below.
+        # it wholesale, unlike the default per-character walk below. Bounded
+        # by index(), never a per-character scan to the newline.
         if ($c eq '#') {
             my $buf = $frame->{buf};
             if ($buf eq '' || substr($buf, -1, 1) =~ /[ \t;|&(]/) {
                 push @segs, $buf;
                 $frame->{buf} = '';
-                while ($i < $len && substr($text, $i, 1) ne "\n") { $i++ }
+                my $nl = index($text, "\n", $i);
+                $i = ($nl >= 0) ? $nl : $len;
                 next;
             }
         }
-        if ($c eq "'") { $quote = "'"; $frame->{buf} .= $c; $i++; next }
-        if ($c eq '"') { $quote = '"'; $frame->{buf} .= $c; $i++; next }
+        if ($c eq "'") { $frame->{quote} = 'squote'; $frame->{buf} .= $c; $i++; next }
+        if (substr($text, $i, 2) eq "\$'") {
+            $frame->{quote} = 'ansic';
+            $frame->{buf} .= "\$'";
+            $i += 2;
+            next;
+        }
+        if ($c eq '"') { $frame->{quote} = 'dquote'; $frame->{buf} .= $c; $i++; next }
         if ($c eq '\\' && $i + 1 < $len) { $frame->{buf} .= $c . substr($text, $i + 1, 1); $i += 2; next }
         if (substr($text, $i, 2) eq '$(') {
-            push @segs, $frame->{buf};
-            $frame->{buf} = '';
-            push @stack, { closer => ')', buf => '' };
+            # never-halt/01 M1: see the dquote '$(' branch above -- do not
+            # flush the enclosing (unquoted) word's buf either, so
+            # "rm -rf $(pwd)/.git" keeps "/.git" attached to the same word.
+            push @stack, { closer => ')', buf => '', quote => 'none' };
             $i += 2;
             next;
         }
         if ($c eq '`') {
-            push @segs, $frame->{buf};
-            $frame->{buf} = '';
-            push @stack, { closer => '`', buf => '' };
+            push @stack, { closer => '`', buf => '', quote => 'none' };
             $i++;
             next;
         }
         if (substr($text, $i, 2) eq '<(' || substr($text, $i, 2) eq '>(') {
-            push @segs, $frame->{buf};
-            $frame->{buf} = '';
-            push @stack, { closer => ')', buf => '' };
+            push @stack, { closer => ')', buf => '', quote => 'none' };
             $i += 2;
             next;
         }
@@ -1150,10 +1242,17 @@ sub _segments {
             $i++;
             next;
         }
-        if ($c eq ';' || $c eq '|' || $c eq "\n") {
+        if ($c eq ';' || $c eq '|') {
             push @segs, $frame->{buf};
             $frame->{buf} = '';
             $i++;
+            next;
+        }
+        if ($c eq "\n") {
+            push @segs, $frame->{buf};
+            $frame->{buf} = '';
+            $i++;
+            $consume_pending_heredocs->() if @pending_heredocs;
             next;
         }
         if ($c eq '&') {
@@ -1178,6 +1277,9 @@ sub _segments {
 
 sub _tokenize_words {
     my ($seg) = @_;
+    # never-halt/01 fix-batch 3 (M2): same byte-copy reasoning as _segments()
+    # -- a decoded character segment makes every substr() below quadratic.
+    utf8::encode($seg) if utf8::is_utf8($seg);
     my @words;
     my $len = length($seg);
     my $i = 0;
@@ -1192,6 +1294,34 @@ sub _tokenize_words {
         while ($i < $len) {
             my $cc = substr($seg, $i, 1);
             last if $cc eq ' ' || $cc eq "\t";
+            # redteam-3 S5: $'...' (ANSI-C quoting) is ONE quoted word --
+            # backslash escapes the next character (so \' does not end it),
+            # and it ends on an unescaped "'". Checked before the generic
+            # "'" and "$" branches below, or the "'" branch would end the
+            # "quote" at the FIRST embedded "'" (even an escaped one),
+            # desyncing every walk downstream (report row: printf $'it\'s').
+            if ($cc eq '$' && $i + 1 < $len && substr($seg, $i + 1, 1) eq "'") {
+                $unpredictable = 1;
+                $value .= '$' . "'";
+                push @flags, 1, 1;
+                $i += 2;
+                while ($i < $len) {
+                    my $c2 = substr($seg, $i, 1);
+                    if ($c2 eq '\\' && $i + 1 < $len) {
+                        $value .= substr($seg, $i + 1, 1);
+                        push @flags, 1;
+                        $i += 2;
+                        next;
+                    }
+                    last if $c2 eq "'";
+                    $value .= $c2;
+                    push @flags, 1;
+                    $i++;
+                }
+                if ($i < $len && substr($seg, $i, 1) eq "'") { $value .= "'"; push @flags, 1; $i++ }
+                $first = 0;
+                next;
+            }
             if ($cc eq "'") {
                 $i++;
                 while ($i < $len && substr($seg, $i, 1) ne "'") {
@@ -1464,6 +1594,24 @@ my $PAYLOAD_CACHE  = {};
 my $PAYLOAD_LOADED = 0;
 my $PAYLOAD_OK     = 0;
 my $PARSE_COUNT    = 0;
+my $PAYLOAD_RAW_LEN = 0;
+
+# Decision 25: the raw byte length of the last load_payload() input, counted
+# BEFORE any decode -- exposed so a guard (GuardBash: Decision 25 (2)) can
+# deny a too-large Bash payload without paying for or waiting on the decode
+# itself. Always counted as UTF-8 BYTES, never characters, whether $raw
+# already carries Perl's internal utf8 flag (a test fixture built in
+# memory) or is a plain byte string (the real stdin-read case).
+sub _byte_len {
+    my ($s) = @_;
+    return 0 unless defined $s;
+    if (utf8::is_utf8($s)) {
+        my $copy = $s;
+        utf8::encode($copy);
+        return length($copy);
+    }
+    return length($s);
+}
 
 # R6-M2 (red-team MEDIUM-2, Decision 51): JSON::PP's decode dies outright on
 # a lone (unpaired) UTF-16 surrogate escape -- one bad code unit sliced out
@@ -1497,20 +1645,138 @@ sub _repair_lone_surrogates {
     return $raw;
 }
 
+# Decision 25 (1): JSON::PP->new->utf8->decode() re-scans a decoded non-ASCII
+# string character by character internally, which is quadratic-feeling in
+# practice for a large payload padded with non-ASCII text -- 32.2s measured
+# for a 524 KB command that is all U+00E9 (driver measurement). Rewrite every
+# non-ASCII UTF-8 byte sequence in the RAW bytes to its \uXXXX escape (a
+# surrogate pair above U+FFFF, exactly as JSON itself would encode it), in
+# ONE linear regex substitution over the byte string, then decode the
+# resulting PURE-ASCII text with the plain (non-->utf8) decoder, which never
+# has to look past a single byte per character. Must be byte-for-byte
+# equivalent to JSON::PP->new->utf8->decode($raw) for every valid UTF-8
+# input (AC-56); any malformed UTF-8 byte sequence makes this return undef so
+# the caller falls back to today's path unchanged (AC-57).
+# Decodes exactly one well-formed multi-byte UTF-8 sequence (already matched
+# by the precise per-length byte-range regex below) into its \uXXXX escape,
+# by bit arithmetic alone -- no Encode::decode() call per character, which
+# is what made an earlier version of this pay per-call XS/exception-handling
+# overhead for every one of half a million characters. Returns undef (and
+# leaves $_[1] set) for a sequence that is well-formed BYTE-RANGE-wise but
+# an invalid Unicode scalar value: overlong (a shorter encoding existed), a
+# UTF-16 surrogate half (never legal in UTF-8), or above U+10FFFF.
+sub _utf8_seq_escape {
+    my ($seq, $bad_ref) = @_;
+    my @b = unpack('C*', $seq);
+    my $cp;
+    if (@b == 2) {
+        $cp = (($b[0] & 0x1F) << 6) | ($b[1] & 0x3F);
+    }
+    elsif (@b == 3) {
+        if (($b[0] == 0xE0 && $b[1] < 0xA0) || ($b[0] == 0xED && $b[1] >= 0xA0)) {
+            $$bad_ref = 1;
+            return '';
+        }
+        $cp = (($b[0] & 0x0F) << 12) | (($b[1] & 0x3F) << 6) | ($b[2] & 0x3F);
+    }
+    elsif (@b == 4) {
+        if (($b[0] == 0xF0 && $b[1] < 0x90) || ($b[0] == 0xF4 && $b[1] > 0x8F)) {
+            $$bad_ref = 1;
+            return '';
+        }
+        $cp = (($b[0] & 0x07) << 18) | (($b[1] & 0x3F) << 12) | (($b[2] & 0x3F) << 6) | ($b[3] & 0x3F);
+    }
+    else {
+        $$bad_ref = 1;
+        return '';
+    }
+    return $cp > 0xFFFF
+        ? do {
+            my $v = $cp - 0x10000;
+            sprintf('\u%04x\u%04x', 0xD800 + ($v >> 10), 0xDC00 + ($v & 0x3FF));
+          }
+        : sprintf('\u%04x', $cp);
+}
+
+# Decision 25 (1): JSON::PP->new->utf8->decode() re-scans a decoded non-ASCII
+# string character by character internally, which is quadratic-feeling in
+# practice for a large payload padded with non-ASCII text -- 32.2s measured
+# for a 524 KB command that is all U+00E9 (driver measurement). Rewrite every
+# non-ASCII UTF-8 byte sequence in the RAW bytes to its \uXXXX escape (a
+# surrogate pair above U+FFFF, exactly as JSON itself would encode it), in
+# ONE linear regex substitution over the byte string, then decode the
+# resulting PURE-ASCII text with the plain (non-->utf8) decoder, which never
+# has to look past a single byte per character. Must be byte-for-byte
+# equivalent to JSON::PP->new->utf8->decode($raw) for every valid UTF-8
+# input (AC-56); any malformed UTF-8 byte sequence makes this return undef so
+# the caller falls back to today's path unchanged (AC-57). The regex only
+# matches BYTE-RANGE-well-formed sequences (a correct number of continuation
+# bytes, and a lead byte that cannot start an overlong/out-of-range
+# sequence); anything else -- a stray continuation byte, a truncated
+# sequence, a lead byte with too few followers -- simply does not match and
+# is caught by the leftover-high-byte check below.
+sub _fast_ascii_escape_decode {
+    my ($raw) = @_;
+    return undef unless defined $raw && length $raw;
+    my $esc = $raw;
+    my $bad = 0;
+    $esc =~ s{
+        ( [\xC2-\xDF][\x80-\xBF]
+        | [\xE0-\xEF][\x80-\xBF]{2}
+        | [\xF0-\xF4][\x80-\xBF]{3}
+        )
+    }{
+        _utf8_seq_escape($1, \$bad)
+    }gex;
+    return undef if $bad;
+    # A stray/malformed byte that never matched the pattern above (a lone
+    # continuation byte, a truncated multi-byte sequence, an invalid lead
+    # byte such as 0xC0/0xC1/0xF5-0xFF) is left as a raw high byte -- never
+    # silently hand that to the ascii-only decoder below (it would treat it
+    # as a Latin-1 code point instead of failing), fall back instead.
+    return undef if $esc =~ /[\x80-\xFF]/;
+    return eval { JSON::PP->new->decode($esc) };
+}
+
 sub load_payload {
     my ($raw) = @_;
     $PARSE_COUNT++;
     my $ok = 1;
     my $data;
+    $PAYLOAD_RAW_LEN = _byte_len($raw);
     if (!defined $raw) {
         $ok = 0;
     }
     else {
-        $data = eval { JSON::PP->new->utf8->decode($raw) };
+        $data = eval { _fast_ascii_escape_decode($raw) };
+        my $fast_err = $@;
+        if ((!defined $data || ref($data) ne 'HASH')
+            && defined $fast_err && length $fast_err && $fast_err =~ /alarm/i)
+        {
+            # Decision 26 (3): an ALRM die that fires mid-fast-path must
+            # never be swallowed into a slow-path retry -- load_payload's own
+            # eval around the fast path would otherwise treat the alarm's
+            # die exactly like an ordinary decode failure and fall through to
+            # the slow JSON::PP->utf8->decode path, which is the very
+            # quadratic-for-non-ASCII cost the fast path exists to avoid.
+            # Re-throw so the caller's own alarm handling sees it.
+            die $fast_err;
+        }
         if (!defined $data || ref($data) ne 'HASH') {
-            my $repaired = _repair_lone_surrogates($raw);
-            if ($repaired ne $raw) {
-                $data = eval { JSON::PP->new->utf8->decode($repaired) };
+            # Decision 26 (2): the slow fallback (JSON::PP->new->utf8->decode
+            # plus the lone-surrogate repair) runs only when the raw payload
+            # is at most 64 KiB -- above that, a fast-path failure is treated
+            # like today's undecodable-payload outcome directly, so one
+            # invalid byte can never force the slow (quadratic-for-non-ASCII)
+            # path onto a large payload.
+            if (defined $PAYLOAD_RAW_LEN && $PAYLOAD_RAW_LEN <= 65536) {
+                $data = eval { JSON::PP->new->utf8->decode($raw) };
+                if (!defined $data || ref($data) ne 'HASH') {
+                    my $repaired = _repair_lone_surrogates($raw);
+                    if ($repaired ne $raw) {
+                        $data = eval { JSON::PP->new->utf8->decode($repaired) };
+                    }
+                }
             }
             if (!defined $data || ref($data) ne 'HASH') {
                 $ok = 0;
@@ -1538,6 +1804,7 @@ sub load_payload {
 sub payload    { return $PAYLOAD_CACHE }
 sub payload_ok { return $PAYLOAD_OK ? 1 : 0 }
 sub parse_count { return $PARSE_COUNT }
+sub raw_length  { return $PAYLOAD_RAW_LEN }
 
 sub _read_stdin_bulk {
     binmode(STDIN, ':raw');
@@ -1594,9 +1861,31 @@ sub main {
     my $decode_warned = 0;
     local $SIG{__WARN__} = sub { $decode_warned = 1; _append_hook_error($module, $_[0]) };
     my $raw = _read_stdin_bulk();
-    load_payload($raw);
 
     return 0 unless defined $module && $module =~ /^[A-Za-z][A-Za-z0-9_]*(?:::[A-Za-z][A-Za-z0-9_]*)*$/;
+
+    # Decision 26 (1): the Bash guard's raw-size/truncation deny must run
+    # BEFORE any JSON decode -- load_payload() decoding first (fast path,
+    # then the slow path) meant an 8 MiB or truncated Bash payload still
+    # paid the whole decode cost before GuardBash's own post-decode check
+    # (Decision 25 (2)) ever ran. The hook matcher (guard-bash.sh) only ever
+    # invokes this module for a Bash tool_name call, so the module name
+    # alone -- known here without decoding anything -- is enough to act on
+    # the raw bytes' length. No decoder of any kind runs on this path.
+    if ($module eq 'Guards::GuardBash') {
+        $PAYLOAD_RAW_LEN = _byte_len($raw);
+        my $truncated = defined $ENV{BP_PAYLOAD_TRUNCATED} && $ENV{BP_PAYLOAD_TRUNCATED} eq '1';
+        if ($truncated || (defined $PAYLOAD_RAW_LEN && $PAYLOAD_RAW_LEN > 1024 * 1024)) {
+            my $require_ok = eval { require "BpHook/Guards/GuardBash.pm"; 1 };
+            unless ($require_ok) {
+                _append_hook_error($module, $@);
+                return 0;
+            }
+            return BpHook::Guards::GuardBash::deny_oversize_raw();
+        }
+    }
+
+    load_payload($raw);
 
     my $relpath = $module;
     $relpath =~ s{::}{/}g;

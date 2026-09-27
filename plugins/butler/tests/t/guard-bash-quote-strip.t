@@ -34,6 +34,7 @@ use Test::More;
 use FindBin qw($Bin);
 use File::Temp qw(tempdir);
 use JSON::PP;
+use Cwd ();
 
 (my $HOOKS = "$Bin/../../hooks") =~ s{\\}{/}g;
 my $GUARD  = "$HOOKS/guard-bash.sh";
@@ -278,11 +279,48 @@ SKIP: {
         [ q{perl -e 'print "never git reset --hard"'}, 'a verb quoted inside prose, no shell carrier' ],
         [ q{git diff --stat},                          'read-only git' ],
         [ q{git stash list},                           'the explicitly allowed stash read' ],
-        [ q{rm -rf /tmp/scratch},                      'rm -rf under /tmp' ],
     ) {
         my ($cmd, $why) = @$row;
         my ($rc, $out) = run_guard($cmd);
         is($rc, 0, "52d3 control: ALLOW -- $why") or diag("hook output: $out");
+    }
+
+    # The `rm -rf /tmp/...` control is kept separate from the loop above because
+    # its ALLOW outcome depends on the environment two different ways, and only
+    # one of them is safe to control for here:
+    #
+    #   1. GB-a's own literal-text exemption (52d3, the rule this file targets)
+    #      matches the SUBSTRING "/tmp/" in the command text -- unaffected by
+    #      the environment. The command below must keep that literal spelling
+    #      so this remains a test of quote-stripping/matching, not of GB-a's
+    #      exemption text.
+    #   2. GB-h ("hygiene", a later rule in the same chain) independently
+    #      resolves the actual filesystem target and checks it by STAT IDENTITY
+    #      against the TMP/TEMP/TMPDIR roots (spec SS2.7: no hardcoded /tmp for
+    #      those roots). Under a bare `perl file.t`, TMP is the real Windows
+    #      temp dir and Git Bash's /tmp is bind-mounted on that same directory,
+    #      so /tmp resolves inside TMP and GB-h allows. Under
+    #      scripts/run-tests.pl's per-file sandbox, TMP/TEMP/TMPDIR are
+    #      overridden to a fresh SUBdirectory, and /tmp is that subdirectory's
+    #      PARENT -- outside TMP -- so GB-h correctly denies, per spec. That
+    #      denial is right; it is just not what THIS control is about.
+    #
+    # So: keep the literal "/tmp/" text (exercises 52d3 exactly as before), but
+    # point TMP/TEMP at wherever /tmp itself actually resolves ON THIS RUN, so
+    # GB-h's stat-identity check independently agrees with GB-a regardless of
+    # which runner invoked this file. Passed as %extra_env (not `local
+    # $ENV{...}`): run_guard() builds the subprocess's environment from
+    # %CLEAN_ENV, a snapshot of %ENV taken once at file-load time -- long
+    # before this block runs -- so a live %ENV override here would never
+    # reach it. %extra_env is layered on top of that snapshot specifically so
+    # a single call can override it.
+    {
+        my $tmp_target = Cwd::abs_path('/tmp');
+        my %tmp_env = (defined $tmp_target && length $tmp_target)
+            ? (TMP => $tmp_target, TEMP => $tmp_target)
+            : ();
+        my ($rc, $out) = run_guard('rm -rf /tmp/scratch', %tmp_env);
+        is($rc, 0, '52d3 control: ALLOW -- rm -rf under /tmp') or diag("hook output: $out");
     }
 }
 
