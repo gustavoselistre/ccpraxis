@@ -1036,7 +1036,7 @@ sub git_path {
 }
 
 # sync -- commit and push ONLY the research dir. Scoped deliberately: the vault
-# also holds projects/ and todos/, each owned by a different script, and a broad
+# also holds projects/, each owned by a different script, and a broad
 # `git add -A` here would sweep another owner's half-finished work into this
 # commit.
 # do_sync -- the shared implementation, used by both the `sync` verb and the

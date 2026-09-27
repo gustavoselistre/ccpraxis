@@ -280,7 +280,7 @@ sub cmd_init {
     # If empty repo (no commits yet), scaffold the vault layout.
     unless (vault_git_ok('rev-parse', 'HEAD')) {
         write_file_text("$VAULT_DIR/README.md",
-            "# claude-code-vault\n\nPersonal Claude Code backup repo — todos and project-scoped files.\nManaged by `vault-sync.pl` in ccpraxis.\n");
+            "# claude-code-vault\n\nPersonal Claude Code backup repo — project-scoped files and the global almanac.\nManaged by `vault-sync.pl` in ccpraxis.\n");
         write_file_text("$VAULT_DIR/.gitignore",
             "# Machine-local registry — maps slug → absolute project path on THIS machine.\n" .
             "/.registry-local.json\n\n" .
@@ -306,12 +306,9 @@ sub cmd_init {
             "# Vault stores byte-exact copies of tracked project files; any normalization\n" .
             "# would break hash comparison during sync.\n" .
             "* -text\n");
-        make_path("$VAULT_DIR/todos") unless -d "$VAULT_DIR/todos";
-        write_file_text("$VAULT_DIR/todos/.gitkeep", "");
-
-        vault_git_ok('add', 'README.md', '.gitignore', '.gitattributes', 'todos/.gitkeep')
+        vault_git_ok('add', 'README.md', '.gitignore', '.gitattributes')
             or emit_error("git add failed during vault scaffold");
-        vault_git_ok('commit', '-m', 'Initial vault scaffold (README, .gitignore, .gitattributes, todos/)')
+        vault_git_ok('commit', '-m', 'Initial vault scaffold (README, .gitignore, .gitattributes)')
             or emit_error("git commit failed during vault scaffold");
         vault_git_ok('push', '-u', 'origin', $BRANCH)
             or emit_error("git push failed during vault scaffold");
