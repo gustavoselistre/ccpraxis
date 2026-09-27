@@ -1,6 +1,6 @@
 ---
 name: todo
-description: Record, list and close todos that must outlive this session, as project todos for this repo or global todos for anything cross-project. Use proactively when the operator says "remind me", "for later" or "add a todo", or names follow-up work this session will not finish, and use when asked what is outstanding. Skip for steps of the current task, which go in /almanac:task, and for questions only the operator can answer, which go in /almanac:decision.
+description: Record, list and close deferred work an agent can do later, as project todos for this repo or global todos for anything cross-project. Use proactively when the operator says "remind me", "for later" or "add a todo", or names follow-up work this session will not finish, and use when asked what is outstanding. Skip for steps of the current task, which go in /almanac:task, and for questions only the operator can answer, which go in /almanac:decision.
 allowed-tools: Bash, Read
 ---
 
