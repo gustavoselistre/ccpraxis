@@ -19,6 +19,7 @@ use File::Basename qw(dirname basename);
 use File::Path qw(make_path);
 use File::Temp qw(tempfile);
 use JSON::PP qw(decode_json);
+use B ();
 
 # ---------------------------------------------------------------------------
 # Usage / argument parsing
@@ -124,8 +125,17 @@ sub write_bytes_atomic {
     make_path($dir) unless -d $dir;
     my $tmp = "$path.tmp.$$." . time();
     open my $fh, '>:raw', $tmp or return "cannot open $tmp for write: $!";
-    print {$fh} $content;
-    close $fh;
+    unless (print {$fh} $content) {
+        my $e = $!;
+        close $fh;
+        unlink $tmp;
+        return "write $tmp failed: $e";
+    }
+    unless (close $fh) {
+        my $e = $!;
+        unlink $tmp;
+        return "close $tmp failed: $e";
+    }
     unless (rename($tmp, $path)) {
         my $e = $!;
         unlink $tmp;
@@ -357,6 +367,142 @@ sub historical_canon_set {
     return \%set;
 }
 
+# ---------------------------------------------------------------------------
+# Array-unit merge (Decision 26 / spec 09-promote-array-merge). Only the
+# three permission-rule arrays get element-wise treatment; everything else
+# (including permissions.additionalDirectories) stays on the whole-value
+# path above unchanged. See spec S2.1-2.3 for the exact rules mirrored here.
+# ---------------------------------------------------------------------------
+
+# True iff $e is a genuine JSON string -- NOT a JSON number. JSON::PP
+# decodes both a string and a number into a bare, non-ref scalar, so a
+# ref/defined check alone cannot tell them apart (review S1 / red-team S3).
+# This mirrors JSON::PP's own string-vs-number test: a number carries the
+# IOK/NOK flag without POK; a string carries POK.
+sub is_json_string {
+    my ($e) = @_;
+    return 0 if ref($e);
+    return 0 unless defined $e;
+    my $flags = B::svref_2object(\$e)->FLAGS;
+    return 0 if ($flags & (B::SVp_IOK() | B::SVp_NOK())) && !($flags & B::SVp_POK());
+    return 1;
+}
+
+# True iff every element of $v is a genuine JSON string (not a number, not a
+# ref). An empty array qualifies (spec S2.1 item 3).
+sub is_string_array {
+    my ($v) = @_;
+    return 0 unless ref($v) eq 'ARRAY';
+    for my $e (@$v) {
+        return 0 unless is_json_string($e);
+    }
+    return 1;
+}
+
+# Returns the array-unit key ('allow' | 'deny' | 'ask') iff $u qualifies as
+# an array unit under spec S2.1, else undef -- in which case the caller
+# falls through to the pre-existing whole-value handling untouched.
+sub array_unit_key {
+    my ($u) = @_;
+    return undef unless @{ $u->{path} } == 2 && $u->{path}[0] eq 'permissions';
+    my $k = $u->{path}[1];
+    return undef unless $k =~ /^(?:allow|deny|ask)\z/;
+    return undef unless $u->{relation} =~ /^(?:diverged|only_left|only_right)\z/;
+
+    # Only check the side(s) actually present for this relation -- an
+    # only_left unit has no payload_val, an only_right unit has no live_val.
+    my $live_present    = $u->{relation} ne 'only_right';
+    my $payload_present = $u->{relation} ne 'only_left';
+    return undef if $live_present    && !is_string_array($u->{live_val});
+    return undef if $payload_present && !is_string_array($u->{payload_val});
+    return $k;
+}
+
+# The union, across every payload-history version, of the string elements
+# found in the array at $path (spec S2.2's H). A version where the path is
+# missing or not an array contributes nothing; non-string elements in
+# history are ignored (they can never appear in a qualifying L/P anyway).
+sub historical_string_set {
+    my ($versions, $path) = @_;
+    my %set;
+    for my $ver (@$versions) {
+        next unless ref($ver) eq 'HASH';
+        my ($found, $val) = value_at_path($ver, $path);
+        next unless $found && ref($val) eq 'ARRAY';
+        for my $e (@$val) {
+            next unless is_json_string($e);
+            $set{$e} = 1;
+        }
+    }
+    return \%set;
+}
+
+# The string set at $path within a single object (or {} when $obj is
+# missing/not a hash) -- used for the baseline (Decision 27's three-way
+# widening merge), which is one payload version, not a history list.
+sub string_set_at {
+    my ($obj, $path) = @_;
+    return {} unless ref($obj) eq 'HASH';
+    return historical_string_set([$obj], $path);
+}
+
+# The element-wise merge itself (spec S2.3), amended by Decision 27: a
+# change that NARROWS permissions is judged against the payload's whole
+# history ($hist_versions, spec S2.2's H, unchanged); a change that WIDENS
+# them is judged only against the payload at the live install's pre-merge
+# HEAD ($baseline_obj, undef when there is none -- fresh install or no
+# settings.json at that commit). Which action narrows/widens depends on the
+# array: removing an allow entry or adding a deny/ask entry narrows;
+# adding an allow entry or removing a deny/ask entry widens. Returns
+# (\@result, \@removed, \@added, $changes).
+sub merge_array_unit {
+    my ($u, $key, $hist_versions, $baseline_obj) = @_;
+    my $L = ($u->{relation} eq 'only_right') ? [] : $u->{live_val};
+    my $P = ($u->{relation} eq 'only_left')  ? [] : $u->{payload_val};
+    my %in_P = map { $_ => 1 } @$P;
+    my %in_L = map { $_ => 1 } @$L;
+
+    my $hist_set     = historical_string_set($hist_versions, $u->{path});
+    my $baseline_set = string_set_at($baseline_obj, $u->{path});
+    my $is_allow      = ($key eq 'allow');
+
+    my (@removed, %removed_seen);
+    # allow removal narrows -> whole history H. deny/ask removal widens ->
+    # the baseline only; with no baseline payload, nothing is removed
+    # (Decision 27's "deny/ask removals remove nothing").
+    my $removal_set = $is_allow ? $hist_set : $baseline_set;
+    for my $e (@$L) {
+        next if $removed_seen{$e};
+        next unless $removal_set->{$e};
+        next if $in_P{$e};
+        push @removed, $e;
+        $removed_seen{$e} = 1;
+    }
+
+    my (@added, %added_seen);
+    # allow addition widens -> added only if new since the baseline; with no
+    # baseline payload the baseline is empty, so every payload entry not
+    # already live counts as new (Decision 27's "allow additions treat the
+    # baseline as empty"). deny/ask addition narrows -> unrestricted, as
+    # spec S2.3 always was.
+    for my $p (@$P) {
+        next if $added_seen{$p} || $in_L{$p};
+        next if $is_allow && $baseline_set->{$p};
+        push @added, $p;
+        $added_seen{$p} = 1;
+    }
+
+    my %remove_set = map { $_ => 1 } @removed;
+    my @result = ((grep { !$remove_set{$_} } @$L), @added);
+    return (\@result, \@removed, \@added, scalar(@removed) + scalar(@added));
+}
+
+# spec S2.6: JSON-string encoding of a report-line entry.
+sub encode_entry_json {
+    my ($e) = @_;
+    return JSON::PP->new->utf8->allow_nonref->encode($e);
+}
+
 sub pref_honoured {
     my ($scope, $name, $category) = @_;
     my $p = $scope->{$name};
@@ -503,8 +649,16 @@ sub main {
     my $payload_ref; # ref within that repo
     my $sync_stopped = 0;
 
+    # Decision 27's baseline for the settings.json array-unit widening merge:
+    # the live install's HEAD *before* this run's merge changes it. Captured
+    # here, before the pull below can move it. --dry-run never pulls, so
+    # live's HEAD is unchanged throughout and IS the baseline (spec: "in
+    # --dry-run the live HEAD is the baseline").
+    my $baseline_sha;
+
     if ($mode eq 'apply') {
         my $pre_head = head_sha($live_dir);
+        $baseline_sha = $pre_head;
         if (is_ancestor($live_dir, $clone_main, 'HEAD')) {
             push @out, "merge: up-to-date";
         } else {
@@ -540,6 +694,7 @@ sub main {
         $payload_ref = 'HEAD';
     } else {
         my $live_head = head_sha($live_dir);
+        $baseline_sha = $live_head;
         if (is_ancestor($live_dir, $clone_main, 'HEAD')) {
             push @out, "merge: up-to-date";
         } else {
@@ -663,6 +818,16 @@ sub main {
             my $reason = $live_err || $payload_err || $prefs_err;
             $bump->(2);
             $settings_status = "error $reason";
+        } elsif (ref($live_obj) ne 'HASH') {
+            # red-team N1: syntactically valid JSON (null, [], "x", ...) that
+            # is not an object cannot be merged as a unit tree -- compute_units
+            # would dereference it as a hashref and die. Report and refuse
+            # instead of writing anything or crashing.
+            $bump->(2);
+            $settings_status = 'error live settings.json is not a JSON object';
+        } elsif (ref($payload_obj) ne 'HASH') {
+            $bump->(2);
+            $settings_status = 'error payload settings.json is not a JSON object';
         } else {
             my @hist_versions = ($payload_obj);
             for my $b (payload_versions_bytes($payload_dir, $payload_ref, $relpath_settings)) {
@@ -676,12 +841,86 @@ sub main {
                 }
             }
 
+            # Decision 27's baseline object: the settings.json payload at the
+            # live install's pre-merge HEAD ($baseline_sha, captured above,
+            # before this run's merge could move it). undef when there is no
+            # such blob (fresh install, or no settings.json at that commit) --
+            # merge_array_unit treats a missing/non-hash baseline as empty.
+            my $baseline_obj;
+            if (defined $baseline_sha) {
+                my $bbytes = show_blob($live_dir, $baseline_sha, $relpath_settings);
+                if (defined $bbytes) {
+                    my ($bobj, $berr) = decode_json_bytes($bbytes);
+                    $baseline_obj = $bobj unless $berr;
+                }
+            }
+
             my $result = deep_clone($live_obj);
             my @units = compute_units($live_obj, $payload_obj);
             my $count = 0;
             for my $u (@units) {
                 my $rel = $u->{relation};
                 next if $rel eq 'identical';
+
+                # Decision 26 / spec 09: the three permission-rule arrays
+                # are merged element by element against payload history,
+                # instead of being kept/replaced as one opaque value.
+                my $array_key = array_unit_key($u);
+                if (defined $array_key) {
+                    # Decision 27 MUST (red-team M1, M2): any preference
+                    # recorded for this array unit pins it fully untouched,
+                    # WHATEVER its current relation -- not only the relation
+                    # the preference's own category names. A skip-always pref
+                    # set while diverged must still protect the array after
+                    # the payload drops the key and it becomes only_left; a
+                    # right-only pref set while only_right must still protect
+                    # it once the operator's own array makes it diverged.
+                    my $pinned_action;
+                    for my $cat (qw(diverged only_left only_right)) {
+                        if (pref_honoured($prefs_scope, $u->{name}, $cat)) {
+                            $pinned_action = $VALID_ACTION{$cat};
+                            last;
+                        }
+                    }
+                    if (defined $pinned_action) {
+                        push @settings_lines, "  kept-pref $u->{name} ($pinned_action)";
+                        next;
+                    }
+
+                    my ($result_arr, $removed, $added, $changes) =
+                        merge_array_unit($u, $array_key, \@hist_versions, $baseline_obj);
+
+                    if ($changes == 0) {
+                        # A pure reorder/duplicate difference or an
+                        # only_left/only_right unit with nothing to report
+                        # (spec S2.6): only the diverged case still names
+                        # live entries the current payload does not carry.
+                        if ($rel eq 'diverged') {
+                            my %in_p = map { $_ => 1 } @{ $u->{payload_val} };
+                            my $has_own = grep { !$in_p{$_} } @{ $u->{live_val} };
+                            push @settings_lines, "  kept-local $u->{name}" if $has_own;
+                        }
+                        next;
+                    }
+
+                    for my $e (@$removed) {
+                        push @settings_lines, "  removed $u->{name} entry " . encode_entry_json($e);
+                    }
+                    for my $e (@$added) {
+                        push @settings_lines, "  added $u->{name} entry " . encode_entry_json($e);
+                    }
+                    if ($rel eq 'only_left' && !@$result_arr) {
+                        # Mirrors Decision 125: emptying an only_left array
+                        # by removing every retired entry retires the key
+                        # itself, same as the whole-value path below.
+                        delete_at_path($result, $u->{path});
+                    } else {
+                        set_at_path($result, $u->{path}, $result_arr);
+                    }
+                    $count += $changes;
+                    next;
+                }
+
                 if ($rel eq 'only_left') {
                     # Decision 125: an only_left unit whose installed value
                     # canonically matches a value the payload once had (any
@@ -730,7 +969,13 @@ sub main {
                     $bump->(2);
                     $settings_status = "error $err";
                 } else {
-                    my $werr = write_bytes_atomic($home_settings, encode_json_bytes($result));
+                    # red-team N2, handled as the CLAUDE.md branch's symlink
+                    # awareness: a plain rename(tmp, $home_settings) would
+                    # replace the symlink node itself with a regular file.
+                    # Resolve through it and write the real target instead,
+                    # so the symlink survives the promotion.
+                    my $write_path = (-l $home_settings) ? (abs_path($home_settings) // $home_settings) : $home_settings;
+                    my $werr = write_bytes_atomic($write_path, encode_json_bytes($result));
                     if (defined $werr) { $bump->(2); $settings_status = "error $werr"; }
                     else { $settings_status = "updated ($count changes)"; }
                 }
