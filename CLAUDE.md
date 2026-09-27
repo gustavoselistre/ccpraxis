@@ -101,6 +101,7 @@ perl scripts/run-tests.pl                   # everything
 perl scripts/run-tests.pl plugins/sandbox   # one plugin
 perl scripts/run-tests.pl --state=failed    # only what failed last sweep
 perl scripts/run-tests.pl --nice            # low-impact: caps workers at max(2, cores/4)
+perl scripts/run-tests.pl --ledger <ledger> <one .t>  # scoped: runs while another worker is live
 ```
 
 **The last measured full `--fast` run was 1047s over 308 files.** That figure is a MEASUREMENT,

@@ -271,10 +271,21 @@ my $VALIDATION_RE = qr/
   | (^|[;&|\s'"\x60(])npx[[:space:]]+(vitest|jest|mocha|playwright)\b
   | (^|[;&|\s'"\x60(])(pytest|prove)\b
   | (^|[;&|\s'"\x60(])(go|cargo|flutter|dart)[[:space:]]+(test|analyze)\b
-  | (^|[;&|\s'"\x60(])perl[[:space:]]+(-[^[:space:]]+[[:space:]]+)*([^\s;&|]*\/)?run-tests\.pl\b
+  | (^|[;&|'"\x60(]|\$\()[\x20\t]*perl[[:space:]]+(-[^[:space:]]+[[:space:]]+)*([^\s;&|]*\/)?run-tests\.pl\b
   | (^|[;&|])[[:space:]]*([^\s;&|]*\/)?run-tests\.pl\b
-  | (^|[;&|\s'"\x60(])perl[[:space:]]+(-[^[:space:]]+[[:space:]]+)*\S*\.t\b
+  | (^|[;&|'"\x60(]|\$\()[\x20\t]*perl[[:space:]]+(-[^[:space:]]+[[:space:]]+)*\S*\.t\b
 /x;
+# never-halt 03 S7: alternatives 5 and 7 above are perl in COMMAND POSITION
+# only (start of text/segment, after a separator, an opening quote/paren/
+# backtick, or a "$(" substitution start) -- NOT after arbitrary whitespace,
+# so "grep perl x.t"/"echo perl x.t" no longer match (redteam S7). A quote
+# char stays a valid anchor: interlock-write-set-scope.t AC-18 pins
+# `perl -e 'system("perl t/x.t")'` as validation-shaped via exactly this
+# raw-matched, quote-preceded "perl t/x.t" inside the eval'd code, and that
+# is a genuinely different command actually being run, not a mere mention.
+# The shape-normalising predicate (_perl_test_run) covers every wrapped/
+# backslash/aliased form these two alternatives used to catch only via the
+# bare-whitespace anchor.
 
 # redteam M1: command substitution ($(...)), a bare subshell ((...)), and a
 # shell/eval in command position (bash -c '...') each hide the real
@@ -396,6 +407,14 @@ sub _blank_data_heredocs_impl {
     my @pending;
     my $i = 0;
     my $abort = 0;
+    # never-halt 03 S7: a "$(" opened WHILE inside a double quote (the
+    # standard "$(cat <<'EOF' ... EOF)" idiom) starts a nested command
+    # substitution, which real shells parse with FRESH quoting -- a heredoc
+    # operator right after it is a real heredoc, not literal dquote text.
+    # Each stack frame remembers the quote state to resume on the matching
+    # unquoted ")", plus how many unquoted "(" it has seen since (so an
+    # inner subshell/grouping paren doesn't close it early).
+    my @qstack;
 
     OUTER: while ($i < $n) {
         my $line = $lines[$i];
@@ -410,11 +429,25 @@ sub _blank_data_heredocs_impl {
             }
             if ($quote eq 'dquote') {
                 if ($c eq '\\') { $pos += 2; next LINE; }
+                if (substr($line, $pos, 2) eq '$(') {
+                    push @qstack, { ret => 'dquote', depth => 0 };
+                    $quote = 'none';
+                    $pos += 2;
+                    next LINE;
+                }
                 $quote = 'none' if $c eq '"';
                 $pos++;
                 next LINE;
             }
             # quote eq 'none'
+            if (@qstack && $c eq '(') { $qstack[-1]{depth}++; $pos++; next LINE }
+            if (@qstack && $c eq ')') {
+                if ($qstack[-1]{depth} > 0) { $qstack[-1]{depth}--; $pos++; next LINE }
+                my $frame = pop @qstack;
+                $quote = $frame->{ret};
+                $pos++;
+                next LINE;
+            }
             if ($c eq "'") { $quote = 'squote'; $pos++; next LINE; }
             if ($c eq '"') { $quote = 'dquote'; $pos++; next LINE; }
             if ($c eq '\\') {
@@ -487,7 +520,7 @@ sub _blank_data_heredocs_impl {
         }
         last OUTER if $abort;
     }
-    $abort = 1 if $quote ne 'none' || @pending;
+    $abort = 1 if $quote ne 'none' || @pending || @qstack;
 
     return $cmd unless @recorded;
 
@@ -611,7 +644,304 @@ sub _validation_shaped {
     }
     $vtext = _neutralize_perl_syntax_checks($vtext);
     $vtext =~ s/\\\n/ /g;
-    return BpHook::Guards::Common::line_match($VALIDATION_RE, $vtext);
+    return 1 if BpHook::Guards::Common::line_match($VALIDATION_RE, $vtext);
+    return _perl_test_run($cmd);
+}
+
+# redteam-3 M2: the exception thrown by _hyg_deadline_check() (BpHook::
+# Guards::GuardBash, further below), caught ONLY by _gb_h_impl and (never-
+# halt 03 N5) by _perl_test_run above's caller-of-_hyg_commands -- never by
+# an outer eval that would otherwise fail OPEN on it like any other internal
+# error. A deadline must fail CLOSED. Not a bare string, so a real die()
+# elsewhere can never be mistaken for it. Declared here (ahead of every
+# user, textually) because it is a lexical `my`: a sub compiled before its
+# declaration cannot see it.
+my $HYG_DEADLINE_MARKER = { hyg_deadline_exceeded => 1 };
+
+# ---------------------------------------------------------------------------
+# never-halt 03 -- shape-normalising test-run predicate (bug 8288, spec sec
+# 2.3). Purely ADDITIVE to $VALIDATION_RE above: it only ever turns "not
+# validation-shaped" into "validation-shaped". Reuses GB-h's own tokenizer
+# stack (BpHook::_segments/_tokenize_words, _hyg_reduce/_hyg_commands via
+# shell -c / eval recursion, _hyg_scan_redirects) so every lexical shape
+# GB-h already understands (forward-slash, backslash, C:/, /c/, quoted,
+# perl.exe, a leading env assignment, -I/-M/-m option words, a wrapper like
+# timeout/bash -c) is recognised here too, without re-deriving any of it.
+# ---------------------------------------------------------------------------
+
+# _word_text($w) -> defined-or-undef text of a tokenized word ($w is a hash
+# with literal/raw/tail keys, as returned by BpHook::_tokenize_words /
+# _hyg_reduce). Mirrors _hyg_command_name's own literal-or-safe-raw-dequote
+# fallback (redteam-2 S5), but keeps any leading directory part and
+# extension -- callers here need the whole path text, not a bare command
+# name.
+sub _word_text {
+    my ($w) = @_;
+    return undef unless ref $w eq 'HASH';
+    return $w->{literal} if defined $w->{literal};
+    if (defined $w->{raw} && _hyg_raw_safe($w->{raw})) {
+        return _hyg_dequote($w->{raw});
+    }
+    return undef;
+}
+
+# _perl_cluster_code_text($opt_word_text) -> $code | undef. never-halt 03
+# S6/review SHOULD-FIX 1/S2(b): a leading-dash option cluster carries perl
+# CODE on the command line (an "e"/"E" letter) rather than a script
+# operand -- walked left to right (never a single regex) because a
+# value-taking letter (i I M m x d D C F) consumes the rest of the cluster
+# as ITS OWN value first, and a bare digit is itself a glued numeric value
+# (e.g. the "0777" of "-ln0777e'print'") rather than a letter to test.
+# Returns the GLUED code text (possibly '') the moment "e"/"E" is found, or
+# undef when no such letter is reachable (a value-letter or end of cluster
+# was hit first).
+sub _perl_cluster_code_text {
+    my ($t) = @_;
+    return undef unless defined $t && $t =~ /^-(.*)$/s;
+    my $rest = $1;
+    my $len = length $rest;
+    for my $pos (0 .. $len - 1) {
+        my $c = substr($rest, $pos, 1);
+        return substr($rest, $pos + 1) if $c eq 'e' || $c eq 'E';
+        return undef if $c =~ /^[iIMmxdDCF]$/;
+    }
+    return undef;
+}
+
+# _perl_opt_walk(\@words, $start) -> ($script_idx | undef, $is_syntax_check,
+# $code_text | undef). Spec sec 2.3 step 3's option walk, shared verbatim by
+# the test-run predicate below (over an argv already redirect-scanned) and
+# by the --ledger flag-source reader (over the raw segment's own tokenized
+# words). $is_syntax_check is also true for "-MO=.../-MO:..." (compile-only,
+# never a test run -- reuses the same "definitely not a test run, skip" verb
+# as the original "-c" flag, per Decision 36 S6). $code_text is defined iff
+# an "e"/"E" cluster was found (S6/S2(b)): the perl code given directly on
+# the command line, glued or taken from the immediately following word when
+# nothing is glued -- so a caller can tell "no script operand, and the code
+# never touches a test file" (S6: allow) apart from "the code itself
+# do/require/runtests a test file" (S2(b): still a test run).
+sub _perl_opt_walk {
+    my ($words, $start) = @_;
+    my $i = defined $start ? $start : 0;
+    my $n = scalar @$words;
+    while ($i < $n) {
+        my $t = _word_text($words->[$i]);
+        return (undef, 0, undef) unless defined $t;
+        if ($t eq '--') { $i++; last }
+        if ($t =~ /^-[wWXtT]*c[wWXtT]*$/) { return (undef, 1, undef) }
+        if ($t =~ /^-MO[=:]/)             { return (undef, 1, undef) }
+        my $code = _perl_cluster_code_text($t);
+        if (defined $code) {
+            if ($code eq '' && $i + 1 < $n) {
+                my $nx = _word_text($words->[$i + 1]);
+                $code = $nx if defined $nx;
+            }
+            return (undef, 0, $code);
+        }
+        if ($t =~ /^-[IMm]$/) { $i += 2; next }
+        if ($t =~ /^-./)      { $i++; next }
+        last;
+    }
+    return (undef, 0, undef) if $i >= $n;
+    return ($i, 0, undef);
+}
+
+# _perl_binary_name($name) -> 0|1. never-halt 03 N4: perl binary names
+# beyond a bare "perl"/"perl.exe" (already folded by _hyg_command_name) --
+# a versioned copy (perl5, perl5.36.0, ...) and the Windows GUI build
+# (wperl/wperl.exe).
+sub _perl_binary_name {
+    my ($name) = @_;
+    return 0 unless defined $name;
+    return 1 if $name eq 'perl' || $name eq 'wperl';
+    return 1 if $name =~ /^perl5(?:\.\d+)*$/;
+    return 0;
+}
+
+# _runner_or_dot_t_name($name, $is_winfam) -> 0|1. never-halt 03 S4: a
+# command's own (already folded/basename'd/case-normalised) name is the
+# runner or a .t file outright -- direct exec/shebang, or a thin wrapper
+# _hyg_reduce/_hyg_commands already unwrapped down to this name. On
+# Windows-family perls only, an 8.3 alias basename (~N.pl / ~N.t) is judged
+# the same way, lexically, without depending on a real alias existing on
+# disk.
+sub _runner_or_dot_t_name {
+    my ($name, $is_winfam) = @_;
+    return 0 unless defined $name;
+    return 1 if $name eq 'run-tests.pl';
+    return 1 if $name =~ /\.t$/;
+    return 1 if $is_winfam && $name =~ /~\d+\.(?:pl|t)$/i;
+    return 0;
+}
+
+# _perl_test_run($cmd) -> 0|1. Never dies (wrapped in eval); a parse failure
+# other than the shared deadline marker fails open (0), leaving the
+# existing regex's verdict untouched. A deadline hit fails CLOSED (N5): the
+# fast-path test already established this command plausibly runs a test, so
+# treat it as validation-shaped rather than letting an oversize/adversarial
+# command slip past the interlock unexamined. Never writes to
+# $HYG_TARGETS_CACHE.
+sub _perl_test_run {
+    my ($cmd) = @_;
+    my $r = eval {
+        return 0 unless defined $cmd;
+        # M1: "xargs ... perl" and "find ... perl" are test runs even with
+        # no .t/run-tests.pl text at all on the line (e.g. a bare `ls | xargs
+        # -n1 /usr/bin/perl`) -- widen the fast path for exactly that pair of
+        # shapes, never generally. S4: an 8.3 alias basename (~N.pl/~N.t)
+        # never contains a literal ".t" or "run-tests.pl" substring either.
+        return 0
+            unless $cmd =~ /\.t\b/i
+                || $cmd =~ /run-tests\.pl/i
+                || $cmd =~ /\bprove\b/i
+                || $cmd =~ /~\d+\.(?:pl|t)\b/i
+                || ($cmd =~ /\bw?perl/i && ($cmd =~ /\bxargs\b/i || $cmd =~ /\bfind\b/i));
+
+        my $deadline = Time::HiRes::time() + 2;
+        my $is_winfam = _hyg_is_winfam();
+        for my $e (_hyg_commands($cmd, 0, $deadline)) {
+            next unless ref $e eq 'HASH';
+            my $name = _hyg_command_name($e->{name});
+            next unless defined $name;
+
+            # S4: the command itself, already unwrapped, is the runner or a
+            # .t file (direct exec/shebang, or a thin wrapper _hyg_reduce
+            # already stripped).
+            return 1 if _runner_or_dot_t_name($name, $is_winfam);
+
+            # S3: `prove`, bare or perl-launched, is a test run outright --
+            # it has no ".t operand" of its own to walk for.
+            if ($name eq 'prove' || $name eq 'prove.bat') { return 1 }
+
+            # M1: xargs/find hand a filename to perl on a LATER word, never
+            # as perl's own script operand -- a perl-variant word anywhere
+            # in THIS command's own argv is enough.
+            if ($name eq 'xargs' || $name eq 'find') {
+                for my $aw (@{ $e->{argv} || [] }) {
+                    my $an = _hyg_command_name($aw);
+                    return 1 if defined $an && _perl_binary_name($an);
+                }
+                next;
+            }
+
+            # S1: a wrapper _hyg_reduce/_hyg_commands doesn't unwrap
+            # (setsid, ionice, chrt, taskset, flock, watch, strace, ltrace,
+            # unbuffer, parallel, script, su) leaves ITS OWN name here --
+            # scan (bounded) its own argv for the first perl-variant or
+            # runner/.t-shaped word and evaluate from there.
+            if (_hyg_wrapper_name($name)) {
+                my @aw = @{ $e->{argv} || [] };
+                my $bound = ($#aw > 7) ? 7 : $#aw;
+                for my $ix (0 .. $bound) {
+                    my $w = $aw[$ix];
+                    my $an = _hyg_command_name($w);
+                    next unless defined $an;
+                    if (_runner_or_dot_t_name($an, $is_winfam)) { return 1 }
+                    if (_perl_binary_name($an)) {
+                        my @rest = @aw[$ix + 1 .. $#aw];
+                        my ($ops2, undef) = _hyg_scan_redirects(\@rest);
+                        my ($idx2, $is_c2, $code2) = _perl_opt_walk($ops2, 0);
+                        next if $is_c2;
+                        if (defined $code2) {
+                            if ($code2 =~ /\b(?:do|require|runtests)\b/) {
+                                return 1 if $cmd =~ /\.t\b/i || $cmd =~ /run-tests\.pl/i;
+                            }
+                            last;
+                        }
+                        if (!defined $idx2) { last }
+                        my $s2 = _word_text($ops2->[$idx2]);
+                        if (defined $s2 && $s2 ne '-') {
+                            (my $f2 = $s2) =~ tr{\\}{/};
+                            (my $b2 = $f2) =~ s{.*/}{};
+                            $b2 = lc($b2) if $is_winfam;
+                            return 1 if _runner_or_dot_t_name($b2, $is_winfam);
+                        }
+                        last;
+                    }
+                }
+                next;
+            }
+
+            next unless _perl_binary_name($name);
+
+            my ($ops, undef) = _hyg_scan_redirects($e->{argv} || []);
+            my ($idx, $is_c, $code) = _perl_opt_walk($ops, 0);
+            next if $is_c;
+
+            if (defined $code) {
+                # S2(b): code-mode is a test run only when the code itself
+                # opens/requires a test file -- plain code-on-the-command-
+                # line (S6) is not, even if a .t happens to be named
+                # elsewhere on the line (as a data argument, e.g. -pi).
+                if ($code =~ /\b(?:do|require|runtests)\b/) {
+                    return 1 if $cmd =~ /\.t\b/i || $cmd =~ /run-tests\.pl/i;
+                }
+                next;
+            }
+
+            if (!defined $idx) {
+                # S2(a)/M1: no predictable script word -- stdin/pipe/
+                # redirect-only argv, or an unresolvable ($VAR/glob) script
+                # word. Fall back to whether the WHOLE command mentions a
+                # .t file, the runner, or a tests/t/ directory.
+                return 1 if $cmd =~ /\.t\b/i || $cmd =~ /run-tests\.pl/i || $cmd =~ m{tests/t/}i;
+                next;
+            }
+
+            my $s = _word_text($ops->[$idx]);
+            # S2(a): _hyg_scan_redirects only drops OUTPUT-shaped redirects
+            # (it exists to find write TARGETS) -- an input redirect ("<",
+            # possibly fd-prefixed) is left in $ops untouched, so it can
+            # surface here as the "script word" for "perl < x.t"/"perl -
+            # < x.t". Treat it exactly like the "-" (stdin) case.
+            if (!defined $s || $s eq '-' || $s =~ $REDIR_OP) {
+                return 1 if $cmd =~ /\.t\b/i || $cmd =~ /run-tests\.pl/i || $cmd =~ m{tests/t/}i;
+                next;
+            }
+
+            # M2: the tokenizer's own literal for an UNQUOTED backslash
+            # (e.g. "scripts\run-tests.pl") consumes the backslash as a
+            # real shell escape of the next character, losing the
+            # Windows-style separator meaning this predicate is meant to
+            # recognise -- fold from the word's RAW text (quote-stripped,
+            # backslash-to-forward-slash) the same way
+            # _runner_basename_matches does, so the two readers agree.
+            my $raw_s = $ops->[$idx]{raw};
+            my $base;
+            if (defined $raw_s) {
+                (my $rf = $raw_s) =~ s/['"]//g;
+                $rf =~ tr{\\}{/};
+                ($base = $rf) =~ s{.*/}{};
+            }
+            else {
+                (my $folded = $s) =~ tr{\\}{/};
+                ($base = $folded) =~ s{.*/}{};
+            }
+            $base = lc($base) if $is_winfam;
+            return 1 if _runner_or_dot_t_name($base, $is_winfam);
+            # S3: `perl /path/to/prove x.t` launches prove as perl's own
+            # script -- the same as a bare/absolute `prove` invocation.
+            return 1 if $base eq 'prove' || $base eq 'prove.bat';
+        }
+        return 0;
+    };
+    if ($@) {
+        my $err = $@;
+        return 1 if ref $err eq 'HASH' && $err == $HYG_DEADLINE_MARKER;
+        return 0;
+    }
+    return $r ? 1 : 0;
+}
+
+# _hyg_wrapper_name($name) -> 0|1. never-halt 03 S1: process wrappers
+# _hyg_reduce doesn't know how to unwrap (it stops at env/timeout/nice/
+# sudo/stdbuf/command/time/builtin/exec/nohup and the shell keywords), so
+# they surface here as the command's own name.
+sub _hyg_wrapper_name {
+    my ($name) = @_;
+    return 0 unless defined $name;
+    return $name =~ /^(?:setsid|ionice|chrt|taskset|flock|watch|strace|ltrace|unbuffer|parallel|script|su)$/
+        ? 1 : 0;
 }
 
 # 24-interlock-scope B-7: a perl invocation carrying a syntax-check flag
@@ -629,17 +959,33 @@ sub _neutralize_perl_syntax_checks {
     $out =~ s{$PERL_INVOCATION_RE}{
         my ($sep, $ws, $rest) = ($1, $2, $3);
         my $has_c = 0;
+        # never-halt 03 S6 + review SHOULD-FIX 1: mirror _perl_opt_walk's own
+        # "no script operand" rule here, so a bare "perl" invocation carrying
+        # e/E (code on the command line) or -MO=/-MO:: (compile-only) is
+        # blanked the same way "-c" already is -- there is no ".t operand"
+        # for $VALIDATION_RE's own perl alternatives to find.
+        my $no_script = 0;
         for my $tok (split /[\x20\t]+/, $rest) {
             next unless length $tok;
             last unless $tok =~ /^-/;
             if ($tok =~ /^-[wWXtT]*c[wWXtT]*$/) { $has_c = 1; last }
+            if ($tok =~ /^-MO[=:]/)             { $no_script = 1; last }
+            if (defined _perl_cluster_code_text($tok)) { $no_script = 1; last }
         }
         # 24-interlock-scope-review M-1: a command substitution, backtick or
         # process substitution among $rest's operands still runs a real
         # command at shell level even though the outer "perl -c ..." itself
         # never executes its script -- never blank those operands away.
         $has_c = 0 if $rest =~ /\x60|\$\(|[<>]\(/;
-        $has_c
+        $no_script = 0 if $rest =~ /\x60|\$\(|[<>]\(/;
+        # never-halt 03 S6 vs interlock-write-set-scope.t AC-18: a second
+        # "perl" word inside the code (system("perl t/x.t"), a nested
+        # eval, ...) is a genuinely different invocation actually being
+        # run, not a mere data argument -- never blank it away just
+        # because the OUTER perl's own e/E cluster carries no script of
+        # its own.
+        $no_script = 0 if $rest =~ /\bperl\b/i;
+        ($has_c || $no_script)
             ? ($sep . (' ' x (length($ws) + length('perl') + length($rest))))
             : ($sep . $ws . 'perl' . $rest);
     }ge;
@@ -857,8 +1203,10 @@ sub _resolve_binding_cached {
 
 # ---------------------------------------------------------------------------
 # 29-driver-validation-scope -- the driver's opt-in BP_VALIDATE_LEDGER=<path>
-# scoping (spec sec 2.1/2.2). The name is read only from the command text
-# (BpHook::_tokenize_words), never from the hook process's own %ENV.
+# scoping (spec sec 2.1/2.2), and (never-halt 03) the equivalent --ledger/
+# --ledger=<path> flag on the leading run-tests.pl invocation. The name is
+# read only from the command text (BpHook::_tokenize_words), never from the
+# hook process's own %ENV.
 # ---------------------------------------------------------------------------
 sub _fold_path {
     my ($s) = @_;
@@ -872,9 +1220,97 @@ sub _fold_path {
     return $v;
 }
 
+# _validate_ledger_value($v) -> 0|1. Spec sec 2.2's shared "validate(v)":
+# defined, non-empty, and free of shell-meaningful characters.
+sub _validate_ledger_value {
+    my ($v) = @_;
+    return 0 unless defined $v && length $v;
+    return 0 if $v =~ /[\s;&|<>()]/;
+    return 1;
+}
+
+# _runner_basename_matches($raw_text) -> 0|1. never-halt 03 Decision 36 M2/
+# N2: the ONE shared runner-recognition reader for a word's RAW text (quotes
+# and backslash intact) -- strips ' and " characters (a quoted runner word,
+# "scripts/run-tests.pl" or 'scripts/run-tests.pl', dequotes to plain text
+# this way since the tokenizer's own literal already stripped matched-pair
+# quotes with no escapes), folds backslash to forward slash (an unquoted
+# Windows-style "scripts\run-tests.pl"), then compares the basename to
+# "run-tests.pl" case-insensitively on Windows-family perls -- the SAME case
+# rule _perl_test_run's own script-basename check uses, so the two readers
+# can never disagree about which basename ends a scoped run (N2).
+sub _runner_basename_matches {
+    my ($raw) = @_;
+    return 0 unless defined $raw;
+    (my $t = $raw) =~ s/['"]//g;
+    $t =~ tr{\\}{/};
+    (my $base = $t) =~ s{.*/}{};
+    $base = lc($base) if _hyg_is_winfam();
+    return $base eq 'run-tests.pl' ? 1 : 0;
+}
+
+# _flag_ledger_values($trimmed) -> list of contributed --ledger/--ledger=
+# values (undef included, spec sec 2.2 "FLG"), read ONLY from the leading
+# runner invocation of the command's FIRST segment (BpHook::_segments), so a
+# --ledger after "&&"/";"/a pipe, or on a bare .t rather than on run-tests.pl
+# itself, is never read (AC-12). Runs the segment through _hyg_reduce first
+# (never-halt 03 N1) so a wrapper (timeout 600, env, nice, sudo, ...) ahead
+# of the runner invocation does not hide it.
+sub _flag_ledger_values {
+    my ($trimmed) = @_;
+    my @out = eval {
+        return () unless defined $trimmed && length $trimmed;
+        my @segs = BpHook::_segments($trimmed);
+        my $seg0 = $segs[0];
+        return () unless defined $seg0 && length $seg0;
+        my $words = BpHook::_tokenize_words($seg0);
+        return () unless ref $words eq 'ARRAY' && @$words;
+
+        my ($name_word, $argv, undef) = _hyg_reduce($words);
+        return () unless defined $name_word;
+        my @w = ($name_word, @$argv);
+        my $n = scalar @w;
+
+        my $name = _hyg_command_name($name_word);
+        my $s_idx;
+        if (defined $name && $name eq 'perl') {
+            my ($idx, $is_c, $code) = _perl_opt_walk(\@w, 1);
+            return () if $is_c || defined $code || !defined $idx;
+            $s_idx = $idx;
+        }
+        else {
+            return () unless _runner_basename_matches($name_word->{raw});
+            $s_idx = 0;
+        }
+        return () unless _runner_basename_matches($w[$s_idx]->{raw});
+
+        my @vals;
+        my $j = $s_idx + 1;
+        while ($j < $n) {
+            my $lit = $w[$j]{literal};
+            if (defined $lit && $lit eq '--ledger') {
+                push @vals, ($j + 1 < $n) ? $w[$j + 1]{literal} : undef;
+                $j += 2;
+                next;
+            }
+            if (defined $lit && $lit =~ /^--ledger=(.*)$/s) {
+                push @vals, $1;
+                $j++;
+                next;
+            }
+            $j++;
+        }
+        return @vals;
+    };
+    return () if $@;
+    return @out;
+}
+
 # _named_validation_ledger($cmd) -> ($state, $value). $state is one of
 # 'absent', 'value', 'bad'. Never dies (spec 2.1: "on any internal failure
-# it returns ('bad', undef)").
+# it returns ('bad', undef)"). Draws from two sources (spec sec 2.2): the
+# leading BP_VALIDATE_LEDGER= prefix assignment (PFX, unchanged), and a
+# --ledger/--ledger= flag on the leading runner invocation (FLG, new).
 sub _named_validation_ledger {
     my ($cmd) = @_;
     my @r = eval {
@@ -888,15 +1324,58 @@ sub _named_validation_ledger {
                 && $w->{raw} =~ /^[A-Za-z_][A-Za-z0-9_]*=/;
             push @prefix, $w;
         }
-        my @matches = grep { index($_->{raw}, 'BP_VALIDATE_LEDGER=') == 0 } @prefix;
-        return ('absent', undef) if @matches == 0;
-        return ('bad', undef) if @matches > 1;
-        my $mw = $matches[0];
-        return ('bad', undef) unless defined $mw->{literal};
-        my $value = substr($mw->{literal}, length('BP_VALIDATE_LEDGER='));
-        return ('bad', undef) unless length($value);
-        return ('bad', undef) if $value =~ /[\s;&|<>()]/;
-        return ('value', $value);
+        my @pfx_matches = grep { index($_->{raw}, 'BP_VALIDATE_LEDGER=') == 0 } @prefix;
+        my @flg = _flag_ledger_values($trimmed);
+
+        return ('bad', undef) if @pfx_matches > 1;
+        return ('bad', undef) if @flg > 1;
+        return ('absent', undef) if @pfx_matches == 0 && @flg == 0;
+
+        my $pval;
+        if (@pfx_matches == 1) {
+            my $mw = $pfx_matches[0];
+            return ('bad', undef) unless defined $mw->{literal};
+            $pval = substr($mw->{literal}, length('BP_VALIDATE_LEDGER='));
+        }
+        my $fval = (@flg == 1) ? $flg[0] : undef;
+
+        my $final_val;
+        if (@pfx_matches == 1 && @flg == 0) {
+            return ('bad', undef) unless _validate_ledger_value($pval);
+            $final_val = $pval;
+        }
+        elsif (@pfx_matches == 0 && @flg == 1) {
+            return ('bad', undef) unless _validate_ledger_value($fval);
+            $final_val = $fval;
+        }
+        else {
+            # both present: both must validate AND resolve to the same path.
+            return ('bad', undef)
+                unless _validate_ledger_value($pval) && _validate_ledger_value($fval);
+            return ('bad', undef) unless _fold_path($pval) eq _fold_path($fval);
+            $final_val = $pval;
+        }
+
+        # never-halt 03 S5: the scope named on segment 0 must not cover a
+        # later &&/;/|-joined segment that is ITSELF validation-shaped --
+        # otherwise one scoped invocation could smuggle in a specific,
+        # differently-targeted invocation under the same allow (a single
+        # OTHER .t file, or a non-run-tests.pl test runner like `prove`,
+        # neither of which _is_full_sweep_runner's own whole-command scan
+        # would ever catch on its own). When that scan ALREADY flags the
+        # whole command as a full sweep (e.g. a later bare/--fast/
+        # multi-operand run-tests.pl segment), the smuggled invocation is
+        # caught there instead, with the more specific full-sweep message --
+        # interlock-runner-redirects.t AC-23 pins that message for exactly
+        # this shape, so S5 must not pre-empt it with a bare 'bad'.
+        unless (_is_full_sweep_runner($cmd)) {
+            my @segs = BpHook::_segments($trimmed);
+            for my $si (1 .. $#segs) {
+                next unless defined $segs[$si] && length $segs[$si];
+                return ('bad', undef) if _validation_shaped($segs[$si]);
+            }
+        }
+        return ('value', $final_val);
     };
     return ('bad', undef) if $@;
     return @r;
@@ -1000,15 +1479,62 @@ sub _is_full_sweep_runner {
             my @kept = _drop_redirects(@tok);
             my $k;
             for my $idx (0 .. $#kept) {
-                if ($kept[$idx] =~ m{(?:^|/)run-tests\.pl\b}) { $k = $idx; last; }
+                if (_runner_basename_matches($kept[$idx])) { $k = $idx; last; }
             }
             next unless defined $k;
             my @tail = @kept[$k + 1 .. $#kept];
+            # never-halt 03 Decision 36 M2: a matched-pair-quoted (or
+            # unquoted, possibly backslash-separated) runner token is
+            # self-contained -- compute its glued suffix from the
+            # NORMALISED text, so a trailing quote CHARACTER never survives
+            # as a phantom operand. An ODD quote count means this token is
+            # a FRAGMENT of a larger quoted argument the naive whitespace
+            # split tore in two (e.g. --note "see scripts/run-tests.pl") --
+            # keep computing $rem from the raw text there, preserving
+            # today's tail semantics exactly (interlock-runner-redirects.t
+            # AC-22).
+            my $quotes_in_k = () = $kept[$k] =~ /['"]/g;
             my $rem;
-            if ($kept[$k] =~ m{(?:^|/)run-tests\.pl(.*)$}) { $rem = $1; }
+            if ($quotes_in_k % 2 == 0) {
+                (my $kn = $kept[$k]) =~ s/['"]//g;
+                $kn =~ tr{\\}{/};
+                if ($kn =~ m{(?:^|/)run-tests\.pl(.*)$}) { $rem = $1; }
+            }
+            elsif ($kept[$k] =~ m{(?:^|/)run-tests\.pl(.*)$}) { $rem = $1; }
             unshift @tail, $rem if defined $rem && length $rem;
+            # never-halt 03 Decision 36 M2: a quoted runner word/flag value
+            # ("scripts/run-tests.pl", '--fast') and a backslash-separated
+            # runner word (scripts\run-tests.pl) must read the same as their
+            # unquoted/forward-slash forms -- strip quote characters from
+            # every tail token once, up front (the runner word itself was
+            # already matched, quote-aware, above).
+            @tail = map { (my $x = $_) =~ s/['"]//g; $x } @tail;
             return 1 if grep { /^--fast\b/ } @tail;
-            my @args = grep { $_ !~ /^--?/ } @tail;
+            # never-halt 03 / Decision 35 Q2: the VALUE of a value-taking
+            # runner flag (--ledger P, --jobs N) is not a path operand --
+            # skip it together with its flag, so it is never miscounted as
+            # a second (or the only) operand.
+            my @args;
+            my $skip_next = 0;
+            for my $t (@tail) {
+                if ($skip_next) { $skip_next = 0; next; }
+                if ($t =~ /^--(?:ledger|jobs)$/) { $skip_next = 1; next; }
+                next if $t =~ /^--?/;
+                # never-halt 03 Decision 36 M3: any runner operand that
+                # carries a glob metacharacter is many files, not one --
+                # and one that LOOKS like a path (has a directory
+                # component) but doesn't end in .t is a directory sweep.
+                # A bare token with neither shape (e.g. a stray leftover
+                # quote character from an already-consumed argument, AC-22's
+                # "kept" tail semantics) is left alone.
+                return 1 if $t =~ /[*?\[{]/;
+                if ($t =~ m{/}) {
+                    (my $tb = $t) =~ s{.*/}{};
+                    $tb = lc($tb) if _hyg_is_winfam();
+                    return 1 unless $tb =~ /\.t$/i;
+                }
+                push @args, $t;
+            }
             return 1 if @args == 0 || @args >= 2;
         }
     }
@@ -1123,7 +1649,9 @@ sub _gb_d {
                                 # 29-driver-validation-scope: the driver main
                                 # thread has no binding of its own, but may
                                 # opt in to the same scoping via a leading
-                                # BP_VALIDATE_LEDGER=<ledger> on the command.
+                                # BP_VALIDATE_LEDGER=<ledger> assignment, or
+                                # (never-halt 03) a --ledger/--ledger=<path>
+                                # on the leading run-tests.pl invocation.
                                 $caller_ws_tried = 1;
                                 my ($st, $val) = _named_validation_ledger($cmd);
                                 if ($st eq 'value') {
@@ -2399,13 +2927,6 @@ sub _hyg_join_eval_words {
     }
     return join(' ', @parts);
 }
-
-# redteam-3 M2: the exception thrown by _hyg_deadline_check() below, caught
-# ONLY by _gb_h_impl (never by the outer _gb_h eval, which would otherwise
-# fail OPEN on it like any other internal error -- a deadline must fail
-# CLOSED). Not a bare string, so a real die() elsewhere can never be
-# mistaken for it.
-my $HYG_DEADLINE_MARKER = { hyg_deadline_exceeded => 1 };
 
 # Package 02, spec sec 2.2 "Targets": a one-entry, per-process cache shared
 # between _gb_h and _gb_w, so a single Bash command is scanned by
