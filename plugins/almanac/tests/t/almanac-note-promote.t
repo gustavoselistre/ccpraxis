@@ -235,7 +235,15 @@ sub count_md_in {
 }
 my $live_before       = count_md_in($LIVE_NOTE_STORE);
 my $live_notes_before = count_md_in($LIVE_NOTES_DIR);
-ok($live_before > 0, "sanity: live note store has records to protect ($live_before found)");
+# Decision 18 / Decision 120(c): the protective intent here is COUNT
+# UNCHANGED and PRE-EXISTING FILES UNTOUCHED (checked below, AC-50) -- not
+# that the real repo's gitignored note store holds any records at all, or
+# holds ac2-target.md specifically. A fresh clone / a store emptied by an
+# unrelated run must not turn this suite red for that reason alone. Whether
+# ac2-target.md happens to be there is recorded (not asserted) so the AC-50
+# "survives untouched" check below stays conditional on it actually having
+# existed, rather than requiring its presence.
+my $ac2_target_existed_before = -f "$LIVE_NOTE_STORE/ac2-target.md" ? 1 : 0;
 
 ok(-f $NOTE_PL, 'almanac-note.pl exists at plugins/almanac/scripts/almanac-note.pl')
     or diag('almanac-note.pl is not present yet -- every assertion below is '
@@ -775,7 +783,14 @@ our ($AC24_STATE_A, $AC24_STATE_B);
     my $live_notes_after = count_md_in($LIVE_NOTES_DIR);
     is($live_after, $live_before,
        "AC-50: live note store's record count is unchanged by this suite ($live_before before, $live_after after)");
-    ok(-f "$LIVE_NOTE_STORE/ac2-target.md", 'AC-50: the existing ac2-target.md fixture survives untouched');
+    # Presence of ac2-target.md is never REQUIRED (Decision 18 / 120(c)) --
+    # only, if it was there before this suite ran, that it is still there
+    # after.
+    SKIP: {
+        skip('ac2-target.md was not present before this suite ran -- nothing to protect', 1)
+            unless $ac2_target_existed_before;
+        ok(-f "$LIVE_NOTE_STORE/ac2-target.md", 'AC-50: the pre-existing ac2-target.md fixture survives untouched');
+    }
     is($live_notes_after, $live_notes_before,
        "AC-50: the repo's own .ccpraxis-local-data/notes/ gains nothing ($live_notes_before before, $live_notes_after after)");
 }

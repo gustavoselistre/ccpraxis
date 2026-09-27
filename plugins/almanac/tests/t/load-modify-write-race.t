@@ -70,7 +70,7 @@ sub count_reports_in {
 (my $REPO = "$Bin/../../../..") =~ s{\\}{/}g;
 my $LIVE_STORE = "$REPO/.ccpraxis-local-data/bug-reports";
 my $live_before = count_reports_in($LIVE_STORE);
-ok($live_before > 0, "sanity: live store has reports to protect ($live_before found)");
+# Decision 120(c): presence in the real gitignored live store is never REQUIRED -- only that this suite leaves its count unchanged (checked below).
 
 # Writes a self-contained hook script that runs a real set-status call
 # through the CLI, with no ALMANAC_RACE_TEST_HOOK of its own (no recursion).
