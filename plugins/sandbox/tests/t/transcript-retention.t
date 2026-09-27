@@ -285,9 +285,10 @@ my $HOST_BASELINE = {
             # test commands, allowed outright so they never reach the auto-mode
             # classifier, whose blocks escalate to a prompt that halts unattended
             # runs. Every entry reads or runs this repo's own tests; none writes
-            # outside the repo, deletes, pushes or installs anything.
+            # outside the repo, deletes, pushes or installs anything. The
+            # BP_VALIDATE_LEDGER mid-wildcard entry was dropped by never-halt 03
+            # (Decision 6); --ledger rides the plain runner rule.
             'Bash(perl scripts/run-tests.pl *)',
-            'Bash(BP_VALIDATE_LEDGER=* perl scripts/run-tests.pl *)',
             'Bash(perl -c *)',
             'Bash(git diff *)', 'Bash(git log *)', 'Bash(git show *)',
             'Bash(git status *)', 'Bash(git ls-files *)',

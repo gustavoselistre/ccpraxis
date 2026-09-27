@@ -179,6 +179,13 @@ $REAL_WINDOWS_TMP = undef unless defined $REAL_WINDOWS_TMP && length $REAL_WINDO
 my $SANDBOX_SWEEP_ROOT;
 my $KEEP_SANDBOX = 0;
 
+# never-halt 03: the --ledger path, taken verbatim (no rel2abs, no separator
+# folding -- File::Spec on Git-for-Windows perl is the Unix flavour, and
+# rel2abs of a C:/ path is wrong). undef unless --ledger was given. Set once
+# during argv parsing in run_sweep(), read-only afterward. Nothing reads it
+# yet except the announcement line below; tooling-fixes 07 builds on it.
+my $LEDGER_PATH;
+
 # The recognisable prefix every per-file sandbox/win-tmp dir carries (m4).
 # Lets an operator (or a stray-orphan reaper) tell this runner's own scratch
 # apart from anything else under %TEMP%/"/tmp" at a glance. Deliberately NOT
@@ -412,12 +419,13 @@ if (defined $__msys2_before_container_require) {
 }
 
 sub _usage { return <<'USAGE' }
-usage: perl scripts/run-tests.pl [--fast] [--jobs N] [--nice] [--state=failed] [--keep-sandbox] [PATH-OR-GLOB ...]
+usage: perl scripts/run-tests.pl [--fast] [--jobs N] [--nice] [--state=failed] [--keep-sandbox] [--ledger PATH] [PATH-OR-GLOB ...]
   --fast          skip the host-serial lane. Membership is a TEXT MATCH on a file's own source, NOT an answer to "does this start a real container" -- a file that merely mentions the container helpers is skipped too (report 20260918-042312-02db). The summary names every file skipped, so check it rather than reading "0 serial" as "there were none". This does NOT touch the container LANE below -- if that is enabled, its files still run there regardless of --fast.
   --jobs N        parallelism for non-container tests (default: cores - 2)
   --nice          low-impact mode: cap parallelism at max(2, cores/4), leaving the machine usable for whoever else is on it. Does not touch OS scheduling priority (spawned git/podman children aren't covered by that). Env var CCPRAXIS_TEST_JOBS=N sets the same kind of ambient low-impact default without a per-run flag.
   --state=failed  re-run only the files recorded failing by the previous run
   --keep-sandbox  do not remove each file's per-file sandbox HOME after it runs (package 21-test-sandbox). Default: removed.
+  --ledger PATH   name the package ledger this run validates (must exist; exit 2 otherwise). The validation interlock scopes the run to that package's write set.
 
 Precedence for parallelism (most to least specific):
   --jobs N  >  --nice  >  CCPRAXIS_TEST_JOBS env var  >  default (cores - 2)
@@ -1204,11 +1212,41 @@ sub run_sweep {
         }
         elsif ($a eq '--help' || $a eq '-h') { print _usage(); exit 0 }
         elsif ($a eq '--keep-sandbox')    { $KEEP_SANDBOX = 1 }
+        elsif ($a eq '--ledger') {
+            if (defined $LEDGER_PATH) {
+                print STDERR "error: --ledger given more than once\n";
+                exit 2;
+            }
+            unless (@ARGV) {
+                print STDERR "error: --ledger requires a value\n";
+                exit 2;
+            }
+            $LEDGER_PATH = shift @ARGV;
+        }
+        elsif ($a =~ /^--ledger=(.*)$/s) {
+            if (defined $LEDGER_PATH) {
+                print STDERR "error: --ledger given more than once\n";
+                exit 2;
+            }
+            my $v = $1;
+            unless (length $v) {
+                print STDERR "error: --ledger= requires a non-empty value\n";
+                exit 2;
+            }
+            $LEDGER_PATH = $v;
+        }
         else                              { push @targets, $a }
+    }
+    if (defined $LEDGER_PATH && !-f $LEDGER_PATH) {
+        print STDERR "error: --ledger path does not exist or is not a file: $LEDGER_PATH\n";
+        exit 2;
     }
     if ($state_mode && @targets) {
         print STDERR "error: --state=failed cannot be combined with a path/glob target\n";
         exit 2;
+    }
+    if (defined $LEDGER_PATH) {
+        print "ledger: $LEDGER_PATH\n";
     }
 
     # Force the sandbox base and the sandbox registry into existence NOW,
