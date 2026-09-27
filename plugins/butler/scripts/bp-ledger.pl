@@ -41,16 +41,20 @@
 # file), 3 usage/argument error (nothing read), 4 I/O/lock/atomicity failure
 # (byte-identical), 5 target region not found (byte-identical).
 #
-# stdout is ALWAYS empty, EXCEPT `rotate --dry-run` and `claim-check`, both of which
-# are report-only ops (b45 §3; 08-completion-claims-checked-spec.md §2.6) that print
-# their report to stdout while touching nothing. stderr on any
+# stdout is ALWAYS empty, EXCEPT `rotate --dry-run`, `claim-check` and `migrate-oracle`
+# (01-compact-oracle-records-spec.md §2.8), all of which print a report/summary line to
+# stdout. `claim-check` and `rotate --dry-run` touch nothing; `migrate-oracle` (a real
+# run) prints its summary AFTER a successful write. stderr on any
 # non-zero exit is EXACTLY ONE line. `append-attempt` may ALSO print one budget-notice
 # line to stderr on an otherwise-successful (exit 0) run — see DEFAULT_BUDGET_BYTES
 # below; that is not a rejection, just visibility, and the append still happens.
 # `rotate` may likewise print one LEDGER_IRREDUCIBLE notice to stderr on an otherwise-
 # successful (exit 0) run when it determines the ledger cannot be reduced further
 # (a03-ledger-budget-irreducible spec §2.1/§2.5) — same non-error notice shape, same
-# one-line discipline.
+# one-line discipline. `tick-step` may likewise print exactly ONE stderr warning naming
+# the ledger, on an otherwise-successful (exit 0) run, when the oracle sidecar cannot be
+# written (Decision 11 of tooling-fixes, amending 01-compact-oracle-records-spec.md
+# §2.6 step 5's "no stderr" line) — the record is still written, in long form.
 #
 # Core Perl only: strict, warnings, Getopt::Long, Fcntl(:flock), JSON::PP, B. No
 # other module may be loaded on any path (latency constraint, §2.5) -- with ONE
@@ -81,6 +85,12 @@ use constant ORACLE_SECTION_HEADING   => '## Oracle identity';
 use constant ORACLE_LINE_PREFIX       => '- oracle ';   # note the single trailing space
 use constant ORACLE_DESCRIPTION_CAP   => 300;           # descriptions[] omitted above this
 use constant ORACLE_DEFAULT_TIMEOUT_S => 300;
+
+# 01-compact-oracle-records (bug 20260926-155710-2c57) — compact ledger records + sidecar
+# (spec §2.1, exact names).
+use constant ORACLE_RECORD_MAX_BYTES  => 400;   # hard cap on one compact ledger line, prefix included
+use constant ORACLE_COMPACT_VERSION   => 2;     # value of the "v" key that marks a compact record
+use constant ORACLE_REASON_MAX_CHARS  => 64;    # compact "reason" length after sanitising
 our @ORACLE_RECORDED_STEPS = (3, 5);
 our @PIPELINE_CONDITIONAL_STEPS = (8);
 
@@ -1136,6 +1146,284 @@ sub merge_and_render_oracle_section {
     return insert_or_replace_oracle_section($B, @lines);
 }
 
+# =====================================================================================
+# Compact oracle records + sidecar (01-compact-oracle-records, bug 2c57).
+# spec §2.3-2.5. Digest::SHA is loaded lazily, INSIDE this sub only (never at file
+# scope -- completion-claim-integrity.t AC-33's file-scope module scan enforces this).
+# =====================================================================================
+
+sub _oracle_lazy_sha256_hex {
+    my ($bytes) = @_;
+    require Digest::SHA;
+    return Digest::SHA::sha256_hex($bytes);
+}
+
+sub canonical_json_encode {
+    my ($rec) = @_;
+    return JSON::PP->new->canonical(1)->ascii(1)->encode($rec);
+}
+
+# spec §2.3: every character outside printable ASCII (0x20-0x7E) becomes "?", then
+# truncate to the first ORACLE_REASON_MAX_CHARS characters.
+sub sanitize_oracle_reason_compact {
+    my ($s) = @_;
+    return '' unless defined $s;
+    (my $r = $s) =~ s/[^\x20-\x7E]/?/g;
+    return substr($r, 0, ORACLE_REASON_MAX_CHARS);
+}
+
+# compact_oracle_record($full) -> \%compact. Pure, deterministic (spec §2.3). Never
+# contains "descriptions" or "reaccept".
+sub compact_oracle_record {
+    my ($full) = @_;
+    my %base = (
+        v           => ORACLE_COMPACT_VERSION,
+        recorded_at => $full->{recorded_at},
+        status      => $full->{status},
+    );
+    # S5 (Decision 13 review ruling): never invent a field the input lacks -- an
+    # undefined "step"/"assertions" must be OMITTED, not coerced to 0 via "+ 0" (which
+    # also warns "Use of uninitialized value in addition" on stderr).
+    $base{step} = $full->{step} + 0 if defined $full->{step};
+    if (defined $base{status} && $base{status} eq 'ok') {
+        $base{sha256}              = $full->{sha256}              if defined $full->{sha256};
+        $base{assertions}          = $full->{assertions} + 0      if defined $full->{assertions};
+        $base{descriptions_sha256} = $full->{descriptions_sha256} if defined $full->{descriptions_sha256};
+    }
+    else {
+        $base{reason} = sanitize_oracle_reason_compact($full->{reason});
+    }
+    $base{reaccepted} = JSON::PP::true if exists $full->{reaccept};
+
+    my %with_path = (%base, path => $full->{path});
+    my $line = encode_oracle_record(\%with_path);
+    return \%with_path if length($line) <= ORACLE_RECORD_MAX_BYTES;
+
+    my %with_hash = (%base, path_sha256 => _oracle_lazy_sha256_hex($full->{path}));
+    return \%with_hash;
+}
+
+# S4 (Decision 13 review ruling): true only for a genuine JSON NUMBER scalar (no POK
+# flag) -- a JSON string "2" (or "2.0", "2abc", etc.) must never pass, even though it is
+# numerically == 2.
+sub is_json_number_scalar {
+    my ($v) = @_;
+    return 0 unless defined $v;
+    return 0 if ref $v;
+    my $f = B::svref_2object(\$v)->FLAGS;
+    return 0 if $f & B::SVp_POK();
+    return ($f & (B::SVp_IOK() | B::SVp_NOK())) ? 1 : 0;
+}
+
+# spec §2.2: a decoded "- oracle" object is compact iff it carries "v":2 as a JSON
+# NUMBER (spec §2.2 / S4). Anything else -- no v, a string "v", or any other v value --
+# is long form.
+sub is_compact_record {
+    my ($r) = @_;
+    return 0 unless ref($r) eq 'HASH';
+    return 0 unless exists $r->{v};
+    my $v = $r->{v};
+    return 0 unless is_json_number_scalar($v);
+    no warnings 'numeric';
+    return ($v == ORACLE_COMPACT_VERSION) ? 1 : 0;
+}
+
+# oracle_sidecar_path($ledger) -- pure (spec §2.4).
+sub oracle_sidecar_path {
+    my ($ledger) = @_;
+    (my $p = $ledger) =~ s{\\}{/}g;
+    # S1 (Decision 13 review ruling): the prefix before "packages/" is OPTIONAL and
+    # defaults to "." (the addressed cwd) -- a bare "packages/x.md" and "./packages/x.md"
+    # must resolve to the SAME sidecar a full ".../<bp>/packages/x.md" resolves to.
+    if ($p =~ m{^(?:(.*)/)?packages/([^/]+)\.md$}) {
+        my $dir = (defined($1) && length($1)) ? $1 : '.';
+        return "$dir/oracle/$2.jsonl";
+    }
+    my ($dir, $base);
+    if ($p =~ m{^(.*)/([^/]+)$}) { ($dir, $base) = ($1, $2) }
+    else                          { ($dir, $base) = ('.', $p) }
+    $base =~ s/\.md$//;
+    return "$dir/oracle/$base.jsonl";
+}
+
+# Read the sidecar JSONL: one full record per line. Missing file -> (). Empty or
+# non-decoding lines are skipped (spec §2.4).
+sub read_sidecar_entries {
+    my ($path) = @_;
+    return () unless -e $path;
+    open(my $fh, '<:raw', $path) or return ();
+    local $/;
+    my $bytes = <$fh>;
+    close $fh;
+    $bytes = '' unless defined $bytes;
+    my @out;
+    for my $line (split(/\n/, $bytes, -1)) {
+        next unless length $line;
+        my $d = eval { JSON::PP->new->decode($line) };
+        push @out, $d if ref($d) eq 'HASH';
+    }
+    return @out;
+}
+
+# render_sidecar_bytes(@entries) -- one full record per line, canonical/ascii encoder,
+# each line ending in "\n" (spec §2.4). No prefix, no header.
+sub render_sidecar_bytes {
+    my (@entries) = @_;
+    return join('', map { canonical_json_encode($_) . "\n" } @entries);
+}
+
+# write_oracle_sidecar($path, @entries) -> 1 (written or already correct) | 0 (failed).
+# Atomic (tmp + $RENAME_FN), parent dir via ensure_dir_exists, written only when the
+# new content differs from what's on disk, never created empty (spec §2.4).
+sub write_oracle_sidecar {
+    my ($path, @entries) = @_;
+    my $new_bytes = render_sidecar_bytes(@entries);
+    my $exists = -e $path;
+    return 1 if !@entries && !$exists;
+
+    if ($exists) {
+        open(my $fh, '<:raw', $path) or return 0;
+        local $/;
+        my $old_bytes = <$fh>;
+        close $fh;
+        $old_bytes = '' unless defined $old_bytes;
+        return 1 if $old_bytes eq $new_bytes;
+    }
+
+    my $dir = $path;
+    $dir =~ s{/[^/]+$}{};
+    ensure_dir_exists($dir) or return 0;
+
+    my $tmp = "$path.tmp.$$";
+    open(my $w, '>:raw', $tmp) or return 0;
+    print {$w} $new_bytes or do { close $w; unlink $tmp; return 0 };
+    close($w) or do { unlink $tmp; return 0 };
+    unless ($RENAME_FN->($tmp, $path)) { unlink $tmp; return 0 }
+    return 1;
+}
+
+# build_sidecar_index(@sidecar_entries) -> \%index, encoded-compact-json => full record
+# (first entry wins for a given key -- spec's matching rule is content equality, so a
+# later duplicate is indistinguishable from the first anyway).
+sub build_sidecar_index {
+    my (@sidecar_entries) = @_;
+    my %index;
+    for my $s (@sidecar_entries) {
+        my $cand = eval { compact_oracle_record($s) };
+        next unless $cand;
+        my $enc = canonical_json_encode($cand);
+        $index{$enc} = $s unless exists $index{$enc};
+    }
+    return \%index;
+}
+
+# hydrate_one_oracle_record($r, \%sidecar_index, \@test_paths) -> ($full|undef, $degraded).
+# Long-form $r: ($r, 0). Compact $r with a backing entry: ($entry, 0). Compact $r with
+# none: degraded reconstruction (spec §2.5), or (undef, 1) if path_sha256 can't be
+# resolved against @test_paths ("no usable key").
+sub hydrate_one_oracle_record {
+    my ($r, $sidecar_index, $test_paths) = @_;
+    return ($r, 0) unless is_compact_record($r);
+
+    my $enc = canonical_json_encode($r);
+    return ($sidecar_index->{$enc}, 0) if exists $sidecar_index->{$enc};
+
+    my %full = %$r;
+    delete $full{v};
+    if (delete $full{reaccepted}) { $full{reaccept} = {} }
+    if (exists $full{path_sha256}) {
+        my $hash = delete $full{path_sha256};
+        my $matched;
+        for my $tp (@$test_paths) {
+            if (_oracle_lazy_sha256_hex($tp) eq $hash) { $matched = $tp; last }
+        }
+        return (undef, 1) unless defined $matched;
+        $full{path} = $matched;
+    }
+    return (\%full, 1);
+}
+
+# hydrate_oracle_records(\@raw, \@sidecar_entries, \@test_paths) -> a list of
+# { raw, full, degraded } (spec §2.5), one per raw record IN ORDER, except that a
+# compact record whose path_sha256 resolves against no @test_paths segment is dropped
+# entirely (it has no usable key).
+sub hydrate_oracle_records {
+    my ($raw, $sidecar_entries, $test_paths) = @_;
+    my $index = build_sidecar_index(@$sidecar_entries);
+    my @out;
+    for my $r (@$raw) {
+        my ($full, $degraded) = hydrate_one_oracle_record($r, $index, $test_paths);
+        next unless defined $full;
+        push @out, { raw => $r, full => $full, degraded => $degraded };
+    }
+    return @out;
+}
+
+# build_sidecar_retention(%p) -> a list of full records to write to the sidecar
+# (spec §2.4's retention rule): (a) one backing entry for every compact record in the
+# NEW ledger section that has one available, in section order; then (b) every existing
+# entry that backed a compact line in the OLD (on-disk) section, in the OLD sidecar's
+# own file order. Identical entries are written once (first occurrence wins).
+sub build_sidecar_retention {
+    my (%p) = @_;
+    my $new_records = $p{new_records};
+    my $new_backing = $p{new_backing} || {};
+    my $old_bytes   = $p{old_bytes};
+    my $old_sidecar = $p{old_sidecar} || [];
+
+    my %old_backing_by_enc;
+    my @old_order;
+    for my $s (@$old_sidecar) {
+        my $cand = eval { compact_oracle_record($s) };
+        next unless $cand;
+        my $enc = canonical_json_encode($cand);
+        unless (exists $old_backing_by_enc{$enc}) {
+            $old_backing_by_enc{$enc} = $s;
+            push @old_order, $enc;
+        }
+    }
+
+    my (@a_list, %seen);
+    for my $rec (@$new_records) {
+        next unless is_compact_record($rec);
+        my $enc = canonical_json_encode($rec);
+        next if $seen{$enc};
+        my $backing = $new_backing->{$enc};
+        $backing = $old_backing_by_enc{$enc} unless defined $backing;
+        next unless defined $backing;
+        push @a_list, $backing;
+        $seen{$enc} = 1;
+    }
+
+    my %needed_b;
+    if (defined $old_bytes) {
+        for my $orec (parse_oracle_records($old_bytes)) {
+            next unless is_compact_record($orec);
+            my $enc = canonical_json_encode($orec);
+            $needed_b{$enc} = 1 if exists $old_backing_by_enc{$enc};
+        }
+    }
+    my @b_list;
+    for my $enc (@old_order) {
+        next unless $needed_b{$enc};
+        next if $seen{$enc};
+        push @b_list, $old_backing_by_enc{$enc};
+        $seen{$enc} = 1;
+    }
+
+    return (@a_list, @b_list);
+}
+
+# compact_or_fallback($cand) -- the per-record defensive rule (spec §2.3): if the
+# compact line would still exceed the cap (never happens for assertions below 10^10),
+# write that ONE record in long form instead.
+sub compact_or_fallback {
+    my ($cand) = @_;
+    my $compact = compact_oracle_record($cand);
+    my $line_len = length(encode_oracle_record($compact));
+    return $line_len <= ORACLE_RECORD_MAX_BYTES ? $compact : $cand;
+}
+
 # Both legal frontmatter forms (colon-delimited scalar AND the YAML-ish list), mirroring
 # the existing $field_segments closure inside validate_bytes (spec §2.9).
 sub ledger_field_segments {
@@ -1434,6 +1722,11 @@ sub op_tick_step {
         arg_error('tick-step', '--reaccept-reason requires at least one --reaccept-oracle');
     }
 
+    # Set inside the splice callback below when the sidecar write fails (Decision 11):
+    # printed by the $post_cb, under the same lock discipline append-attempt's own
+    # budget notice uses, so it can never race a concurrent invocation.
+    my $sidecar_warn;
+
     run_op('tick-step', $opt{ledger}, sub {
         my ($B) = @_;
         my ($ticked, $notfound) = splice_tick_step($B, $opt{step});
@@ -1454,14 +1747,19 @@ sub op_tick_step {
 
             my $now = iso_now();
             my %reaccept_wanted = map { ($_ => 1) } @reaccept_paths;
-            my @existing = parse_oracle_records($B);
+            my $sidecar_path = oracle_sidecar_path($opt{ledger});
+            my @old_sidecar  = read_sidecar_entries($sidecar_path);
+            my $sidecar_index = build_sidecar_index(@old_sidecar);
+            my @raw_existing = parse_oracle_records($B);
+
             my %step3_by_path;
-            for my $r (@existing) {
-                next unless defined $r->{step} && $r->{step} == 3;
-                $step3_by_path{ $r->{path} } = $r if defined $r->{path};
+            for my $r (@raw_existing) {
+                my ($full) = hydrate_one_oracle_record($r, $sidecar_index, \@paths);
+                next unless defined $full && defined $full->{step} && $full->{step} == 3;
+                $step3_by_path{ $full->{path} } = $full if defined $full->{path};
             }
 
-            my @new_records;
+            my @candidates;
             for my $path (@paths) {
                 my $identity = derive_oracle_identity($path);
                 my %args = (step => $step_n, path => $path, recorded_at => $now, identity => $identity);
@@ -1470,19 +1768,81 @@ sub op_tick_step {
                     my $delta = oracle_delta($step3, $identity);
                     $args{reaccept} = { reason => $opt{'reaccept-reason'}, delta => $delta };
                 }
-                push @new_records, build_oracle_record(%args);
+                push @candidates, build_oracle_record(%args);
             }
+            my %cand_by_key = map { (($_->{step} // '') . '|' . ($_->{path} // '')) => $_ } @candidates;
 
-            my $merged = merge_and_render_oracle_section($ticked, @new_records);
+            # Merge (spec §2.6 step 4), keyed by (step, path) taken from the HYDRATED
+            # full record. $render_fn decides how a replaced/new candidate is rendered
+            # (compact-with-per-record-fallback, or forced long form).
+            my $do_merge = sub {
+                my ($render_fn) = @_;
+                my (@final, %used, %new_backing);
+                for my $r (@raw_existing) {
+                    my ($full, $degraded) = hydrate_one_oracle_record($r, $sidecar_index, \@paths);
+                    my $key = (defined $full && defined $full->{path})
+                        ? (($full->{step} // '') . '|' . $full->{path}) : undef;
+                    if (defined $key && exists $cand_by_key{$key} && !$used{$key}) {
+                        my $cand = $cand_by_key{$key};
+                        if (!$degraded && oracle_records_equal_ignoring_time($full, $cand)) {
+                            push @final, $r;
+                        }
+                        else {
+                            my $rendered = $render_fn->($cand);
+                            push @final, $rendered;
+                            $new_backing{ canonical_json_encode($rendered) } = $cand if is_compact_record($rendered);
+                        }
+                        $used{$key} = 1;
+                    }
+                    else {
+                        push @final, $r;
+                    }
+                }
+                for my $cand (@candidates) {
+                    my $key = ($cand->{step} // '') . '|' . ($cand->{path} // '');
+                    next if $used{$key};
+                    my $rendered = $render_fn->($cand);
+                    push @final, $rendered;
+                    $new_backing{ canonical_json_encode($rendered) } = $cand if is_compact_record($rendered);
+                    $used{$key} = 1;
+                }
+                return (\@final, \%new_backing);
+            };
+
+            my ($final_records, $new_backing) = $do_merge->(\&compact_or_fallback);
+            my @lines = map { encode_oracle_record($_) } @$final_records;
+            my $merged = insert_or_replace_oracle_section($ticked, @lines);
 
             # Self-validate BEFORE returning: never let run_op's own re-validation
             # be the thing that discovers a problem (that path exits 2, forbidden here).
             return $ticked if defined validate_bytes($merged);
             return $ticked if defined validate_no_new_ref_addr($B, $merged);
-            return $merged;
+
+            my @retention = build_sidecar_retention(
+                new_records => $final_records, new_backing => $new_backing,
+                old_bytes   => $B,             old_sidecar => \@old_sidecar);
+
+            if (write_oracle_sidecar($sidecar_path, @retention)) {
+                return $merged;
+            }
+
+            # Decision 11 fallback: the sidecar could not be written -- render every
+            # candidate this tick touches in LONG FORM instead, leave the sidecar file
+            # untouched, and warn (exactly once) via $post_cb below.
+            my ($long_records, undef) = $do_merge->(sub { return $_[0] });
+            my @long_lines = map { encode_oracle_record($_) } @$long_records;
+            my $long_merged = insert_or_replace_oracle_section($ticked, @long_lines);
+            return $ticked if defined validate_bytes($long_merged);
+            return $ticked if defined validate_no_new_ref_addr($B, $long_merged);
+
+            $sidecar_warn = "bp-ledger: tick-step: $opt{ledger}: could not write oracle sidecar "
+                . "($sidecar_path); recorded oracle data in long form instead";
+            return $long_merged;
         };
         $final = $ticked if $@ || !defined $final;
         return ($final, undef);
+    }, sub {
+        print STDERR $sidecar_warn . "\n" if defined $sidecar_warn;
     });
 }
 
@@ -2113,12 +2473,24 @@ sub op_claim_check {
     my @unsatisfied = map { $_->{step} } grep { !$_->{satisfied} } @items;
 
     my @test_paths = ledger_test_paths($B);
-    my @records    = parse_oracle_records($B);
-    my %latest;   # "$step|$path" => rec (last one wins if somehow duplicated)
-    $latest{ ($_->{step} // '') . '|' . ($_->{path} // '') } = $_ for @records;
+    my @raw_records = parse_oracle_records($B);
+    my $sidecar_path = oracle_sidecar_path($opt{ledger});
+    my @sidecar_entries = eval { read_sidecar_entries($sidecar_path) };
+    @sidecar_entries = () if $@;
+    my @hydrated = eval { hydrate_oracle_records(\@raw_records, \@sidecar_entries, \@test_paths) };
+    @hydrated = () if $@;
+
+    my %latest;            # "$step|$path" => full record (last one wins if somehow duplicated)
+    my %latest_degraded;   # "$step|$path" => 0|1
+    for my $h (@hydrated) {
+        my $f = $h->{full};
+        my $key = ($f->{step} // '') . '|' . ($f->{path} // '');
+        $latest{$key} = $f;
+        $latest_degraded{$key} = $h->{degraded};
+    }
 
     my %all_paths = map { ($_ => 1) } @test_paths;
-    $all_paths{ $_->{path} } = 1 for grep { defined $_->{path} } @records;
+    $all_paths{ $_->{full}{path} } = 1 for grep { defined $_->{full}{path} } @hydrated;
 
     my @oracle_paths;
     my @findings;
@@ -2195,6 +2567,7 @@ sub op_claim_check {
             elsif (!$r3)        { $verdict = 'not-recorded' }
         }
 
+        my $sidecar_missing = (($r3 && $latest_degraded{"3|$path"}) || ($r5 && $latest_degraded{"5|$path"})) ? 1 : 0;
         push @oracle_paths, {
             path    => $path,
             verdict => $verdict,
@@ -2202,6 +2575,7 @@ sub op_claim_check {
             step5   => $r5 ? $r5->{status} : undef,
             (defined $delta ? (delta => $delta) : ()),
             reaccept => ($r5 && exists $r5->{reaccept}) ? $r5->{reaccept} : undef,
+            ($sidecar_missing ? (sidecar => 'missing') : ()),
         };
     }
 
@@ -3096,6 +3470,129 @@ sub op_create {
 }
 
 # =====================================================================================
+# `migrate-oracle` (01-compact-oracle-records spec §2.8) -- the ONLY thing that converts
+# a long-form oracle record to compact. Implemented manually (not via run_op) because a
+# failed sidecar write must exit 4 (io_error) with the ledger left byte-identical, which
+# run_op's splice-callback shape (undef/reason -> exit 5) cannot express.
+# =====================================================================================
+
+sub op_migrate_oracle {
+    my @args = @_;
+    my %opt;
+    my $ok;
+    { local $SIG{__WARN__} = sub { };
+      $ok = GetOptionsFromArray(\@args, \%opt, 'ledger=s', 'dry-run'); }
+    arg_error('migrate-oracle', 'unrecognised option') unless $ok;
+    arg_error('migrate-oracle', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
+    arg_error('migrate-oracle', 'missing required --ledger') unless defined $opt{ledger};
+    my $ledger  = $opt{ledger};
+    my $dry_run = $opt{'dry-run'} ? 1 : 0;
+
+    my $lockpath = "$ledger.lock";
+    open(my $lk, '>', $lockpath) or io_error('migrate-oracle', $ledger, "cannot open lock file $lockpath: $!");
+    flock($lk, LOCK_EX) or io_error('migrate-oracle', $ledger, "cannot acquire lock on $lockpath: $!");
+
+    my $orig;
+    {
+        open(my $fh, '<:raw', $ledger) or io_error('migrate-oracle', $ledger, "cannot read: $!");
+        local $/;
+        $orig = <$fh>;
+        close $fh;
+        $orig = '' unless defined $orig;
+    }
+
+    my $detail = validate_bytes($orig);
+    reject_error('migrate-oracle', $ledger, $detail) if defined $detail;
+
+    # S6 (Decision 13 review ruling): the future-dated last_updated check applies even
+    # when there turn out to be zero records to convert -- it must not be skipped just
+    # because the early-exit branches below never reach the later last_updated_check
+    # against $new_bytes.
+    my $lu_detail0 = last_updated_check($orig, $orig);
+    reject_error('migrate-oracle', $ledger, $lu_detail0) if defined $lu_detail0;
+
+    my @raw = parse_oracle_records($orig);
+    my $total = scalar @raw;
+    my $sidecar_path = oracle_sidecar_path($ledger);
+
+    my $print_and_exit0 = sub {
+        my ($verb, $n, $before, $after) = @_;
+        print "bp-ledger: migrate-oracle: $ledger: $verb $n of $total oracle records; "
+            . "$before -> $after bytes; sidecar $sidecar_path\n";
+        flock($lk, LOCK_UN);
+        close($lk);
+        exit 0;
+    };
+
+    unless ($total) {
+        $print_and_exit0->($dry_run ? 'would compact' : 'compacted', 0, length($orig), length($orig));
+    }
+
+    my @old_sidecar = read_sidecar_entries($sidecar_path);
+
+    my (@final, %new_backing);
+    my $n = 0;
+    for my $r (@raw) {
+        if (is_compact_record($r) || !defined($r->{step}) || !defined($r->{path})) {
+            push @final, $r;
+            next;
+        }
+        my $compact = compact_oracle_record($r);
+        push @final, $compact;
+        $new_backing{ canonical_json_encode($compact) } = $r;   # verbatim (spec §2.8 step 2)
+        $n++;
+    }
+
+    if ($n == 0) {
+        $print_and_exit0->($dry_run ? 'would compact' : 'compacted', 0, length($orig), length($orig));
+    }
+
+    my @lines = map { encode_oracle_record($_) } @final;
+    my $new_bytes = insert_or_replace_oracle_section($orig, @lines);
+
+    my $detail2 = validate_bytes($new_bytes);
+    reject_error('migrate-oracle', $ledger, $detail2) if defined $detail2;
+    my $ref_detail = validate_no_new_ref_addr($orig, $new_bytes);
+    reject_error('migrate-oracle', $ledger, $ref_detail) if defined $ref_detail;
+    my $lu_detail = last_updated_check($orig, $new_bytes);
+    reject_error('migrate-oracle', $ledger, $lu_detail) if defined $lu_detail;
+
+    if ($dry_run) {
+        $print_and_exit0->('would compact', $n, length($orig), length($new_bytes));
+    }
+
+    my @retention = build_sidecar_retention(
+        new_records => \@final, new_backing => \%new_backing,
+        old_bytes   => $orig,   old_sidecar => \@old_sidecar);
+    unless (write_oracle_sidecar($sidecar_path, @retention)) {
+        io_error('migrate-oracle', $ledger, "cannot write sidecar $sidecar_path: $!");
+    }
+
+    my $tmp = "$ledger.tmp.$$";
+    open(my $w, '>:raw', $tmp) or io_error('migrate-oracle', $ledger, "cannot open temp file $tmp: $!");
+    print {$w} $new_bytes or do { close $w; unlink $tmp; io_error('migrate-oracle', $ledger, "write to $tmp failed: $!") };
+    close($w) or do { unlink $tmp; io_error('migrate-oracle', $ledger, "close $tmp failed: $!") };
+    unless ($RENAME_FN->($tmp, $ledger)) {
+        unlink $tmp;
+        io_error('migrate-oracle', $ledger, "rename $tmp -> $ledger failed: $!");
+    }
+
+    my $after;
+    {
+        open(my $rfh, '<:raw', $ledger) or io_error('migrate-oracle', $ledger, "read-back: cannot read: $!");
+        local $/;
+        $after = <$rfh>;
+        close $rfh;
+        $after = '' unless defined $after;
+    }
+    unless ($after eq $new_bytes) {
+        io_error('migrate-oracle', $ledger, "value did not survive the write");
+    }
+
+    $print_and_exit0->('compacted', $n, length($orig), length($new_bytes));
+}
+
+# =====================================================================================
 # Main
 # =====================================================================================
 
@@ -3114,6 +3611,7 @@ my %DISPATCH = (
     'rotate'           => \&op_rotate,
     'validate'         => \&op_validate,
     'claim-check'      => \&op_claim_check,
+    'migrate-oracle'   => \&op_migrate_oracle,
     'create'           => \&op_create,
 );
 
