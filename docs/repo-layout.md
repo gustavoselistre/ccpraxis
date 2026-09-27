@@ -368,6 +368,7 @@ ccpraxis/
 │   │   │       ├── bug-path-discoverable.t                   # platform: any
 │   │   │       ├── cache-state.t                             # platform: any b41-tracking oracle.
 │   │   │       ├── checkpoint-hardening.t                    # platform: windows b02-durable-checkpoint-commits — hardening regressions…
+│   │   │       ├── compact-oracle-records.t                  # platform: windows
 │   │   │       ├── completion-claim-integrity.t              # platform: windows
 │   │   │       ├── conformance-gate.t                        # platform: any 24 — b05
 │   │   │       ├── container-lane.t                          # platform: windows The oracle for the throwaway, capped run-mode that executes…
