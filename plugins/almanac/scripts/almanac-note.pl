@@ -144,6 +144,15 @@ sub _check_reserved_field {
     _usage('journal_is_reserved')  if $k eq 'promote_to';
 }
 
+# _check_stdin_conflict(\%o) -- both --body - and --content - given (create
+# and edit). Checked before any stdin read, store open or write (S2.2).
+sub _check_stdin_conflict {
+    my ($o) = @_;
+    _usage('stdin_conflict')
+        if exists($o->{body})    && !ref($o->{body})    && $o->{body}    eq '-'
+        && exists($o->{content}) && !ref($o->{content}) && $o->{content} eq '-';
+}
+
 # _resolve_body(\%o) -> $body | undef -- the RECORD's body.
 sub _resolve_body {
     my ($o) = @_;
@@ -478,6 +487,8 @@ sub _cmd_create {
     my ($scope, $o, $pos) = @_;
     _usage('extra_positional') if @$pos > 0;
 
+    _check_stdin_conflict($o);
+
     _usage('missing_title') unless exists $o->{title};
     my $title = _trim($o->{title});
     _usage('bad_title') if $title eq '' || $title =~ /[\r\n]/;
@@ -548,7 +559,8 @@ sub _cmd_create {
                 die Almanac::Store::Error->new(kind => 'exists', id => $id, path => _encode_for_error($target_abs));
             }
             my $content = _resolve_content($o);
-            $content = '' unless defined $content;
+            $content = $body unless defined $content;   # C1: fall back to the body
+            $content = ''    unless defined $content;   # C4: neither given
             open(my $fh, '>:raw', $target_abs)
                 or die Almanac::Store::Error->new(kind => 'io', path => _encode_for_error($target_abs), errno => "$!");
             print {$fh} $content;
@@ -615,13 +627,25 @@ sub _cmd_edit {
         }
     }
 
-    my $title_given  = exists $o->{title};
-    my $covers_given = exists $o->{covers};
-    my $tags_given   = exists $o->{tags};
-    my $body_given   = exists($o->{body}) || exists($o->{'body-file'});
+    my $title_given   = exists $o->{title};
+    my $covers_given  = exists $o->{covers};
+    my $tags_given    = exists $o->{tags};
+    my $body_given    = exists($o->{body}) || exists($o->{'body-file'});
+    my $content_given = exists($o->{content}) || exists($o->{'content-file'});
 
+    # Step 1 (spec S2.2/S3.2): stdin_conflict, body_conflict, content_conflict
+    # and force_external_without_content -- all pure existence/value checks,
+    # none of them read stdin.
+    _check_stdin_conflict($o);
+    _usage('body_conflict')    if exists($o->{body})    && exists($o->{'body-file'});
+    _usage('content_conflict') if exists($o->{content}) && exists($o->{'content-file'});
+    _usage('force_external_without_content')
+        if exists($o->{'force-external'}) && !$content_given;
+
+    # Step 2: nothing_to_change now also counts content given as a change.
     _usage('nothing_to_change')
-        unless $title_given || $covers_given || $tags_given || $body_given || @set_order || @unset;
+        unless $title_given || $covers_given || $tags_given || $body_given
+            || $content_given || @set_order || @unset;
 
     if ($title_given) {
         my $t = _trim($o->{title});
@@ -638,17 +662,90 @@ sub _cmd_edit {
         if (defined $t) { $set{tags} = $t }
         else            { push @unset, 'tags' unless grep { $_ eq 'tags' } @unset }
     }
-    my $body = $body_given ? _resolve_body($o) : undef;
 
+    # Step 3: resolve the body (if given), then the content (if given).
+    my $body    = $body_given    ? _resolve_body($o)    : undef;
+    my $content = $content_given ? _resolve_content($o) : undef;
+    $content = '' if $content_given && !defined $content;
+
+    # Step 4: open the store and read the record.
     my $store = _open_store($scope, $o);
     my $rec   = $store->read($id);
+
+    my $target_abs;
+    if ($content_given) {
+        # Step 5: target guards against the record just read.
+        _usage('promote_in_flight') if defined $rec->{fields}{promote_to};
+
+        my $audience = $rec->{fields}{audience};
+        my $target   = $rec->{fields}{target};
+        my $valid_audience = defined($audience) && ($audience eq 'internal' || $audience eq 'external');
+        my $anchor_abs = _anchor_abs($store);
+        die Almanac::Store::Error->new(kind => 'malformed', id => $id,
+                path => _encode_for_error(defined($target) ? "$anchor_abs/$target" : undef))
+            unless $valid_audience && defined($target) && _structurally_valid_target($target);
+
+        # S2: audience-consistent check -- an internal note whose target does
+        # not actually sit under the internal notes prefix gets the same
+        # external_target_refused protection as a genuinely external note.
+        # Decision 6(12)'s point is to protect user-owned files, not merely
+        # honour a self-reported `audience` field (which could come from a
+        # hand edit or an older script version -- spec 2.3).
+        my $target_is_internal_shaped = 0;
+        if ($audience eq 'internal') {
+            my $prefix = _internal_prefix($store);
+            $target_is_internal_shaped = ($target =~ m{\A\Q$prefix\E/[^/]+\.md\z}) ? 1 : 0;
+        }
+        _usage('external_target_refused')
+            if ($audience eq 'external' || ($audience eq 'internal' && !$target_is_internal_shaped))
+                && !exists $o->{'force-external'};
+
+        $target_abs = "$anchor_abs/$target";
+        my $parent = $target_abs;
+        $parent =~ s{/[^/]+\z}{};
+        _usage('dest_parent_missing') unless -d $parent;
+    }
+
     my %expect = (rev => $rec->{rev}, fields => $rec->{fields});
     $expect{rev} = $o->{'expect-rev'} if exists $o->{'expect-rev'};
 
     my %update_args = (expect => \%expect, set => \%set, unset => \@unset);
     $update_args{body} = $body if $body_given;
 
+    # Step 6: this runs even for a content-only edit -- it is the
+    # writability gate, the lock and the --expect-rev CAS.
     my $new = $store->update($id, %update_args);
+
+    # Step 7: write the target atomically.
+    if ($content_given) {
+        my $tmp = "$target_abs.tmp.$$";
+        my $created = 0;
+        my $ok = eval {
+            open(my $fh, '>:raw', $tmp)
+                or die Almanac::Store::Error->new(kind => 'io', path => _encode_for_error($tmp), errno => "$!");
+            $created = 1;
+            print {$fh} $content;
+            close($fh)
+                or die Almanac::Store::Error->new(kind => 'io', path => _encode_for_error($tmp), errno => "$!");
+            my ($renamed, $err) = Almanac::Lock::rename_with_retry($tmp, $target_abs);
+            die Almanac::Store::Error->new(kind => 'io', path => _encode_for_error($target_abs),
+                    errno => (ref($err) eq 'HASH' ? $err->{errno} : undef))
+                unless $renamed;
+            1;
+        };
+        unless ($ok) {
+            my $err = $@;
+            # S1 (review 02-review.md): clean up only a temp THIS invocation
+            # created, and only if it is still a plain file -- never a
+            # directory (or anything else) that happened to occupy the same
+            # name. AC-46 (almanac-note-crud.t) forbids the literal `unlink`
+            # in this file; remove_tree also removes a plain file, but never
+            # recurses into one, so it is safe once gated this way.
+            File::Path::remove_tree($tmp) if $created && -f $tmp && !-l $tmp;
+            die $err;
+        }
+    }
+
     _print_result(id => $new->{id}, scope => $scope, path => $new->{path},
                   audience => $new->{fields}{audience}, target => $new->{fields}{target},
                   rev => $new->{rev}, changed => 'yes');
@@ -826,7 +923,7 @@ unless (caller) {
             create         => [qw(title audience target covers tags body body-file content content-file set id root home global project)],
             list           => [qw(json root home global project)],
             show           => [qw(json root home global project)],
-            edit           => [qw(title covers tags body body-file set unset expect-rev root home global project)],
+            edit           => [qw(title covers tags body body-file content content-file force-external set unset expect-rev root home global project)],
             promote        => [qw(audience target expect-rev root home global project)],
             delete         => [qw(expect-rev root home global project)],
             'check-pointers' => [qw(json root home global project)],
