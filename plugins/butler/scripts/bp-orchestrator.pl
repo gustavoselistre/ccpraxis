@@ -2658,15 +2658,28 @@ sub _min_interval_gate {
 sub _project_root_of {
     my ($bpdir) = @_;
     return undef unless defined $bpdir && !ref $bpdir && length $bpdir;
-    my $d = abs_path($bpdir) // $bpdir;
-    my %seen;
-    while (length $d && !$seen{$d}++) {
-        return $d if -d "$d/.ccpraxis-local-data";
-        my $parent = dirname($d);
-        last if $parent eq $d;                     # filesystem / drive root
-        $d = $parent;
+    my $start = abs_path($bpdir) // $bpdir;
+
+    # Decision 24 item 2 (red-team S1): the bpdir has a known shape,
+    # <root>/.ccpraxis-local-data/blueprints/<name>, so try that structural
+    # answer BEFORE walking. A bounded walk from the bpdir climbs
+    # bp -> blueprints -> .ccpraxis-local-data and then reaches <root> as a
+    # stop strictly ABOVE the start (R2), so a project rooted at HOME (or any
+    # other stop dir) would otherwise never be examined even though it is the
+    # right answer here, not an escape.
+    (my $s = $start) =~ s{\\}{/}g;
+    if ($s =~ m{\A(.+)/\.ccpraxis-local-data/blueprints/[^/]+/?\z} && -d "$1/.ccpraxis-local-data") {
+        return $1;
     }
-    return undef;
+
+    # bounded walk-up (package 03, Decision 3): never ascend out of temp, and
+    # never adopt home unless the start IS home. The start here is the bpdir,
+    # not the process cwd (see spec §2.1 table).
+    return eval {
+        require "$DIR/BpProjectRoot.pm"
+            unless grep { m{(?:^|/)BpProjectRoot\.pm$} } keys %INC;
+        BpProjectRoot::bounded_walkup($start);
+    };
 }
 
 # lifecycle_data_dir($bpdir) -> the data root (parent of blueprints/) to hand

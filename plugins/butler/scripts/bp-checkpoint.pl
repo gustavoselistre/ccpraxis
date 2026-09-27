@@ -52,6 +52,8 @@ use File::Basename qw(dirname);
 # package only: `package main` at the bottom turns full warnings back on.
 no warnings 'redefine';
 
+my $BP_CHECKPOINT_DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
+
 our $DETAIL_MAX = 200;                 # `detail` is one trimmed line, at most this long
 our $PKG_MAX    = 120;                 # a package id is a slug; a subject line is not a ledger cell
 our $GIT_TIMEOUT = 30;                 # seconds a single git child may take before it is killed
@@ -345,7 +347,10 @@ sub _broke_reason {
 # The order is the in-house canon (bp-drive-next.pl:702-726, itself mirroring
 # bp-lib.sh:15-26) with the injectable hint on top. It is DUPLICATED here rather
 # than reused: bp-drive-next.pl is an 800-line director with no business inside
-# the orchestrator's blast radius, and this is twenty lines.
+# the orchestrator's blast radius, and this is twenty lines. The walk-up step
+# (package 03) goes through BpProjectRoot::bounded_walkup rather than its own
+# loop, since BpProjectRoot.pm is ~60 lines, not the 800-line director this
+# comment used to keep out.
 #
 # A wrong answer is not fatal — it degrades to `not-a-repo`, one logged
 # checkpoint_failed per package per interval.
@@ -363,17 +368,15 @@ sub resolve_root {
         return $top if length $top && -d $top;
     }
 
-    # walk up for the first ancestor already holding .ccpraxis-local-data
-    my $d = Cwd::getcwd();
-    if (defined $d && length $d) {
-        my %seen;
-        while (!$seen{$d}++) {
-            return $d if -d "$d/.ccpraxis-local-data";
-            my $parent = dirname($d);
-            last if $parent eq $d;                     # filesystem / drive root
-            $d = $parent;
-        }
-    }
+    # bounded walk-up (package 03, Decision 3): never ascend out of temp, and
+    # never adopt home unless the cwd IS home.
+    my $found = eval {
+        require "$BP_CHECKPOINT_DIR/BpProjectRoot.pm"
+            unless grep { m{(?:^|/)BpProjectRoot\.pm$} } keys %INC;
+        BpProjectRoot::bounded_walkup(Cwd::getcwd());
+    };
+    return $found if defined $found;
+
     return Cwd::getcwd() // '.';
 }
 

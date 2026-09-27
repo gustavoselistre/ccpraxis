@@ -443,13 +443,15 @@ sub _resolve_data_dir {
         }
     }
 
-    my $dir = getcwd();
-    while (1) {
-        my $candidate = File::Spec->catdir($dir, '.ccpraxis-local-data');
-        return $candidate if -d $candidate;
-        my $parent = abs_path(File::Spec->catdir($dir, File::Spec->updir));
-        last if !defined $parent || $parent eq $dir;
-        $dir = $parent;
+    # bounded walk-up (package 03, Decision 3): never ascend out of temp, and
+    # never adopt home unless the cwd IS home.
+    my $found = eval {
+        require "$BP_SCRIPT_DIR/BpProjectRoot.pm"
+            unless grep { m{(?:^|/)BpProjectRoot\.pm$} } keys %INC;
+        BpProjectRoot::bounded_walkup(getcwd());
+    };
+    if (defined $found) {
+        return File::Spec->catdir($found, '.ccpraxis-local-data');
     }
 
     _fail(4, '[cannot locate <data>]: tried CCPRAXIS_DATA_DIR > git toplevel > '

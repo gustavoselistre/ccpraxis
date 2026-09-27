@@ -102,13 +102,14 @@ sub _project_root {
     $top = '' unless defined $top;
     chomp $top;
     return $top if length $top;
-    my $d = getcwd();
-    while (defined $d && length $d) {
-        return $d if -d "$d/.ccpraxis-local-data";
-        my $parent = dirname($d);
-        last if $parent eq $d;
-        $d = $parent;
-    }
+    # bounded walk-up (package 03, Decision 3): never ascend out of temp, and
+    # never adopt home unless the cwd IS home.
+    my $found = eval {
+        require "$DIR/BpProjectRoot.pm"
+            unless grep { m{(?:^|/)BpProjectRoot\.pm$} } keys %INC;
+        BpProjectRoot::bounded_walkup(getcwd());
+    };
+    return $found if defined $found;
     return getcwd();
 }
 

@@ -15,15 +15,28 @@
 # ---------------------------------------------------------------- roots ----
 
 bp_project_root() {
-  # Priority: explicit env > git toplevel > walk-up for data dir > cwd.
+  # Priority: explicit env > git toplevel > bounded walk-up (bp-data-root.pl,
+  # package 03/Decision 3 -- never ascend out of temp, never adopt home unless
+  # the cwd IS home) > cwd. The bounded rules live once in BpDataRoot.pm; a
+  # bash mirror of the 8.3/drive-form/Cygwin tolerance they need would be a
+  # third copy of the hardest part, in the language least able to express it,
+  # so this shells out to the small perl helper instead.
   if [ -n "${BP_PROJECT_ROOT:-}" ]; then printf '%s\n' "$BP_PROJECT_ROOT"; return 0; fi
   local r
   if r=$(git rev-parse --show-toplevel 2>/dev/null); then printf '%s\n' "$r"; return 0; fi
-  local d="$PWD"
-  while [ "$d" != "/" ]; do
-    if [ -d "$d/.ccpraxis-local-data" ]; then printf '%s\n' "$d"; return 0; fi
-    d=$(dirname "$d")
-  done
+  local h
+  h="$(dirname "${BASH_SOURCE[0]}")/../../butler/scripts/bp-data-root.pl"
+  # Decision 24 item 5 (red-team S3): accept the helper's stdout only if it is
+  # a single line naming an EXISTING directory -- a noisy/multi-line answer
+  # (a stray PATH-first "perl" that prints extra output) must fall to $PWD,
+  # never be exported as-is.
+  if [ -f "$h" ]; then
+    r=$(perl "$h" --cwd "$PWD" 2>/dev/null)
+    case "$r" in *$'\n'*) r='' ;; esac
+    if [ -n "$r" ] && [ -d "$r" ]; then
+      printf '%s\n' "$r"; return 0
+    fi
+  fi
   printf '%s\n' "$PWD"
 }
 
