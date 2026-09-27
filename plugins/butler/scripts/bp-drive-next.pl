@@ -120,6 +120,7 @@ my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
 # does this same require).
 require "$DIR/bp-orchestrator.pl";
 require "$DIR/bp-keepawake.pl";    # the shared wake-lock (also used by the fleet)
+require "$DIR/BpDataRoot.pm";      # the single, bounded data-root resolution chain (package 04)
 
 # ===========================================================================
 # PURE DECISION FUNCTIONS (no I/O, no globals, no network — unit-tested in t/17)
@@ -1979,48 +1980,71 @@ END_HELP
 # "../../../.ccpraxis-local-data" guess resolves an unrelated root (the
 # marketplaces dir) that has no blueprints/. read_state then builds an empty DAG,
 # every blueprint looks settled, and `next` silently emits blueprint-done→done
-# despite pending work. This mirrors bp-lib.sh's bp_project_root()+bp_data_dir()
-# so the perl director and the bash helpers agree on exactly one root.
+# despite pending work. bp-lib.sh's bp_project_root()+bp_data_dir() is still
+# the unbounded walk-up this package replaces here (Decision 17 follow-up);
+# the two are not yet the same logic.
 #
-# Priority (identical to bp-lib.sh, plus the injected data_dir opt on top for tests):
-#   data_dir opt (--data-dir) > $CCPRAXIS_DATA_DIR
+# Priority (BpDataRoot.pm, package 04 — written once, shared with bp-lifecycle.pl):
+#   data_dir opt ($opts->{data_dir}, a PROGRAMMATIC seam -- there is no CLI
+#     --data-dir option on this director) > $CCPRAXIS_DATA_DIR
 #     > <project root>/.ccpraxis-local-data
 #   project root = $BP_PROJECT_ROOT > git toplevel
-#     > walk up from cwd for a dir containing .ccpraxis-local-data > cwd
+#     > BOUNDED walk-up from cwd for a dir containing .ccpraxis-local-data
+#       (stops at the OS temp dir and at the user's home dir; neither is
+#       adopted unless it IS the cwd -- bug 0f1e) > cwd
 
-sub _resolve_project_root {
-    return $ENV{BP_PROJECT_ROOT}
-        if defined $ENV{BP_PROJECT_ROOT} && length $ENV{BP_PROJECT_ROOT};
-
-    # git toplevel — trust only a clean exit and a real directory.
-    my $top = `git rev-parse --show-toplevel 2>/dev/null`;
-    if ($? == 0 && defined $top) {
-        chomp $top;
-        return $top if length $top && -d $top;
-    }
-
-    # Walk up from cwd for the first ancestor that already holds .ccpraxis-local-data.
-    my $d = Cwd::getcwd();
-    if (defined $d && length $d) {
-        my %seen;
-        while (!$seen{$d}++) {
-            return $d if -d "$d/.ccpraxis-local-data";
-            my $parent = dirname($d);
-            last if $parent eq $d;    # reached the filesystem / drive root
-            $d = $parent;
-        }
-    }
-
-    return Cwd::getcwd() // '.';
-}
+sub _resolve_project_root { BpDataRoot::project_root() }
 
 sub _resolve_data_dir {
     my ($opts) = @_;
-    return $opts->{data_dir}
-        if defined $opts->{data_dir} && length $opts->{data_dir};
-    return $ENV{CCPRAXIS_DATA_DIR}
-        if defined $ENV{CCPRAXIS_DATA_DIR} && length $ENV{CCPRAXIS_DATA_DIR};
-    return _resolve_project_root() . '/.ccpraxis-local-data';
+    return BpDataRoot::data_dir(data_dir => $opts->{data_dir});
+}
+
+# ===========================================================================
+# ARGUMENT VALIDATION (spec §2.4, Decision 7: "any argument starting with
+# '-' that the subcommand does not define" is rejected, exit 2, BEFORE any
+# root resolution -- so a bug-0f1e-shaped mistyped flag never gets a chance
+# to be silently ignored while the walk-up quietly adopts the wrong root).
+# ===========================================================================
+
+my $USAGE = <<'END_USAGE';
+usage: bp-drive-next.pl next --scope <spec>
+       bp-drive-next.pl record-order <bp> [<bp> ...]
+       bp-drive-next.pl park <blueprint> <reason...>
+       bp-drive-next.pl --help
+END_USAGE
+
+# Returns the FIRST offending dash-argument (in argv order), or undef if
+# every element is well-formed for $sub. `next` defines --scope <spec>: the
+# element right after --scope is consumed as its value only when it exists
+# and does not itself start with '-' (otherwise --scope's value is '' and
+# that next element is validated on its own, same as the old silent-ignore
+# parse used to leave for _cmd_next). `record-order` and `park` define no
+# options at all, so ANY element starting with '-' is rejected -- including
+# a `park` reason word typed unquoted with a leading dash (Q4).
+sub _reject_unknown_options {
+    my ($sub, $argv) = @_;
+    my @a = @$argv;
+
+    if ($sub eq 'next') {
+        my $i = 0;
+        while ($i <= $#a) {
+            my $o = $a[$i];
+            if ($o eq '--scope') {
+                $i++;
+                $i++ if $i <= $#a && $a[$i] !~ /^-/;
+                next;
+            }
+            return $o if $o =~ /^-/;
+            $i++;
+        }
+        return undef;
+    }
+
+    for my $o (@a) {
+        return $o if $o =~ /^-/;
+    }
+    return undef;
 }
 
 # ===========================================================================
@@ -2040,6 +2064,25 @@ sub run {
         return 0;
     }
 
+    # NEW (spec §2.4 step 2): an unrecognised subcommand -- including a
+    # leading flag such as `--data-dir X next` -- is rejected here, before
+    # any root resolution, rather than falling through to the old
+    # end-of-run() "unknown subcommand" branch.
+    unless ($sub eq 'next' || $sub eq 'record-order' || $sub eq 'park') {
+        print STDERR "bp-drive-next: unknown subcommand '$sub'\n";
+        print STDERR $USAGE;
+        return 2;
+    }
+
+    # NEW (spec §2.4 step 3): reject any dash-argument the subcommand does
+    # not define, BEFORE any resolution -- nothing is resolved, spawned, or
+    # written on rejection.
+    if (defined(my $bad = _reject_unknown_options($sub, \@argv))) {
+        print STDERR "bp-drive-next $sub: unknown option '$bad'\n";
+        print STDERR $USAGE;
+        return 2;
+    }
+
     # Inject production defaults for each seam. data_dir is PROJECT-anchored
     # (see _resolve_data_dir) — NEVER __FILE__/plugin-relative.
     my $data_dir = _resolve_data_dir($opts);
@@ -2057,9 +2100,9 @@ sub run {
         unless (-d "$data_dir/blueprints") {
             print STDERR "bp-drive-next: no blueprints/ under the resolved data dir:\n";
             print STDERR "    $data_dir\n";
-            print STDERR "  Resolution order: --data-dir opt > \$CCPRAXIS_DATA_DIR > \$BP_PROJECT_ROOT\n";
-            print STDERR "                    > git toplevel > walk-up for .ccpraxis-local-data > cwd.\n";
-            print STDERR "  Set CCPRAXIS_DATA_DIR=<project>/.ccpraxis-local-data (or pass --data-dir) and retry.\n";
+            print STDERR "  Resolution order: \$CCPRAXIS_DATA_DIR > \$BP_PROJECT_ROOT > git toplevel\n";
+            print STDERR "                    > walk-up for .ccpraxis-local-data (stops at the temp dir and at home) > cwd.\n";
+            print STDERR "  Set CCPRAXIS_DATA_DIR=<project>/.ccpraxis-local-data and retry.\n";
             return 2;
         }
     }
@@ -2116,7 +2159,7 @@ sub run {
         return _cmd_next(\@argv, \%full_opts);
     } elsif ($sub eq 'record-order') {
         return _cmd_record_order(\@argv, \%full_opts);
-    } elsif ($sub eq 'park') {
+    } else {    # $sub eq 'park' — the only remaining option per the guard above
         my $bp     = shift @argv;
         my $reason = join(' ', @argv);
         unless (defined $bp && length $bp) {
@@ -2124,10 +2167,6 @@ sub run {
             return 2;
         }
         return _cmd_park($bp, $reason, \%full_opts);
-    } else {
-        print STDERR "bp-drive-next: unknown subcommand '$sub'\n";
-        print STDERR "usage: bp-drive-next.pl next|record-order|park|--help\n";
-        return 2;
     }
 }
 
