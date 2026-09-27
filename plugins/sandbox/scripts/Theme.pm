@@ -500,7 +500,7 @@ sub _glyphs_data {
         # a glyph that surface emits without an entry here is exactly what that
         # guard exists to catch. East-Asian-ambiguous, declared as one column.
         'icon.blueprints' => { cp => 0x29C9, desc => 'two joined squares, blueprint count' },
-        'icon.todos'      => { cp => 0x22EE, desc => 'vertical ellipsis, todo count' },
+        'icon.todos'      => { cp => 0x274F, desc => 'lower right drop-shadowed white square, todo count' },
         # The almanac counters and the continuity badge (hook-continuity-remake
         # package 10). Declared here for the same reason as the two icons
         # above: statusline.pl emits them and AC-S5 checks its width table

@@ -733,9 +733,14 @@ my ($Q10_PROJECT, $Q10_TITLE);
 # as UTF-8 bytes (the statusline output is read raw); the counts they pin are
 # unchanged. Decision 121 repointed S2 and S4's negative checks to the same
 # flag form, so they can fail again.
+#
+# blueprint operator-ui-tweaks Decision 1(b) (package 01-statusline-counters):
+# the flag gains a space between the glyph and the count -- "U+2691 N", not
+# "U+2691N" -- and moves out of the marker field into the counters segment.
+# The positive checks below (S1, S3, S5, S6) are updated for the space.
 my $FLAG_BYTES = Encode::encode('UTF-8', chr(0x2691));
 
-# S1 -- 3 records (2 unanswered, 1 answered): ?2, not followed by a digit.
+# S1 -- 3 records (2 unanswered, 1 answered): U+2691 2, not followed by a digit.
 {
     my $P = mk_project();
     AD_list('file', root => $P, title => 'S1 unanswered A');
@@ -745,20 +750,20 @@ my $FLAG_BYTES = Encode::encode('UTF-8', chr(0x2691));
 
     my ($out, $rc) = run_statusline_q(sl_payload(current_dir => $P));
     is($rc, 0, 'S1: statusline exits 0') or diag($out);
-    like($out, qr/\Q$FLAG_BYTES\E2(?!\d)/, 'S1: shows U+2691 2 for the two unanswered decisions, not followed by a digit');
+    like($out, qr/\Q$FLAG_BYTES\E 2(?!\d)/, 'S1: shows U+2691 2 for the two unanswered decisions, not followed by a digit');
 }
 
-# S2 -- 0 unanswered (only answered, or no store at all): no ?N.
+# S2 -- 0 unanswered (only answered, or no store at all): no U+2691 N.
 {
     my $P = mk_project();
     my $rec = AD('file', root => $P, title => 'S2 answered only');
     AD_list('answer', $rec->{id}, root => $P, answer => 'done') if ref $rec eq 'HASH';
     my ($out, $rc) = run_statusline_q(sl_payload(current_dir => $P));
-    unlike($out, qr/\Q$FLAG_BYTES\E\d/, 'S2: 0 unanswered (only an answered record) shows no U+2691 N');
+    is(index($out, $FLAG_BYTES), -1, 'S2: 0 unanswered (only an answered record) shows no U+2691 N');
 
     my $P2 = mk_project();
     my ($out2, $rc2) = run_statusline_q(sl_payload(current_dir => $P2));
-    unlike($out2, qr/\Q$FLAG_BYTES\E\d/, 'S2: no decision dir at all shows no U+2691 N');
+    is(index($out2, $FLAG_BYTES), -1, 'S2: no decision dir at all shows no U+2691 N');
 }
 
 # S3 -- same resolution as ask: a subdirectory (no CLAUDE_PROJECT_DIR) walks
@@ -769,13 +774,13 @@ my $FLAG_BYTES = Encode::encode('UTF-8', chr(0x2691));
     my $sub = "$P/sub/dir";
     make_path($sub);
     my ($out, $rc) = run_statusline_q(sl_payload(current_dir => $sub));
-    like($out, qr/\Q$FLAG_BYTES\E1(?!\d)/, 'S3: a subdirectory current_dir with no CLAUDE_PROJECT_DIR counts the walked-up project');
+    like($out, qr/\Q$FLAG_BYTES\E 1(?!\d)/, 'S3: a subdirectory current_dir with no CLAUDE_PROJECT_DIR counts the walked-up project');
 
     my $OUTSIDE = outside_dir();
     SKIP: {
         skip 'S3: no clean outside dir available on this host', 1 unless defined $OUTSIDE;
         my ($out2, $rc2) = run_statusline_q(sl_payload(current_dir => $OUTSIDE), env => { CLAUDE_PROJECT_DIR => $P });
-        like($out2, qr/\Q$FLAG_BYTES\E1(?!\d)/, 'S3: an outside current_dir with CLAUDE_PROJECT_DIR set counts that project');
+        like($out2, qr/\Q$FLAG_BYTES\E 1(?!\d)/, 'S3: an outside current_dir with CLAUDE_PROJECT_DIR set counts that project');
     }
 }
 
@@ -786,7 +791,7 @@ my $FLAG_BYTES = Encode::encode('UTF-8', chr(0x2691));
     my $legacy_content = "- [2020-01-01T00:00:00Z] legacy a?\n- legacy b?\n";
     write_raw("$P/.ccpraxis-local-data/.subagent-guard/questions.md", $legacy_content);
     my ($out, $rc) = run_statusline_q(sl_payload(current_dir => $P));
-    unlike($out, qr/\Q$FLAG_BYTES\E\d/, 'S4: a legacy questions.md with no store shows no U+2691 N');
+    is(index($out, $FLAG_BYTES), -1, 'S4: a legacy questions.md with no store shows no U+2691 N');
     is(slurp("$P/.ccpraxis-local-data/.subagent-guard/questions.md"), $legacy_content,
        'S4: the legacy file is byte-identical afterwards (read-only)');
     ok(!-d "$P/.ccpraxis-local-data/almanac", 'S4: no almanac/ dir was created');
@@ -807,7 +812,7 @@ my $FLAG_BYTES = Encode::encode('UTF-8', chr(0x2691));
     write_raw("$dec_dir/real.md", "---\ntitle: real one\nstatus: unanswered\ncreated: 2020-01-01T00:00:00Z\n---\n");
 
     my ($out, $rc) = run_statusline_q(sl_payload(current_dir => $P));
-    like($out, qr/\Q$FLAG_BYTES\E1(?!\d)/, 'S5: exactly the one genuine unanswered frontmatter record is counted');
+    like($out, qr/\Q$FLAG_BYTES\E 1(?!\d)/, 'S5: exactly the one genuine unanswered frontmatter record is counted');
 }
 
 # S6 -- 300 records (1 unanswered): completes within a 20s timeout, ?1.
@@ -832,7 +837,7 @@ my $FLAG_BYTES = Encode::encode('UTF-8', chr(0x2691));
     SKIP: {
         skip 'S6: did not complete', 2 unless $ok;
         is($rc, 0, 'S6: exit 0');
-        like($out, qr/\Q$FLAG_BYTES\E1(?!\d)/, 'S6: shows U+2691 1 for the one unanswered record');
+        like($out, qr/\Q$FLAG_BYTES\E 1(?!\d)/, 'S6: shows U+2691 1 for the one unanswered record');
     }
 }
 
