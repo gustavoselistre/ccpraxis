@@ -236,7 +236,7 @@ sub count_reports_in {
     return scalar @f;
 }
 my $live_before = count_reports_in($LIVE_STORE);
-ok($live_before > 0, "sanity: live store has reports to protect ($live_before found)");
+# Decision 120(c): presence in the real gitignored live store is never REQUIRED -- only that this suite leaves its count unchanged (checked below).
 
 sub live_almanac_listing {
     my %out;

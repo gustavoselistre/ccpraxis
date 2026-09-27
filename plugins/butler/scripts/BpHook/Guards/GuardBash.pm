@@ -2407,6 +2407,12 @@ sub _hyg_join_eval_words {
 # mistaken for it.
 my $HYG_DEADLINE_MARKER = { hyg_deadline_exceeded => 1 };
 
+# Package 02, spec sec 2.2 "Targets": a one-entry, per-process cache shared
+# between _gb_h and _gb_w, so a single Bash command is scanned by
+# hyg_targets() at most once when both rules run for it. Keyed on a byte-
+# equality check of the command text; never persisted across processes.
+my $HYG_TARGETS_CACHE = { cmd => undef, targets => undef, deadline_at => undef };
+
 sub _hyg_deadline_check {
     my ($deadline_at) = @_;
     return unless defined $deadline_at;
@@ -2894,6 +2900,13 @@ sub _hyg_deadline_seconds {
 
 sub _gb_h_impl {
     my ($p, $cmd, $ti) = @_;
+    # review S2: reset the cross-call cache as the FIRST statement of every
+    # _gb_h_impl call, before any return -- a stale entry (e.g. one filled
+    # under an already-expired deadline by a prior call in this process,
+    # before GB-h itself failed open) must never be visible to _gb_w's hit
+    # test. Only a fresh fill by THIS call's own hyg_targets() scan below may
+    # populate it again.
+    $HYG_TARGETS_CACHE = { cmd => undef, targets => undef, deadline_at => undef };
     # redteam-3 M2: work on a BYTE copy for the whole rest of this call --
     # see BpHook::_segments's comment for why a decoded non-ASCII string
     # makes every substr()/index() walk downstream quadratic.
@@ -2949,6 +2962,10 @@ sub _gb_h_impl {
         return _hyg_oversize_lines($cmd, $hint_ok) if ref $err && $err == $HYG_DEADLINE_MARKER;
         die $err; # a real internal error: let the outer _gb_h eval fail open
     }
+    # Package 02: cache this scan for _gb_w, which runs right after this rule
+    # for the same command -- this must never change what _gb_h itself
+    # verdicts, only save _gb_w a repeat hyg_targets() call.
+    $HYG_TARGETS_CACHE = { cmd => $cmd, targets => \@targets, deadline_at => $deadline_at };
 
     for my $t (@targets) {
         if (Time::HiRes::time() > $deadline_at) { return _hyg_oversize_lines($cmd, $hint_ok) }
@@ -2986,6 +3003,199 @@ sub _gb_h_impl {
 sub _gb_h {
     my ($p, $cmd, $ti) = @_;
     my $lines = eval { _gb_h_impl($p, $cmd, $ti) };
+    return undef if $@;
+    return $lines;
+}
+
+# ---------------------------------------------------------------------------
+# GB-w -- package 02 (spec 02-bash-write-set-spec.md sec 2.2). For a
+# bound, write-capable subagent -- or, Decision 32's amendment to Q2, a
+# coordinator context whose active-worker marker names a writer -- judges
+# every resolvable in-repo write/delete/move target the same way
+# WriteGuards' Edit guard would (BpHook::WriteGuards::may_write, the seam
+# package 02 extracted). Runs after GB-h, so a protected-root or cd denial
+# always wins first and GB-w never re-judges a target GB-h already denied.
+# ---------------------------------------------------------------------------
+sub _gb_w_require_writeguards {
+    return 1 if grep { m{(?:^|/)WriteGuards\.pm$} } keys %INC;
+    require "$SELF_DIR/../WriteGuards.pm";
+    return 1;
+}
+
+# _gb_w_mkdir_ancestor_ok($R, $root, $D) -- Q3's mkdir allowance: true iff D
+# (already known to be a denied mkdir target, lexically under root) is an
+# ancestor of some write_set or test_paths pattern of a package in $R. A
+# bare `mkdir -p` for a new file's directory would otherwise be a false
+# denial Edit never has.
+sub _gb_w_mkdir_ancestor_ok {
+    my ($R, $root, $D) = @_;
+    my $Rc = BpHook::Guards::Common::canon($root);
+    my $Dc = BpHook::Guards::Common::canon($D);
+    return 0 unless defined $Rc && length $Rc && defined $Dc && length $Dc;
+    my $REL;
+    if ($Dc eq $Rc)                    { $REL = '' }
+    elsif (index($Dc, "$Rc/") == 0)    { $REL = substr($Dc, length($Rc) + 1) }
+    else                                { return 0 }
+    return 0 unless length $REL;
+    my $ci = eval { BpHook::WriteGuards::_is_ci() } ? 1 : 0;
+    my $cand = $REL . '/';
+    my $cand_m = $ci ? lc($cand) : $cand;
+    for my $P (@{ $R->{packages} || [] }) {
+        for my $field (qw(write_set test_paths)) {
+            my $v = $P->{$field};
+            next unless defined $v && length $v;
+            for my $pat (split /:/, $v, -1) {
+                next if $pat eq '';
+                my $pat_m = $ci ? lc($pat) : $pat;
+                return 1 if index($pat_m, $cand_m) == 0;
+            }
+        }
+    }
+    return 0;
+}
+
+my $GB_W_INSTEAD_LINE = 'Instead (Bash): put scratch output and mutation copies under the temp dir or '
+                      . 'the session scratchpad; repo files outside your scope are not yours to change.';
+
+sub _gb_w_impl {
+    my ($p, $cmd, $ti) = @_;
+    utf8::encode($cmd) if utf8::is_utf8($cmd);
+
+    my ($mt, undef) = _match_text_and_reason($cmd);
+    my $triggered = BpHook::Guards::Common::line_match($HYG_TRIGGER_RE, $mt);
+    unless ($triggered) {
+        my $relaxed = _hyg_relaxed_trigger_text($cmd);
+        $triggered = BpHook::Guards::Common::line_match($HYG_TRIGGER_RE, $relaxed);
+    }
+    return undef unless $triggered;
+
+    # review S4: WriteGuards::resolve() is expensive (inflight.json plus
+    # every in-flight ledger's frontmatter) -- never require/run it for a
+    # payload that cannot possibly become a confined context. Only a
+    # coordinator context (BP_LEDGER set) or a driver-armed session (the
+    # driver's own Bash calls, and every subagent it dispatches -- both
+    # share the driver's armed session_id) can resolve() to anything but
+    # undef; every other role (manual/unarmed/judge-without-ledger) always
+    # would.
+    my $ledger_env = $ENV{BP_LEDGER};
+    my $could_resolve = (defined $ledger_env && length $ledger_env) ? 1 : 0;
+    $could_resolve = 1 if !$could_resolve && eval { BpHook::role($p) eq 'driver' };
+    return undef unless $could_resolve;
+
+    _gb_w_require_writeguards();
+    my $R = eval { BpHook::WriteGuards::resolve($p) };
+    return undef unless ref $R eq 'HASH';
+
+    # Decision 33 (consolidating review M2 / redteam M1): _gb_w applies
+    # exactly when WriteGuards::resolve() yields a context in which the Edit
+    # guard would confine this agent -- every bound subagent (whatever its
+    # agent_type), and every coordinator context, with or without an
+    # active-worker marker. Never a role-listed set of its own: Edit and
+    # Bash can never disagree about a bound agent (Decision 32 Q2). Every
+    # other resolve() kind (sole, refused, refused_bound, exempt_reports)
+    # and driver mode (no agent binding, the driver's own main session)
+    # abstain here, exactly as may_write's own allow_dirs/root logic would
+    # leave them unconfined.
+    my $scoped = 0;
+    $scoped = 1 if $R->{mode} eq 'subagent' && defined($R->{kind}) && $R->{kind} eq 'bound';
+    $scoped = 1 if $R->{mode} eq 'coordinator';
+    return undef unless $scoped;
+
+    my $root = $R->{root};
+    return undef unless defined $root && length $root;
+
+    my ($targets, $deadline_at);
+    if (ref $HYG_TARGETS_CACHE eq 'HASH' && defined($HYG_TARGETS_CACHE->{cmd}) && $HYG_TARGETS_CACHE->{cmd} eq $cmd) {
+        $targets     = $HYG_TARGETS_CACHE->{targets};
+        $deadline_at = $HYG_TARGETS_CACHE->{deadline_at};
+    }
+    else {
+        $deadline_at = Time::HiRes::time() + _hyg_deadline_seconds();
+        my @t = eval { hyg_targets($cmd, $deadline_at) };
+        if (my $err = $@) {
+            return _hyg_oversize_lines($cmd, 0) if ref $err && $err == $HYG_DEADLINE_MARKER;
+            die $err; # a real internal error: the outer _gb_w eval fails open
+        }
+        $targets = \@t;
+    }
+
+    my $cwd;
+    if (ref $p eq 'HASH' && defined $p->{cwd} && !ref($p->{cwd}) && length $p->{cwd}) {
+        my $c = BpHook::_to_bytes($p->{cwd});
+        $cwd = $c if _hyg_is_abs($c);
+    }
+    # spec sec 2.2 "Resolution context": a cd anywhere in the command makes
+    # the payload cwd untrustworthy for a relative target later in the same
+    # command -- clear it, exactly as GB-h's own bypass-mode cd handling
+    # assumes, so a relative target after a cd is unresolvable rather than
+    # judged against the wrong directory.
+    if (grep { ref($_) eq 'HASH' && defined($_->{kind}) && $_->{kind} eq 'cd' } @$targets) {
+        $cwd = undef;
+    }
+
+    my $home1;
+    for my $v ($ENV{HOME}, $ENV{USERPROFILE}) {
+        next unless defined $v && length $v;
+        my $b = BpHook::_to_bytes($v);
+        if (_hyg_is_abs($b)) { $home1 = $b; last }
+    }
+    my $rctx = { home1 => $home1 };
+    my ($rootD, $rootK) = _hyg_root_dk($root);
+
+    my %judged_ok;
+    for my $t (@$targets) {
+        if (Time::HiRes::time() > $deadline_at) { return _hyg_oversize_lines($cmd, 0) }
+        next unless $t->{kind} eq 'write' || $t->{kind} eq 'delete' || $t->{kind} eq 'move';
+
+        my ($D, $K) = _hyg_resolve($t->{word}, $cwd, $rctx);
+        next unless defined $D; # unresolvable target: allowed through (Decision 4(d))
+
+        next if _hyg_never_target($D);
+
+        # Repo scope: only a target statically inside WriteGuards' own root
+        # is judged here -- temp, the scratchpad and home lie outside it.
+        # review S3: decided LEXICALLY only, no per-target stat walk -- a
+        # target that is not a lexical descendant of root is never a repo
+        # write GB-w need judge (Decision 22 M3).
+        next unless _hyg_lexical_inside($K, $root);
+        next if defined($rootK) && $K eq $rootK; # the root itself is GB-h (c)'s concern
+
+        next if $judged_ok{$K};
+
+        my $v = BpHook::WriteGuards::may_write($R, $D, $p);
+        if ($v->{allow}) { $judged_ok{$K} = 1; next }
+
+        # review M1: the mkdir allowance is a verdict about THIS shape only
+        # (an ancestor-of-scope mkdir), never a fact about the path itself --
+        # memoising it as $judged_ok{$K} let a later rm/mv of the same path
+        # ride the memo through. Never mark $K allowed here.
+        if ($t->{shape} eq 'mkdir' && _gb_w_mkdir_ancestor_ok($R, $root, $D)) {
+            next;
+        }
+
+        my @lines = @{ $v->{lines} || [] };
+        # Decision 33/S1: the sec 2.3 "Instead (Bash)" + Command remedy is
+        # relocation advice -- it only fits a write-set-scope denial (the
+        # file is fine, just outside this package's scope; move the write).
+        # Every other may_write denial (test-modify, writer-scope, sibling
+        # ledger, 8.3, root-scope, refused/bound) already carries its own
+        # correct remedy, and for those Bash must match Edit's lines
+        # byte-for-byte -- appending relocation advice there would be wrong
+        # (a protected test file is not "yours to relocate") and is what
+        # broke AC-14/S1's Edit-parity check.
+        if (grep { m/is outside (?:this package's write set|the write set of every package in flight)/ } @lines) {
+            push @lines, $GB_W_INSTEAD_LINE;
+            push @lines, 'Command: ' . BpHook::Guards::Common::echo_cmd($cmd);
+        }
+        return \@lines;
+    }
+
+    return undef;
+}
+
+sub _gb_w {
+    my ($p, $cmd, $ti) = @_;
+    my $lines = eval { _gb_w_impl($p, $cmd, $ti) };
     return undef if $@;
     return $lines;
 }
@@ -3034,7 +3244,7 @@ sub run {
         return BpHook::deny(@fitted);
     }
 
-    for my $rule (\&_gb_a, \&_gb_b, \&_gb_c, \&_gb_h, \&_gb_d) {
+    for my $rule (\&_gb_a, \&_gb_b, \&_gb_c, \&_gb_h, \&_gb_w, \&_gb_d) {
         my $lines = eval { $rule->($p, $cmd, $ti) };
         if (defined $lines) {
             my @fitted = map { BpHook::Guards::Common::fit($_) } @$lines;

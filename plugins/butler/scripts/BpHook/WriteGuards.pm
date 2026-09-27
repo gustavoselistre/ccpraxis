@@ -133,10 +133,18 @@ sub _has_8dot3 {
     return 0;
 }
 
+# _deny_8dot3_lines is the pure form (package 02, spec sec 2.1): the line
+# list only, already _cfit'd, never printed. _deny_8dot3 stays the printing
+# wrapper _ledger uses, so ledger mode's bytes do not move.
+sub _deny_8dot3_lines {
+    my ($ABS) = @_;
+    return [ _cfit(sprintf(
+        'BLOCKED: %s uses a Windows short (8.3) name; write it by its long name.', _cpathecho($ABS))) ];
+}
+
 sub _deny_8dot3 {
     my ($ABS) = @_;
-    return BpHook::deny(_cfit(sprintf(
-        'BLOCKED: %s uses a Windows short (8.3) name; write it by its long name.', _cpathecho($ABS))));
+    return BpHook::deny(@{ _deny_8dot3_lines($ABS) });
 }
 
 # ---------------------------------------------------------------------------
@@ -164,25 +172,39 @@ sub _sibling_ledger_name {
     return $name;
 }
 
-sub _maybe_deny_sibling_ledger {
-    my ($ABS, $ABS_c, $R, $mode) = @_;
+# _sibling_ledger_deny_lines is may_write's pure form of the 'ledger' branch
+# below: the line list only, already _cfit'd.
+sub _sibling_ledger_deny_lines {
+    my ($ABS_c, $R) = @_;
     return undef unless defined($R->{mode}) && $R->{mode} eq 'subagent';
     for my $P (@{ $R->{packages} || [] }) {
         my $sib = _sibling_ledger_name($ABS_c, $P);
         next unless defined $sib;
-        if ($mode eq 'ledger') {
-            return _ledger_deny(sprintf(
-                "this subagent is bound to package %s and may not write sibling package %s's ledger; each subagent may only write its own package ledger",
-                $P->{package}, $sib), $ABS);
-        }
-        return BpHook::deny(_cfit(sprintf(
+        return [ _cfit(sprintf(
             "BLOCKED: this subagent is bound to package %s and may not write the ledger of sibling package %s; each subagent may only write its own package ledger.",
-            $P->{package}, $sib)));
+            $P->{package}, $sib)) ];
     }
     return undef;
 }
 
-sub _maybe_deny_8dot3 {
+# _maybe_deny_sibling_ledger -- ledger mode's only remaining caller
+# (_ledger, below); _writes now goes through may_write ->
+# _sibling_ledger_deny_lines directly, so there is no other shape to keep.
+sub _maybe_deny_sibling_ledger {
+    my ($ABS, $ABS_c, $R) = @_;
+    return undef unless defined($R->{mode}) && $R->{mode} eq 'subagent';
+    for my $P (@{ $R->{packages} || [] }) {
+        my $sib = _sibling_ledger_name($ABS_c, $P);
+        next unless defined $sib;
+        return _ledger_deny(sprintf(
+            "this subagent is bound to package %s and may not write sibling package %s's ledger; each subagent may only write its own package ledger",
+            $P->{package}, $sib), $ABS);
+    }
+    return undef;
+}
+
+# _maybe_deny_8dot3_lines is may_write's pure form: the line list only.
+sub _maybe_deny_8dot3_lines {
     my ($ABS, $ABS_c, $R) = @_;
     my @roots;
     push @roots, $R->{root} if defined($R->{root}) && length($R->{root});
@@ -191,9 +213,15 @@ sub _maybe_deny_8dot3 {
         next unless _in($ABS_c, $r);
         my $rc = _ccanon($r);
         my $rel = substr($ABS_c, length($rc) + 1);
-        return _deny_8dot3($ABS) if _has_8dot3($rel);
+        return _deny_8dot3_lines($ABS) if _has_8dot3($rel);
     }
     return undef;
+}
+
+sub _maybe_deny_8dot3 {
+    my ($ABS, $ABS_c, $R) = @_;
+    my $lines = _maybe_deny_8dot3_lines($ABS, $ABS_c, $R);
+    return defined($lines) ? BpHook::deny(@$lines) : undef;
 }
 
 # ---------------------------------------------------------------------------
@@ -846,7 +874,9 @@ sub _deny_test_modify {
             $who, $REL, $pat, $pkg),
         'Tests are the immutable oracle; if a test is wrong, report the test, why it contradicts the spec, and your evidence.',
     );
-    return BpHook::deny(map { _cfit($_) } @lines);
+    # Package 02: returns the line list rather than printing -- may_write is
+    # pure, and _writes prints on its behalf.
+    return [ map { _cfit($_) } @lines ];
 }
 
 sub _deny_writer_scope {
@@ -860,7 +890,7 @@ sub _deny_writer_scope {
         sprintf("BLOCKED: %s may only write under the package's test paths (%s), not %s.", $role, $tp, $REL),
         $line2,
     );
-    return BpHook::deny(map { _cfit($_) } @lines);
+    return [ map { _cfit($_) } @lines ];
 }
 
 # _write_set_pattern_lines($ws) -> (COUNT, @LINES). Report 20260916-175013-34af:
@@ -900,6 +930,8 @@ sub _test_paths_display {
     return $tp;
 }
 
+# _deny_write_set returns its line list (package 02) rather than printing;
+# every caller is inside may_write/_writes_step7, never ledger mode.
 sub _deny_write_set {
     my ($R, $REL) = @_;
     my @packages = @{ $R->{packages} };
@@ -928,14 +960,14 @@ sub _deny_write_set {
               . 'repair will not help -- relaunch is the only recovery.',
                 'Record the scope problem under Next action and escalate; the orchestrator re-scopes packages.',
             );
-            return BpHook::deny(map { _cfit($_) } @lines);
+            return [ map { _cfit($_) } @lines ];
         }
         my @lines = (
             sprintf("BLOCKED: %s is outside this package's write set (package %s).", $REL, $P->{package}),
             sprintf('  write_set: %s', (defined $P->{write_set} && length $P->{write_set}) ? $P->{write_set} : '(empty)'),
             'Record the scope problem under Next action and escalate; the orchestrator re-scopes packages.',
         );
-        return BpHook::deny(map { _cfit($_) } @lines);
+        return [ map { _cfit($_) } @lines ];
     }
     else {
         # Decision 69 A7 (review M2): spec sec 3.2's T5, verbatim -- two
@@ -950,7 +982,7 @@ sub _deny_write_set {
             sprintf('BLOCKED: %s is outside the write set of every package in flight: %s.', $REL, $list),
             "The driver's own edits must fall inside one in-flight package's write set.",
         );
-        return BpHook::deny(map { _cfit($_) } @lines);
+        return [ map { _cfit($_) } @lines ];
     }
 }
 
@@ -976,19 +1008,34 @@ sub _writes_step7 {
     return _deny_write_set($R, $REL);
 }
 
-sub _writes {
-    my ($p, $R) = @_;
-    my $tool = (ref $p eq 'HASH') ? $p->{tool_name} : undef;
-    return 0 unless defined $tool && !ref($tool) && grep { $tool eq $_ } qw(Write Edit MultiEdit NotebookEdit);
+# ---------------------------------------------------------------------------
+# may_write($R, $abs, $p) -- package 02, spec sec 2.1. The pure Edit verdict:
+# never prints, never calls BpHook::deny, never exits. Returns
+# { allow => 1 } or { allow => 0, lines => [ ..already _cfit'd.. ] }. $R is
+# resolve()'s return, unmodified; $abs is an already-canon-shaped absolute
+# path (Common::resolve_path's/`_abs_of`'s form); $p is used only by
+# _own_scratchpad ({} is fine, and yields no scratchpad allowance). This is
+# the seam GB-h's _gb_w calls, and the only place writes-mode decision logic
+# lives -- _writes below is a thin printer over it.
+# ---------------------------------------------------------------------------
+sub may_write {
+    my ($R, $abs, $p) = @_;
+    $p = {} unless ref $p eq 'HASH';
+    # AC-19 (done criterion 6): the caller normally already passes an
+    # _abs_of()-shaped, lexically-collapsed path, but may_write must not
+    # DEPEND on that -- re-collapsing here (idempotent when it's already
+    # collapsed) is what keeps a caller-supplied ".." segment judged
+    # identically to Edit's own re-derived ABS, which always runs it through
+    # this same resolve_path.
+    my $ABS   = _cresolvepath($abs, undef);
+    $ABS      = $abs unless defined $ABS;
+    my $ABS_c = _ccanon($ABS);
 
-    my ($ABS, $ABS_c) = _abs_of($p);
-    return 0 unless defined $ABS;
+    if (my $lines = _maybe_deny_8dot3_lines($ABS, $ABS_c, $R)) { return { allow => 0, lines => $lines } }
+    if (my $lines = _sibling_ledger_deny_lines($ABS_c, $R))    { return { allow => 0, lines => $lines } }
 
-    if (my $d = _maybe_deny_8dot3($ABS, $ABS_c, $R)) { return $d }
-    if (my $d = _maybe_deny_sibling_ledger($ABS, $ABS_c, $R, 'writes')) { return $d }
-
-    return 0 if _own_scratchpad($p, $ABS_c, $R);
-    return 0 if _is_temp($ABS_c, $R->{root}, $R->{data});
+    return { allow => 1 } if _own_scratchpad($p, $ABS_c, $R);
+    return { allow => 1 } if _is_temp($ABS_c, $R->{root}, $R->{data});
 
     my $in_deny = 0;
     for my $d (@{ $R->{deny_dirs} || [] }) {
@@ -996,7 +1043,7 @@ sub _writes {
     }
     unless ($in_deny) {
         for my $d (@{ $R->{allow_dirs} || [] }) {
-            return 0 if _in($ABS_c, $d);
+            return { allow => 1 } if _in($ABS_c, $d);
         }
     }
 
@@ -1007,14 +1054,14 @@ sub _writes {
         # <data>/blueprints/<any bp>/reports/ -- regardless of how many
         # packages are in flight, and never any package's write_set/
         # test_paths, even when it is the sole package in flight.
-        return 0 if _under_any_reports($ABS_c, $R->{data});
-        return BpHook::deny(_cfit(
-            'BLOCKED: this subagent is exempt from package binding and may write only under blueprints/<bp>/reports/.'));
+        return { allow => 1 } if _under_any_reports($ABS_c, $R->{data});
+        return { allow => 0, lines => [ _cfit(
+            'BLOCKED: this subagent is exempt from package binding and may write only under blueprints/<bp>/reports/.') ] };
     }
     if ($R->{kind} eq 'refused') {
         my $n = defined($R->{inflight}) ? $R->{inflight} : 0;
-        return BpHook::deny(_cfit(sprintf(
-            'No package binding for this subagent; with %d packages in flight its edits are refused.', $n)));
+        return { allow => 0, lines => [ _cfit(sprintf(
+            'No package binding for this subagent; with %d packages in flight its edits are refused.', $n)) ] };
     }
     if ($R->{kind} eq 'refused_bound') {
         # Decision 69 A3 (red-team H4): distinct from the generic no-binding
@@ -1023,15 +1070,15 @@ sub _writes {
         my $bd  = $R->{bound} || {};
         my $bp  = defined($bd->{blueprint}) ? $bd->{blueprint} : '?';
         my $pkg = defined($bd->{package})   ? $bd->{package}   : '?';
-        return BpHook::deny(_cfit(sprintf(
+        return { allow => 0, lines => [ _cfit(sprintf(
             'BLOCKED: this subagent is bound to package %s/%s, which is not usable now (no ledger, or a terminal/parked status); its edits are refused.',
-            $bp, $pkg)));
+            $bp, $pkg)) ] };
     }
 
     unless (_in($ABS_c, $R->{root})) {
-        return BpHook::deny(_cfit(sprintf(
+        return { allow => 0, lines => [ _cfit(sprintf(
             'BLOCKED: %s is outside the project root (%s); writes must stay in the project, the blueprint dir or /tmp.',
-            _cpathecho($ABS), _cpathecho($R->{root}))));
+            _cpathecho($ABS), _cpathecho($R->{root}))) ] };
     }
     my $root_c = _ccanon($R->{root});
     my $REL = substr($ABS_c, length($root_c) + 1);
@@ -1047,7 +1094,21 @@ sub _writes {
         push @classified, { P => $P, kind => $kind2, tpat => $tpat, wpat => $wpat };
     }
 
-    return _writes_step7($REL, $R, \@classified);
+    my $lines = _writes_step7($REL, $R, \@classified);
+    return $lines ? { allow => 0, lines => $lines } : { allow => 1 };
+}
+
+sub _writes {
+    my ($p, $R) = @_;
+    my $tool = (ref $p eq 'HASH') ? $p->{tool_name} : undef;
+    return 0 unless defined $tool && !ref($tool) && grep { $tool eq $_ } qw(Write Edit MultiEdit NotebookEdit);
+
+    my ($ABS, $ABS_c) = _abs_of($p);
+    return 0 unless defined $ABS;
+
+    my $v = may_write($R, $ABS, $p);
+    return 0 if $v->{allow};
+    return BpHook::deny(@{ $v->{lines} });
 }
 
 # ---------------------------------------------------------------------------
@@ -1267,7 +1328,7 @@ sub _ledger {
     return 0 unless defined $ABS;
 
     if (my $d = _maybe_deny_8dot3($ABS, $ABS_c, $R)) { return $d }
-    if (my $d = _maybe_deny_sibling_ledger($ABS, $ABS_c, $R, 'ledger')) { return $d }
+    if (my $d = _maybe_deny_sibling_ledger($ABS, $ABS_c, $R)) { return $d }
 
     my $ci = _is_ci();
     my $in_scope = 0;
