@@ -391,7 +391,7 @@ SKIP: {
     my $row = first_line($out);
     my @fields = sep_fields($row);
     my $last = @fields ? $fields[-1] : '';
-    my $want = "${G_FLAG} 2  ${G_BLUEPRINT}  1  ${G_TASK} 4  ${G_TODO} 5${G_DOT}3  ${G_NOTE}2${G_DOT}1";
+    my $want = "${G_FLAG} 2  ${G_BLUEPRINT} 1  ${G_TASK} 4  ${G_TODO} 5${G_DOT}3  ${G_NOTE}2${G_DOT}1";
     is($last, $want,
         'AC-1 (behaviour 1): the last field is exactly the decisions/blueprints/tasklist/todos/notes join')
         or diag("  last field = [$last]\n  row 1 = [" . strip_sgr($row) . "]");
@@ -426,7 +426,7 @@ SKIP: {
         seed_blueprint($data, 'bp');
         my ($out) = render(proj => $P, home => mk_home(), data => $data);
         my $last = (sep_fields(first_line($out)))[-1] // '';
-        is($last, "${G_BLUEPRINT}  1  ${G_TODO} 2", 'AC-2: {blueprints, todos} -> "U+29C9  1  U+274F 2"');
+        is($last, "${G_BLUEPRINT} 1  ${G_TODO} 2", 'AC-2: {blueprints, todos} -> "U+29C9 1  U+274F 2"');
         ok($last !~ /\A\s|\s\z/, 'AC-2: {blueprints, todos} has no leading/trailing space');
         ok($last !~ /   /, 'AC-2: {blueprints, todos} has no 3-space run');
     }
@@ -489,7 +489,7 @@ SKIP: {
 }
 
 # ===========================================================================
-# AC-6 -- blueprint counter, exactly two spaces.
+# AC-6 -- blueprint counter, exactly one space.
 # ===========================================================================
 SKIP: {
     skip('almanac modules did not load', 3) unless $ALMANAC_OK;
@@ -498,11 +498,11 @@ SKIP: {
     seed_blueprint($data, 'one');
     my ($out) = render(proj => $P, home => mk_home(), data => $data);
     my $row = first_line($out);
-    my $raw_seg = "${MUTED}${G_BLUEPRINT}  ${R}${PRIMARY}1${R}";
-    ok(index($row, $raw_seg) >= 0, 'AC-6: raw row 1 contains MUTED."U+29C9  ".R.PRIMARY."1".R (two spaces)')
+    my $raw_seg = "${MUTED}${G_BLUEPRINT} ${R}${PRIMARY}1${R}";
+    ok(index($row, $raw_seg) >= 0, 'AC-6: raw row 1 contains MUTED."U+29C9 ".R.PRIMARY."1".R (one space)')
         or diag("  row 1 raw = [$row]");
     my $vis = strip_sgr($row);
-    ok(index($vis, "${G_BLUEPRINT}  1") >= 0, 'AC-6: stripped text contains "U+29C9  1" (two spaces)');
+    ok(index($vis, "${G_BLUEPRINT} 1") >= 0, 'AC-6: stripped text contains "U+29C9 1" (one space)');
     ok($vis !~ /\Q$G_BLUEPRINT\E 1\d/ && $vis !~ /\Q$G_BLUEPRINT\E   /,
         'AC-6: neither "U+29C9 1" (one space, digit-adjacent) nor a 3-space run follows the glyph');
 }

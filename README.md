@@ -140,7 +140,7 @@ nothing itself.
 Claude Code gives you a couple of rows at the bottom of the terminal. This puts everything you would otherwise interrupt yourself to check into them:
 
 ```text
-○ HOST ｜ ccpraxis ｜ ⌥ main ↑3 ↓22 ｜ ⧉  2  ❏ 14
+○ HOST ｜ ccpraxis ｜ ⌥ main ↑3 ↓22 ｜ ⧉ 2  ❏ 14
 Opus 5 200k 59% 118k 82k ｜ 5h 34% 3h 35m｜7d 12% 4d 4h
 /c/Development/ccpraxis
 ```

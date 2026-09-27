@@ -1036,9 +1036,10 @@ eval {
         # want any colored emoji"). U+29C9, two joined squares -- layered
         # packages, which is what a blueprint is -- chosen from four offered.
         # It is East-Asian-ambiguous width, so it is DECLARED in %GLYPH_COLS
-        # above rather than left to the fallback. Two spaces after the glyph
-        # (Decision 1), matching the double-space join between segments.
-        push @parts, "${MUTED}\x{29C9}  ${R}${PRIMARY}${n}${R}" if $n > 0;
+        # above rather than left to the fallback. One space after the glyph,
+        # like the tasklist and todos counters (operator, 2026-09-27: the
+        # two-space form tried in package 01 was one too many).
+        push @parts, "${MUTED}\x{29C9} ${R}${PRIMARY}${n}${R}" if $n > 0;
     }
 
     # The almanac counters, from the one accessor call above. Each reads
