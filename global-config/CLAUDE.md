@@ -104,6 +104,6 @@ If you must write new code that reads/writes Windows registry env vars:
 
 ## Durable facts go in almanac notes
 
-Claude Code memory is disabled; record a durable cross-project fact as a global almanac note (`perl ~/.claude/ccpraxis/plugins/almanac/scripts/almanac-note.pl create --global --title "..."`), never as a memory. Your notes index is imported on the next line from `~/.claude/almanac-notes.md`, which `almanac-migrate-memories.pl render-index` generates from your own vault; every `target` in it is relative to `~/.claude/claude-code-vault/`.
+Claude Code memory is disabled; record a durable cross-project fact as a global almanac note (`perl ~/.claude/ccpraxis/plugins/almanac/scripts/almanac-note.pl create --global --title "..." --content -`, the fact on stdin), never as a memory. Your notes index is imported on the next line from `~/.claude/almanac-notes.md`, which `almanac-migrate-memories.pl render-index` generates from your own vault; every `target` in it is relative to `~/.claude/claude-code-vault/`.
 
 @~/.claude/almanac-notes.md
