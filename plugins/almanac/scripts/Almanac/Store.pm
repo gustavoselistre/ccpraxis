@@ -31,6 +31,7 @@ use strict;
 use warnings;
 use Cwd ();
 use File::Path ();
+use File::Spec ();
 use Digest::SHA ();
 use JSON::PP ();
 use Sys::Hostname ();
@@ -190,28 +191,263 @@ sub _parent_of {
     return $parent;
 }
 
+# ---------------------------------------------------------------------------
+# _bounded_walk (package 03, Decision 3 & 20/Q2) -- a PRIVATE mirror of
+# plugins/butler/scripts/BpDataRoot.pm's bounded walk-up (R1-R4 there),
+# reimplemented here rather than loaded: this file's AC-47/48 import
+# allowlist forbids any require of a sibling plugin and any compile outside
+# `-I plugins/almanac/scripts`, so BpDataRoot.pm -- the source of truth for
+# this algorithm -- cannot be a dependency. A parity test (unify-walkups.t
+# AC9) asserts this mirror agrees with the real thing on every fixture start,
+# so a future edit to either side that drifts is caught there.
+#
+# R1: the stop dirs are File::Spec->tmpdir, TMP, TEMP, TMPDIR, HOME and
+#     USERPROFILE -- absolute, not a bare root.
+# R2: a stop dir strictly above the start is never examined; the walk ends.
+# R3: a start that IS a stop dir examines itself, adopts it if it holds the
+#     marker, then ends either way.
+# R4: stop matching folds ASCII case, treats "/x/..." and "X:/..." alike,
+#     tolerates 8.3 short names, and also compares the abs_path and
+#     Cygwin::posix_to_win_path forms -- Windows-family perls only.
+# The marker stays Store's own: .ccpraxis-local-data OR .git (unlike
+# BpDataRoot.pm, which never looks at .git).
+# ---------------------------------------------------------------------------
+
+my $SW_IS_WIN = ($^O =~ /^(MSWin32|msys|cygwin)$/) ? 1 : 0;
+
+sub _sw_fold_ascii {
+    my ($s) = @_;
+    return $s unless defined $s;
+    (my $t = $s) =~ tr/A-Z/a-z/;
+    return $t;
+}
+
+sub _sw_is_abs_ish {
+    my ($p) = @_;
+    return 0 unless defined $p && length $p;
+    return 1 if $p =~ m{^/};
+    return 1 if $p =~ m{^[A-Za-z]:[\\/]};
+    return 1 if $SW_IS_WIN && $p =~ m{^\\};
+    return 0;
+}
+
+# _sw_lex_canon($p) -- lexical canonicalisation, same rules as
+# BpDataRoot::_lex_canon: backslash to forward slash; on Windows-family
+# perls, "/x/..." folds to "x:/...", drive letter lower-cased; "." segments
+# dropped, ".." collapsed lexically; no trailing slash except a bare root.
+sub _sw_lex_canon {
+    my ($p) = @_;
+    return '' unless defined $p;
+    (my $s = $p) =~ s{\\}{/}g;
+
+    my $drive_prefix = '';
+    if ($SW_IS_WIN) {
+        if ($s =~ m{^/([A-Za-z])(/.*)?$}) {
+            my $rest = defined $2 ? $2 : '/';
+            $s = lc($1) . ':' . $rest;
+        }
+        elsif ($s =~ m{^([A-Za-z]):(/.*)?$}) {
+            my $rest = defined $2 ? $2 : '/';
+            $s = lc($1) . ':' . $rest;
+        }
+        if ($s =~ m{^([a-z]:)(/.*)?$}) {
+            $drive_prefix = $1;
+            $s = defined $2 ? $2 : '/';
+        }
+    }
+
+    my $is_abs = ($s =~ m{^/});
+    my @parts = split m{/+}, $s;
+    shift @parts if @parts && $parts[0] eq '';
+    my @out;
+    for my $seg (@parts) {
+        next if $seg eq '' || $seg eq '.';
+        if ($seg eq '..') { pop @out if @out; next }
+        push @out, $seg;
+    }
+
+    my $canon = $is_abs ? ('/' . join('/', @out)) : join('/', @out);
+    $canon = $drive_prefix . $canon if length $drive_prefix;
+
+    unless ($canon =~ m{^(?:[a-z]:)?/\z}) {
+        $canon =~ s{/\z}{};
+    }
+    return $canon;
+}
+
+sub _sw_seg_eq {
+    my ($x, $y, $allow_83) = @_;
+    $allow_83 = 1 unless defined $allow_83;
+    return $x eq $y unless $SW_IS_WIN;
+    return 1 if _sw_fold_ascii($x) eq _sw_fold_ascii($y);
+    return 0 unless $allow_83;
+
+    for my $pair ([$x, $y], [$y, $x]) {
+        my ($short, $long) = @$pair;
+        next unless defined $short && $short =~ /^([^~\/]{1,6})~[0-9]+(?:\.[^.\/]{0,3})?$/;
+        my $stem = _sw_fold_ascii($1);
+        $stem =~ s/[^a-z0-9]//g;
+        next unless length $stem;
+        my $longfold = _sw_fold_ascii($long);
+        $longfold =~ s/[^a-z0-9]//g;
+        $longfold = substr($longfold, 0, 6);
+        return 1 if $stem eq $longfold;
+    }
+    return 0;
+}
+
+sub _sw_same_path {
+    my ($p, $q, $allow_83) = @_;
+    $allow_83 = 1 unless defined $allow_83;
+    return 0 unless defined $p && defined $q;
+    my $ca = _sw_lex_canon($p);
+    my $cb = _sw_lex_canon($q);
+    my @sa = grep { length } split m{/}, $ca, -1;
+    my @sb = grep { length } split m{/}, $cb, -1;
+    return 0 unless scalar(@sa) == scalar(@sb);
+    for my $i (0 .. $#sa) {
+        return 0 unless _sw_seg_eq($sa[$i], $sb[$i], $allow_83);
+    }
+    return 1;
+}
+
+sub _sw_real_path {
+    my ($p) = @_;
+    return $p unless defined $p && length $p;
+    return $p unless -e $p;
+    my $r = eval { Cwd::abs_path($p) };
+    return (defined $r && length $r) ? $r : $p;
+}
+
+sub _sw_same_path_any_form {
+    my ($d, $s, $allow_83) = @_;
+    $allow_83 = 1 unless defined $allow_83;
+    return 1 if _sw_same_path($d, $s, $allow_83);
+    my $rd = _sw_real_path($d);
+    my $rs = _sw_real_path($s);
+    return 1 if _sw_same_path($rd, $rs, $allow_83);
+    if ($^O =~ /^(msys|cygwin)$/ && defined &Cygwin::posix_to_win_path) {
+        my $wd = eval { Cygwin::posix_to_win_path($rd) };
+        my $ws = eval { Cygwin::posix_to_win_path($rs) };
+        $wd = $rd unless defined $wd;
+        $ws = $rs unless defined $ws;
+        return 1 if _sw_same_path($wd, $ws, $allow_83);
+    }
+    return 0;
+}
+
+sub _sw_compute_stops {
+    my @candidates;
+    push @candidates, eval { File::Spec->tmpdir };
+    push @candidates, $ENV{TMP}, $ENV{TEMP}, $ENV{TMPDIR};
+    push @candidates, $ENV{HOME}, $ENV{USERPROFILE};
+
+    my @stops;
+    for my $v (@candidates) {
+        next unless defined $v && length $v;
+        next unless _sw_is_abs_ish($v);
+        my $canon = _sw_lex_canon($v);
+        next if $canon =~ m{^(?:[a-z]:)?/\z};
+        push @stops, $v;
+    }
+    return \@stops;
+}
+
+sub _sw_is_stop {
+    my ($d, $stops, $allow_83) = @_;
+    $allow_83 = 1 unless defined $allow_83;
+    for my $s (@$stops) {
+        return 1 if _sw_same_path_any_form($d, $s, $allow_83);
+    }
+    return 0;
+}
+
+# _sw_collapse_dotdot($p) -> mirrors BpDataRoot::_collapse_dotdot (item 8(a));
+# not one of the source-parity-checked subs (item 7) for the same reason as
+# _sw_home_usable below.
+sub _sw_collapse_dotdot {
+    my ($p) = @_;
+    return $p unless defined $p && length $p;
+    return $p unless $p =~ m{(?:^|/)\.\.?(?:/|\z)};
+
+    my $drive_prefix = '';
+    my $s = $p;
+    if ($SW_IS_WIN && $s =~ m{^([A-Za-z]:)(/.*)?\z}) {
+        $drive_prefix = $1;
+        $s = defined $2 ? $2 : '/';
+    }
+    my $is_abs = ($s =~ m{^/});
+    my @parts = split m{/+}, $s;
+    shift @parts if @parts && $parts[0] eq '';
+    my @out;
+    for my $seg (@parts) {
+        next if $seg eq '' || $seg eq '.';
+        if ($seg eq '..') { pop @out if @out; next }
+        push @out, $seg;
+    }
+    my $canon = $is_abs ? ('/' . join('/', @out)) : join('/', @out);
+    $canon = $drive_prefix . $canon if length $drive_prefix;
+    unless ($canon =~ m{^(?:[A-Za-z]:)?/\z}) {
+        $canon =~ s{/\z}{};
+    }
+    return $canon;
+}
+
+# _sw_home_usable() -> 1|0 -- mirrors BpDataRoot::_home_usable (Decision 25 /
+# item 8(b)); not one of the source-parity-checked subs (item 7) because it
+# has no counterpart name to compare against by construction.
+sub _sw_home_usable {
+    for my $v ($ENV{HOME}, $ENV{USERPROFILE}) {
+        return 1 if defined $v && length $v && _sw_is_abs_ish($v);
+    }
+    return 0;
+}
+
+# _bounded_walk($start) -> $dir | undef -- a test seam (spec §2.4); also the
+# marker-holding step resolve_project_root calls. $start undef/'' defaults to
+# Cwd::getcwd(), mirroring BpDataRoot::walkup's own default.
+sub _bounded_walk {
+    my ($start) = @_;
+    $start = Cwd::getcwd() // '.' unless defined $start && length $start;
+    (my $s = $start) =~ s{\\}{/}g;
+    # Item 8(a): canonicalise a start containing ".." before walking.
+    $s = _sw_collapse_dotdot($s) if length $s;
+    my $home_ok = _sw_home_usable();
+    my $stops = _sw_compute_stops();
+    my $d = $s;
+    my %seen;
+    while (1) {
+        return undef if $seen{$d}++;
+        my $is_stop_here = _sw_is_stop($d, $stops);
+        return undef if $is_stop_here && !_sw_same_path_any_form($d, $s);
+        if (-d "$d/.ccpraxis-local-data" || -e "$d/.git") {
+            return $d;
+        }
+        return undef if $is_stop_here;
+        # Item 8(b)/Decision 25: no usable home known means never ascend.
+        return undef unless $home_ok;
+        my $parent = _parent_of($d);
+        return undef unless defined $parent && length $parent && $parent ne $d;
+        $d = $parent;
+    }
+}
+
 # resolve_project_root(%opt) -> $abs_path      (%opt: cwd => $dir)
 #
-# Precedence, first hit wins: (1) cwd's nearest ancestor containing
-# .ccpraxis-local-data or .git; (2) $ENV{CLAUDE_PROJECT_DIR}; (3) the
-# starting directory itself. The upward walk is deliberately ahead of
-# CLAUDE_PROJECT_DIR (DC8): a subdirectory must resolve to the same root as
-# the project root itself, and an unset env var is not an answer.
+# Precedence, first hit wins: (1) the bounded walk-up (_bounded_walk, above)
+# from cwd for a dir holding .ccpraxis-local-data or .git; (2)
+# $ENV{CLAUDE_PROJECT_DIR}; (3) the starting directory itself. The walk is
+# deliberately ahead of CLAUDE_PROJECT_DIR (DC8): a subdirectory must resolve
+# to the same root as the project root itself, and an unset env var is not
+# an answer.
 sub resolve_project_root {
     my (%opt) = @_;
     my $cwd = (defined $opt{cwd} && length $opt{cwd}) ? $opt{cwd} : Cwd::getcwd();
     $cwd = _fold_drive_form($cwd);
 
-    my $dir = $cwd;
-    while (1) {
-        if (-d "$dir/.ccpraxis-local-data" || -e "$dir/.git") {
-            return _canonical_path($dir);
-        }
-        my $parent = _parent_of($dir);
-        last unless defined $parent;
-        last if $parent eq $dir;
-        $dir = $parent;
-    }
+    my $hit = _bounded_walk($cwd);
+    return _canonical_path($hit) if defined $hit;
+
     if (defined $ENV{CLAUDE_PROJECT_DIR} && length $ENV{CLAUDE_PROJECT_DIR}) {
         return _canonical_path($ENV{CLAUDE_PROJECT_DIR});
     }

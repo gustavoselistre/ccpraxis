@@ -46,8 +46,11 @@ package BpSession;
 use strict;
 use warnings;
 use File::Spec;
+use File::Basename qw(dirname);
 use Cwd qw(getcwd abs_path);
 use JSON::PP ();
+
+my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
 
 # ── transcript discovery ───────────────────────────────────────────────────
 #
@@ -76,12 +79,17 @@ sub transcript_roots {
         push @roots, File::Spec->catdir($d, 'claude-home', 'projects');
     }
     {
-        my $dir = getcwd();
-        while (1) {
+        # bounded walk-up (package 03, Decision 3): the cwd and each of its
+        # parents in turn, nearest first, stopping at temp/home per
+        # BpProjectRoot::bounded_ancestors -- never past the boundary that used
+        # to let a temp-dir cwd adopt the real home data root.
+        my @ancestors = eval {
+            require "$DIR/BpProjectRoot.pm"
+                unless grep { m{(?:^|/)BpProjectRoot\.pm$} } keys %INC;
+            BpProjectRoot::bounded_ancestors(getcwd());
+        };
+        for my $dir (@ancestors) {
             push @roots, File::Spec->catdir($dir, '.ccpraxis-local-data', 'claude-home', 'projects');
-            my $parent = abs_path(File::Spec->catdir($dir, File::Spec->updir));
-            last if !defined $parent || $parent eq $dir;
-            $dir = $parent;
         }
     }
 

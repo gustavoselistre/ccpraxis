@@ -2202,14 +2202,24 @@ sub resolve_data_root {
     }
     my ($root, $source);
     if (defined(my $cwd = _session_recorded_cwd($session))) {
-        my ($d, $prev, $n) = ($cwd, '', 0);
-        while (length($d) && $d ne $prev && $n++ < 64) {
-            my $cand = ($d eq '/') ? '/.ccpraxis-local-data' : "$d/.ccpraxis-local-data";
-            if (-d $cand) { ($root, $source) = ($d, 'session-cwd'); last }
-            $prev = $d;
-            $d =~ s{/[^/]*\z}{};
-            $d = '/' if $d eq '' && $prev =~ m{\A/};
-        }
+        # Decision 22: _session_recorded_cwd returns exactly what
+        # JSON::PP->new->utf8->decode gives for `cwd` -- a Perl CHARACTER
+        # string (utf8 flag on) whenever the recorded cwd holds a non-ASCII
+        # byte. Every path this file compares or returns uses the
+        # filesystem's own representation, raw UTF-8 BYTES on this perl.
+        # This is the ONE boundary where the decoded JSON string enters path
+        # logic (the bounded walk-up just below), so it is normalised here,
+        # once, rather than by weakening any comparison downstream.
+        utf8::encode($cwd) if utf8::is_utf8($cwd);
+        # bounded walk-up (package 03, Decision 3): never ascend out of temp,
+        # and never adopt home unless the start IS home. Soft require: a
+        # missing/broken BpProjectRoot.pm must not take down this file's
+        # loaders -- resolution simply falls through to the next step.
+        eval {
+            require "$DIR/BpProjectRoot.pm" unless grep { m{(?:^|/)BpProjectRoot\.pm$} } keys %INC;
+            my $found = BpProjectRoot::bounded_walkup($cwd);
+            ($root, $source) = ($found, 'session-cwd') if defined $found;
+        };
     }
     if (!defined $root && defined $ENV{CLAUDE_PROJECT_DIR} && length $ENV{CLAUDE_PROJECT_DIR}) {
         ($root, $source) = ($ENV{CLAUDE_PROJECT_DIR}, 'CLAUDE_PROJECT_DIR');
@@ -3222,7 +3232,21 @@ unless (caller) {
         }
 
         if ($opt{json}) {
-            print JSON::PP->new->canonical->utf8->encode($doc), "\n";
+            # Decision 24 item 3 (review S2): $doc->{data_root} is a byte
+            # string (every resolve_data_root() source is bytes, including
+            # the Decision 22 boundary encode). JSON::PP's ->utf8 layer
+            # expects CHARACTERS and encodes them to UTF-8 bytes -- handed
+            # bytes already, it re-encodes each one as Latin-1, double-
+            # encoding a non-ASCII data_root. Encode from a shallow copy with
+            # data_root decoded back to characters, so ->utf8->encode emits a
+            # single layer; the text branch below prints the original byte
+            # string unchanged, which already displays correctly with no
+            # layer on STDOUT.
+            my %json_doc = %$doc;
+            if (defined $json_doc{data_root}) {
+                utf8::decode($json_doc{data_root});
+            }
+            print JSON::PP->new->canonical->utf8->encode(\%json_doc), "\n";
             exit 0;
         }
 

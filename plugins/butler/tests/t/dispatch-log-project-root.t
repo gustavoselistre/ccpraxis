@@ -68,18 +68,13 @@ subtest 'resolve: environment first, then the directory walk, never the install'
     my $plain = Cwd::abs_path(tempdir(CLEANUP => 1));
     {
         local $ENV{GIT_CEILING_DIRECTORIES} = dirname($plain);
-        # The machine may hold a real data dir above the tempdir (a home
-        # directory can), so the expectation is computed, not assumed: the
-        # nearest ancestor holding one, else cwd itself.
-        my $want = $plain;
-        for (my $d = $plain; ; ) {
-            if (-d "$d/.ccpraxis-local-data") { $want = $d; last }
-            my $p = dirname($d);
-            last if $p eq $d;
-            $d = $p;
-        }
-        is(in_dir($plain, sub { BpProjectRoot::resolve() }), $want,
-           'no data dir in the tempdir: the nearest ancestor holding one, else cwd');
+        # AC16 (tooling-fixes 03, spec 03-unify-walkups): the walk-up is now
+        # BOUNDED (never-halt 04's rules), never the old unbounded "nearest
+        # ancestor holding one, else cwd" climb. A tempdir sits under TMP,
+        # which is itself a stop dir, so the bounded walk halts at the
+        # tempdir immediately and resolve() gives the tempdir back unchanged.
+        is(in_dir($plain, sub { BpProjectRoot::resolve() }), $plain,
+           'no data dir in the tempdir: the bounded walk-up never climbs past it; resolves to the tempdir itself');
     }
     my $install = Cwd::abs_path("$SCRIPTS/../../..");
     isnt(in_dir("$proj/deep", sub { BpProjectRoot::resolve() }), $install, 'never the install dir');

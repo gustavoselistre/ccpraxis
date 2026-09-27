@@ -186,6 +186,52 @@ sub _is_stop {
     return 0;
 }
 
+# _collapse_dotdot($p) -> $p with "." and ".." segments collapsed lexically,
+# preserving every other aspect of the spelling (Decision 23: this file must
+# not respell a drive form) -- unlike _lex_canon, this never folds "/x/..."
+# to "x:/..." or lower-cases a drive letter, and it is a no-op (returns the
+# input unchanged) unless the input actually contains a "." or ".." segment,
+# so a caller never observing item 8(a)'s edge case sees no spelling change.
+sub _collapse_dotdot {
+    my ($p) = @_;
+    return $p unless defined $p && length $p;
+    return $p unless $p =~ m{(?:^|/)\.\.?(?:/|\z)};
+
+    my $drive_prefix = '';
+    my $s = $p;
+    if ($IS_WIN && $s =~ m{^([A-Za-z]:)(/.*)?\z}) {
+        $drive_prefix = $1;
+        $s = defined $2 ? $2 : '/';
+    }
+    my $is_abs = ($s =~ m{^/});
+    my @parts = split m{/+}, $s;
+    shift @parts if @parts && $parts[0] eq '';
+    my @out;
+    for my $seg (@parts) {
+        next if $seg eq '' || $seg eq '.';
+        if ($seg eq '..') { pop @out if @out; next }
+        push @out, $seg;
+    }
+    my $canon = $is_abs ? ('/' . join('/', @out)) : join('/', @out);
+    $canon = $drive_prefix . $canon if length $drive_prefix;
+    unless ($canon =~ m{^(?:[A-Za-z]:)?/\z}) {
+        $canon =~ s{/\z}{};
+    }
+    return $canon;
+}
+
+# _home_usable() -> 1|0 -- Decision 25: a walk-up can only trust the HOME
+# stop it computed if HOME or USERPROFILE is itself a usable (non-empty,
+# absolute) value. When neither is, the process cannot tell whether some
+# ancestor of the start IS the real home, so it must not ascend at all
+# (item 8(b)): only the start directory itself is considered.
+sub _home_usable {
+    for my $v ($ENV{HOME}, $ENV{USERPROFILE}) {
+        return 1 if defined $v && length $v && _is_abs_ish($v);
+    }
+    return 0;
+}
+
 # Lexical parent of a "/"-normalised path: strip the last segment while
 # keeping any "x:" drive prefix intact, so a drive-letter-form path (M1)
 # climbs to its OWN drive root ("c:/x" -> "c:/") rather than through
@@ -217,6 +263,10 @@ sub _parent_of {
 sub _walkup {
     my ($cwd, $stops) = @_;
     (my $start = $cwd) =~ s{\\}{/}g;
+    # Item 8(a): canonicalise a start containing ".." before walking, so a
+    # relative "../.." spelling cannot be mistaken for an ancestor climb.
+    $start = _collapse_dotdot($start) if length $start;
+    my $home_ok = _home_usable();
     my $d = $start;
     my %seen;
     while (1) {
@@ -234,11 +284,61 @@ sub _walkup {
         if ($is_stop_here) {
             return undef;
         }
+        # Item 8(b)/Decision 25: with no usable home known, the walk cannot
+        # rule out an unrecognised ancestor being the real home, so it never
+        # ascends past the start.
+        return undef unless $home_ok;
         my $parent = eval { _parent_of($d) };
         return undef unless defined $parent && length $parent;
         return undef if $parent eq $d;
         $d = $parent;
     }
+}
+
+# ---------------------------------------------------------------------------
+# Public API (Decision 20, spec §7 Q1) — the ONLY cross-module surface other
+# packages may call. bp-drive-next.pl/bp-lifecycle.pl and this file's own
+# resolve()/project_root()/data_dir() keep using the private _walkup/
+# _compute_stops directly; BpProjectRoot.pm's bounded_walkup/bounded_ancestors
+# adapter (package 03) calls these two instead of reaching for the
+# underscore-prefixed internals across a module boundary.
+# ---------------------------------------------------------------------------
+
+# walkup(cwd => $start) -> $dir | undef. $start defaults to Cwd::getcwd().
+sub walkup {
+    my (%a) = @_;
+    my $c = (defined $a{cwd} && length $a{cwd}) ? $a{cwd} : (Cwd::getcwd() // '.');
+    return _walkup($c, _compute_stops());
+}
+
+# ancestors(cwd => $start) -> @dirs. $start and its parents, nearest first,
+# stopping per the same R1-R4 rules _walkup uses (see spec §2.2): a stop dir
+# strictly above the start is excluded and ends the list; the start itself is
+# included even when it is a stop dir, and that ends the list too (R3).
+sub ancestors {
+    my (%a) = @_;
+    my $start = (defined $a{cwd} && length $a{cwd}) ? $a{cwd} : (Cwd::getcwd() // '.');
+    (my $s = $start) =~ s{\\}{/}g;
+    # Item 8(a): canonicalise a start containing ".." before walking.
+    $s = _collapse_dotdot($s) if length $s;
+    my $home_ok = _home_usable();
+    my $stops = _compute_stops();
+    my @out;
+    my $d = $s;
+    my %seen;
+    while (1) {
+        last if $seen{$d}++;
+        my $is_stop = _is_stop($d, $stops);
+        last if $is_stop && !_same_path_any_form($d, $s);
+        push @out, $d;
+        last if $is_stop;
+        # Item 8(b)/Decision 25: no usable home known means never ascend.
+        last unless $home_ok;
+        my $p = eval { _parent_of($d) };
+        last unless defined $p && length $p && $p ne $d;
+        $d = $p;
+    }
+    return @out;
 }
 
 # ---------------------------------------------------------------------------
