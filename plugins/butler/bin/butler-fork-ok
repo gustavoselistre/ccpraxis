@@ -1,0 +1,16 @@
+#!/bin/bash
+# butler-fork-ok -- extensionless shim (Decision 47, package 19). All logic
+# lives in ../scripts/butler-fork-ok.pl; this only locates it and execs it.
+if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
+
+set -e
+
+BIN_DIR=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+SCRIPT="$BIN_DIR/../scripts/butler-fork-ok.pl"
+
+if [ ! -f "$SCRIPT" ]; then
+  echo "butler-fork-ok: butler-fork-ok.pl not found."
+  exit 1
+fi
+
+exec perl "$SCRIPT" "$@"

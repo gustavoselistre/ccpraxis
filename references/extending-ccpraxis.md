@@ -15,7 +15,6 @@ ccpraxis/
 │   ├── _install-bin-helper.pl       # Shared "add a bin/ to PATH" logic
 │   ├── statusline.pl
 │   ├── vault-sync.pl
-│   ├── todo-sync.pl
 │   └── update-{research,install,bootstrap-monitor}.pl
 ├── plugins/                         # Local plugin marketplace
 │   ├── .claude-plugin/marketplace.json

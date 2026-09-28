@@ -337,7 +337,36 @@ sub collapse_records {
             push @out, { %$rec };
         }
     }
-    return \@out;
+    # Stable reorder: restore non-decreasing displayed-epoch order after the
+    # merge decisions above are finalized. Records with an undefined epoch
+    # stay anchored at their own original array slot -- they are never
+    # relocated -- while the defined-epoch records are sorted amongst
+    # themselves (ascending epoch, original index as tiebreak) and dropped
+    # into the remaining slots in that sorted order. This is a two-pass
+    # construction, not a single comparator that switches its comparison key
+    # per pair (that shape is non-transitive: Perl's sort has no consistency
+    # guarantee for it, and it can -- and did -- leave two DEFINED epochs out
+    # of order relative to each other whenever an undefined-epoch record fell
+    # between them; see spec 03-activity-feed-ordering S2a redteam-01
+    # finding). This construction guarantees the pinned postcondition (for
+    # any i < j with both epochs defined, out[i]{epoch} <= out[j]{epoch}) by
+    # construction, for every input, and keeps every undefined-epoch record
+    # transparent to the reorder as a group.
+    my @idx = (0 .. $#out);
+    my @defined_idx = grep { defined $out[$_]{epoch} } @idx;
+    my @sorted_defined = sort {
+        $out[$a]{epoch} <=> $out[$b]{epoch} || $a <=> $b
+    } @defined_idx;
+    my @new_idx;
+    my $di = 0;
+    for my $i (@idx) {
+        if (defined $out[$i]{epoch}) {
+            push @new_idx, $sorted_defined[$di++];
+        } else {
+            push @new_idx, $i;
+        }
+    }
+    return [ @out[@new_idx] ];
 }
 
 # ===========================================================================
@@ -1084,7 +1113,7 @@ sub _one_run_summary_cells {
 # THE CURRENT PACKAGE IS DELIBERATELY NOT A TABLE COLUMN, and the reason is a
 # rule this project already paid for. Package d02 of the predecessor initiative
 # closed bug report 20260814-093052-312a with a standing requirement, asserted
-# by plugins/sandbox/tests/t/75-wrap-on-overflow.t AC1: an overflowing row must
+# by plugins/sandbox/tests/t/wrap-on-overflow.t AC1: an overflowing row must
 # WRAP, and no word may be silently dropped. A table column that is given up
 # when the panel is narrow drops content -- which is exactly what that rule
 # forbids, and the first draft of this package did it. t/75 caught it.
@@ -1205,11 +1234,11 @@ sub _indent {
 # == child_indent), a hierarchy inversion: a continuation of a package row
 # reads as its own coordinator, a continuation of a coordinator reads as its
 # own worker. tui::Screen DOES let a panel override the continuation indent
-# via `wrap_indent`, but only on its character-break wrap path
-# (tui/Screen.pm:315-339); the word-wrap path this panel actually uses
-# hardcodes tui::Screen's constant and ignores the override. Both
-# tui/Screen.pm and tui/Frame.pm are outside this package's write set, so
-# that plumbing gap cannot be closed there (verified: switching the whole
+# via `wrap_indent`, but AT THE TIME THIS WAS WRITTEN only on its
+# character-break wrap path; the word-wrap path this panel actually uses
+# hardcoded tui::Screen's constant and ignored the override. Both
+# tui/Screen.pm and tui/Frame.pm were outside that package's write set, so
+# the plumbing gap could not be closed there (verified: switching the whole
 # Blueprints panel to the char-break path instead was tried and reverted --
 # it breaks t/182 AC14's "every word survives a wrap" guarantee, because
 # character breaking is not word-safe for the "cur"/"paused" free-text
@@ -1221,6 +1250,16 @@ sub _indent {
 # level's own indent (2, 4, 6). A row that already fits the panel's content
 # width hits tui::Frame::wrap_line's own unmodified fast path -- byte-
 # identical passthrough -- so a row that never wraps is unaffected.
+#
+# THAT PLUMBING GAP IS NOW CLOSED. tui::Screen's word-wrap path honours
+# `wrap_indent` too (needed by the approval screen's label/value rows, whose
+# values wrapped back to column 2 from a gutter at 16). So this panel COULD
+# now declare wrap_indent instead of pre-wrapping its own rows. It is left
+# as-is deliberately: the pre-wrap is correct, tested, and per-ROW, while
+# wrap_indent is per-PANEL and this panel mixes tree rows with free-text
+# "cur"/"paused" lines that want the ordinary indent. Adopting it would be a
+# behaviour change across t/182 and t/187, which is its own piece of work and
+# not a side effect of closing the gap.
 use constant TREE_WRAP_CONTINUATION_INDENT => 1;
 
 # _wrap_tree_row($row, $width) -> \@rows. Pre-wraps one tree row (an
@@ -1605,15 +1644,50 @@ sub _run_body {
         push @lines, $r if @$r;
     }
 
+    # "I COULD NOT READ THE LEASE" AND "THERE IS NO LEASE" ARE DIFFERENT FACTS,
+    # and this row used to print the second one for both. An operator watching
+    # a live fleet saw `busy-lease none (no active run)` beside `keep-awake
+    # released (PC may sleep)` while, inside the container, the lease was being
+    # refreshed every two to ten seconds (20260915-230820-d33e). Only one of
+    # those two facts justifies letting the machine sleep, so only one of them
+    # may be rendered as a definite negative.
+    my $probe   = (ref $state->{lease_probe} eq 'HASH') ? $state->{lease_probe} : {};
+    my $pstate  = defined $probe->{state} ? $probe->{state} : '';
     my ($busy_text, $busy_role);
-    if (!defined $state->{busy_age})   { ($busy_text, $busy_role) = ('none (no active run)', 'text.muted'); }
+    if ($pstate eq 'probe-failed') {
+        my $why = defined $probe->{detail} && length $probe->{detail} ? $probe->{detail} : 'reason unrecorded';
+        $why = substr($why, 0, 44) . '...' if length $why > 47;
+        ($busy_text, $busy_role) = ("unreadable ($why)", 'state.warn');
+    }
+    elsif (!defined $state->{busy_age})   { ($busy_text, $busy_role) = ('none (no active run)', 'text.muted'); }
     elsif ($state->{stay_awake})       { ($busy_text, $busy_role) = ('active (' . fmt_duration($state->{busy_age}) . ' ago)', 'state.ok'); }
     else                                 { ($busy_text, $busy_role) = ('idle ('   . fmt_duration($state->{busy_age}) . ' ago)', 'state.warn'); }
     my $busy_row = row({ label => 'busy-lease', value => [ { text => $busy_text, role => $busy_role } ], force => 1 });
     push @lines, $busy_row if @$busy_row;
 
-    my ($keep_text, $keep_role) = $state->{stay_awake}
-        ? ('holding (PC stays awake)', 'state.ok') : ('released (PC may sleep)', 'text.muted');
+    # Report what the lock IS doing, not what this frame would like it to do.
+    # The two diverge exactly while a probe failure is being held through --
+    # the one moment the row is worth reading.
+    my $held = defined $state->{keepawake_held} ? $state->{keepawake_held} : $state->{stay_awake};
+    # "(PC stays awake)" WAS AN OUTCOME THIS ROW CANNOT KNOW, and it was false.
+    # Measured 2026-09-18 on the host: the machine spent 9h58m in genuine
+    # low-power sleep across one day (powercfg /sleepstudy, SW/HW DRIPS 99%)
+    # while a wake-lock was asserted and refreshing. Under Modern Standby,
+    # ES_SYSTEM_REQUIRED is a REQUEST against the system idle timer; it does not
+    # decide, and on that regime it demonstrably did not win.
+    #
+    # The row already knows this in its own header two lines up -- "Report what
+    # the lock IS doing, not what this frame would like it to do" -- and then
+    # asserted the consequence anyway. Saying what is asserted is truthful in
+    # every regime; saying the PC stays awake is only true in some, and the
+    # operator has no way to tell which from here.
+    #
+    # `released (PC may sleep)` stays as it is: with nothing asserted, the
+    # machine genuinely may sleep. That one is a permission, not a promise.
+    my ($keep_text, $keep_role) =
+          (!$held)                     ? ('released (PC may sleep)', 'text.muted')
+        : ($pstate eq 'probe-failed')  ? ('holding through an unreadable probe', 'state.warn')
+        :                                ('holding (wake-lock asserted)', 'state.ok');
     my $keep_row = row({ label => 'keep-awake', value => [ { text => $keep_text, role => $keep_role } ], force => 1 });
     push @lines, $keep_row if @$keep_row;
 

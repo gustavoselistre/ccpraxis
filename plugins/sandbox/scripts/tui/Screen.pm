@@ -312,6 +312,20 @@ sub _render_panel {
                   ? [ { text => (' ' x BODY_INDENT()), role => 'text.primary' }, @elems ]
                   : [ @elems ];
 
+        # `wrap_indent` is declared by the PANEL and is relative to the row's own
+        # text: the panel knows the shape of its own prefix, this function does
+        # not. Hoisted out of the char-break branch below so the WORD-wrap path
+        # can honour it too -- the approval screen's detail rows are label/value
+        # pairs sharing a gutter, and a value that wrapped back to the default
+        # 2 columns left the continuation nowhere near the column it continued.
+        # Defaults to WRAP_CONTINUATION_INDENT, so a panel that declares nothing
+        # wraps exactly as before.
+        my $hang = (ref($panel) eq 'HASH'
+                    && defined $panel->{wrap_indent}
+                    && !ref($panel->{wrap_indent})
+                    && $panel->{wrap_indent} =~ /^\d+$/)
+                 ? $panel->{wrap_indent} : WRAP_CONTINUATION_INDENT();
+
         my $cells;
         if (defined $brk && !ref($brk) && $brk eq 'char') {
             # CHARACTER BREAKING WITH A HANGING INDENT, for panels whose rows
@@ -321,21 +335,14 @@ sub _render_panel {
             # at the character", and the continuation "should be aligned to the
             # text itself after the icon".
             #
-            # `wrap_indent` is declared by the PANEL and is relative to the row's
-            # own text: the panel knows its prefix is `HH:MM  <glyph> `, this
-            # function does not. The 2-column body indent prepended just above is
-            # added here rather than by the panel, because it is this function's
-            # doing and the panel has no business knowing about it.
-            my $hang = (ref($panel) eq 'HASH'
-                        && defined $panel->{wrap_indent}
-                        && !ref($panel->{wrap_indent})
-                        && $panel->{wrap_indent} =~ /^\d+$/)
-                     ? $panel->{wrap_indent} : WRAP_CONTINUATION_INDENT();
+            # For the activity column the panel knows its prefix is
+            # `HH:MM  <glyph> `, this function does not. The body indent
+            # prepended just above is added here rather than by the panel,
+            # because it is this function's doing and the panel has no business
+            # knowing about it.
             $cells = tui::Frame::wrap_chars($spans, $role, $content_w, $hang + BODY_INDENT(), $cap);
         } else {
-            $cells = tui::Frame::wrap_capped(
-                $spans, $role, $content_w, WRAP_CONTINUATION_INDENT(), $cap
-            );
+            $cells = tui::Frame::wrap_capped($spans, $role, $content_w, $hang, $cap);
         }
         for my $c (@$cells) {
             last if @out >= $maxh;
@@ -890,7 +897,11 @@ sub compose {
             for my $c (@$wrapped) {
                 my @spans = ( { text => ' ' x $pad, role => $banner_role },
                               @{ ref($c->{spans}) eq 'ARRAY' ? $c->{spans} : [] } );
-                $c = { text => tui::Frame::spans_text(\@spans), role => $c->{role}, spans => \@spans };
+                # Carry `continuation` through the rebuild: this pad changes
+                # where a row starts, not whether it is the first row of its
+                # banner, and callers count banners by that flag.
+                $c = { text => tui::Frame::spans_text(\@spans), role => $c->{role},
+                       spans => \@spans, continuation => ($c->{continuation} ? 1 : 0) };
             }
         }
         push @banner_cells, @$wrapped;
@@ -1087,7 +1098,12 @@ sub overlay_warnings {
                   ? $row->{spans}
                   : (ref($row) eq 'ARRAY' ? $row : []);
         $spans = tui::Frame::fit_spans($spans, $cols, 'overlay.warn');
-        $out[ $first + $i ] = tui::Frame::make_cell($spans, 'overlay.warn', $cols);
+        my $cell = tui::Frame::make_cell($spans, 'overlay.warn', $cols);
+        # make_cell defaults `continuation` to 0; this row already knows its own
+        # answer from the wrap above, and losing it here would make every
+        # overlay row look like the first row of a banner.
+        $cell->{continuation} = (ref($row) eq 'HASH' && $row->{continuation}) ? 1 : 0;
+        $out[ $first + $i ] = $cell;
     }
     return \@out;
 }

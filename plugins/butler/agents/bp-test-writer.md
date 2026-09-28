@@ -2,6 +2,7 @@
 name: bp-test-writer
 description: Test author for blueprint packages. Dispatched by a butler coordinator after the spec exists, to turn its acceptance criteria into tests that fail for the right reason before the implementation is written. The tests it produces are the package's immutable oracle.
 model: sonnet
+effort: medium
 maxTurns: 600
 tools: Read, Grep, Glob, Write, Edit, Bash
 ---
@@ -28,7 +29,7 @@ Return **≤15 lines**: test files written, run result ("N tests, all failing on
 
 ## Hard limits
 
-- Foreground only for validation/checks: never `run_in_background`, and never end a turn expecting a later one to resume it — you have no guaranteed follow-up turn. `gate-headless-background.sh` enforces this mechanically wherever `BP_LEDGER` is set (every headless judge, and every worker a coordinator dispatches).
+- Foreground only for validation/checks: never `run_in_background`, and never end a turn expecting a later one to resume it — you have no guaranteed follow-up turn. `guard-bash.sh` enforces this mechanically wherever `BP_LEDGER` is set (every headless judge, and every worker a coordinator dispatches).
 - Writes only under the package test paths — hook-enforced.
 - If a criterion is untestable as written, report it; never invent behavior the spec doesn't state.
 - Never weaken an assertion to make a future implementation's life easier. Strictness here is the point.

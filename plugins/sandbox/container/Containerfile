@@ -1,6 +1,23 @@
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# tzdata is here so the launcher's IANA TZ (sandbox-session-ux/01, Decision
+# 8: containers follow the host's CURRENT timezone, re-derived at every
+# session launch -- HostTz.pm) has a /usr/share/zoneinfo to resolve against.
+# DEBIAN_FRONTEND=noninteractive is scoped to ONLY the package-installing
+# apt-get invocation below, so tzdata's debconf question never prompts
+# during the build; the image's default /etc/localtime is then left at UTC
+# (the launcher sets TZ per `podman exec`, never at `podman create`).
+#
+# CLDR legacy link names (e.g. Asia/Calcutta, which HostTz.pm's
+# windowsZones table can produce) rely on bookworm's tzdata still shipping
+# the `backward` compatibility links. If a future base-image bump moves to
+# a release that splits those into a separate `tzdata-legacy` package, that
+# package must be added here too, or a legacy-named lookup will resolve to
+# nothing inside the image.
+#
+# Manual check after a rebuild:
+#   podman run --rm --entrypoint ls claude-sandbox:latest /usr/share/zoneinfo/Europe/Berlin /usr/share/zoneinfo/Asia/Calcutta
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tzdata \
     git \
     curl \
     wget \
@@ -171,6 +188,24 @@ RUN curl -sSL --connect-timeout 10 --max-time 180 --retry 2 --retry-delay 3 --re
 # the container hits the same wall, and would "succeed" and then be unreachable
 # -- a silent failure far harder to diagnose than this loud one.
 ENV PATH="/opt/node24/bin:${PATH}"
+
+# ccpraxis plugin shims, so the verbs a hook tells the agent to run are
+# reachable BY NAME inside a sandbox and not only on the host.
+#
+# WHY THIS IS BAKED RATHER THAN WIRED AT LAUNCH. On the host, plugin bin dirs
+# reach PATH through each plugin's ccpraxis-install.pl. A container never runs
+# that installer -- it bind-mounts the live plugin tree read-only and starts --
+# so without this the in-container agent gets the fallback spelling of every
+# remedy (a fully resolved path) while the host agent gets `bp-continuity.sh`.
+#
+# The mount target is fixed by the launcher (launcher.pl: the directory-source
+# marketplace is bound at /root/.claude/plugins/marketplaces/<name>), and
+# ccpraxis-local is that marketplace. The directory is absent until the bind
+# happens, which costs nothing: a PATH entry that does not resolve is skipped.
+#
+# Verified: a Windows bind mount presents these files as 0777 inside the
+# container, so the shims are executable there without the host's chmod.
+ENV PATH="/root/.claude/plugins/marketplaces/ccpraxis-local/butler/bin:${PATH}"
 
 # pnpm supply-chain hardening -- separate from the npm_config_ignore_scripts
 # key above (that one governs npm; pnpm reads its own PNPM_CONFIG_* env).

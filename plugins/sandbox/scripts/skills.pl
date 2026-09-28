@@ -23,6 +23,7 @@ use strict;
 use warnings;
 use JSON::PP;
 use Encode qw(decode);
+use B ();
 use Fcntl qw(:flock);
 use File::Basename qw(dirname);
 use File::Path qw(make_path);
@@ -35,6 +36,14 @@ our $SCHEMA_VERSION = 3;
 # layout under /root/.claude/plugins/ via materialize-plugins.
 our $CONTAINER_PLUGINS_ROOT = '/root/.claude/plugins';
 our $CONTAINER_PROJECT_PATH = '/project';
+
+# Short notes shown next to a plugin's row in the sandbox selector, keyed by
+# the plugin's full key (name@marketplace) so a same-named plugin from a
+# different marketplace is unaffected. ASCII only -- select-model's STDOUT
+# is UTF-8 encoded, and a non-ASCII note here would double-encode.
+our %PLUGIN_SELECTOR_NOTES = (
+    'steward@ccpraxis-local' => 'only relevant when working on ccpraxis itself',
+);
 
 # Strings from $ENV{HOME}, readdir(), etc. arrive as raw UTF-8 bytes on Git Bash.
 # decode_json() returns Unicode-decoded strings. We need them in the SAME perl
@@ -106,6 +115,29 @@ sub denormalize_to_windows {
     return $p;
 }
 
+# 06-plugins-current-at-start (Decision 11/22-24). A filesystem test on a
+# path decoded from JSON (may carry non-ASCII codepoints, e.g. U+00E9, with
+# the utf8 flag set) must run on the UTF-8 BYTE form, per spec section 2.4.
+sub _dir_exists_fs {
+    my $p = shift;
+    return 0 unless defined $p && length $p;
+    my $bytes = utf8::is_utf8($p) ? Encode::encode('UTF-8', $p) : $p;
+    return -d $bytes;
+}
+
+# True iff $v decoded from JSON as a JSON *integer* (not a string, not a
+# float). JSON::PP marks a decoded number with the IOK flag and no POK flag;
+# a decoded string always carries POK. Used for the top-level "version" carry
+# (spec 2.2 / AC11).
+sub _is_json_integer {
+    my $v = shift;
+    return 0 if ref $v;
+    return 0 unless defined $v;
+    my $sv = B::svref_2object(\$v);
+    my $flags = $sv->FLAGS;
+    return ($flags & B::SVp_IOK()) && !($flags & B::SVp_POK());
+}
+
 sub read_json {
     my $file = shift;
     open my $fh, '<:raw', $file or return undef;
@@ -175,6 +207,136 @@ sub skill_host_only_status {
     }
     close $fh;
     return 'visible';
+}
+
+# plugin_source_dir($key, $install_path) -> the directory that actually holds
+# this plugin's files on the host, or undef.
+#
+# installPath is NOT reliably that directory. Claude Code records a cache path
+# (plugins/cache/<marketplace>/<plugin>/<version>) for every install, but for a
+# `directory`-source marketplace it never populates that cache -- it resolves the
+# plugin from the marketplace's own source.path instead, leaving
+# plugins/marketplaces/<name>/ an empty placeholder and the recorded cache path
+# nonexistent. ccpraxis-local is exactly that case: every ccpraxis plugin's
+# installPath points at plugins/cache/ccpraxis-local/<plugin>/0.1.0, which does
+# not exist on this host.
+#
+# So a census keyed on installPath alone reports zero skills for precisely the
+# plugins whose skills we need to judge. Resolve in two steps: trust installPath
+# when it is really there (cache-copied marketplaces), else follow the
+# directory-source marketplace's source.path plus the plugin's own relative
+# `source` from that marketplace's marketplace.json.
+{
+    my %km_cache;      # marketplace name => source.path (directory-source only)
+    my %mkt_cache;     # marketplace name => { plugin name => relative source }
+    my $km_loaded = 0;
+
+    sub _load_known_marketplaces {
+        return if $km_loaded;
+        $km_loaded = 1;
+        my $file = home() . "/.claude/plugins/known_marketplaces.json";
+        my $data = read_json($file);
+        return unless ref $data eq 'HASH';
+        for my $name (keys %$data) {
+            my $entry = $data->{$name};
+            next unless ref $entry eq 'HASH' && ref $entry->{source} eq 'HASH';
+            next unless ($entry->{source}{source} // '') eq 'directory';
+            my $p = $entry->{source}{path};
+            next unless defined $p && length $p;
+            $km_cache{$name} = normalize_path($p);
+        }
+    }
+
+    sub _marketplace_plugin_sources {
+        my ($name, $root) = @_;
+        return $mkt_cache{$name} if exists $mkt_cache{$name};
+        my %sources;
+        my $data = read_json("$root/.claude-plugin/marketplace.json");
+        if (ref $data eq 'HASH' && ref $data->{plugins} eq 'ARRAY') {
+            for my $entry (@{ $data->{plugins} }) {
+                next unless ref $entry eq 'HASH';
+                my ($pname, $psrc) = ($entry->{name}, $entry->{source});
+                next unless defined $pname && length $pname;
+                next unless defined $psrc && !ref $psrc && length $psrc;
+                # Only repo-relative sources can be resolved against $root.
+                next unless $psrc =~ m{^\./};
+                (my $rel = $psrc) =~ s{^\./}{};
+                $sources{$pname} = $rel;
+            }
+        }
+        $mkt_cache{$name} = \%sources;
+        return \%sources;
+    }
+
+    # plugin_directory_source($key) -> ($marketplace, $rel, $root), or () when
+    # this plugin does not come from a directory-source marketplace. $rel is what
+    # that marketplace's own marketplace.json declares as the plugin's `source`,
+    # with the leading "./" stripped.
+    sub plugin_directory_source {
+        my ($key) = @_;
+        return () unless defined $key && $key =~ /^([^@]+)\@(.+)$/;
+        my ($pname, $mkt) = ($1, $2);
+
+        _load_known_marketplaces();
+        my $root = $km_cache{$mkt};
+        return () unless defined $root && -d $root;
+
+        my $rel = _marketplace_plugin_sources($mkt, $root)->{$pname};
+        return () unless defined $rel && length $rel;
+        return ($mkt, $rel, $root);
+    }
+
+    sub plugin_source_dir {
+        my ($key, $install_path) = @_;
+        return $install_path
+            if defined $install_path && length $install_path && -d $install_path;
+
+        my ($mkt, $rel, $root) = plugin_directory_source($key);
+        return undef unless defined $rel;
+
+        my $dir = "$root/$rel";
+        return -d $dir ? $dir : undef;
+    }
+}
+
+# plugin_skill_census($install_path) -> { total => N, host_only => [names] }
+#
+# THE OTHER HALF OF skill_host_only_status. `host-only: true` was enforced on
+# exactly one of the two paths that put a skill into a container: discover_skills
+# drops a host-only STANDALONE skill, while plugin-shipped skills reach the
+# container through plugin selection, which never opened a SKILL.md and so could
+# not see the marker. Nine skills across three plugins declared themselves
+# host-only and were mounted anyway -- including /sandbox:setup, whose whole body
+# is "exit this session and run claude-sandbox from a terminal", and
+# /sandbox:test, which needs a container runtime the image does not ship.
+#
+# Census, not a verdict: the two callers want different things from it.
+# discover_plugins drops a plugin whose skills are ALL host-only (there is
+# nothing left to offer); cmd_materialize_plugins excludes the individual
+# host-only skill dirs of a MIXED plugin (steward and todo each ship both kinds)
+# from the copy that lands in claude-home.
+#
+# `total` counts skill dirs that actually carry a SKILL.md -- a stray directory
+# is not a skill, and counting it would make an all-host-only plugin look mixed.
+sub plugin_skill_census {
+    my ($install_path) = @_;
+    my %census = (total => 0, host_only => []);
+    return \%census unless defined $install_path && length $install_path;
+
+    my $skills_dir = "$install_path/skills";
+    return \%census unless -d $skills_dir;
+    opendir my $dh, $skills_dir or return \%census;
+    my @entries = sort grep { $_ !~ /^\.\.?$/ } map { from_fs($_) } readdir $dh;
+    closedir $dh;
+
+    for my $entry (@entries) {
+        next unless -d "$skills_dir/$entry";
+        my $status = skill_host_only_status("$skills_dir/$entry/SKILL.md");
+        next if $status eq 'missing';
+        $census{total}++;
+        push @{ $census{host_only} }, $entry if $status eq 'host-only';
+    }
+    return \%census;
 }
 
 sub now_iso {
@@ -398,15 +560,32 @@ sub discover_plugins {
         my ($label) = $key =~ /^([^@]+)/;
         $label //= $key;
 
+        # host-only census. A plugin whose skills are ALL host-only has nothing
+        # to offer a container, so it is dropped here -- the exact analogue of
+        # discover_skills dropping a host-only standalone skill, and the reason
+        # the picker no longer offers `sandbox` inside a sandbox (both its skills
+        # are host-only; one tells you to exit and run claude-sandbox, the other
+        # needs a container runtime the image does not ship).
+        #
+        # A plugin with NO skills at all is NOT dropped: plenty of plugins are
+        # hooks, agents or scripts, and `total == 0` means "nothing to judge",
+        # not "nothing usable". Only a plugin that shipped skills and made every
+        # one of them host-only is filtered.
+        my $census = plugin_skill_census(plugin_source_dir($key, $install_path));
+        my @host_only = @{ $census->{host_only} };
+        next if $census->{total} > 0 && @host_only == $census->{total};
+
         push @plugins, {
-            key          => $key,
-            label        => $label,
-            install_path => $install_path,
-            scope        => $scope,
-            project_path => $entry_project,
-            version      => $best->{version},
-            partition    => $partition,
-            enabled      => $enabled,
+            key              => $key,
+            label            => $label,
+            install_path     => $install_path,
+            scope            => $scope,
+            project_path     => $entry_project,
+            version          => $best->{version},
+            partition        => $partition,
+            enabled          => $enabled,
+            skills_total     => $census->{total},
+            host_only_skills => [sort @host_only],
         };
     }
 
@@ -638,12 +817,25 @@ sub cmd_diff {
         $was_mounted_p{$m->{key}} = $m;
     }
 
-    my (@plugins_added, @plugins_removed, @plugins_path_changed);
+    my (@plugins_added, @plugins_removed, @plugins_path_changed,
+        @plugins_host_only);
     for my $key (sort keys %was_mounted_p) {
         my $prev = $was_mounted_p{$key};
         my $cur  = $avail_p{$key};
         if (!$cur) {
-            push @plugins_removed, $key;
+            # Gone from discovery. Distinguish "uninstalled" from "every one of
+            # its skills is host-only, so discover_plugins now drops it" -- the
+            # same distinction the skill loop above already draws. Reporting a
+            # deliberate policy filter as "removed" would send the operator
+            # looking for an uninstall that never happened.
+            my $census = plugin_skill_census(
+                plugin_source_dir($key, $prev->{install_path}));
+            if ($census->{total} > 0
+                && @{ $census->{host_only} } == $census->{total}) {
+                push @plugins_host_only, $key;
+            } else {
+                push @plugins_removed, $key;
+            }
         } elsif (!$selected_p{$key}) {
             push @plugins_removed, $key;
         } else {
@@ -665,6 +857,7 @@ sub cmd_diff {
         plugins_added          => [sort @plugins_added],
         plugins_removed        => [sort @plugins_removed],
         plugins_path_changed   => [sort @plugins_path_changed],
+        plugins_host_only      => [sort @plugins_host_only],
     });
     return 0;
 }
@@ -970,6 +1163,16 @@ sub cmd_select_apply {
 
 # --- The actual subcommand ------------------------------------------
 
+# Appends the selector note for a plugin key (if any) after its already-built
+# display string (key, plus a scope tag for suggestions). Keys with no table
+# entry get back exactly the display they were passed.
+sub _plugin_row_display {
+    my ($key, $display) = @_;
+    my $note = $PLUGIN_SELECTOR_NOTES{$key};
+    return $display unless defined $note;
+    return "$display - $note";
+}
+
 sub cmd_select_interactive {
     my %opts = @_;
     my $file = $opts{selection_file} or die "--selection-file required\n";
@@ -1053,7 +1256,7 @@ sub cmd_select_interactive {
                     section   => 'plugins',
                     partition => 'project',
                     id        => $p->{key},
-                    display   => $p->{key},
+                    display   => _plugin_row_display($p->{key}, $p->{key}),
                     is_new    => $is_new_plugin{$p->{key}} ? 1 : 0,
                 };
             }
@@ -1077,7 +1280,7 @@ sub cmd_select_interactive {
                     section   => 'plugins',
                     partition => 'suggestion',
                     id        => $p->{key},
-                    display   => $disp,
+                    display   => _plugin_row_display($p->{key}, $disp),
                     is_new    => $is_new_plugin{$p->{key}} ? 1 : 0,
                 };
             }
@@ -1593,6 +1796,122 @@ sub cmd_mounts {
 }
 
 # =====================================================================
+# Subcommand: host-only-masks
+# =====================================================================
+#
+# Emits the container paths of every host-only skill belonging to a plugin --
+# selected in the picker OR enabled in any settings layer (Decision 10) -- that
+# reaches the container through a LIVE BIND rather than a copy.
+#
+# Two different mechanisms put a plugin's files into the container, and a
+# host-only skill has to be removed from each differently:
+#
+#   * A cache-copied marketplace is COPIED into claude-home, so a host-only
+#     skill can simply be left out of the copy. Nothing for this subcommand.
+#   * A directory-source marketplace (ccpraxis-local) is bind-mounted LIVE and
+#     read-only, so nothing can be "left out" -- the tree in the container IS the
+#     host's tree. The skill dir is MASKED instead: the launcher binds an empty
+#     directory over it, leaving a directory with no SKILL.md, and a directory
+#     with no SKILL.md is not a skill. Measured against podman before being
+#     written: a nested bind over a subtree of a read-only bind mounts fine and
+#     leaves its siblings intact.
+#
+# Decision 10: masks are computed for every plugin key SELECTED in the picker
+# OR ENABLED (truthy) in any settings layer the container can see -- project
+# settings.json, project settings.local.json, the container's user settings,
+# and the seed settings the launcher would copy in on a fresh create. This is
+# a UNION across layers, deliberately not Claude Code's local-over-project
+# precedence: an over-mask (enabled true in one layer, false in another) costs
+# one inert bind, while an under-mask is the bug this closes. Resolution goes
+# straight through plugin_directory_source + plugin_skill_census -- it never
+# consults discover_plugins/installed_plugins.json, so a plugin whose skills
+# are ALL host-only (which discover_plugins would drop) is still masked whole,
+# and no installed_plugins.json record is required at all.
+# M3 (review m2): a settings.json saved by a Windows editor can carry a
+# leading UTF-8 BOM (EF BB BF). decode_json rejects that byte sequence outright,
+# so read_json's shared path would silently treat the whole layer as malformed
+# -- reintroducing exactly the under-mask this package closes. Strip it here,
+# scoped to this one caller, rather than in shared read_json.
+sub _enabled_plugin_keys_from_settings_file {
+    my ($file) = @_;
+    return () unless defined $file && length $file && -f $file;
+    my $data = do {
+        open my $fh, '<:raw', $file or return ();
+        local $/;
+        my $content = <$fh>;
+        close $fh;
+        $content =~ s/^\xEF\xBB\xBF// if defined $content;
+        eval { decode_json($content) };
+    };
+    return () unless ref $data eq 'HASH' && ref $data->{enabledPlugins} eq 'HASH';
+    my %keys;
+    for my $key (keys %{ $data->{enabledPlugins} }) {
+        $keys{$key} = 1 if $data->{enabledPlugins}{$key};
+    }
+    return %keys;
+}
+
+sub cmd_host_only_masks {
+    my %opts = @_;
+    my $output = $opts{output};
+
+    my %keys;
+    if (defined $opts{selection_file} && length $opts{selection_file} && -f $opts{selection_file}) {
+        my $state = load_state($opts{selection_file});
+        $keys{$_} = 1 for @{ $state->{selected_plugins} || [] };
+    }
+
+    my @layer_files;
+    if (defined $opts{project_path} && length $opts{project_path}) {
+        push @layer_files, "$opts{project_path}/.claude/settings.json",
+                            "$opts{project_path}/.claude/settings.local.json";
+    }
+    push @layer_files, $opts{user_settings} if defined $opts{user_settings};
+    push @layer_files, $opts{seed_settings} if defined $opts{seed_settings};
+
+    for my $layer_file (@layer_files) {
+        my %layer_keys = _enabled_plugin_keys_from_settings_file($layer_file);
+        $keys{$_} = 1 for keys %layer_keys;
+    }
+
+    my @masks;
+    for my $key (sort keys %keys) {
+        my ($mkt, $rel, $root) = plugin_directory_source($key);
+        next unless defined $rel;
+
+        my $census = plugin_skill_census("$root/$rel");
+        for my $skill (@{ $census->{host_only} }) {
+            push @masks, {
+                key            => $key,
+                skill          => $skill,
+                container_path => "$CONTAINER_PLUGINS_ROOT/marketplaces/$mkt/$rel/skills/$skill",
+            };
+        }
+    }
+
+    my %seen;
+    @masks = grep { !$seen{$_->{container_path}}++ } @masks;
+    @masks = sort { $a->{key} cmp $b->{key} || $a->{skill} cmp $b->{skill} } @masks;
+
+    my $json = JSON::PP->new->canonical(1)->pretty->utf8->encode(\@masks);
+    if (defined $output && length $output) {
+        my $dir = dirname($output);
+        make_path($dir) unless -d $dir;
+        my $tmp = "$output.tmp.$$";
+        open my $fh, '>:raw', $tmp or die "write $tmp: $!\n";
+        print $fh $json;
+        close $fh or die "close $tmp: $!\n";
+        rename $tmp, $output or do {
+            unlink $tmp;
+            die "rename $tmp -> $output: $!\n";
+        };
+    } else {
+        print $json;
+    }
+    return 0;
+}
+
+# =====================================================================
 # Subcommand: record-mount
 # =====================================================================
 
@@ -1724,7 +2043,26 @@ sub cmd_materialize_plugins {
     $host_data = {} unless ref $host_data eq 'HASH';
     my $host_plugins = (ref $host_data->{plugins} eq 'HASH')
         ? $host_data->{plugins} : {};
+    my $host_top_version = (ref $host_data eq 'HASH') ? $host_data->{version} : undef;
     my $project_path = normalize_path($opts{project_path});
+
+    # 06-plugins-current-at-start (Decision 11/22): a marketplace whose host
+    # known_marketplaces.json entry is source.source eq "directory" is a live
+    # bind (ccpraxis-local etc), never copied, so its keys are never
+    # host-refreshed below. Derived from dirname($host_plugins_file), NOT
+    # home()/_load_known_marketplaces, so a test passing --plugins-file stays
+    # hermetic (spec 2.1). Missing/unparseable -> nothing is directory-source.
+    my $host_km_file = dirname($host_plugins_file) . '/known_marketplaces.json';
+    my $host_km = -f $host_km_file ? read_json($host_km_file) : {};
+    $host_km = {} unless ref $host_km eq 'HASH';
+    my %directory_source_mkt;
+    for my $mkt_name (keys %$host_km) {
+        my $mkt_entry = $host_km->{$mkt_name};
+        next unless ref $mkt_entry eq 'HASH';
+        my $src = $mkt_entry->{source};
+        $directory_source_mkt{$mkt_name} = 1
+            if ref $src eq 'HASH' && ($src->{source} // '') eq 'directory';
+    }
 
     # The host-side prefix that needs to be replaced with the container's
     # plugin root. Discovery normalizes paths to Git Bash form, e.g.
@@ -1780,11 +2118,22 @@ sub cmd_materialize_plugins {
     # the merge below. Read BEFORE we overwrite it.
     my $manifest_file = $opts{manifest};
     my %prior_keys;
+    # 06-plugins-current-at-start (spec 2.3): a prior entry carrying an
+    # `origin` (host-refresh / host-refresh-retained) never counts as
+    # "placed by the launcher" for %prior_keys, so a refreshed-but-unselected
+    # key is never dropped as deselected. Its dest_rel is remembered
+    # separately, for the retain rule (Behaviour 9 / AC7).
+    my %prior_refresh_dest_rel;
     if ($manifest_file && -f $manifest_file) {
         my $pj = read_json($manifest_file);
         if (ref $pj eq 'ARRAY') {
             for my $e (@$pj) {
-                $prior_keys{$e->{key}} = 1 if ref $e eq 'HASH' && defined $e->{key};
+                next unless ref $e eq 'HASH' && defined $e->{key};
+                if (defined $e->{origin} && ($e->{origin} eq 'host-refresh' || $e->{origin} eq 'host-refresh-retained')) {
+                    $prior_refresh_dest_rel{$e->{key}} = $e->{dest_rel};
+                } elsif (!defined $e->{origin}) {
+                    $prior_keys{$e->{key}} = 1;
+                }
             }
         }
     }
@@ -1826,8 +2175,8 @@ sub cmd_materialize_plugins {
         #
         # p01-sandbox-plugin-provisioning, defect A ("not cached" errors on a
         # fresh container) -- ROOT CAUSE, NOT FIXED HERE, deliberately.
-        # This copy mechanism is already correct and complete (t/31-plugin-merge.t,
-        # t/32-plugin-sync.t, and a live .host-tier-plugins.json artifact from the
+        # This copy mechanism is already correct and complete (t/plugin-merge.t,
+        # t/plugin-sync.t, and a live .host-tier-plugins.json artifact from the
         # affected launch all confirm the copied tree is byte-identical to the
         # host's). The actual defect is one layer deeper, inside Claude Code's own
         # runtime: it resolves and caches installed plugin code under a
@@ -1843,7 +2192,7 @@ sub cmd_materialize_plugins {
         # here would be validated ONLY by "the symptom stopped" on a live launch,
         # which this package's done-criterion 2 explicitly forbids as evidence.
         # Done-criterion 1 (zero manual repair needed) is therefore EXPLICITLY
-        # UNMET by this package. t/84-plugin-unknown-version-dest-rel.t is a
+        # UNMET by this package. t/plugin-unknown-version-dest-rel.t is a
         # regression LOCK on today's dest_rel naming (cache/<marketplace>/<plugin>/
         # unknown) -- changing that naming without solving the hash problem above
         # would not fix anything and must be a deliberate, reviewed decision, not
@@ -1879,10 +2228,67 @@ sub cmd_materialize_plugins {
     for my $key (sort keys %$existing_plugins) {
         next if exists $plugins_out{$key};   # host-selected this launch -> fresh wins
         next if exists $prior_keys{$key};    # we placed it before, now deselected -> drop
-        $plugins_out{$key} = $existing_plugins->{$key};  # sandbox-installed -> preserve
+
+        # 06-plugins-current-at-start (spec 2.1, Behaviour 4/8/9): a preserved
+        # key whose host install is current is rewritten to the host's
+        # version rather than kept stale (Decision 11's root cause). Directory-
+        # source marketplaces (live binds) and any key with no present host
+        # dir are kept verbatim.
+        my $mkt_name = ($key =~ /\@([^@]*)$/) ? $1 : undef;
+        my $is_dir_source = defined $mkt_name && exists $directory_source_mkt{$mkt_name};
+        my $host_inst = (!$is_dir_source) ? $best_host_install->($key) : undef;
+        my $host_dir  = $host_inst ? normalize_path($host_inst->{installPath}) : undef;
+        my $host_dir_present = defined $host_dir && _dir_exists_fs($host_dir);
+        my $rewritten = $host_dir_present ? $rewrite->($host_dir) : undef;
+        my $dest_rel;
+        my $refreshable = 0;
+        if ($host_inst && $host_dir_present && defined $rewritten
+            && $rewritten =~ m{^\Q$CONTAINER_PLUGINS_ROOT\E/(.+)$}) {
+            $dest_rel   = $1;
+            $refreshable = 1;
+        }
+        # Review M1: a record that isn't an array (Claude Code's old v1
+        # single-object shape, a null, or any other in-container write) must
+        # never be dereferenced as one below -- that used to die and, wrapped
+        # in run_perl_or_die at the call site, abort every launch. Fall
+        # through to the verbatim branch instead.
+        $refreshable = 0 unless ref $existing_plugins->{$key} eq 'ARRAY';
+
+        if ($refreshable) {
+            my @refreshed = map {
+                my %e = (ref $_ eq 'HASH') ? %$_ : ();
+                $e{version}     = $host_inst->{version};
+                $e{installPath} = $rewritten;
+                if (defined $host_inst->{gitCommitSha}) {
+                    $e{gitCommitSha} = $host_inst->{gitCommitSha};
+                } else {
+                    delete $e{gitCommitSha};
+                }
+                $e{lastUpdated} = $host_inst->{lastUpdated} if defined $host_inst->{lastUpdated};
+                \%e;
+            } @{ $existing_plugins->{$key} };
+            $plugins_out{$key} = \@refreshed;
+            push @copy_plan, { key => $key, src => $host_dir, dest_rel => $dest_rel, origin => 'host-refresh' };
+        } else {
+            $plugins_out{$key} = $existing_plugins->{$key};  # preserve verbatim
+            if (exists $prior_refresh_dest_rel{$key}) {
+                # Host no longer supplies a previously refreshed key (spec
+                # Behaviour 9 / AC7): keep the cache dir alive with a retain
+                # entry carrying no src, so reconcile_copy_plan doesn't prune it.
+                push @copy_plan, { key => $key, dest_rel => $prior_refresh_dest_rel{$key}, origin => 'host-refresh-retained' };
+            }
+        }
     }
 
     my $registry = { plugins => \%plugins_out };
+    # 06-plugins-current-at-start (spec 2.2 / AC11): mirror the host file's
+    # top-level "version" only when it decoded as a JSON integer (matches the
+    # schema Claude Code itself writes, "version": 2).
+    # Review S4: force the numeric form at the point of use. _is_json_integer
+    # must still run BEFORE this line -- once assigned, "0 + $v" makes the SV
+    # numeric-only regardless of how $host_top_version got here, but the
+    # is-it-really-an-integer decision has to happen on the untouched value.
+    $registry->{version} = 0 + $host_top_version if _is_json_integer($host_top_version);
 
     my $dir = dirname($output);
     make_path($dir) unless -d $dir;
@@ -2771,14 +3177,10 @@ Commands:
   load-selection      --selection-file FILE         Print current state (migrates v1->v3).
   prune               --selection-file FILE         Drop dead entries; write state.
   diff                --selection-file FILE         Compare discovery to mounted baseline.
-  select-interactive  --selection-file FILE         TUI selector for skills/plugins/MCP;
-                                                    writes selection + settings.local.json.
-  select-model        --selection-file FILE         Print the selector's item model as one
-                                                    JSON object; writes nothing, no terminal.
+  select-interactive  --selection-file FILE         TUI selector for skills/plugins/MCP; writes selection + settings.local.json.
+  select-model        --selection-file FILE         Print the selector's item model as one JSON object; writes nothing, no terminal.
   select-apply        --decision-file D --selection-file FILE
-                                                    Apply a decision produced by the launch
-                                                    screen through the same persist path.
-                                                    Exit 2 when the decision was not confirmed.
+                                                    Apply a decision produced by the launch screen through the same persist path. Exit 2 when the decision was not confirmed.
   mounts              --selection-file FILE         Emit host_path<TAB>name per line.
   record-mount        --selection-file FILE         Set mounted_at_create = selected.
   manifest            --selection-file FILE [--output FILE]
@@ -2786,18 +3188,11 @@ Commands:
   materialize-plugins --selection-file FILE --output FILE
                                                     Emit container-shaped installed_plugins.json.
   clone-to-project    --project-path P (--plugin-key K | --mcp-name N)
-                                                    Promote a Suggestion to Project: append
-                                                    scope=project install (plugins) or add to
-                                                    enabledMcpjsonServers (MCP) in settings.json.
-                                                    Idempotent; only ADDS, never edits existing.
-  materialize-credentials --output FILE             Emit sandbox-isolated .credentials.json:
-                                                    claudeAiOauth + mcpOAuth from previous
-                                                    container state only (host token never
-                                                    injected; one-time reset marker gates it).
-  materialize-known-marketplaces --output FILE      Emit container-shaped known_marketplaces.json:
-                                                    rewrites Windows installLocation paths to the
-                                                    container mount target; drops directory-source
-                                                    marketplaces whose source.path isn't mounted.
+                                                    Promote a Suggestion to Project: append scope=project install (plugins) or add to enabledMcpjsonServers (MCP) in settings.json. Idempotent; only ADDS, never edits existing.
+  materialize-credentials --output FILE             Emit sandbox-isolated .credentials.json: claudeAiOauth + mcpOAuth from previous container state only (host token never injected; one-time reset marker gates it).
+  host-only-masks     [--selection-file F] [--project-path P] [--user-settings U] [--seed-settings S] [--output FILE]
+                                      Container paths of host-only skills of every selected or enabled live-bound plugin; the launcher masks each.
+  materialize-known-marketplaces --output FILE      Emit container-shaped known_marketplaces.json: rewrites Windows installLocation paths to the container mount target; drops directory-source marketplaces whose source.path isn't mounted.
   help                                              Show this help.
 
 Common options:
@@ -2852,6 +3247,7 @@ my %DISPATCH = (
     'record-mount'        => \&cmd_record_mount,
     'manifest'            => \&cmd_manifest,
     'discover-mcp'            => \&cmd_discover_mcp,
+    'host-only-masks'                  => \&cmd_host_only_masks,
     'materialize-plugins'              => \&cmd_materialize_plugins,
     'materialize-credentials'          => \&cmd_materialize_credentials,
     'materialize-known-marketplaces'   => \&cmd_materialize_known_marketplaces,

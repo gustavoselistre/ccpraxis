@@ -109,7 +109,7 @@ our $PID_ALIVE_FN;
 # the stale value the tick captured (fixbatch step7 / red-team MAJOR). Gating
 # on `['done','dropped']` here would still be wrong, unconditionally refusing
 # the ORDINARY case (status genuinely still 'done' while the harvest audit is
-# unresolved, which is what the MUST-STAY-GREEN t/99-write-guard-sites.t S4/
+# unresolved, which is what the MUST-STAY-GREEN t/write-guard-sites.t S4/
 # AC14 control pins) -- the table row was never the right tool for a
 # freshness problem. Instead, `_judge_outcome_still_applies` (below) now ALSO
 # re-reads the ledger's live `status:` immediately before either branch
@@ -317,7 +317,7 @@ sub _require_category {
 our $COORDINATOR_MAX_RUNTIME_SECS = $ENV{BP_COORDINATOR_MAX_RUNTIME_SECS} || (24 * 3600);
 
 # ===========================================================================
-# PURE DECISIONS  (no I/O, no globals — unit-tested in t/06-orchestrator.t)
+# PURE DECISIONS  (no I/O, no globals — unit-tested in t/orchestrator-decision-core.t)
 # ===========================================================================
 
 sub _is_terminal { my $s = shift // ''; $s =~ /^(done|dropped|blocked|parked)$/ ? 1 : 0 }
@@ -825,6 +825,152 @@ sub terminal_verdict {
     return \%v;
 }
 
+# --- SUSPEND DETECTION (report 20260917-155603-b83e).
+#
+# The orchestrator log stamps a usage_poll roughly every 60s. On 2026-09-17 it
+# contained two gaps -- 186.2 and 203.9 minutes -- with NO events of any kind,
+# and `grep -ic suspend` over the whole log returned 0. Six and a half hours of
+# wall time passed, in a log with a sixty-second heartbeat, and nothing recorded
+# that anything had happened.
+#
+# The absence was then read as evidence by two other consumers. The token keeper
+# woke four seconds after the first gap, found the OAuth token under its refresh
+# floor, got HTTP 400, and paused the fleet with manual=1 while alerting that the
+# host and sandbox token GRANTS MAY HAVE DIVERGED -- a pause that never
+# self-clears. One second later an authenticated usage poll returned 200. The
+# credentials were fine; the machine had simply been asleep through the refresh
+# window. A human was told to go and revisit the copy-token architecture over a
+# fault that did not exist (filed separately as 20260917-110321-ff63).
+#
+# THE REPORT'S OWN DIAGNOSIS IS WRONG, and the correction matters for anyone
+# reading it: it blames `fleet-govern.pl`'s `suspend_gap()` for never firing.
+# That file belongs to the FILING PROJECT's own fleet, not to ccpraxis, and
+# `fleet-orchestrator.pl:405` does call it. ccpraxis has no `fleet-govern.pl`
+# and no `suspend_gap` anywhere; `bp-govern.pl` has no suspend detection at all.
+# So the defect is not a wired-up detector failing to fire -- it is that butler's
+# orchestrator, alone among the long-lived loops on this machine, never had one.
+#
+# The idiom is NOT invented here. `plugins/sandbox/container/heartbeat.sh:31`
+# already carries `SUSPEND_SLACK=120` -- "a tick overshooting TICK by this much
+# means the world was suspended, not that the manager died" -- and uses it to
+# stop reaping a container whose host merely slept. Same rule, same threshold,
+# second caller. No monotonic clock is needed and none is portable here: the
+# INTENDED sleep is the reference, and a tick that took three hours when it asked
+# for ten seconds did not take three hours of work.
+use constant SUSPEND_SLACK_SECS => 120;
+
+# suspend_gap PREV_TICK_EPOCH, NOW, INTENDED_INTERVAL_S [, SLACK_S]
+#   -> { suspended => 0|1, gap_secs => N, overshoot_secs => N }
+# PURE: no I/O, no clock, no exit. Total over undef/garbage inputs.
+#
+# A BACKWARD clock is never a suspend. NTP stepping the clock back would
+# otherwise produce a negative gap that compares however the reader's numeric
+# coercion happens to fall; it is reported as gap 0, not suspended.
+sub suspend_gap {
+    my ($prev, $now, $interval, $slack) = @_;
+    my %v = (suspended => 0, gap_secs => 0, overshoot_secs => 0);
+    # Numeric-STRICT, not merely non-fatal. A bare `$now - $prev` over a
+    # non-numeric value is only a warning, and a warning from the orchestrator's
+    # hot loop is noise in the one log a reader turns to when they already
+    # suspect the clock -- which is the exact situation this function exists for.
+    my $NUM = qr/\A\s*[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?\s*\z/;
+    return \%v unless defined $prev && defined $now;
+    return \%v if ref $prev || ref $now;
+    return \%v unless $prev =~ $NUM && $now =~ $NUM;
+    my $gap = $now - $prev;
+    return \%v unless $gap > 0;
+    $interval = 0 unless defined $interval && !ref $interval && $interval =~ $NUM && $interval > 0;
+    $slack    = SUSPEND_SLACK_SECS unless defined $slack && !ref $slack && $slack =~ $NUM && $slack >= 0;
+    my $overshoot = $gap - $interval;
+    $v{gap_secs}       = $gap;
+    $v{overshoot_secs} = $overshoot > 0 ? $overshoot : 0;
+    $v{suspended}      = ($overshoot >= $slack) ? 1 : 0;
+    return \%v;
+}
+
+# --- COORDINATOR DEATH EVIDENCE (report 20260917-155539-b6bf).
+#
+# 436 watchdog relaunches across two days recorded exit_reason "unknown" -- which
+# is what terminal_verdict returns whenever the last jsonl line is not a `result`
+# object, i.e. whenever the process was killed mid-stream. The report's summary:
+# "436 deaths produce 436 identical log lines with no distinguishing information,
+# and a reader has no way to tell one cause from another. A defect that recurs
+# 436 times and leaves no evidence is one that cannot be fixed, only absorbed."
+#
+# The transcripts existed the whole time; nothing looked at them when a session
+# died. This does, through the SAME bounded tail reader b29 already uses -- one
+# rule, two callers, and no second implementation that could slurp a multi-GB
+# stream into the orchestrator's hot loop.
+#
+# SHAPE, NOT CONTENT. Coordinator transcripts contain prompts. This records the
+# sequence of event types, the tool NAMES in the tail, and any error string the
+# CLI itself emitted -- enough to tell "died mid-Bash" from "died waiting on a
+# dispatched Agent" from "died right after an API error", and not enough to copy
+# anybody's prompt into a log.
+#
+# The report's items 1 and 3 -- the real exit status, and a per-package death cap
+# -- are NOT here. Recording the exit status means restructuring bp-launch.sh's
+# detached launch, which changes what `$!` records and therefore what the
+# liveness and kill paths target; that belongs in a package with a spec and a
+# red-team, not in a forensic read. (The report asks for waitpid, which cannot
+# work at all: bp-launch.sh runs `setsid nohup claude ... &` inside a subshell
+# that exits immediately, so the coordinator is reparented and no ancestor has a
+# wait status to collect.)
+sub coordinator_death_evidence {
+    my ($runs, $pkg, $max_lines) = @_;
+    $max_lines = 40 unless defined $max_lines && $max_lines =~ /\A\d+\z/ && $max_lines > 0;
+
+    my $file = "$runs/$pkg.jsonl";
+    my %ev = (tail_types => [], tail_tools => [], last_error => undef,
+              jsonl_bytes => undef, tail_lines => 0);
+
+    my @st = stat($file);
+    $ev{jsonl_bytes} = $st[7] if @st;
+
+    my $objs = eval { _tail_jsonl_objs($file, $max_lines) } || [];
+    return \%ev unless ref $objs eq 'ARRAY' && @$objs;
+
+    my (@types, @tools, $err);
+    for my $o (@$objs) {
+        next unless ref $o eq 'HASH';
+        my $t = (defined $o->{type} && !ref $o->{type}) ? $o->{type} : '?';
+        push @types, $t;
+
+        # Tool NAMES only. The stream-json shape puts them under
+        # message.content[].name for a tool_use block.
+        my $msg = $o->{message};
+        if (ref $msg eq 'HASH' && ref $msg->{content} eq 'ARRAY') {
+            for my $b (@{ $msg->{content} }) {
+                next unless ref $b eq 'HASH';
+                next unless defined $b->{type} && !ref $b->{type} && $b->{type} eq 'tool_use';
+                push @tools, $b->{name} if defined $b->{name} && !ref $b->{name};
+            }
+        }
+        # An error string the CLI emitted about ITSELF is a diagnostic, not user
+        # content, and is the single most useful line in the whole tail.
+        for my $k (qw(error subtype)) {
+            next unless defined $o->{$k} && !ref $o->{$k};
+            $err = "$k=$o->{$k}" if $o->{$k} =~ /error/i;
+        }
+    }
+    $ev{tail_lines} = scalar @types;
+    # Collapse consecutive repeats: 40 lines of "assistant,user" tells a reader
+    # nothing that "assistant,user x20" does not, and keeps the log line bounded.
+    my @collapsed;
+    for my $t (@types) {
+        if (@collapsed && $collapsed[-1]{t} eq $t) { $collapsed[-1]{n}++ }
+        else { push @collapsed, { t => $t, n => 1 } }
+    }
+    $ev{tail_types} = [ map { $_->{n} > 1 ? "$_->{t} x$_->{n}" : $_->{t} } @collapsed ];
+    # Last few distinct tool names, most recent last.
+    my (%seen_tool, @uniq);
+    for my $tn (@tools) { push @uniq, $tn unless $seen_tool{$tn}++ }
+    @uniq = @uniq[-6 .. -1] if @uniq > 6;
+    $ev{tail_tools} = \@uniq;
+    $ev{last_error} = $err;
+    return \%ev;
+}
+
 # --- did the package make SEMANTIC progress since the snapshot taken at launch?
 # Deliberately NOT jsonl growth (a max-turns run always appends lines, so growth
 # would make every exhaustion look productive) and NOT a ledger mtime bump (a
@@ -946,6 +1092,44 @@ sub _observe_cache {
     return;
 }
 
+# 08-fleet-on-holder: does $sid have a live, unexpired holder record right
+# now? Batch C (spec 16-cutover 2.8): the old holder-toggle check is deleted
+# -- the holder path is unconditional now, so this call site behaves as if it always
+# returned 1. Never dies, never writes. There is deliberately no pid check
+# and no background_tasks check (the orchestrator has no payload); the
+# deadline alone bounds the exemption to at most 1h past the last hold/extend.
+#
+# $launched_epoch (optional): the current incarnation's own registry
+# `launched_at`, as an epoch. Red-team MEDIUM-2a: a record whose `started_at`
+# predates this incarnation's own launch belongs to an earlier, already-dead
+# process that happened to share this session id (a warm resume that
+# inherited a stale holder record) -- it must NOT grant the exemption. When
+# $launched_epoch or the record's `started_at` is absent, this check is
+# skipped (fixtures that predate `started_at`/`launched_at` keep prior
+# behavior). In list context, also returns the record's deadline so the
+# caller can remember it after the hold ends (spec/red-team MEDIUM-1).
+sub coordinator_holding {
+    my ($sid, $now, $launched_epoch) = @_;
+    return 0 unless defined $sid && $sid =~ /\A[A-Za-z0-9_-]{1,128}\z/;
+    my $ok = eval {
+        require Cwd;
+        require File::Basename;
+        my $d = File::Basename::dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
+        require "$d/BpHook.pm";    # require() itself is idempotent per exact %INC key
+        1;
+    };
+    return 0 unless $ok;
+    my $h = eval { BpHook::holder($sid) };
+    return 0 unless ref $h eq 'HASH';
+    my $deadline = $h->{deadline};
+    return 0 unless defined $deadline && $deadline =~ /\A[0-9]+\z/;
+    return 0 unless $now < $deadline && $deadline <= $now + 3600;
+    if (defined $launched_epoch && defined $h->{started_at} && $h->{started_at} =~ /\A[0-9]+\z/) {
+        return 0 if $h->{started_at} < $launched_epoch;
+    }
+    return wantarray ? (1, $deadline) : 1;
+}
+
 sub resume_mode {
     my ($age_min, $sid, $threshold_min) = @_;
     unless (defined $threshold_min) {
@@ -1001,6 +1185,116 @@ sub creds_backoff_secs {
     $n = 1 if !defined $n || $n < 1;
     my $s = $base; $s *= $mult for 2 .. $n;
     return $s > $max ? $max : $s;
+}
+
+# --- 03-deaths-are-diagnosable: death_backoff_secs(n) = min(base * mult^(n-1), max);
+# n<=0/undef treated as 1. Byte-for-byte the same shape as creds_backoff_secs
+# above, but a DISTINCT sequence (own tunable keys, own default base) -- gates
+# the relaunch interval for a package with an active consecutive-death streak,
+# in place of the flat min_relaunch floor (spec §2.3, Done criterion 5).
+sub death_backoff_secs {
+    my ($n, $t) = @_;
+    $t ||= {};
+    my $base = $t->{death_bo_base} // $ENV{BP_DEATH_BACKOFF_BASE_SECS} // 30;
+    my $mult = $t->{death_bo_mult} // $ENV{BP_DEATH_BACKOFF_MULT}      // 2;
+    my $max  = $t->{death_bo_max}  // $ENV{BP_DEATH_BACKOFF_MAX_SECS}  // 1800;
+    $n = 1 if !defined $n || $n < 1;
+    my $s = $base; $s *= $mult for 2 .. $n;
+    return $s > $max ? $max : $s;
+}
+
+# --- 03-deaths-are-diagnosable: total reader of the JSON exit-status record
+# bp-watch-child.pl writes (runs/<pkg>.exit-status). Returns undef, never
+# dies, for: a missing file, malformed JSON, or a file whose `attempt` field
+# does not equal $expected_attempt -- the last case guards the race where a
+# stale watcher (killed-wedged, then immediately relaunched) writes its
+# STATUSFILE AFTER the new attempt's `rm -f` (spec §5 edge case 1): a
+# mismatched file reads as "no status yet", never as a wrong one.
+sub _read_exit_status {
+    my ($runs, $pkg, $expected_attempt) = @_;
+    return undef unless defined $runs && defined $pkg && length $pkg;
+    return undef unless defined $expected_attempt;
+    my $obj = eval { _read_json("$runs/$pkg.exit-status") };
+    return undef unless ref $obj eq 'HASH';
+    return undef unless defined $obj->{attempt} && !ref $obj->{attempt} && $obj->{attempt} =~ /\A-?\d+\z/;
+    return undef unless $obj->{attempt} == $expected_attempt;
+    return $obj;
+}
+
+# --- b-fca/pkg02: context-growth checkpoint helpers (spec §2.3). Pure, no I/O.
+# Sum the three context-carrying usage fields from one assistant usage hashref.
+# Missing/non-numeric fields count as 0 (mirrors bp-spend.pl's _safe_usage_num
+# tolerance for malformed transcript lines - never dies on bad input).
+sub context_tokens_from_usage {
+    my ($usage) = @_;                      # hashref: message.usage from one jsonl record
+    return 0 unless ref $usage eq 'HASH';
+    my $n = sub { my $v = shift; (defined $v && $v =~ /^\d+$/) ? $v + 0 : 0 };
+    return $n->($usage->{input_tokens})
+         + $n->($usage->{cache_creation_input_tokens})
+         + $n->($usage->{cache_read_input_tokens});
+}
+
+# coordinator-context-discipline/02: the canonical two-tier ceiling table.
+# These two literals are the ONLY place either number is written in code
+# (spec §2.1). The old single-ceiling env var is GONE -- not read, not
+# honoured, not aliased (Decision 7: superseded, not run alongside).
+our %CTX_CEILING_DEFAULT = ( soft => 250_000, hard => 350_000 );
+our %CTX_CEILING_ENV     = ( soft => 'BP_CONTEXT_CEILING_SOFT_TOKENS',
+                             hard => 'BP_CONTEXT_CEILING_HARD_TOKENS' );
+
+# True if the given usage total is at/over the given tier's ceiling. $t is an
+# optional tunables hashref (same shape _tunables_base() returns); falls back
+# to _ctx_ceiling_env(TIER) (validated per-tier env var, else the pinned
+# default for that tier). $tier defaults to 'soft' when omitted or
+# unrecognized (spec §2.4) -- the conservative reading.
+# NOTE: an explicit $t->{"ctx_ceiling_$tier"} is intentionally NOT validated
+# here -- a caller-supplied tunables hashref (including a deliberate 0, per
+# spec §5's documented degenerate case) is trusted as-is; only the raw env
+# string, which an operator can fat-finger, is validated.
+sub context_growth_ceiling_breached {
+    my ($usage, $t, $tier) = @_;
+    $tier = 'soft' unless defined $tier && ($tier eq 'soft' || $tier eq 'hard');
+    my $ceiling = (ref $t eq 'HASH' ? $t->{"ctx_ceiling_$tier"} : undef)
+                // _ctx_ceiling_env($tier);
+    return context_tokens_from_usage($usage) >= $ceiling ? 1 : 0;
+}
+
+# context_ceiling_tier($usage, $t) -> 'hard'|'soft'|'none' -- PURE, NEW
+# (spec §2.5/§5.3). Resolves each tier's own ceiling value (tunables > env >
+# default, same resolution order context_growth_ceiling_breached uses), then
+# compares usage against the numerically LARGER of the two as the "hard"
+# threshold and the smaller as the "soft" threshold -- so a misconfigured
+# hard < soft still yields a sane, monotone answer ("a usage above both reads
+# hard, between them reads soft", §5.3) rather than the smaller threshold
+# always winning regardless of which key it was assigned to.
+sub context_ceiling_tier {
+    my ($usage, $t) = @_;
+    my $soft_ceiling = (ref $t eq 'HASH' ? $t->{ctx_ceiling_soft} : undef) // _ctx_ceiling_env('soft');
+    my $hard_ceiling = (ref $t eq 'HASH' ? $t->{ctx_ceiling_hard} : undef) // _ctx_ceiling_env('hard');
+    my ($lo, $hi) = ($soft_ceiling <= $hard_ceiling) ? ($soft_ceiling, $hard_ceiling) : ($hard_ceiling, $soft_ceiling);
+    my $tokens = context_tokens_from_usage($usage);
+    return 'hard' if $tokens >= $hi;
+    return 'soft' if $tokens >= $lo;
+    return 'none';
+}
+
+# Given the parsed lines of a runs/<pkg>.jsonl (array of decoded hashrefs, already
+# JSON-decoded by the caller - this sub does no I/O), return the usage hashref of
+# the LAST record that is the coordinator's own assistant turn: type eq
+# 'assistant' AND parent_tool_use_id absent/undef (subagent turns are tagged with
+# a defined parent_tool_use_id, same split bp-spend.pl:713 makes). Returns undef
+# if no such record exists.
+sub last_coordinator_usage {
+    my ($records) = @_;
+    return undef unless ref $records eq 'ARRAY';
+    for my $rec (reverse @$records) {
+        next unless ref $rec eq 'HASH';
+        next unless defined($rec->{type}) && $rec->{type} eq 'assistant';
+        next if defined $rec->{parent_tool_use_id};
+        next unless ref $rec->{message} eq 'HASH' && ref $rec->{message}{usage} eq 'HASH';
+        return $rec->{message}{usage};
+    }
+    return undef;
 }
 
 # --- pause payload (Decision #12 contract: epoch resets_at + jittered relaunch).
@@ -1064,7 +1358,7 @@ sub has_progressable_work {
 }
 
 # --- awaiting-human packages (blocked/parked) that have NO queued needs-you
-# decision. A coordinator can self-block/park in its OWN ledger (gate-stop.sh
+# decision. A coordinator can self-block/park in its OWN ledger (stop-gate.sh
 # permits a terminal stop with a '## Next action') WITHOUT the orchestrator ever
 # running its escalation path — so no decision is filed, the reporter's queue-watcher
 # (bp-wait-for-decision) stays silent, and the run goes quiet. The loop reconciles
@@ -1407,7 +1701,7 @@ sub ledger_age_min {
 }
 
 # b11-progress-heuristic-turns-backstop: has b10's mechanical repeat guard
-# (plugins/butler/hooks/lib.sh, repeat-guard.sh) already flagged THIS package
+# (plugins/butler/hooks/wait-shape-guard.sh) already flagged THIS package
 # recently? The guard's own state lives at runs/<pkg>.repeat-<session-token>.log,
 # one file per coordinator session, each line "TS\tHASH\tFIRED". Read-only, tail
 # only (reuses _last_nonempty_line — no second reader), and best-effort: any glob
@@ -1983,8 +2277,8 @@ sub archive_judge_verdict {
 # narrowed (whole-tick -> gate-return-to-act) but not eliminated. Closing it fully
 # would mean folding every one of those side effects into this gate's own `mutate`
 # (the `queue_needs_you` S2 pattern), which is a substantially larger, riskier change
-# than this fix-batch's budget allows without jeopardizing the pinned t/98-100
-# oracle. Left open, and named here rather than only in the fix-batch report, per
+# than this fix-batch's budget allows without jeopardizing the pinned write-guard-primitive /
+# write-guard-sites / write-guard-audit oracle. Left open, and named here rather than only in the fix-batch report, per
 # the same "never leave the current shape while comments claim the window is
 # closed" instruction that flagged it. Also: this lock excludes nothing else in the
 # tree (grepped -- no other writer takes `runs/<kind>/<pkg>.lock`); its value is the
@@ -2364,15 +2658,50 @@ sub _min_interval_gate {
 sub _project_root_of {
     my ($bpdir) = @_;
     return undef unless defined $bpdir && !ref $bpdir && length $bpdir;
-    my $d = abs_path($bpdir) // $bpdir;
-    my %seen;
-    while (length $d && !$seen{$d}++) {
-        return $d if -d "$d/.ccpraxis-local-data";
-        my $parent = dirname($d);
-        last if $parent eq $d;                     # filesystem / drive root
-        $d = $parent;
+    my $start = abs_path($bpdir) // $bpdir;
+
+    # Decision 24 item 2 (red-team S1): the bpdir has a known shape,
+    # <root>/.ccpraxis-local-data/blueprints/<name>, so try that structural
+    # answer BEFORE walking. A bounded walk from the bpdir climbs
+    # bp -> blueprints -> .ccpraxis-local-data and then reaches <root> as a
+    # stop strictly ABOVE the start (R2), so a project rooted at HOME (or any
+    # other stop dir) would otherwise never be examined even though it is the
+    # right answer here, not an escape.
+    (my $s = $start) =~ s{\\}{/}g;
+    if ($s =~ m{\A(.+)/\.ccpraxis-local-data/blueprints/[^/]+/?\z} && -d "$1/.ccpraxis-local-data") {
+        return $1;
     }
-    return undef;
+
+    # bounded walk-up (package 03, Decision 3): never ascend out of temp, and
+    # never adopt home unless the start IS home. The start here is the bpdir,
+    # not the process cwd (see spec §2.1 table).
+    return eval {
+        require "$DIR/BpProjectRoot.pm"
+            unless grep { m{(?:^|/)BpProjectRoot\.pm$} } keys %INC;
+        BpProjectRoot::bounded_walkup($start);
+    };
+}
+
+# lifecycle_data_dir($bpdir) -> the data root (parent of blueprints/) to hand
+# bp-lifecycle.pl as --data-dir, or undef when it cannot be determined.
+#
+# Bug report 20260922-214319-9389: bp-lifecycle.pl re-derives its OWN data
+# root (project_root(), a fresh `git rev-parse`/walk-up from ITS cwd) whenever
+# a caller omits --data-dir. That need not be the data root this orchestrator
+# is actually running against -- a drive-solo driver started with an explicit
+# --data-dir (bp-drive-next.pl) writes its solo-claim pointer
+# (<data>/.drive-solo/current.json) under that root, and if the reconciler's
+# own guess lands somewhere else, solo_claimed() reads a missing file and
+# returns 0 -- silently defeating the P4 solo-driver protection in
+# bp-lifecycle.pl's orphan_running repair. Passing the SAME root explicitly,
+# derived from $bpdir (not from this process's cwd either) closes that gap.
+# Undef when no .ccpraxis-local-data ancestor exists (e.g. a bare test
+# tempdir) -- callers must skip the flag rather than pass a wrong root.
+sub lifecycle_data_dir {
+    my ($bpdir) = @_;
+    my $proot = _project_root_of($bpdir);
+    return undef unless defined $proot && length $proot;
+    return "$proot/.ccpraxis-local-data";
 }
 
 # b02: a log `detail` is one trimmed line of at most 200 chars — git output and
@@ -2446,6 +2775,12 @@ sub _tunables_base {
         remediation_cap    => $ENV{BP_REMEDIATION_CAP}    // 6,    # b07: global rounds opened per run (SYN-7)
         min_relaunch => _min_relaunch_secs(),  # r01: floor between two watchdog
                                                 # relaunches of the SAME package
+        ctx_ceiling_soft => _ctx_ceiling_env('soft'),  # coordinator-context-discipline/02: two-tier ceiling
+        ctx_ceiling_hard => _ctx_ceiling_env('hard'),
+        death_thresh  => $ENV{BP_DEATH_THRESH}            // 5,     # 03-deaths-are-diagnosable, Decision 10
+        death_bo_base => $ENV{BP_DEATH_BACKOFF_BASE_SECS} // 30,    # matches today's min_relaunch default
+        death_bo_mult => $ENV{BP_DEATH_BACKOFF_MULT}      // 2,
+        death_bo_max  => $ENV{BP_DEATH_BACKOFF_MAX_SECS}  // 1800,  # matches creds_bo_max
     };
 }
 
@@ -2471,6 +2806,33 @@ sub _min_relaunch_secs {
     return 30;
 }
 
+# coordinator-context-discipline/02 spec §2.2: same validation convention as
+# _min_relaunch_secs() above, now per-tier via %CTX_CEILING_DEFAULT/
+# %CTX_CEILING_ENV. Unvalidated, a non-numeric or non-positive override
+# silently coerces to 0 in numeric comparison (`"abc" >= $tokens` warns but
+# evaluates as 0 >= $tokens), which breaches on every single check --
+# constant checkpoint thrashing, the same failure shape _min_relaunch_secs()
+# was written to prevent for its own tunable. Only a strictly-positive
+# integer is honoured; anything else falls back to the documented default for
+# that tier and warns, naming the rejected value.
+#
+# An unrecognized tier degrades to 'soft' (the lower, more conservative
+# ceiling), so a mis-call can only ever be stricter, never "no ceiling".
+sub _ctx_ceiling_env {
+    my ($tier) = @_;
+    $tier = 'soft' unless defined $tier && ($tier eq 'soft' || $tier eq 'hard');
+    my $env = $CTX_CEILING_ENV{$tier};
+    my $default = $CTX_CEILING_DEFAULT{$tier};
+    return $default unless exists $ENV{$env};  # truly unset -> quiet default, no warning
+    my $raw = $ENV{$env};
+    $raw = '' unless defined $raw;
+    if ($raw =~ /^[0-9]+$/ && $raw > 0) { return $raw + 0; }
+    warn "bp-orchestrator: $env='$raw' is not a positive integer -- "
+       . "falling back to the default ($default tokens). A malformed value here "
+       . "silently degrades to ceiling=0, causing constant checkpoint thrashing.\n";
+    return $default;
+}
+
 # Build { pkg => {deps, write_set} } and { pkg => status } from disk.
 sub _load_state {
     my ($bpdir, $runs) = @_;
@@ -2479,6 +2841,26 @@ sub _load_state {
     my (%meta, %status, %att, %pid, %sid);
     for my $pkg (keys %$dag) {
         my $raw_status = ledger_fm($bpdir, $pkg, 'status');
+
+        # RE-READ ONCE BEFORE BELIEVING A NEGATIVE. Report 20260917-023637-0f99:
+        # a false `awaiting-ledger` escalation fired for a package whose ledger
+        # was present, healthy and `status: running` with a live coordinator.
+        # Timed to the second, the ledger, its `.lock` and the escalation all
+        # carry the same mtime -- the orchestrator read the path during the
+        # coordinator's own ATOMIC WRITE, in the instant `rename()` swaps the
+        # file in, when neither the old nor the new name resolves.
+        #
+        # This is a TOCTOU on a correct atomic write, not a broken one: the
+        # writer is doing exactly the right thing and the reader is sampling at
+        # the wrong moment. The window is microseconds, so a single re-read
+        # after a brief settle closes it -- and the cost is paid ONLY on the
+        # negative, which is rare and which today produces a wrong answer
+        # anyway. Believing a first negative here escalates a healthy package
+        # to the operator and holds it from launching.
+        if (!defined $raw_status) {
+            select(undef, undef, undef, 0.05);
+            $raw_status = ledger_fm($bpdir, $pkg, 'status');
+        }
         $status{$pkg} = $raw_status // 'pending';
         # fix-batch F2 (redteam-step6 MEDIUM): a ledger file that EXISTS but
         # whose frontmatter will not parse (unresolved merge conflict, a
@@ -2496,7 +2878,15 @@ sub _load_state {
         # accounting (:596), and (c) files an operator-visible needs-you
         # escalation every tick until the ledger is repaired (:2420-2452) --
         # so "unknown" is held, not silently treated as "pending".
-        my $file_exists = -f "$bpdir/packages/$pkg.md" ? 1 : 0;
+        # Same race, same remedy (20260917-023637-0f99): `-f` samples a single
+        # instant, and during an atomic rename that instant can fall in the gap.
+        # Re-stat once before concluding the ledger is missing.
+        my $lpath = "$bpdir/packages/$pkg.md";
+        my $file_exists = -f $lpath ? 1 : 0;
+        if (!$file_exists) {
+            select(undef, undef, undef, 0.05);
+            $file_exists = -f $lpath ? 1 : 0;
+        }
         $meta{$pkg}   = { deps => $dag->{$pkg}, write_set => (ledger_fm($bpdir, $pkg, 'write_set') // ''), priority => ledger_fm($bpdir, $pkg, 'priority'), requires_clean_tree => ledger_fm($bpdir, $pkg, 'requires_clean_tree'), ledger_missing => (!$file_exists || !defined $raw_status) ? 1 : 0 };
         $att{$pkg}    = $reg->{$pkg}{attempt} // 0;
         $pid{$pkg}    = $reg->{$pkg}{pid};
@@ -2632,6 +3022,18 @@ sub run {
     local $SIG{INT}  = sub { $STOP = 1 };
 
     my %seen;            # pkg => {size,mtime} prior jsonl observation
+    # 08-fleet-on-holder / red-team MEDIUM-1: pkg => the last holder deadline
+    # seen while this package was actively held. LOOP-SCOPE, mirroring %seen
+    # above -- bounded by the package count (one entry per package, overwritten
+    # every hold, never appended to), never persisted. Once a hold lapses this
+    # gives the coordinator one full `flat` window of grace (measured from
+    # max(mtime, this deadline)) before the byte-growth watchdog can judge it
+    # wedged, instead of the flat clock silently resuming mid-window.
+    my %held_until;
+    # pkg => 1 while watchdog_flat_held has already been logged for the
+    # CURRENT hold (red-team LOW-3): logs once on the transition into held,
+    # not once per tick. Cleared as soon as the hold is no longer active.
+    my %held_logged;
     # b02 checkpoint bookkeeping: pkg => { at => epoch of the last observation,
     # snap => the launch_snapshot taken then }. LOOP-SCOPE on purpose, mirroring
     # %seen and b01's $exec_fail_streak: no registry schema, no per-tick writes,
@@ -2644,7 +3046,7 @@ sub run {
     my %ckpt_warned;
     # r01: pkg => epoch of the last watchdog-issued relaunch THIS process. LOOP-SCOPE
     # and deliberately NOT persisted to registry.json — see spec §5: persisting this
-    # would silently break t/68-exit-reason-classification.t's C4 oracle, which drives
+    # would silently break t/exit-reason-classification.t's C4 oracle, which drives
     # four SEPARATE go() calls at a fixed $now to simulate four restarts. Same
     # convention/rationale as %seen/%ckpt above.
     my %last_relaunch_at;
@@ -2712,10 +3114,68 @@ sub run {
     # the flag goes away so a recurrence (ledger deleted again) is reported again.
     my %awaiting;
 
+    # Previous tick's wall clock, for suspend detection. LOOP-SCOPE, mirroring
+    # %seen/%ckpt/%awaiting: a fresh process cannot infer a gap it did not
+    # observe, so the first tick of every run is never a suspend.
+    my $prev_tick;
+
     my $err;
     eval {
         while (!$STOP) {
             my $now = $now_fn->();
+
+            # ---- SUSPEND GAP (b83e) ----
+            # Before anything else in the tick, because every consumer that read
+            # the 2026-09-17 gaps as evidence read them from THIS log, and the
+            # token keeper's 400 arrived four seconds after a wake. The marker
+            # file is what lets it ask, cheaply, whether the machine just came
+            # back rather than inferring an architectural fault. Never fatal:
+            # failing to record a suspend must not stop the fleet.
+            {
+                my $sg = suspend_gap($prev_tick, $now, $t->{watch_tick}, SUSPEND_SLACK_SECS);
+                if ($sg->{suspended}) {
+                    _log($log, 'suspend_gap', {
+                        gap_secs       => $sg->{gap_secs},
+                        overshoot_secs => $sg->{overshoot_secs},
+                        intended_s     => $t->{watch_tick},
+                        slack_s        => SUSPEND_SLACK_SECS,
+                        detail         => 'wall clock jumped far past the intended tick interval; '
+                                        . 'the host was almost certainly suspended. Work did not stop '
+                                        . 'because of a fault here.',
+                    });
+                    eval {
+                        _write_json_atomic("$runs/.last-suspend.json", {
+                            at_epoch       => $now,
+                            gap_secs       => $sg->{gap_secs},
+                            overshoot_secs => $sg->{overshoot_secs},
+                        });
+                        1;
+                    } or 1;
+                }
+                $prev_tick = $now;
+            }
+
+            # ---- BUSY-LEASE OBSERVED MTIME (package 03, host-wake-and-suspend) ----
+            # Read-only: records what is ALREADY on disk from a PRIOR tick's touch_busy,
+            # before this tick's own touch_busy call (below, gated by should_touch_busy,
+            # unchanged) can update it. Never fatal -- a missing/unreadable lease file
+            # records as "not observed", mirroring the suspend marker's own eval{}||undef
+            # idiom immediately above. This does not change WHEN touch_busy runs or what
+            # should_touch_busy gates -- purely additive.
+            {
+                my @st = eval { stat($t->{busy_path}) };
+                my $observed_mtime = (!$@ && @st) ? $st[9] : undef;
+                # eval-wrapped (mirroring :4371-4394 / :629-634): BpLog::event DIES on
+                # an unwritable runs/, and this call fires every tick unconditionally
+                # (unlike its sibling event-gated _log calls), so a transient log-write
+                # failure must degrade this tick rather than kill the whole loop.
+                eval { _log($log, 'busy_lease_tick', {
+                    path           => $t->{busy_path},
+                    observed_mtime => $observed_mtime,
+                    age_s          => defined($observed_mtime) ? ($now - $observed_mtime) : undef,
+                }); 1 } or 1;
+            }
+
             my $shutdown = -e "$runs/.shutdown" ? 1 : 0;
             %exec_counted = ();       # the exec-failure dedupe is per tick
 
@@ -2773,8 +3233,26 @@ sub run {
 
             # ---- TOKEN-KEEPER (runs even while paused, to keep the token alive) ----
             if ($now >= $next_keeper) {
+                # Hand the keeper the suspend fact we recorded above. Without it
+                # a 4xx four seconds after a three-hour sleep reads as a possible
+                # architectural fault, which is exactly what happened on
+                # 2026-09-17 (reports 20260917-110321-ff63, 20260917-155603-b83e).
+                # Best-effort: a missing or unreadable marker means "not observed",
+                # never an error.
+                my $last_suspend = eval {
+                    my $p = "$runs/.last-suspend.json";
+                    return undef unless -f $p;
+                    open my $r, '<', $p or return undef;
+                    local $/;
+                    my $b = <$r>;
+                    close $r;
+                    my $d = JSON::PP->new->decode($b // '');
+                    (ref $d eq 'HASH') ? $d : undef;
+                } || undef;
+
                 my $k = BpKeeper::keeper_tick({ creds_path => $creds, now_ms => $now * 1000, log_path => $log,
-                                                 http_post => $http_post, quiet_creds_error => $creds_gate{armed} });
+                                                 http_post => $http_post, quiet_creds_error => $creds_gate{armed},
+                                                 recent_suspend => $last_suspend });
                 my $act = $k->{action} // 'ok';
                 $next_keeper = $now + ($act eq 'backoff' ? $t->{keeper_bo} : $t->{keeper_int});
                 $creds_ok->($now, 'keeper') if $act ne 'pause-creds';
@@ -2784,20 +3262,19 @@ sub run {
                           question => 'OAuth token crossed the refresh floor unrefreshed — re-authenticate with /login.',
                           context => 'token-keeper hit the pause-floor', created_at => $now, category => 'operator-action' });
                 } elsif ($act eq 'pause-auth') {
-                    # LOUD divergence alert (hard requirement): a 4xx on the
-                    # sandbox's OWN refresh is distinct from a routine expiry —
-                    # it means the copied token was rejected / the host & sandbox
-                    # grants diverged, the signal to revisit the copy-token
-                    # architecture. Wording is deliberately DIFFERENT from the
-                    # pause-floor re-login case so it stands out in the
-                    # reporter/dashboard. The graceful pause underneath is
-                    # unchanged (nothing collapses silently).
+                    # question now surfaces the keeper's own discriminated diagnosis instead of a
+                    # static sentence that always asserted divergence. Report 20260917-110321-ff63:
+                    # the old static question was wrong the one time it fired (2026-09-17) because
+                    # the machine had simply been asleep. context is unchanged.
+                    my $question = (defined $k->{detail} && length $k->{detail})
+                        ? $k->{detail}
+                        : "!! ALERT: the sandbox's OWN OAuth refresh was REJECTED (4xx). "
+                        . "The copied token may be invalid OR the host/sandbox token grants have "
+                        . "DIVERGED -- REVISIT the copy-token architecture. This is NOT a routine "
+                        . "/login expiry.";
                     _enter_pause_manual($runs, $log, 'token-auth',
                         { package => '_fleet', blueprint => $bp, kind => 'reauth', alert => 1,
-                          question => "!! ALERT: the sandbox's OWN OAuth refresh was REJECTED (4xx). "
-                                    . "The copied token may be invalid OR the host/sandbox token grants have "
-                                    . "DIVERGED -- REVISIT the copy-token architecture. This is NOT a routine "
-                                    . "/login expiry.",
+                          question => $question,
                           context => ($k->{detail} // 'the sandbox refresh returned a 4xx'), created_at => $now, category => 'operator-action' });
                 } elsif ($act eq 'pause-contract' || $act eq 'pause-creds') {
                     my $is_creds = ($act eq 'pause-creds');
@@ -3796,7 +4273,26 @@ sub run {
                 if ($alive) {
                     my ($sz, $mt) = jsonl_stat($runs, $pkg);
                     my $prev = $seen{$pkg};
-                    my $prog = progress_verdict($sz, $mt, ($prev ? $prev->{size} : undef), $now, $t->{flat});
+                    # 08-fleet-on-holder / red-team MEDIUM-1: once a hold has
+                    # lapsed, judge flatness from max(mtime, that hold's last
+                    # deadline) rather than the raw (possibly long-frozen)
+                    # mtime -- see %held_until above. progress_verdict itself
+                    # stays pure/unit-tested; only the mtime fed to it here
+                    # is adjusted.
+                    # Only bump the effective mtime once the remembered hold's
+                    # deadline is itself in the past ($held_until{$pkg} <= $now)
+                    # -- while a hold is STILL active (deadline in the future)
+                    # flatness must be judged from the real mtime, exactly as
+                    # before, so the transition-into-held branch below still
+                    # sees a genuine 'flat' verdict to log and override. The
+                    # bump only ever extends the grace window AFTER a hold has
+                    # lapsed, never while one is in progress.
+                    my $eff_mt = $mt;
+                    if (defined $held_until{$pkg} && $held_until{$pkg} <= $now
+                        && (!defined $mt || $held_until{$pkg} > $mt)) {
+                        $eff_mt = $held_until{$pkg};
+                    }
+                    my $prog = progress_verdict($sz, $eff_mt, ($prev ? $prev->{size} : undef), $now, $t->{flat});
                     $seen{$pkg} = { size => ($sz // 0), mtime => ($mt // $now) };
 
                     # b11-progress-heuristic-turns-backstop: consult the semantic
@@ -3828,6 +4324,38 @@ sub run {
                                 why=>"progress heuristic: $sv ($sr)", now=>$now, reg=>$reg, t=>$t,
                                 spawn_judge=>$spawn_judge, shutdown=>$shutdown });
                             next;   # already actioned this tick — skip the byte-growth verdict below
+                        }
+                    }
+
+                    # 08-fleet-on-holder: a coordinator ending its turn to wait on a
+                    # background subagent writes nothing to its stream log until the
+                    # subagent's completion wakes it -- that can outlast `flat`. With
+                    # the switch on and an unexpired holder record for this package's
+                    # session, treat this tick as growing rather than flat so the
+                    # byte-growth watchdog does not kill it as wedged.
+                    {
+                        my $launched_at = $reg->{$pkg}{launched_at};
+                        my $launched_epoch = defined $launched_at ? BpGovern::iso_to_epoch($launched_at) : undef;
+                        my ($holding, $deadline) = coordinator_holding($sid->{$pkg}, $now, $launched_epoch);
+                        if ($holding) {
+                            $held_until{$pkg} = $deadline;
+                            if ($prog eq 'flat') {
+                                unless ($held_logged{$pkg}) {
+                                    _log($log, 'watchdog_flat_held', { package => $pkg, session_id => $sid->{$pkg} });
+                                    $held_logged{$pkg} = 1;
+                                }
+                                $prog = 'growing';
+                            }
+                        } else {
+                            # red-team LOW: once a previously-held coordinator's
+                            # exemption goes inert (deadline lapsed, record gone,
+                            # BpHook became unavailable, etc.), say so once rather
+                            # than silently falling back to plain byte-growth
+                            # judgment with no trace of why.
+                            if ($held_logged{$pkg}) {
+                                _log($log, 'watchdog_hold_lapsed', { package => $pkg, session_id => $sid->{$pkg} });
+                            }
+                            $held_logged{$pkg} = 0;
                         }
                     }
 
@@ -3889,6 +4417,7 @@ sub run {
                         _upd_pkg($runs, $log, $pkg, { turn_exhaust_streak => 0 });   # B9b
                         $reg->{$pkg}{turn_exhaust_streak} = 0;
                     }
+
                     # b29-rate-limit-attempt-isolation: classify THIS death before the
                     # cap is evaluated. Gated on the attempt number already discounted
                     # (rate_limit_discounted_attempt) so a package that sits dead across
@@ -3908,16 +4437,77 @@ sub run {
                                 { package => $pkg, evidence => $rl_evidence, attempts => $att->{$pkg} });
                         }
                     }
+                    # A death whose attempt was (this tick or a previous tick) discounted as
+                    # a rate-limit rejection is isolated from the ATTEMPT cap above -- the
+                    # SAME evidence/reasoning extends to the DEATH cap below: a rejecting API
+                    # is not the coordinator's own health, so it must not count against
+                    # either axis (b29's isolation, not a new rule invented here).
+                    my $rl_discounted_this_death = $cur_att > 0
+                        && (_reg_int($reg->{$pkg}{rate_limit_discounted_attempt}) // 0) == $cur_att;
+
+                    # --- 03-deaths-are-diagnosable: death_streak, a THIRD, independent
+                    # axis from turn_exhaust_streak/attempt (spec §1/§3). unknown|error
+                    # verdicts (never rate-limit-discounted ones -- same isolation as the
+                    # ATTEMPT cap above) feed the death-cap escalation (Decision 10: 5
+                    # consecutive deaths); a max_turns exhaustion is handled by its own
+                    # B7/B8 fork below (reset-on-progress / unchanged-on-fruitless); a
+                    # success verdict (the "died mid-stream but never marked terminal"
+                    # contract-violation shape) resets it, same as turn_exhaust_streak's
+                    # own reset-on-success precedent just above. The counter is only
+                    # ever INCREMENTED at the point a relaunch is actually attempted (or
+                    # would be, but for the death cap itself) -- never merely because a
+                    # still-unresolved death was re-observed on a tick that deferred
+                    # (min-interval/death-backoff/parallel-cap-full) without acting, so a
+                    # package that sits dead across several deferred ticks before its
+                    # next real launch attempt is counted once per actual death, not once
+                    # per tick (spec §5 edge case 6's own constraint).
+                    my $death_streak_before = _reg_int($reg->{$pkg}{death_streak}) // 0;
+                    my $is_death_verdict = ($tv->{verdict} eq 'unknown' || $tv->{verdict} eq 'error')
+                                         && !$rl_discounted_this_death;
+                    if ($tv->{verdict} eq 'success' && $death_streak_before) {
+                        _upd_pkg($runs, $log, $pkg, { death_streak => 0 });
+                        $reg->{$pkg}{death_streak} = 0;
+                        $death_streak_before = 0;
+                    }
                     my $v = watchdog_verdict({ alive => 0,
                         attempts => effective_attempts($att->{$pkg}, _reg_int($reg->{$pkg}{turn_continuations}) // 0,
                                                         _reg_int($reg->{$pkg}{rate_limit_discounts}) // 0),
                         cap => $t->{cap} });
                     if ($v eq 'relaunch') {
                         my $last = $last_relaunch_at{$pkg};
-                        if (_min_interval_gate($last, $now, $t->{min_relaunch})) {
-                            _log($log, 'relaunch_deferred', { package => $pkg, reason => 'min_interval',
-                                since_last => $now - $last, min_relaunch => $t->{min_relaunch} });
+                        # 03-deaths-are-diagnosable: a package with an active death
+                        # streak backs off geometrically instead of the flat
+                        # min_relaunch floor (spec §2.3/§3 behavior 12) -- ONLY when
+                        # death_streak > 0; a package with no death history is gated
+                        # by the unchanged flat floor exactly as today.
+                        my $use_death_bo = $death_streak_before > 0;
+                        my $min_gap = $use_death_bo ? death_backoff_secs($death_streak_before, $t) : $t->{min_relaunch};
+                        if (_min_interval_gate($last, $now, $min_gap)) {
+                            _log($log, 'relaunch_deferred', { package => $pkg,
+                                reason => ($use_death_bo ? 'death_backoff' : 'min_interval'),
+                                since_last => $now - $last, min_relaunch => $min_gap });
                         } elsif (@live < $t->{max_par}) {
+                            # This tick is genuinely about to attempt a relaunch (or, for
+                            # a death past the cap, escalate INSTEAD of one) -- the one
+                            # point where a death is actually counted.
+                            my $death_exit_status;
+                            if ($is_death_verdict) {
+                                $death_exit_status = _read_exit_status($runs, $pkg, $att->{$pkg});
+                                my $death_streak_new = $death_streak_before + 1;
+                                if ($death_streak_new >= ($t->{death_thresh} // 5)) {
+                                    _upd_pkg($runs, $log, $pkg, { death_streak => $death_streak_new, last_death_at => $now,
+                                        ($death_exit_status ? (last_death_classification => $death_exit_status->{classification}) : ()) });
+                                    $reg->{$pkg}{death_streak} = $death_streak_new;
+                                    _log($log, 'coordinator_death', { package => $pkg, death_streak => $death_streak_new,
+                                        exit_status => ($death_exit_status ? $death_exit_status->{classification} : undef) });
+                                    _log($log, 'watchdog_block', { package => $pkg,
+                                        reason => 'consecutive coordinator deaths past death cap', death_streak => $death_streak_new });
+                                    $status->{$pkg} = _escalate_stuck({ bpdir=>$bpdir, runs=>$runs, log=>$log, bp=>$bp, pkg=>$pkg,
+                                        why=>"$death_streak_new consecutive coordinator deaths (death cap)", now=>$now, reg=>$reg, t=>$t,
+                                        spawn_judge=>$spawn_judge, shutdown=>$shutdown });
+                                    next;
+                                }
+                            }
                             # Continuation bookkeeping is COMPUTED here (the widened
                             # budget has to be known before @args is built) but only
                             # PERSISTED after a successful launch — a relaunch that
@@ -3928,6 +4518,13 @@ sub run {
                             # effective_attempts is pinned and the give-up cap can
                             # never be reached (§3 B7/B8).
                             my %pending_reg;
+                            if ($is_death_verdict) {
+                                $pending_reg{death_streak} = $death_streak_before + 1;
+                                $pending_reg{last_death_at} = $now;
+                                $pending_reg{last_death_classification} = $death_exit_status->{classification} if $death_exit_status;
+                                _log($log, 'coordinator_death', { package => $pkg, death_streak => $pending_reg{death_streak},
+                                    exit_status => ($death_exit_status ? $death_exit_status->{classification} : undef) });
+                            }
                             my $reg_rollback;      # in-memory max_turns to restore on failure
                             # Turn-exhaustion fork (only with a free slot: a deferred
                             # relaunch must not widen or count a continuation).
@@ -3943,7 +4540,7 @@ sub run {
                                     my $next = widen_max_turns($current, $initial);
                                     my $tc   = (_reg_int($reg->{$pkg}{turn_continuations}) // 0) + 1;
                                     %pending_reg = (max_turns => $next, turn_continuations => $tc,
-                                                    turn_exhaust_streak => 0);
+                                                    turn_exhaust_streak => 0, death_streak => 0);
                                     $reg_rollback = $current;
                                     # the widened budget must ride @args below, so the
                                     # in-memory mirror is set now and rolled back if the
@@ -4033,10 +4630,54 @@ sub run {
                             # correct for a genuine crash and actively harmful here. b41's
                             # cache-warmth verdict answers "can we resume cheaply?"; this
                             # answers "should we resume at all?" and overrides it ONLY on
-                            # max_turns. An unknown/unparseable exit reason must never force
-                            # cold -- that would invent new uncertainty this package doesn't
-                            # own (b41's verdict stands untouched for success/error/unknown).
+                            # max_turns and (below) a breached context-growth ceiling. An
+                            # unknown/unparseable exit reason must never force cold -- that
+                            # would invent new uncertainty this package doesn't own (b41's
+                            # verdict stands untouched for success/error/unknown).
                             $mode = 'cold' if $tv->{verdict} eq 'max_turns';
+                            # b-fca/pkg02 FOLLOW-UP FIX: a coordinator that self-checkpointed
+                            # on context growth exits cleanly (subtype 'success', structurally
+                            # indistinguishable from an ordinary clean turn-end) and does so
+                            # almost immediately -- exactly the shape b41's cache-warmth
+                            # verdict calls warm. --resume then restores the FULL accumulated
+                            # context, defeating the entire point of checkpointing. The
+                            # coordinator writes no signal file for this (by the checkpoint's
+                            # own design -- see coordinator-protocol/SKILL.md), so this
+                            # re-derives the SAME ceiling check from the transcript directly,
+                            # reusing the pure functions b-fca/pkg02 built but never wired to
+                            # any caller: if the last coordinator-owned usage record was at or
+                            # over the ceiling, force cold, exactly like the max_turns override.
+                            # Only bothers reading the tail when the generic verdict already
+                            # said warm -- an already-cold relaunch needs no second check.
+                            # coordinator-context-discipline/02 spec §2.6: checks the SOFT
+                            # tier, not hard. Soft SUBSUMES hard (any usage >= hard is also
+                            # >= soft), so the flush's own cold-relaunch guarantee holds by
+                            # construction, with no second check and no second code path.
+                            my $ctx_forced_cold = 0;
+                            my $ctx_forced_tier;
+                            if ($mode eq 'warm') {
+                                my $usage = eval { last_coordinator_usage(_tail_jsonl_objs("$runs/$pkg.jsonl")) };
+                                if (defined $usage && context_growth_ceiling_breached($usage, $t)) {
+                                    $mode = 'cold';
+                                    $ctx_forced_cold = 1;
+                                    $ctx_forced_tier = context_ceiling_tier($usage, $t);
+                                }
+                            }
+                            # spec §2.6's table: ctx_flush_overrun is gated ONLY on the
+                            # overrun log existing and being non-empty, not on whether
+                            # THIS relaunch happened to be ceiling-forced (Review M-6) --
+                            # a coordinator that overran its flush and then died of
+                            # max_turns or a crash still deserves visibility.
+                            my $ctx_flush_overrun_lines;
+                            my $overrun_log = "$runs/$pkg.ctx-flush-overrun.log";
+                            if (-s $overrun_log) {
+                                my $n = 0;
+                                if (open my $fh, '<', $overrun_log) {
+                                    $n++ while <$fh>;
+                                    close $fh;
+                                }
+                                $ctx_flush_overrun_lines = $n if $n > 0;
+                            }
                             my @args = ($mode eq 'warm') ? ('--resume-session', $sid->{$pkg}) : ();
                             # The widened budget rides on the relaunch. Only ever set
                             # after a continuation, so an ordinary run's @cmd is
@@ -4044,8 +4685,24 @@ sub run {
                             # ledger fallback when no --max-turns is passed).
                             my $budget = _reg_int($reg->{$pkg}{max_turns});
                             push @args, '--max-turns', $budget if defined $budget;
+                            # b6bf: attach forensic evidence ONLY for the anonymous
+                            # deaths. A clean `success` or a `max_turns` exhaustion
+                            # already says what happened; adding a tail to those
+                            # would put noise on every ordinary relaunch and bury
+                            # the 436 that carry no information at all.
+                            my $death = ($tv->{verdict} eq 'unknown')
+                                      ? coordinator_death_evidence($runs, $pkg) : undef;
                             _log($log, 'watchdog_relaunch', { package => $pkg, mode => $mode, age_min => $age,
-                                attempts => $att->{$pkg}, exit_reason => $tv->{verdict} });
+                                attempts => $att->{$pkg}, exit_reason => $tv->{verdict},
+                                ($ctx_forced_cold ? (ctx_ceiling_forced_cold => 1) : ()),
+                                ($ctx_forced_cold ? (ctx_ceiling_tier => $ctx_forced_tier) : ()),
+                                (defined $ctx_flush_overrun_lines ? (ctx_flush_overrun => $ctx_flush_overrun_lines) : ()),
+                                ($death ? (death_evidence => $death) : ()),
+                                ($death_exit_status ? (
+                                    exit_status  => $death_exit_status->{classification},
+                                    exit_code    => $death_exit_status->{exit_code},
+                                    signal_name  => $death_exit_status->{signal_name},
+                                ) : ()) });
                             my $snap = launch_snapshot($bpdir, $runs, $pkg, $now);
                             my $rc = $launch->({ pkg => $pkg, args => \@args, kind => $mode });
                             $note_exec->($pkg, $rc);
@@ -4199,7 +4856,7 @@ sub run {
 
             # ---- RECONCILE ORPHANED ESCALATIONS ----
             # A coordinator can end a package blocked/parked in its OWN ledger
-            # (gate-stop.sh permits a terminal stop) without the orchestrator's
+            # (stop-gate.sh permits a terminal stop) without the orchestrator's
             # escalation path ever running — so no needs-you decision is filed and
             # the reporter's watcher stays silent. Enforce the invariant "every
             # awaiting-human package has a decision the human can act on" so the run
@@ -4478,9 +5135,16 @@ sub run {
     {
         my $lifecycle = "$DIR/bp-lifecycle.pl";
         if (-f $lifecycle) {
+            # --data-dir: see lifecycle_data_dir()'s header comment (bug
+            # report 20260922-214319-9389) -- without it, bp-lifecycle.pl
+            # guesses its own data root from cwd, which can defeat the
+            # solo-driver claim check. Skip the flag only when the root
+            # cannot be determined, so behaviour there is unchanged.
+            my $ldd = lifecycle_data_dir($bpdir);
+            my @data_dir_arg = (defined $ldd && length $ldd) ? ('--data-dir', $ldd) : ();
             my $rc = eval {
                 system($^X, $lifecycle, 'reconcile', '--blueprint', $bpdir,
-                       '--no-archive', '--quiet');
+                       @data_dir_arg, '--no-archive', '--quiet');
             };
             _log($log, 'lifecycle_reconcile', {
                 ok  => (!$@ && defined $rc && $rc == 0) ? 1 : 0,
@@ -4882,7 +5546,7 @@ sub remediation_step {
 
 sub _block_and_queue {
     # fixbatch step7 / reviewer SHOULD-FIX 2: NOT converted to a hashref -- see
-    # fixbatch-step7.md. t/115-escalation-categories.t (immutable, MUST STAY
+    # fixbatch-step7.md. t/escalation-categories.t (immutable, MUST STAY
     # GREEN) calls this sub directly with the current 9/10-positional-arg
     # signature at 4 sites (D1/D2/D3/E3), including deliberately testing the
     # "old 9-arg call" (no category) refusal shape by arity. A hashref-only
@@ -5306,6 +5970,34 @@ unless (caller) {
         }
         my $tv = BpOrch::terminal_verdict(BpOrch::_last_jsonl_obj("$bpdir/runs", $pkg));
         print "$tv->{verdict}\n";
+        exit 0;
+    }
+    if (@ARGV && $ARGV[0] eq '--ctx-usage') {
+        # coordinator-context-discipline/02 spec §2.7: one CLI seam so both new
+        # hooks get the measurement and both ceilings from the SAME code the
+        # orchestrator itself uses, in ONE bounded tail-read.
+        shift @ARGV;
+        my ($bpdir, $pkg) = @ARGV;
+        unless (defined $bpdir && length $bpdir && defined $pkg && length $pkg) {
+            print STDERR "usage: bp-orchestrator.pl --ctx-usage <bp-dir> <pkg>\n";
+            exit 2;
+        }
+        my $t = BpOrch::_tunables_base();
+        my $tokens;
+        my $tier = 'unknown';
+        eval {
+            my $usage = BpOrch::last_coordinator_usage(BpOrch::_tail_jsonl_objs("$bpdir/runs/$pkg.jsonl"));
+            if (defined $usage) {
+                $tokens = BpOrch::context_tokens_from_usage($usage);
+                $tier = BpOrch::context_ceiling_tier($usage, $t);
+            }
+            1;
+        };
+        my $tokens_line = (defined $tokens) ? $tokens : 'unknown';
+        print "context_tokens: $tokens_line\n";
+        print "ceiling_soft: $t->{ctx_ceiling_soft}\n";
+        print "ceiling_hard: $t->{ctx_ceiling_hard}\n";
+        print "tier: $tier\n";
         exit 0;
     }
     my $bp = shift @ARGV;

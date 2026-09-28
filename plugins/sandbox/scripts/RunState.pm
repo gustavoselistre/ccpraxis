@@ -440,6 +440,24 @@ sub _count_decisions_split {
     for my $f (readdir $dh) {
         next if $f =~ /^\./;
         next if $f =~ /\.tmp$/;
+        # A QUEUE RECORD IS A .json FILE. Everything that WRITES or REMOVES one
+        # already agrees on that -- bp-answer-decision.pl's clear_pkg_decisions
+        # and sweep_settled, and bp-orchestrator.pl's queued_decision_pkgs, all
+        # filter /\.json$/. This counter did not, and the gap had a name: a
+        # zero-byte `<id>.json.lock` left behind after its record was answered
+        # and unlinked. No cleanup path can see it, and every filter here let it
+        # through -- not a dotfile, does not end in .tmp, is a file. It then read
+        # as unparseable, which decision_live deliberately treats as LIVE and
+        # decision_operator_owned deliberately treats as the OPERATOR'S, both
+        # being the right answer for a truncated RECORD and the wrong one for a
+        # stray lock. The panel reported "needs you: 1 decision waiting" against
+        # an empty queue, permanently (almanac 20260916-103055-7f5e, and the
+        # unexplained item 4 of 20260915-230820-d33e).
+        #
+        # The fail-safe below is untouched on purpose: an unreadable .json still
+        # counts as live. This narrows WHAT IS A RECORD, not what an unreadable
+        # record means.
+        next unless $f =~ /\.json$/;
         next unless -f "$dir/$f";
         my $rec;
         if (defined $blueprint_dir) {

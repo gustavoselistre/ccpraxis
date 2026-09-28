@@ -36,6 +36,12 @@ use Cwd qw(getcwd abs_path);
 use IO::Handle;
 use Encode qw(decode encode);
 use JSON::PP ();
+use File::Basename qw(dirname);
+
+my $BP_SCRIPT_DIR = dirname(File::Spec->rel2abs(__FILE__));
+# Guarded on the module, not the path.
+require "$BP_SCRIPT_DIR/BpSession.pm"
+    unless grep { m{(?:^|/)BpSession\.pm$} } keys %INC;
 
 # ---------------------------------------------------------------------------
 # Usage / help
@@ -45,32 +51,18 @@ sub _usage {
     return <<'EOF';
 bp-feedback.pl [options] [--] [text ...]
 
-  --source <token>     override the source token (default "chat", or
-                       "transcript" when --from-session supplied the body)
-  --from-session <id>  take the body from that session's transcript instead of
-                       argv/stdin, so the operator's bytes are never retyped by
-                       an agent. Pair with --command to lift the exact
-                       <command-args> payload of a slash-command invocation.
-  --command <name>     with --from-session: the slash command whose arguments
-                       are the feedback (e.g. butler:feedback). Without it, the
-                       last plainly-typed user message is used.
+  --source <token>     override the source token (default "chat", or "transcript" when --from-session supplied the body)
+  --from-session <id>  take the body from that session's transcript instead of argv/stdin, so the operator's bytes are never retyped by an agent. Pair with --command to lift the exact <command-args> payload of a slash-command invocation.
+  --command <name>     with --from-session: the slash command whose arguments are the feedback (e.g. butler:feedback). Without it, the last plainly-typed user message is used.
   --blueprint <name>   record this blueprint name; overrides detection
   --batch <name>       target batch directory name
-                       (default: the newest OPEN batch, i.e. one with no
-                        DECOMPOSED.md; if the newest batch is closed, or
-                        there are none, a new batch-<max+1> is created and
-                        used)
+                       (default: the newest OPEN batch, i.e. one with no DECOMPOSED.md; if the newest batch is closed, or there are none, a new batch-<max+1> is created and used)
   --data-dir <path>    override <data> resolution
   -h, --help           print usage to STDOUT and exit 0
 
-Reads the feedback body from the positional arguments if any are given,
-otherwise from stdin (read to EOF, in binary). Captures verbatim, byte for
-byte; interprets nothing.
+Reads the feedback body from the positional arguments if any are given, otherwise from stdin (read to EOF, in binary). Captures verbatim, byte for byte; interprets nothing.
 
-When piping into this tool, prefer `set -o pipefail` in the calling shell: a
-producer that dies mid-pipe closes stdin early, which this tool cannot
-distinguish from a short, complete message, and pipefail is what surfaces
-the producer's own exit code to the caller.
+When piping into this tool, prefer `set -o pipefail` in the calling shell: a producer that dies mid-pipe closes stdin early, which this tool cannot distinguish from a short, complete message, and pipefail is what surfaces the producer's own exit code to the caller.
 EOF
 }
 
@@ -252,56 +244,13 @@ $opt_source = 'transcript' if defined $from_session && !$source_explicit;
 # exact failure this route exists to prevent.
 # ---------------------------------------------------------------------------
 
-# Candidate roots holding <project>/<session>.jsonl, most explicit first.
-# Cheap and non-fatal by design: a missing root is skipped, never an error,
-# because the caller can still fall back to argv.
-sub _transcript_roots {
-    my ($data_dir_override) = @_;
-    my @roots;
-
-    push @roots, File::Spec->catdir($ENV{CLAUDE_CONFIG_DIR}, 'projects')
-        if defined $ENV{CLAUDE_CONFIG_DIR} && length $ENV{CLAUDE_CONFIG_DIR};
-    for my $home (grep { defined && length } ($ENV{HOME}, $ENV{USERPROFILE})) {
-        push @roots, File::Spec->catdir($home, '.claude', 'projects');
-    }
-    # In a sandbox the container's ~/.claude/projects IS the bind-mounted
-    # claude-home, so the HOME entry above already covers it; this handles the
-    # host-side view of the same tree (reading a container session's transcript
-    # from outside), which HOME does not reach.
-    for my $d (grep { defined && length } ($data_dir_override, $ENV{CCPRAXIS_DATA_DIR})) {
-        push @roots, File::Spec->catdir($d, 'claude-home', 'projects');
-    }
-    {
-        my $dir = getcwd();
-        while (1) {
-            push @roots, File::Spec->catdir($dir, '.ccpraxis-local-data', 'claude-home', 'projects');
-            my $parent = abs_path(File::Spec->catdir($dir, File::Spec->updir));
-            last if !defined $parent || $parent eq $dir;
-            $dir = $parent;
-        }
-    }
-
-    my (@out, %seen);
-    for my $r (@roots) {
-        next if $seen{$r}++;
-        push @out, $r if -d $r;
-    }
-    return @out;
-}
-
-sub _find_transcript {
-    my ($session_id, $data_dir_override) = @_;
-    for my $root (_transcript_roots($data_dir_override)) {
-        opendir(my $dh, $root) or next;
-        my @projects = grep { $_ ne '.' && $_ ne '..' } readdir $dh;
-        closedir $dh;
-        for my $p (@projects) {
-            my $cand = File::Spec->catfile($root, $p, "$session_id.jsonl");
-            return $cand if -f $cand;
-        }
-    }
-    return undef;
-}
+# Transcript discovery lives in BpSession.pm — the search-roots list (sandbox
+# bind, host-side view of a container's claude-home, CLAUDE_CONFIG_DIR, the walk
+# up for .ccpraxis-local-data) was written here first and is now shared, because
+# a second consumer arrived and two copies of that list would drift silently.
+# These stay as named wrappers so the call sites below read unchanged.
+sub _transcript_roots { return BpSession::transcript_roots(@_) }
+sub _find_transcript  { return BpSession::find_transcript(@_) }
 
 # Returns ($bytes, $route) or (undef, undef). $bytes are UTF-8 ENCODED bytes:
 # JSON::PP hands back character strings, and everything downstream of here
@@ -494,13 +443,15 @@ sub _resolve_data_dir {
         }
     }
 
-    my $dir = getcwd();
-    while (1) {
-        my $candidate = File::Spec->catdir($dir, '.ccpraxis-local-data');
-        return $candidate if -d $candidate;
-        my $parent = abs_path(File::Spec->catdir($dir, File::Spec->updir));
-        last if !defined $parent || $parent eq $dir;
-        $dir = $parent;
+    # bounded walk-up (package 03, Decision 3): never ascend out of temp, and
+    # never adopt home unless the cwd IS home.
+    my $found = eval {
+        require "$BP_SCRIPT_DIR/BpProjectRoot.pm"
+            unless grep { m{(?:^|/)BpProjectRoot\.pm$} } keys %INC;
+        BpProjectRoot::bounded_walkup(getcwd());
+    };
+    if (defined $found) {
+        return File::Spec->catdir($found, '.ccpraxis-local-data');
     }
 
     _fail(4, '[cannot locate <data>]: tried CCPRAXIS_DATA_DIR > git toplevel > '

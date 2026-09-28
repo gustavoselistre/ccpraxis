@@ -31,7 +31,7 @@ use strict;
 use warnings;
 use Getopt::Long qw(GetOptionsFromArray);
 use Fcntl qw(:flock);
-use File::Basename qw(dirname);
+use File::Basename qw(dirname basename);
 use Cwd qw(abs_path);
 
 # abs_path, NOT bare dirname(__FILE__): invoked as `perl plugins/butler/scripts/bp-blueprint.pl`
@@ -59,7 +59,7 @@ require "$DIR/bp-validate-dag.pl";
 # /butler:status -- never via this script's write verbs. The seven-glyph
 # vocabulary that used to live here (and its legend/help/normalize machinery) is
 # retired along with the table column; `dropped` remains a live LEDGER status
-# (bp-drive-next.pl, bp-orchestrator.pl, ledger-guard.sh, gate-stop.sh,
+# (bp-drive-next.pl, bp-orchestrator.pl, ledger-guard.sh, stop-gate.sh,
 # bp-ledger.pl all still enforce it there -- none of those files are touched by
 # this retirement).
 # =====================================================================================
@@ -378,11 +378,105 @@ sub split_dep_tokens {
     my @out; my %seen;
     for my $t (split /[,\s]+/, (defined $raw ? $raw : '')) {
         next unless length $t;
-        next unless $t =~ $DEP_TOK_RE;
+        # package 30 (spec §2.4): keep every token containing '/' too --
+        # well-formed or not; validation happens later, per token, in the
+        # caller. Other shapes ('—', punctuation) are still silently dropped.
+        next unless $t =~ $DEP_TOK_RE || $t =~ m{/};
         next if $seen{$t}++;
         push @out, $t;
     }
     return @out;
+}
+
+# _own_bp_and_base($file) -> ($own_bp, $bp_base) (spec §2.4).
+sub _own_bp_and_base {
+    my ($file) = @_;
+    my $own_bp  = basename(dirname($file));
+    my $bp_base = dirname(dirname($file));
+    return ($own_bp, $bp_base);
+}
+
+# _resolve_cross_token($tok, $own_bp, $bp_base) -> ($canon, undef) |
+# (undef, $reason) (spec §2.4). Validates a single '<bp>/<pkg>' token in
+# order: malformed -> self-blueprint -> unknown blueprint (checked via an
+# exact, case-sensitive readdir of $bp_base then $bp_base/_archive, never
+# -f, so a case-insensitive filesystem cannot pass a case mismatch) ->
+# unresolvable package (via the REAL BpOrch::resolve_dep_token against the
+# REFERENT blueprint's own BpOrch::parse_dag keys).
+sub _resolve_cross_token {
+    my ($tok, $own_bp, $bp_base) = @_;
+    my ($bp, $pkg) = ($tok =~ m{^([A-Za-z0-9][A-Za-z0-9_.-]*)/([A-Za-z0-9][A-Za-z0-9_.-]*)$});
+    return (undef, 'malformed') unless defined $bp;
+    return (undef, 'names this blueprint') if $bp eq $own_bp;
+
+    my $bpdir;
+    for my $root ($bp_base, "$bp_base/_archive") {
+        next unless opendir(my $dh, $root);
+        my @entries = readdir $dh;
+        closedir $dh;
+        if (grep { $_ eq $bp } @entries) {
+            my $cand = "$root/$bp";
+            if (-f "$cand/blueprint.md") { $bpdir = $cand; last; }
+        }
+    }
+    unless (defined $bpdir) {
+        return (undef, "no blueprint '$bp' under $bp_base (or its _archive/)");
+    }
+
+    my $ref_md  = _slurp("$bpdir/blueprint.md");
+    my $ref_dag = BpOrch::parse_dag(defined $ref_md ? $ref_md : '');
+    my ($how, $name) = BpOrch::resolve_dep_token($pkg, $ref_dag);
+    unless ($how eq 'exact' || $how eq 'normalized') {
+        return (undef, "package '$pkg' does not resolve in blueprint '$bp'");
+    }
+    return ("$bp/$name", undef);
+}
+
+# resolve_deps_mixed(\@tokens, $names, $own_bp, $bp_base) -> (\@canon, \@bad)
+# (spec §2.4). Local tokens resolve exactly as before (resolve_deps);
+# cross tokens ('/'-bearing) resolve via _resolve_cross_token. Canonical
+# tokens are kept in INPUT ORDER, local and cross interleaved, deduped
+# (first occurrence wins). @bad holds { tok, reason } in encounter order;
+# reason is 'local' for an unresolved local token (keeps the existing
+# aggregate message), else the specific cross-token refusal text.
+sub resolve_deps_mixed {
+    my ($tokens, $names, $own_bp, $bp_base) = @_;
+    my (@canon, @bad, %seen);
+    for my $tok (@$tokens) {
+        if ($tok =~ m{/}) {
+            my ($canon_tok, $reason) = _resolve_cross_token($tok, $own_bp, $bp_base);
+            if (defined $canon_tok) {
+                next if $seen{$canon_tok}++;
+                push @canon, $canon_tok;
+            } else {
+                push @bad, { tok => $tok, reason => $reason };
+            }
+        } else {
+            my ($how, $name) = BpOrch::resolve_dep_token($tok, $names);
+            if ($how eq 'exact' || $how eq 'normalized') {
+                next if $seen{$name}++;
+                push @canon, $name;
+            } else {
+                push @bad, { tok => $tok, reason => 'local' };
+            }
+        }
+    }
+    return (\@canon, \@bad);
+}
+
+# _deps_bad_message(\@bad) -> $msg. Keeps the existing local-only message
+# byte-identical (spec §2.4: "unchanged"); a cross-token failure appends
+# '<tok>: <reason>' entries, each of which names the offending token.
+sub _deps_bad_message {
+    my ($bad) = @_;
+    my @local_bad = map { $_->{tok} } grep { $_->{reason} eq 'local' } @$bad;
+    my @cross_bad = grep { $_->{reason} ne 'local' } @$bad;
+    my @parts;
+    push @parts, '--deps names package id(s) that do not resolve: ' . join(', ', @local_bad)
+        if @local_bad;
+    push @parts, join('; ', map { "'$_->{tok}': $_->{reason}" } @cross_bad)
+        if @cross_bad;
+    return join(' | ', @parts);
 }
 
 # Resolve every token in @tokens against the REAL resolver (BpOrch::resolve_dep_token,
@@ -781,8 +875,9 @@ sub op_add_package {
 
         my $dag = BpOrch::parse_dag($orig);
         my @tokens = defined $opt{deps} ? split_dep_tokens($opt{deps}) : ();
-        my ($canon, $bad) = resolve_deps(\@tokens, $dag);
-        return (undef, "--deps names package id(s) that do not resolve: " . join(', ', @$bad)) if @$bad;
+        my ($own_bp, $bp_base) = _own_bp_and_base($opt{file});
+        my ($canon, $bad) = resolve_deps_mixed(\@tokens, $dag, $own_bp, $bp_base);
+        return (undef, _deps_bad_message($bad)) if @$bad;
 
         my %fields = (
             pkg         => $pkg,
@@ -842,8 +937,9 @@ sub op_set_deps {
         my $dag = BpOrch::parse_dag($orig);
         delete $dag->{$pkg};   # a package cannot depend on itself
         my @tokens = split_dep_tokens($opt{deps});
-        my ($canon, $bad) = resolve_deps(\@tokens, $dag);
-        return (undef, "--deps names package id(s) that do not resolve: " . join(', ', @$bad)) if @$bad;
+        my ($own_bp, $bp_base) = _own_bp_and_base($opt{file});
+        my ($canon, $bad) = resolve_deps_mixed(\@tokens, $dag, $own_bp, $bp_base);
+        return (undef, _deps_bad_message($bad)) if @$bad;
 
         my @lines = @{ $tbl->{lines} };
         my $ncols = scalar @{ $tbl->{cols} };
@@ -1209,6 +1305,69 @@ sub op_set_decision {
     });
 }
 
+# -------------------------------------------------------------------------------------
+# op_set_title — rewrite the document's H1 title (line 1: `# <text>`).
+#
+# No existing verb owns this region (04-blueprint-title-verb spec §1): `set-meta` only
+# rewrites `key: value` lines inside the fenced metadata block, and `set-section`
+# explicitly refuses structural sections and operates on `##` headings, not the H1.
+# Fence-aware (spec §2.2): both real blueprints carry single-`#`-prefixed COMMENT lines
+# (e.g. `# worker_backend: claude`) inside the fenced metadata block, which a naive `^#`
+# scan would miscount as extra H1 candidates and refuse on every real invocation.
+# Refuse-rather-than-guess on no H1 / H1 not on line 1 / more than one candidate --
+# matching this script's existing posture (add-package refuses a missing depends_on
+# table rather than inventing one; set-section refuses a missing `## ` heading the same
+# way). Always normalises to a single space after `#` (spec §2.3), so idempotence falls
+# out of run_write's own `$new eq $orig` no-op branch -- no second check is added here.
+# -------------------------------------------------------------------------------------
+sub op_set_title {
+    my @args = @_;
+    my %opt;
+    my $ok;
+    { local $SIG{__WARN__} = sub { };
+      $ok = GetOptionsFromArray(\@args, \%opt, 'file=s', 'title=s'); }
+    arg_error('set-title', 'unrecognised option') unless $ok;
+    arg_error('set-title', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
+    for my $r (qw(file title)) {
+        arg_error('set-title', "missing required --$r") unless defined $opt{$r};
+    }
+    unless (field_safe($opt{title})) {
+        arg_error('set-title', '--title contains a pipe or newline');
+    }
+
+    run_write('set-title', $opt{file}, sub {
+        my ($orig) = @_;
+        my @lines = split /\n/, $orig, -1;
+
+        my $in_fence = 0;
+        my @candidates;
+        for my $i (0 .. $#lines) {
+            if ($lines[$i] =~ /^```/) { $in_fence = !$in_fence; next }
+            next if $in_fence;
+            push @candidates, $i if $lines[$i] =~ /^#(?!#)[ \t]+\S/;
+        }
+
+        if (!@candidates) {
+            return (undef, "no H1 (a single '# ' heading) found outside any fenced block in $opt{file} -- "
+                         . "refusing to invent one; the template places it on line 1.");
+        }
+        if (@candidates > 1) {
+            my $n = scalar @candidates;
+            my @onebased = map { $_ + 1 } @candidates;
+            return (undef, "$n '# ' headings found outside fenced blocks (lines " . join(', ', @onebased) . ') '
+                         . '-- refusing to guess which is the title.');
+        }
+        if ($candidates[0] != 0) {
+            my $n1 = $candidates[0] + 1;
+            return (undef, "the only '# ' heading found is on line $n1, not line 1 -- refusing to guess this "
+                         . "is the blueprint's title; move it to line 1, or this is not the H1.");
+        }
+
+        $lines[0] = '# ' . $opt{title};
+        return (join("\n", @lines), undef);
+    });
+}
+
 sub op_set_field {
     my @args = @_;
     my %opt;
@@ -1310,7 +1469,22 @@ sub op_deps {
     my $B = _read_or_die('deps', $opt{file});
     my $dag = BpOrch::parse_dag($B);
     notfound_error('deps', "no such package '$opt{pkg}' in the table") unless exists $dag->{ $opt{pkg} };
-    print "$_\n" for @{ $dag->{ $opt{pkg} } };
+
+    # package 30 (spec §2.4): print tokens verbatim, in CELL ORDER, including
+    # cross tokens -- BpOrch::parse_dag itself still drops them (§5, "other
+    # readers"), so the existence check above uses it but the printed list
+    # does not.
+    my @tokens;
+    my $tbl = locate_table($B);
+    if ($tbl) {
+        my $ci = col_index($tbl, 'depends_on');
+        my $ri = defined $ci ? find_row_index($tbl, $opt{pkg}) : undef;
+        if (defined $ci && defined $ri) {
+            my @c = _table_cols($tbl->{lines}[$ri]);
+            @tokens = split_dep_tokens($c[$ci] // '');
+        }
+    }
+    print "$_\n" for @tokens;
     exit 0;
 }
 
@@ -1414,6 +1588,7 @@ my %DISPATCH = (
     'set-decision' => \&op_set_decision,
     'add-harvest'  => \&op_add_harvest,
     'set-field'    => \&op_set_field,
+    'set-title'    => \&op_set_title,
     'show'         => \&op_show,
     'deps'         => \&op_deps,
     'status'       => \&op_status,

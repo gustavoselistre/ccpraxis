@@ -109,7 +109,7 @@ use Encode ();   # core; used only for UTF-8 encoding of declared glyphs
 #     load. All token DATA tables (roles, glyphs) live inside memoized
 #     builder functions rather than as top-level literals. NOTE (reviewer
 #     S3, package 02-design-tokens): this shape is NOT forced by any
-#     t/64-theme-tokens.t source scan -- B-A2 scans the whole file (not
+#     t/theme-tokens.t source scan -- B-A2 scans the whole file (not
 #     scoped to top-level-only) for spawn/I/O constructs and use/require
 #     targets, none of which a plain top-level hash literal would trip;
 #     B-A3's top-level-only scan forbids just a reference to the process
@@ -464,7 +464,7 @@ sub accent_lightness_band {
 # the block comment beside them for why that number is what it is.
 #
 # NO EMOJI: every codepoint below was checked against the emoji-range test
-# in t/64-theme-tokens.t's own detector (mirroring spec §2.6.1) and none
+# in t/theme-tokens.t's own detector (mirroring spec §2.6.1) and none
 # match. The Miscellaneous Symbols and Dingbats blocks in particular are
 # off-limits to this design system.
 # =============================================================================
@@ -500,7 +500,20 @@ sub _glyphs_data {
         # a glyph that surface emits without an entry here is exactly what that
         # guard exists to catch. East-Asian-ambiguous, declared as one column.
         'icon.blueprints' => { cp => 0x29C9, desc => 'two joined squares, blueprint count' },
-        'icon.todos'      => { cp => 0x22EE, desc => 'vertical ellipsis, todo count' },
+        'icon.todos'      => { cp => 0x274F, desc => 'lower right drop-shadowed white square, todo count' },
+        # The almanac counters and the continuity badge (hook-continuity-remake
+        # package 10). Declared here for the same reason as the two icons
+        # above: statusline.pl emits them and AC-S5 checks its width table
+        # against this one. U+2630 is East-Asian-Wide, so it is the one
+        # declared at two columns. None is an emoji: the no-emoji oracle
+        # intersects its block list with \p{Emoji}, which U+2630/U+2691 fail.
+        'icon.notes'      => { cp => 0x2630, desc => 'trigram for heaven, note count', width => 2 },
+        'icon.tasklist'   => { cp => 0x25A3, desc => 'square containing a small filled square, tasklist count and focus row' },
+        'icon.decisions'  => { cp => 0x2691, desc => 'black flag, pending-decision count' },
+        # The Decision 7 badge. 'agentoff' has no hyphen because glyph names
+        # are dot-separated lowercase alphanumerics (Decision 119).
+        'badge.silenced'  => { cp => 0x2016, desc => 'double vertical line, this session is silenced' },
+        'badge.agentoff'  => { cp => 0x2205, desc => 'empty set, an agent disarmed this session' },
         # THE GAUGE IS NOT A FULL-HEIGHT BLOCK (operator, 2026-08-26: "I want a
         # different usage bar foreground styling. Different colors and also
         # different character. Maybe doesn't need to be a solid block, could be
@@ -604,7 +617,7 @@ sub _glyphs_data {
         # t03-activity-column: the truncation marker for a row that wrapped
         # past its cap. Declared HERE rather than written into tui/Frame.pm
         # because that module is held to an ASCII-only source rule
-        # (t/65-tui-render-library.t AC-T2: no byte >= 0x80 and no \x{...}
+        # (t/tui-render-library.t AC-T2: no byte >= 0x80 and no \x{...}
         # escape >= 0x80), and this table's chr($cp) construction is the
         # mechanism that rule exists to funnel every glyph through.
         'ellipsis'    => { cp => 0x2026, desc => 'horizontal ellipsis -- a row was truncated past its wrap cap' },
@@ -1096,7 +1109,7 @@ sub _reset_capability_memo {
 # THE GENERATED BLOCK (spec §2.7) -- the statusline drift guard's canonical
 # output. Package 10 embeds generated_block()'s exact text, between the two
 # marker lines generated_markers() returns, into scripts/statusline.pl; the
-# guard in t/64-theme-tokens.t regenerates this payload in memory and
+# guard in t/theme-tokens.t regenerates this payload in memory and
 # compares it byte-for-byte against what is on disk.
 # =============================================================================
 
@@ -1109,7 +1122,8 @@ sub generated_markers {
 
 # generated_block() -- deterministic, LF-only, byte-exact payload per spec
 # §2.7.2's grammar. Every role in roles() appears in all three hashes, in
-# sort (ASCII-betical) order of role name.
+# sort (ASCII-betical) order of role name. A fourth hash, %THEME_BG, follows
+# with exactly the roles that declare a background.
 sub generated_block {
     my $roles_data = _roles_data();
     my @sorted     = sort keys %$roles_data;
@@ -1133,6 +1147,16 @@ sub generated_block {
     $s .= "my \%THEME_ATTR = (\n";
     for my $role (@sorted) {
         $s .= "  '$role' => '$roles_data->{$role}{attr}',\n";
+    }
+    $s .= ");\n";
+
+    # %THEME_BG (hook-continuity-remake package 10): ONLY the roles whose
+    # record declares a background, with %THEME_RGB's line grammar. Appended
+    # after %THEME_ATTR so the three existing hashes keep their bytes.
+    $s .= "my \%THEME_BG = (\n";
+    for my $role (grep { ref($roles_data->{$_}{bg}) eq 'ARRAY' } @sorted) {
+        my ($r, $g, $b) = @{ $roles_data->{$role}{bg} };
+        $s .= "  '$role' => [$r,$g,$b],\n";
     }
     $s .= ");\n";
 

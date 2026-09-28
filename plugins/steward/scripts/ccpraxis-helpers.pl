@@ -21,6 +21,10 @@
 #                           where the user's saved backup preferences, or a
 #                           --skip-key flag, say to leave the repo side alone.
 #                           Writes result to repo path atomically.
+#   claude-internals       — Read-only check that the installed claude binary
+#                           still contains the undocumented internals our
+#                           settings rely on. Dispatches to the sibling
+#                           claude-internals-check.pl and mirrors its exit code.
 #   help
 #
 # All output is JSON on stdout. Exit codes:
@@ -738,6 +742,29 @@ sub cmd_settings_export_merge {
     exit 0;
 }
 
+# ─── Subcommand: claude-internals ─────────────────────────────────────────
+# Runs the sibling claude-internals-check.pl as a child process ($^X, never
+# the claude binary). Everything after the subcommand is passed through
+# unchanged. Exits with the child's exit code; the child's stdout/stderr pass
+# through untouched. Adds no JSON of its own.
+sub cmd_claude_internals {
+    # Separators FIRST, then dirname -- __FILE__ can carry backslashes on
+    # Windows. Same shape as BpTurnCaps::script_dir_for; asserted repo-wide by
+    # turn-cap-consistency.t's C9.
+    (my $self = __FILE__) =~ s{\\}{/}g;
+    my $sibling = File::Spec->catfile(dirname($self), 'claude-internals-check.pl');
+    my $rc = system($^X, $sibling, @ARGV);
+    if ($rc == -1) {
+        print STDERR "ccpraxis-helpers.pl: failed to run claude-internals-check.pl: $!\n";
+        exit 2;
+    }
+    if ($rc & 127) {
+        print STDERR "ccpraxis-helpers.pl: claude-internals-check.pl died with signal " . ($rc & 127) . "\n";
+        exit 2;
+    }
+    exit($rc >> 8);
+}
+
 # ─── Help ─────────────────────────────────────────────────────────────────
 
 sub cmd_help {
@@ -745,34 +772,19 @@ sub cmd_help {
 ccpraxis-helpers.pl
 
 Subcommands:
-  sync-skills            Mirror ccpraxis/skills/ to ~/.claude/skills/.
-                         Symlinks on Unix, copies on Windows. Idempotent.
+  sync-skills            Mirror ccpraxis/skills/ to ~/.claude/skills/. Symlinks on Unix, copies on Windows. Idempotent.
 
-  check-claude-md        Report status of live CLAUDE.md vs the repo version.
-                         Possible statuses: linked, equal_content, differs,
-                         symlinked_elsewhere, missing_live, missing_repo.
+  check-claude-md        Report status of live CLAUDE.md vs the repo version. Possible statuses: linked, equal_content, differs, symlinked_elsewhere, missing_live, missing_repo.
 
-  marketplace-diff       Diff live known_marketplaces.json vs repo's
-                         global-config/known_marketplaces.json. Strips
-                         installLocation from each entry before comparing.
+  marketplace-diff       Diff live known_marketplaces.json vs repo's global-config/known_marketplaces.json. Strips installLocation from each entry before comparing.
 
-  settings-export-merge  Merge live settings.json into repo's
-                         global-config/settings.json. Live wins on shared
-                         keys; keys only in repo are preserved. Saved backup
-                         preferences (.backup-preferences.json, live_vs_repo
-                         scope) override that: "keep different" (skip-always)
-                         and "keep repo-only" (right-only) keep the repo's
-                         value; "keep live-only" (left-only) stays out of the
-                         repo entirely.
+  settings-export-merge  Merge live settings.json into repo's global-config/settings.json. Live wins on shared keys; keys only in repo are preserved. Saved backup preferences (.backup-preferences.json, live_vs_repo scope) override that: "keep different" (skip-always) and "keep repo-only" (right-only) keep the repo's value; "keep live-only" (left-only) stays out of the repo entirely.
                          Options:
-                           --skip-key KEY  Leave the repo side of KEY alone for
-                                           this run only (repeatable). Use for
-                                           the user's per-run "Skip" answers.
-                                           Dotted names (env.FOO) address one
-                                           sub-key, matching json-diff.pl.
+                           --skip-key KEY  Leave the repo side of KEY alone for this run only (repeatable). Use for the user's per-run "Skip" answers. Dotted names (env.FOO) address one sub-key, matching json-diff.pl.
 
-All output is JSON on stdout. Exit codes: 0=ok, 1=soft fail, 2=hard fail,
-3=usage error.
+  claude-internals  Read-only check that the installed claude binary still contains the undocumented internals our settings rely on. Options: --binary PATH, --data PATH. Exit 0 all present, 1 changed, 2 could not check.
+
+All output is JSON on stdout. Exit codes: 0=ok, 1=soft fail, 2=hard fail, 3=usage error.
 EOF
     exit 0;
 }
@@ -786,5 +798,6 @@ if    ($sub eq 'sync-skills')           { cmd_sync_skills(); }
 elsif ($sub eq 'check-claude-md')       { cmd_check_claude_md(); }
 elsif ($sub eq 'marketplace-diff')      { cmd_marketplace_diff(); }
 elsif ($sub eq 'settings-export-merge') { cmd_settings_export_merge(); }
+elsif ($sub eq 'claude-internals')      { cmd_claude_internals(); }
 elsif ($sub eq 'help' || $sub eq '--help' || $sub eq '-h') { cmd_help(); }
 else { die_json(3, "Unknown subcommand: $sub"); }

@@ -3,9 +3,10 @@
 #
 # Implements plugins/butler/tests/../specs/b32-worker-backend-dispatcher-spec.md.
 # Invoked by a coordinator via Bash instead of Task when the resolved
-# `worker_backend:` is not `claude`. Re-implements no policy of its own: it
-# sources hooks/lib.sh for the marker/lock/stop-signal primitives and
-# reproduces track-dispatch.sh's and log-dispatch.sh's side effects
+# `worker_backend:` is not `claude`. Re-implements no policy of its own:
+# it inlines the marker/lock/stop-signal paths hooks/track-dispatch.sh (and
+# BpHook::Guards::TrackDispatch) also use -- package 16 spec sec 2.7 --
+# and reproduces track-dispatch.sh's side effects
 # byte-for-byte, because a Bash subprocess dispatch fires no PreToolUse /
 # PostToolUse Task hooks.
 #
@@ -106,13 +107,10 @@ sub usage_text {
 usage: bp-worker.pl --worker <name> --prompt-file <path> [--model <M>]
                      [--turn-budget <N>] [--help]
 
-  --worker <name>       required; one of: implementer, test-writer, ui-prober,
-                        scout, architect, reviewer, redteam (any of the
-                        bp-<name> / butler:bp-<name> spellings also accepted)
+  --worker <name>       required; one of: implementer, test-writer, ui-prober, scout, architect, reviewer, redteam (any of the bp-<name> / butler:bp-<name> spellings also accepted)
   --prompt-file <path>  required; readable file whose contents are the prompt
   --model <M>           optional; passed through to a non-claude backend
-  --turn-budget <N>     optional; materialises a per-dispatch copy of the
-                        OpenCode agent file with `steps:` overridden to N
+  --turn-budget <N>     optional; materialises a per-dispatch copy of the OpenCode agent file with `steps:` overridden to N
   --help                print this message and exit 0
 USAGE
 }
@@ -192,25 +190,25 @@ my $BP_PACKAGE  = $ENV{BP_PACKAGE};
 my $BP_LEDGER   = $ENV{BP_LEDGER};
 
 # ---------------------------------------------------------------------------
-# 3. Source hooks/lib.sh (once) for marker_path / ledger_lock / bp_active_stop_signal.
+# 3. Marker / lock / stop-signal paths (package 16 spec sec 2.7) -- inlined,
+# no hook-script source, no bash -c. These equal the paths
+# BpHook::Guards::TrackDispatch uses for coordinators, so the one-writer
+# rule still spans Task dispatches and bp-worker.pl dispatches.
 # ---------------------------------------------------------------------------
-(my $LIB = "$Bin/../hooks/lib.sh") =~ s{\\}{/}g;
-
-sub sh_fn {
-    my ($fn) = @_;
-    my $o = `bash -c '. "\$1" >/dev/null 2>&1; $fn' bash "$LIB" 2>/dev/null`;
-    $o = '' unless defined $o;
-    chomp $o;
-    return $o;
-}
-
-my $MARKER  = sh_fn('marker_path');
-my $LOCKFILE = sh_fn('ledger_lock');
+my $BP_PACKAGE_OR_PKG = (defined $BP_PACKAGE && length $BP_PACKAGE) ? $BP_PACKAGE : 'pkg';
+my $MARKER   = "$BP_DIR/runs/$BP_PACKAGE_OR_PKG.active-worker";
+my $LOCKFILE = "$BP_DIR/runs/$BP_PACKAGE_OR_PKG.ledger.lock";
 
 # ---------------------------------------------------------------------------
 # 4. Stop-signal gate (§2.11 step 4) -> exit 5, NO marker, checked first.
 # ---------------------------------------------------------------------------
-my $stop = sh_fn('bp_active_stop_signal');
+my $stop = '';
+{
+    my $runs = "$BP_DIR/runs";
+    if (-f "$runs/.shutdown") { $stop = 'shutdown' }
+    elsif (-f "$runs/$BP_PACKAGE_OR_PKG.force-stop") { $stop = 'forcestop' }
+    elsif (-f "$runs/.paused") { $stop = 'paused' }
+}
 if (defined $stop && length $stop) {
     print STDERR "bp-worker.pl: a fleet stop signal ('$stop') is in force; refusing to dispatch $CANON\n";
     exit 5;
@@ -491,9 +489,9 @@ sub _dispatch_tmp_owner_alive {
     my ($pid, $fp) = split(/:/, $line, 2);
     return 0 unless defined $pid && $pid =~ /^\d+$/;
     return 0 unless defined $fp && length $fp;
-    require "$Bin/bp-runstate.pl";
-    return 0 unless BpRunState::pid_alive($pid);
-    my $have = BpRunState::pid_fingerprint($pid);
+    require "$Bin/BpResumption.pm";
+    return 0 unless BpResumption::pid_alive($pid);
+    my $have = BpResumption::pid_fingerprint($pid);
     return (defined $have && $have eq $fp) ? 1 : 0;
 }
 
@@ -521,8 +519,8 @@ sweep_stale_tmp($TMPROOT, $WORKER_TMP_TTL_MIN);
 my $DISPATCH_TMP = "$TMPROOT/$BP_PACKAGE.$SHORT.$ts.$$";
 make_path($DISPATCH_TMP);
 {
-    require "$Bin/bp-runstate.pl";
-    my $owner_fp = BpRunState::pid_fingerprint($$);
+    require "$Bin/BpResumption.pm";
+    my $owner_fp = BpResumption::pid_fingerprint($$);
     if (defined $owner_fp && length $owner_fp) {
         if (open(my $ownfh, '>', "$DISPATCH_TMP/.owner")) {
             print {$ownfh} "$$:$owner_fp\n";

@@ -1,0 +1,123 @@
+#!/usr/bin/env perl
+# platform: any
+# 139 — IMMUTABLE ORACLE for w02's
+# §2.5 edit to plugins/butler/skills/coordinator-protocol/SKILL.md:
+# criterion 6 ("coordination, not a dependency" with e03) is satisfied by
+# documenting the dispatch-log bracket and the interrupt doctrine somewhere
+# a headless coordinator's own Task dispatch can adopt it from, WITHOUT
+# adding a DAG edge and WITHOUT documenting stop-gate.sh here (that
+# gate is drive-solo-scoped by construction — coordinator-protocol's own
+# stop discipline is stop-gate.sh, untouched by this package).
+#
+# Spec: .../specs/w02-dispatch-budget-and-interrupt-spec.md §2.5, §3
+# behavior 15, §4 AC6. AC6 is explicit that "the doctrine text exists and
+# is reusable in principle" is all that is testable — whether e03 actually
+# adopts it is that package's business, not assertable here.
+#
+# Text-only, no execution — same posture as t/135 for drive-solo/SKILL.md.
+# Written against the file's CURRENT (pre-w02) content: B1 is RED today by
+# construction (the file does not mention bp-dispatch-log.pl at all yet).
+# B2/B3 are regression guards that also hold true TODAY (the file mentions
+# neither stop-gate.sh nor duplicates the canonical prompt) — they
+# are not red-before-green assertions, they are invariants meant to hold
+# across the edit, same class as t/137's I1.
+#
+# Runs standalone:
+#   perl this file
+use strict;
+use warnings;
+BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 } # package 16 post-fix-batch (Decision 80): this file names a wake-lock actuator, in prose or a path check, never a real invocation -- the guard is the cheap side of test-wakelock-hygiene.t's deliberate over-matching.
+use FindBin qw($Bin);
+use Test::More;
+
+my $SKILL = "$Bin/../../skills/coordinator-protocol/SKILL.md";
+ok(-f $SKILL, 'A0: coordinator-protocol/SKILL.md exists');
+
+my $content = do {
+    local $/;
+    open my $fh, '<', $SKILL or die "read SKILL.md: $!";
+    <$fh>;
+};
+ok(defined $content && length $content, 'A1: coordinator-protocol/SKILL.md is readable');
+
+# ===========================================================================
+# B1 (behavior 15 / AC6). The per-package worker-dispatch step gains a
+# reference to bp-dispatch-log.pl — available uniformly to a headless
+# coordinator's Task dispatch, not just the interactive driver's Agent
+# dispatch, since both share the same blind spot (§2.5).
+# ===========================================================================
+like($content, qr/bp-dispatch-log\.pl/,
+     'B1 CANONICAL (behavior 15 / AC6): coordinator-protocol/SKILL.md references '
+   . 'bp-dispatch-log.pl — the shared budget/elapsed-time mechanism a coordinator\'s own '
+   . 'Task dispatch can adopt, per criterion 6\'s "coordination, not a dependency"');
+
+# Positioned near the existing worker-dispatch machinery, not bolted on
+# anywhere unrelated in the file. Anchor loosely: from "## Pipeline" (the
+# per-package worker-dispatch steps) through to "## Resumption" (the next
+# unrelated top-level section) — spans "## Pipeline", "## Worker dispatch
+# contract" and its "### Turn caps" subsection, without pinning the exact
+# heading the spec did not itself mandate (spec §2.5 says "at the existing
+# per-package worker-dispatch step", not a literal heading string).
+my ($dispatch_section) = $content =~ /(^## Pipeline\b.*?)(?=^## Resumption\b|\z)/ms;
+$dispatch_section //= '';
+ok(length($dispatch_section), 'B2: the "## Pipeline" .. "## Resumption" span exists '
+                             . '(sanity anchor covering the per-package dispatch machinery)');
+if (length $dispatch_section) {
+    like($dispatch_section, qr/bp-dispatch-log\.pl/,
+         'B3: the reference lands within the per-package worker-dispatch machinery '
+       . '("## Pipeline" through "## Worker dispatch contract"), not merely somewhere '
+       . 'unrelated elsewhere in the file');
+}
+
+# ===========================================================================
+# C (behavior 15, regression guard -- fix-batch F11/review m5). E2's
+# mechanical rename left this block's own comment and description false
+# and self-contradicting: it claimed stop-gate.sh "exits immediately
+# whenever BP_LEDGER is set" (false -- post-cutover, stop-gate.sh's own
+# coordinator branch is what a BP_LEDGER-bearing session's Stop actually
+# runs; see BpHook::StopGate::_coordinator) while also saying "a
+# coordinator's own stop discipline is stop-gate.sh", and the description
+# claimed the regex checks "does NOT mention stop-gate.sh" when the regex
+# it names (gate-drive-loop, the RETIRED predecessor hook, batch E1) can no
+# longer fail either way -- vacuous under its own stated description.
+#
+# What this assertion actually is, and remains: a residue guard (code DEL)
+# that the retired gate-drive-loop hook is never named here again. It is
+# NOT a claim that coordinator-protocol/SKILL.md must avoid "the stop
+# gate" generically -- it legitimately does describe the one shared gate
+# now (see lines mentioning "the stop gate" / "the Stop gate" elsewhere in
+# this file).
+# ===========================================================================
+unlike($content, qr/gate-drive-loop/,
+       'C1 (regression guard, code DEL): coordinator-protocol/SKILL.md does NOT name '
+     . 'the retired gate-drive-loop hook');
+
+# ===========================================================================
+# D (§2.5). The interrupt-and-report doctrine is dispatch-shape-agnostic
+# and documented HERE too, but "by reference ... rather than duplicating
+# the text — one canonical wording, one place it can drift out of sync".
+# So: coordinator-protocol must POINT at drive-solo/SKILL.md for the
+# canonical prompt, and must NOT duplicate the prompt's literal opening
+# line verbatim (duplication is exactly the drift risk the spec names).
+# ===========================================================================
+like($content, qr{drive-solo/SKILL\.md},
+     'D1 (§2.5): coordinator-protocol/SKILL.md references drive-solo/SKILL.md by path — '
+   . 'the canonical prompt lives in ONE place, referenced by pointer, per the spec\'s own '
+   . '"one canonical wording, one place it can drift" reasoning');
+unlike($content, qr/STOP ITERATING AND REPORT NOW/,
+       'D2 CANONICAL (§2.5): coordinator-protocol/SKILL.md does NOT duplicate the canonical '
+     . 'prompt\'s literal opening line — a second, independently-editable copy is precisely '
+     . 'the drift risk the spec calls out by name');
+
+# ===========================================================================
+# E (§2.5, negative). No DAG edge language — criterion 6 is explicit that
+# there is deliberately NO DAG edge between w02 and e03; this file must not
+# gain prose asserting or implying one (e.g. "depends on e03", "e03 must
+# land first").
+# ===========================================================================
+unlike($content, qr/e03\b.*\bdepends|\bdepends\b.*\be03\b/i,
+       'E1 (criterion 6): coordinator-protocol/SKILL.md carries no dependency language '
+     . 'tying it to e03 — criterion 6 rules this "coordination, not a dependency", and no '
+     . 'DAG edge is to be inferred as a fix');
+
+done_testing();

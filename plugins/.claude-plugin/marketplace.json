@@ -32,9 +32,9 @@
       "description": "Executes blueprints. /butler:dispatch-fleet starts a deterministic, token-free orchestrator script that drives detached headless coordinators (one per package, scoped worker subagents, hook-enforced discipline) and auto-resumes across usage/token limits; /butler:drive-solo is the single interactive execute verb — a thin loop over the perl director bp-drive-next.pl that drives one blueprint, a named set, or ALL audited blueprints to done in one host-or-sandbox session (flat worker layer, director-managed keep-awake + self-governed usage-limit sleep-through); /butler:reporter is the interactive front door; /butler:status reports. Start-or-continue (no resume verb). Fleet is sandbox-only; pairs with the host-side blueprint plugin."
     },
     {
-      "name": "todo",
-      "source": "./todo",
-      "description": "Personal todo notes synced to your private vault. Provides /todo:create (save a note), /todo:manage (list/view/edit/delete/done), and /todo:resume (load a note and work on it). Backed by scripts/todo-sync.pl; pushed by /steward:backup."
+      "name": "almanac",
+      "source": "./almanac",
+      "description": "Durable records that outlive a session, one file per record, written only through their scripts: project and global todos, notes (a pointer plus metadata, in place of Claude Code auto-memory), the project's ordered tasklist, pending product decisions for the operator, and ccpraxis bug reports. Bundles /almanac:todo, /almanac:note, /almanac:task, /almanac:decision, /almanac:bug-report and /almanac:bug-triage, the almanac dispatcher and doctor, and hooks that deny direct edits to the stores."
     }
   ]
 }

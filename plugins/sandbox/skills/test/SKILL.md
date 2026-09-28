@@ -16,7 +16,7 @@ heartbeat-only container keep-alive. Expect 1–2 minutes total.
 
 ## Arguments
 
-- `t/02-*.t` (optional) — restrict to a subset by glob. The runner
+- `t/launcher-*.t` (optional) — restrict to a subset by glob. The runner
   resolves the glob relative to the current directory first, then falls
   back to the plugin root and the `t/` subdirectory, so the same glob
   works from both the repo root and `plugins/sandbox/`. Without args,
@@ -75,12 +75,12 @@ user verbatim — don't paraphrase failures.
 If everything passed, a one-line confirmation is enough. Optionally point
 out the headline tests:
 
-- `01-bind-honors-append-and-utimensat.t` — proves the host bind mount is
+- `bind-honors-append-and-utimensat.t` — proves the host bind mount is
   safe for claude's syscalls (the assumption underlying the whole
   bind-mount architecture)
-- `02-launcher-bind-mount-shape.t` — confirms no volume-workaround
+- `launcher-bind-mount-shape.t` — confirms no volume-workaround
   residue snuck back in
-- `04-runtime-detection.t` — confirms docker/podman detection is
+- `runtime-detection.t` — confirms docker/podman detection is
   consistent across all three scripts (launcher, bootstrap, TestSandbox)
 
 ## When tests fail
@@ -88,18 +88,18 @@ out the headline tests:
 A failed test isn't a redo signal — read its output. Specific failure
 shapes mean specific things:
 
-- **`01-bind-honors-…` fails on T1 (O_APPEND):** the current backend's
+- **`bind-honors-…` fails on T1 (O_APPEND):** the current backend's
   host bind doesn't honor `O_APPEND` — likely a regression to a 9p-style
   share. Reintroduce the xfs-volume workaround OR switch to a healthier
   backend.
-- **`01-bind-honors-…` fails on T2/T3 (utimensat):** same diagnosis as
+- **`bind-honors-…` fails on T2/T3 (utimensat):** same diagnosis as
   above but specific to `utimensat`. Bun's lock manager will wedge on
   this backend without a workaround.
-- **`02-launcher-bind-mount-shape.t` fails:** someone partially
+- **`launcher-bind-mount-shape.t` fails:** someone partially
   reintroduced volume code. Check the mount layout in `launcher.pl`.
-- **`04-runtime-detection.t` fails:** the `_detect_container_cli` helper
+- **`runtime-detection.t` fails:** the `_detect_container_cli` helper
   drifted out of sync across files. Re-paste it.
-- **`12-keepalive-heartbeat.t` fails:** the container's heartbeat-only
+- **`keepalive-heartbeat.t` fails:** the container's heartbeat-only
   keep-alive loop is broken (sentinel staleness not detected, or stays
   alive when it shouldn't). Risk: containers either die mid-session or
   orphan-leak forever. Fix before shipping.

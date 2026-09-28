@@ -49,13 +49,55 @@ use CcpraxisWorkCopy qw(workcopy_route workcopy_refusal_outcome);
 use ProtectedPaths qw(path_relation protected_roots target_self_codes normalize_path);
 use LaunchLog ();   # B1: durable per-launch diagnostic log (next to us in scripts/)
 use Dashboard ();   # B2: the raw-ANSI TUI dashboard framework
+use WtProfile ();   # sandbox-wt-profile/02: [c]-press profile fragment ensure + name
+use HostTz ();      # sandbox-session-ux/01: host-timezone detection for the session exec
 use TokenInfo ();   # s08: pure access/refresh token status struct for the dashboard
 use SpendPanel ();  # b37: pure Claude/Go/Zen spend status struct for the dashboard
                     # (the LAUNCHER loads it and computes; Dashboard.pm renders the
                     # already-computed struct and must never load it — same split
-                    # TokenInfo has, and t/54-spend-panel asserts both halves)
+                    # TokenInfo has, and t/spend-panel asserts both halves)
 use Resources ();   # s09: pure resource-probe parsers + the injectable probe seam
 use RunState ();    # s10: pure orchestrator/run-state summarizer for the dashboard
+use SessionFork (); # sandbox-session-ux/07: host-session-fork path/uuid helpers (pure, no fs writes)
+
+# THE HOST CANNOT PROBE A CONTAINER'S PIDS, SO IT ASKS THE SAMPLER INSTEAD.
+#
+# A sandboxed run writes its orchestrator and coordinator PIDs from INSIDE the
+# container, which has a private PID namespace (launcher.pl passes no
+# --pid=host). kill(0,...) on this host therefore cannot answer for them, and
+# _pid_alive below correctly degrades to UNKNOWN rather than fabricating a
+# "dead". Correct -- but it meant the Run panel showed `orchestrator unknown`
+# for the entire life of every sandboxed run, against an orchestrator the
+# operator could see was alive, and the same blindness left finished workers
+# indistinguishable from wedged ones (20260915-230820-d33e items 2 and 3).
+#
+# The container sampler is already exec'ing into the container every
+# $CONTAINER_POLL_SECONDS. It now brings back the container's PID list, which
+# turns "cannot answer" into a real answer for exactly the namespace the
+# markers were written in. Refreshed lazily from the snapshot the sampler
+# already writes -- one file read, TTL'd, never a subprocess from here.
+my %CONTAINER_PIDS;            # pid => 1, as of the last snapshot read
+my $CONTAINER_PIDS_AT = 0;     # host time() of that read (0 = never)
+my $CONTAINER_PIDS_TTL = 5;    # re-read the snapshot at most this often
+my $CONTAINER_PIDS_MAX_AGE = 50;  # a snapshot older than this answers nothing
+
+# _container_pids_fresh() -> \%pids | undef. undef means "no usable reading",
+# which is what keeps _pid_alive's UNKNOWN reachable rather than silently
+# turning every unprobeable pid into a confident "dead".
+sub _container_pids_fresh {
+    my $now = time;
+    if ($now - $CONTAINER_PIDS_AT >= $CONTAINER_PIDS_TTL) {
+        $CONTAINER_PIDS_AT = $now;
+        my $snap = eval { _container_snapshot_read() };
+        %CONTAINER_PIDS = ();
+        if (ref $snap eq 'HASH' && ref $snap->{container_pids} eq 'ARRAY'
+            && defined $snap->{measured_at} && $snap->{measured_at} =~ /^\d+$/
+            && ($now - $snap->{measured_at}) <= $CONTAINER_PIDS_MAX_AGE) {
+            $CONTAINER_PIDS{$_} = 1 for grep { defined && /^\d+$/ } @{ $snap->{container_pids} };
+        }
+    }
+    return %CONTAINER_PIDS ? \%CONTAINER_PIDS : undef;
+}
 
 # _pid_alive($pid) -> 1 | 0 | undef
 #
@@ -84,6 +126,13 @@ sub _pid_alive {
     # this host cannot prove is its own to probe -- degrade to UNKNOWN, and
     # let RunState's "unknown liveness never demotes 'running'" rule (and
     # quiet_probe's state=='running' OR-clause) fail safe instead.
+    # ...unless the sampler has a current census of the container's own PID
+    # namespace, which is where a sandboxed run's markers were written. With
+    # one in hand, absence from it IS a real answer -- and it is the answer
+    # that lets a finished worker stop looking wedged.
+    if (my $pids = _container_pids_fresh()) {
+        return $pids->{$pid} ? 1 : 0;
+    }
     return undef;                   # ESRCH (or any other errno) -> UNKNOWN, never a fabricated "dead"
 }
 
@@ -146,8 +195,7 @@ sub _detect_container_cli {
 my $PODMAN = _detect_container_cli();
 unless (defined $PODMAN) {
     print STDERR "ERROR: no container CLI on PATH (looked for docker, podman).\n";
-    print STDERR "       Install Docker Desktop (https://docker.com) or Podman Desktop\n";
-    print STDERR "       (https://podman-desktop.io/) and re-run.\n";
+    print STDERR "       Install Docker Desktop (https://docker.com) or Podman Desktop (https://podman-desktop.io/) and re-run.\n";
     exit 1;
 }
 
@@ -204,6 +252,16 @@ my $SANDBOX_PLUGIN    = "$CLAUDE_HOST_CONFIG/ccpraxis/plugins/sandbox";
 my $CONTAINER_CONFIG  = "$SANDBOX_PLUGIN/container";
 my $SANDBOX_SKILLS_PL = "$SANDBOX_PLUGIN/scripts/skills.pl";
 my $SELECT_SESSION_PL = "$SANDBOX_PLUGIN/scripts/select-session.pl";
+# select-session.pl's dedicated "host-session fork failed" exit code (see its
+# own header comment) -- the ONLY exit that makes pick_session_action /
+# _pick_session_via_screen return to the picker, bounded to 3 retries.
+use constant SELECT_SESSION_FORK_FAILED_EXIT => 3;
+# Decision 34 (review M1): set just before a bounded fork-retry loop
+# exhausts and returns ('cancel', undef) instead of falling through to a
+# new session. The single 'cancel' call site (below, where $action is
+# handled) prints this AFTER host_leave, since an emit into a live alt-
+# screen frame is a byte the screen restore is about to discard.
+my $PICK_ERROR;
 my $HOST_PLUGINS_DIR  = "$CLAUDE_HOST_CONFIG/plugins";
 # B2: the canonical entry paths the dashboard spawns for a new claude session,
 # and whether the raw-ANSI TUI is even possible (else the plain heartbeat loop).
@@ -545,32 +603,15 @@ sub _pp_env_seam {
 sub _pp_explanation {
     my ($reason) = @_;
     my %text = (
-        'ccpraxis-install' => q{That is the ccpraxis installation Claude Code is running from. Its plugins,
-skills and launcher are in use right now, so sandboxing it would edit the
-tooling while it is running, and git inside the container would not work.},
-        'claude-home' => q{That is Claude Code's own configuration home. It holds your credentials, your
-session transcripts, your memory files and every installed plugin.
-Bind-mounting it into a container would expose all of it read-write.},
-        'marketplace-install' => q{That is where Claude Code installed a plugin marketplace registered in
-known_marketplaces.json. Editing it from inside a container would corrupt the
-installed plugin tree Claude Code is loading from.},
-        'marketplace-source' => q{That is the directory-source of a plugin marketplace registered in
-known_marketplaces.json. Claude Code loads plugins straight out of it, so it
-is live installed code, not a checkout.},
-        'user-configured' => q{That path is in your own protected-paths list at
-~/.claude/ccpraxis-protected-paths.json.
+        'ccpraxis-install' => q{That is the ccpraxis installation Claude Code is running from. Its plugins, skills and launcher are in use right now, so sandboxing it would edit the tooling while it is running, and git inside the container would not work.},
+        'claude-home' => q{That is Claude Code's own configuration home. It holds your credentials, your session transcripts, your memory files and every installed plugin. Bind-mounting it into a container would expose all of it read-write.},
+        'marketplace-install' => q{That is where Claude Code installed a plugin marketplace registered in known_marketplaces.json. Editing it from inside a container would corrupt the installed plugin tree Claude Code is loading from.},
+        'marketplace-source' => q{That is the directory-source of a plugin marketplace registered in known_marketplaces.json. Claude Code loads plugins straight out of it, so it is live installed code, not a checkout.},
+        'user-configured' => q{That path is in your own protected-paths list at ~/.claude/ccpraxis-protected-paths.json.
 
-The guard reads that list from your real home directory only. CLAUDE_CONFIG_DIR
-does not relocate it: a list read from a directory named by one environment
-variable could be pointed elsewhere, and the guard would then silently stop
-reading your real list - fewer protections, not more.},
-        'drive-root' => q{A filesystem root contains every file on the volume - your home directory,
-Claude Code's configuration, and every other project on the machine. Putting
-all of that inside a container read-write is never what a sandbox is for, and
-every file operation in the container would crawl.},
-        'user-home' => q{Your home directory contains every project you have, plus Claude Code's
-configuration and your credentials. Putting all of that inside a container
-read-write is never what a sandbox is for.},
+The guard reads that list from your real home directory only. CLAUDE_CONFIG_DIR does not relocate it: a list read from a directory named by one environment variable could be pointed elsewhere, and the guard would then silently stop reading your real list - fewer protections, not more.},
+        'drive-root' => q{A filesystem root contains every file on the volume - your home directory, Claude Code's configuration, and every other project on the machine. Putting all of that inside a container read-write is never what a sandbox is for, and every file operation in the container would crawl.},
+        'user-home' => q{Your home directory contains every project you have, plus Claude Code's configuration and your credentials. Putting all of that inside a container read-write is never what a sandbox is for.},
     );
     return $text{$reason}
         // 'This path collides with something Claude Code has installed on this machine.';
@@ -580,45 +621,34 @@ sub _pp_advice {
     my ($reason, $root) = @_;
 
     if ($reason eq 'ccpraxis-install') {
-        return q{Work on a separate clone instead. Pick any ordinary directory outside this
-install (for example C:/Development/ccpraxis on Windows, or ~/src/ccpraxis on
-macOS or Linux), then run:
+        return q{Work on a separate clone instead. Pick any ordinary directory outside this install (for example C:/Development/ccpraxis on Windows, or ~/src/ccpraxis on macOS or Linux), then run:
 
   git clone --no-hardlinks } . $root . q{ <your-clone-dir>
   cd <your-clone-dir>
   claude-sandbox
 
-The --no-hardlinks flag is required: a local clone hardlinks the object store
-by default, which would silently re-couple the clone to this installation.
-See plugins/sandbox/docs/working-on-ccpraxis.md.};
+The --no-hardlinks flag is required: a local clone hardlinks the object store by default, which would silently re-couple the clone to this installation. See plugins/sandbox/docs/working-on-ccpraxis.md.};
     }
 
     if ($reason eq 'marketplace-install' || $reason eq 'marketplace-source') {
-        return q{Open the specific project directory you meant to work in - cd into it and run
-claude-sandbox there, or pass it explicitly:
+        return q{Open the specific project directory you meant to work in - cd into it and run claude-sandbox there, or pass it explicitly:
 
   claude-sandbox <your-project-dir>
 
-If you meant to work on the plugin source that lives there, work from a
-clone outside it. That directory is not necessarily a repository root, so
-clone the repository that contains it - not the directory itself:
+If you meant to work on the plugin source that lives there, work from a clone outside it. That directory is not necessarily a repository root, so clone the repository that contains it - not the directory itself:
 
   git clone --no-hardlinks <repository-root> <your-clone-dir>};
     }
 
     if ($reason eq 'user-configured') {
-        return q{Open the specific project directory you meant to work in - cd into it and run
-claude-sandbox there, or pass it explicitly:
+        return q{Open the specific project directory you meant to work in - cd into it and run claude-sandbox there, or pass it explicitly:
 
   claude-sandbox <your-project-dir>
 
-If that entry was added by mistake, remove it from
-~/.claude/ccpraxis-protected-paths.json - your real home directory, which is the
-only place this list is read from (CLAUDE_CONFIG_DIR does not relocate it).};
+If that entry was added by mistake, remove it from ~/.claude/ccpraxis-protected-paths.json - your real home directory, which is the only place this list is read from (CLAUDE_CONFIG_DIR does not relocate it).};
     }
 
-    return q{Open the specific project directory you meant to work in - cd into it and run
-claude-sandbox there, or pass it explicitly:
+    return q{Open the specific project directory you meant to work in - cd into it and run claude-sandbox there, or pass it explicitly:
 
   claude-sandbox <your-project-dir>};
 }
@@ -628,9 +658,7 @@ sub _pp_message {
 
     my $explanation = _pp_explanation($reason);
     my $advice      = _pp_advice($reason, $root);
-    my $no_override = q{There is no override: no flag and no environment variable will make
-claude-sandbox act on this path. If this refusal is wrong, the guard itself
-has to be fixed - see plugins/sandbox/docs/protected-paths.md.};
+    my $no_override = q{There is no override: no flag and no environment variable will make claude-sandbox act on this path. If this refusal is wrong, the guard itself has to be fixed - see plugins/sandbox/docs/protected-paths.md.};
 
     my $header;
     my $body;
@@ -911,18 +939,33 @@ $CLAUDE_HOST_CONFIG = do {
 my $CCPRAXIS_DATA            = "$PROJECT_PATH/.ccpraxis-local-data";
 my $CLAUDE_DATA              = "$CCPRAXIS_DATA/claude-home";
 
+# sandbox-session-ux/07: the operator's HOST projects dir for this project
+# (~/.claude/projects/<encoded cwd>), read-only, never written. Both picker
+# spawns pass it so a host session can be listed and forked into $CLAUDE_DATA.
+my $HOST_SESSIONS_DIR = SessionFork::host_sessions_dir($CLAUDE_HOST_CONFIG, $PROJECT_PATH);
+
 # How many launches' logs to keep under claude-home/sandbox-logs/. Operator's
 # call: the last 10. Env-overridable for debugging a long-tail problem.
 my $LOG_RETENTION_LAUNCHES   = ($ENV{CCPRAXIS_LOG_RETENTION} && $ENV{CCPRAXIS_LOG_RETENTION} =~ /\A\d+\z/
                                 && $ENV{CCPRAXIS_LOG_RETENTION} >= 1)
                              ? $ENV{CCPRAXIS_LOG_RETENTION} + 0 : 10;
 my $LAUNCHER_DIR              = "$CLAUDE_DATA/.launcher";
+# 02-idle-footprint: the 9 sampler/keepawake files below are written on a ~23s
+# cadence but have zero container-side readers (every reader is launcher.pl
+# itself, reading back what it wrote) -- so they don't need to live on host
+# NTFS inside the project tree, and moving them off it removes them from the
+# $LAUNCHER_DIR whole-directory RO bind's churn. The hash of $LAUNCHER_DIR
+# keeps this project-unique, same idiom as $LAUNCHER_DIR's own creation below.
+my $SAMPLER_TMPDIR = File::Spec->catdir(
+    File::Spec->tmpdir(), 'ccpraxis-sampler-' . md5_of_string($LAUNCHER_DIR)
+);
+make_path($SAMPLER_TMPDIR) unless -d $SAMPLER_TMPDIR;
 # Where a forked sampler's STDERR lands. Its validation exits 2 after printing
 # exactly one line saying what was wrong; that line used to go to /dev/null, so
 # "FAILED - sampler exited before writing a reading" was the end of the trail.
-my $SAMPLER_ERR_RESOURCES     = "$LAUNCHER_DIR/resources-sampler.err";
-my $SAMPLER_ERR_SPEND         = "$LAUNCHER_DIR/spend-sampler.err";
-my $SAMPLER_ERR_CONTAINER     = "$LAUNCHER_DIR/container-sampler.err";
+my $SAMPLER_ERR_RESOURCES     = "$SAMPLER_TMPDIR/resources-sampler.err";
+my $SAMPLER_ERR_SPEND         = "$SAMPLER_TMPDIR/spend-sampler.err";
+my $SAMPLER_ERR_CONTAINER     = "$SAMPLER_TMPDIR/container-sampler.err";
 my $SELECTION_FILE            = "$LAUNCHER_DIR/selected-skills.json";
 my $MANIFEST_FILE             = "$LAUNCHER_DIR/container-manifest.json";
 my $SNAPSHOT_FILE             = "$LAUNCHER_DIR/.discovery-snapshot.json";
@@ -933,8 +976,8 @@ my $MCP_SNAPSHOT_FILE         = "$LAUNCHER_DIR/.mcp-snapshot.json";
 # other snapshot above. Deliberately never unlinked by the reaper on launch
 # (see _resources_sampler_reap_orphan) -- a leftover snapshot simply ages
 # past Resources::max_age() and reads 'stale', which IS the mechanism.
-my $RESOURCES_SNAPSHOT_FILE   = "$LAUNCHER_DIR/.resources-snapshot.json";
-my $RESOURCES_SAMPLER_PID     = "$LAUNCHER_DIR/resources-sampler.pid";
+my $RESOURCES_SNAPSHOT_FILE   = "$SAMPLER_TMPDIR/.resources-snapshot.json";
+my $RESOURCES_SAMPLER_PID     = "$SAMPLER_TMPDIR/resources-sampler.pid";
 # t02-spend-persistence, blueprint Decision 11: the run-independent home for
 # the spend snapshot. bp-spend.pl writes `spend.json` INSIDE this directory, so
 # the directory is what we hand it and the filename is its business.
@@ -946,9 +989,16 @@ my $RESOURCES_SAMPLER_PID     = "$LAUNCHER_DIR/resources-sampler.pid";
 # describe the account, not the run that polled for it -- to a run, and so made
 # it unreadable in exactly the state the operator is normally in.
 my $SPEND_GLOBAL_DIR          = $LAUNCHER_DIR;
-my $SPEND_SAMPLER_PID         = "$LAUNCHER_DIR/spend-sampler.pid";
-my $CONTAINER_SAMPLER_PID     = "$LAUNCHER_DIR/container-sampler.pid";
-my $CONTAINER_SNAPSHOT_FILE   = "$LAUNCHER_DIR/.container-snapshot.json";
+my $SPEND_SAMPLER_PID         = "$SAMPLER_TMPDIR/spend-sampler.pid";
+my $CONTAINER_SAMPLER_PID     = "$SAMPLER_TMPDIR/container-sampler.pid";
+my $CONTAINER_SNAPSHOT_FILE   = "$SAMPLER_TMPDIR/.container-snapshot.json";
+# The two CONTAINER-SIDE paths, named once so every podman-exec call site spells
+# them identically -- which is what the "asked for X, got Y" guard in
+# _busy_lease_probe compares against. Both are absolute POSIX paths INSIDE the
+# container and must never be translated for the host; see every call site
+# wrapping them in `sh -c` for why.
+my $BUSY_LEASE_PATH     = "/tmp/.butler-busy";
+my $LAUNCHER_ALIVE_PATH = "/tmp/.launcher-alive";
 # t11-tui-hot-reload: the mtimes the currently-loaded render modules had when
 # this process read them. Populated once at dashboard entry and advanced only
 # for a module that actually reloaded -- see _hot_reload's closing note on why
@@ -991,6 +1041,16 @@ my $MATERIALIZED_MARKETPLACES_FILE = "$CLAUDE_DATA/plugins/known_marketplaces.js
 # no zombies) and the NEW one to copy the current set; materialize reads the
 # plugins manifest back as merge provenance (sandbox-installed vs deselected).
 my $PLUGINS_COPY_MANIFEST      = "$LAUNCHER_DIR/.host-tier-plugins.json";
+# Host-only skill masks. skills.pl emits the container paths of host-only skills
+# belonging to a selected, LIVE-BOUND plugin; the launcher binds $EMPTY_SKILL_DIR
+# over each one so the container sees a skill directory with no SKILL.md.
+my $HOST_ONLY_MASKS_FILE       = "$LAUNCHER_DIR/.host-only-masks.json";
+# Decision 19 (review M2): the signature (sorted container_paths) that the
+# CURRENT container was created with. Compared against a freshly computed
+# signature in the drift check below, the same "no saved record is not drift"
+# rule the Containerfile/launcher-hash checks already follow.
+my $HOST_ONLY_MASKS_SIGNATURE_FILE = "$LAUNCHER_DIR/.host-only-masks-signature";
+my $EMPTY_SKILL_DIR            = "$LAUNCHER_DIR/empty-skill";
 my $MARKETPLACES_COPY_MANIFEST = "$LAUNCHER_DIR/.host-tier-marketplaces.json";
 my $SKILLS_COPY_MANIFEST       = "$LAUNCHER_DIR/.host-tier-skills.json";
 # Container CLAUDE.md and settings.json: per-project copies (blueprint
@@ -1130,6 +1190,12 @@ my $CONTAINER_POLL_SECONDS = 20;
 # Resources uses for its own snapshot (MAX_AGE = 60 against a 23s interval).
 my $CONTAINER_SNAPSHOT_MAX_AGE = 50;
 
+# sandbox-launcher-lifecycle package 01 (spec sec 2.3): how often the
+# gather-round throttle re-checks whether the owning console-host process is
+# still alive. Independent of $CONTAINER_POLL_SECONDS -- a different signal,
+# a different cadence.
+my $CONSOLE_LIVENESS_POLL_SECONDS = 5;
+
 # s21-keep-awake-probe-failure-handling (spec S2.3): how many CONSECUTIVE
 # 'probe-failed' busy-lease results KeepAwake::on_probe holds the wake-lock
 # through before releasing it as a sustained failure -- a NAMED constant, not
@@ -1141,6 +1207,18 @@ my $CONTAINER_SNAPSHOT_MAX_AGE = 50;
 # before falling back to releasing, so a genuinely dead container still
 # releases the lock well within the same launch.
 my $KEEPAWAKE_PROBE_TOLERANCE = 3;
+
+# How often the keep-awake DECISION is written down, whether or not it changed.
+#
+# It used to be written only on a transition, which meant the steady state --
+# held, for the entire length of a run -- logged nothing. `busy_age` appeared
+# zero times across every launch log on the reporting host, so neither a caller
+# inside the sandbox nor the operator outside could tell a working keep-awake
+# from a broken one; should_stay_awake was a pure function whose output nobody
+# recorded (20260911-224616-e8e0). Matched to the manager heartbeat's own
+# cadence: one line every two minutes is free, and it makes the mechanism
+# falsifiable.
+my $KEEPAWAKE_LOG_SECONDS = 120;
 
 # s17-statusline-and-output-hygiene (spec S5): the ONE heartbeat/tick
 # predicate, called from BOTH _history_events (below) and the
@@ -1534,9 +1612,11 @@ sub _select_via_screen {
 # _pick_session_via_screen() -> ('new'|'resume'|'cancel', $uuid) with no
 # --output file round-trip. Its plain-path twin is byte-for-byte today's.
 sub _pick_session_via_screen {
-    my ($sessions_dir) = @_;
+    my ($sessions_dir, $retries_left, $notice) = @_;
+    $retries_left = 3 unless defined $retries_left;
     my ($rc, $out, $err) = _capture_out_err($^X, $SELECT_SESSION_PL,
-        '--sessions-dir', $sessions_dir, '--project-label', $PROJECT_NAME, '--list-json');
+        '--sessions-dir', $sessions_dir, '--host-sessions-dir', $HOST_SESSIONS_DIR,
+        '--project-label', $PROJECT_NAME, '--list-json');
     my $data = ($rc == 0) ? eval { JSON::PP->new->utf8->decode($out) } : undef;
     if (ref $data ne 'HASH') {
         _emit_err("WARNING: session selector could not list sessions; starting a new session.\n");
@@ -1545,23 +1625,62 @@ sub _pick_session_via_screen {
     my @rows = (ref $data->{sessions} eq 'ARRAY') ? @{ $data->{sessions} } : ();
     return ('new', undef) unless @rows || $data->{error};
 
-    my @items = ( { kind => 'row', id => 'NEW', group => 'sessions',
-                    display => '+ Start a new session', disabled => 0, selected => 0 } );
-    for my $s (@rows) {
-        next unless ref $s eq 'HASH' && defined $s->{uuid};
-        push @items, { kind => 'row', id => $s->{uuid}, group => 'sessions',
-                       display => (defined $s->{label} && length $s->{label}
-                                   ? $s->{label} : $s->{uuid}),
-                       disabled => 0, selected => 0 };
-    }
-    my $res = _launch_run_list({ mode  => 'single',
-                                 label => "resume a session - $PROJECT_NAME",
-                                 error => $data->{error},
-                                 items => \@items });
+    # Decision 34 (review M2): a fork error from an EARLIER retry ($notice)
+    # takes priority over --list-json's own $data->{error} (a plain listing
+    # error), so the operator sees why the picker came back rather than the
+    # picker just blinking back with no explanation.
+    my $error_for_screen = (defined($notice) && length($notice)) ? $notice : $data->{error};
+    my $model = tui::LaunchScreens::session_pick_model(\@rows, "resume a session - $PROJECT_NAME", $error_for_screen);
+    my $res = _launch_run_list($model);
     my $d = $res->{decision};
     return ('cancel', undef) unless $d->{confirmed};
     my $id = $d->{cursor_id};
     return ('new', undef) if !defined $id || $id eq 'NEW';
+
+    # Decision 34 (red-team S1, promoted MUST-FIX): host-ness is decided by
+    # looking the picked item up in @rows and reading ITS OWN `origin` --
+    # never by pattern-matching a "host:" prefix out of $cursor_id, which is
+    # exactly the shape a spoofed SANDBOX row could be given (S1's attack).
+    # The candidate id is rebuilt the same way session_pick_model built it
+    # (host rows: "host:<uuid>"; everything else: bare uuid), so this only
+    # ever matches the row the operator actually saw highlighted.
+    my ($row) = grep {
+        defined($_->{uuid})
+            && $id eq ((defined($_->{origin}) && $_->{origin} eq 'host') ? "host:$_->{uuid}" : "$_->{uuid}")
+    } @rows;
+
+    if (defined($row) && defined($row->{origin}) && $row->{origin} eq 'host') {
+        # Decision 14/32/33/34: a HOST row is forked into the sandbox BEFORE
+        # resuming. A failed fork shows its error and returns to the picker
+        # (never falls through to a new session on its own) ONLY when
+        # select-session.pl --fork exits its dedicated fork-failed code, and
+        # only up to 3 times -- a picker that fails on EVERY run must never
+        # loop the launcher forever, and once it does, Decision 34 CANCELS
+        # rather than silently starting the blank session the operator never
+        # asked for.
+        my $host_uuid = $row->{uuid};
+        unless (defined($host_uuid) && SessionFork::is_uuid_shaped($host_uuid)) {
+            _emit_err("ERROR: malformed host session id; starting a new session.\n");
+            return ('new', undef);
+        }
+        my ($frc, $fout, $ferr) = _capture_out_err($^X, $SELECT_SESSION_PL,
+            '--sessions-dir', $sessions_dir, '--host-sessions-dir', $HOST_SESSIONS_DIR,
+            '--fork', $host_uuid);
+        if ($frc == 0 && $fout =~ /\ARESUME\s+([0-9a-f-]{36})\s*\z/i) {
+            return ('resume', $1);
+        }
+        my ($first_err_line) = split /\n/, ($ferr // '');
+        $first_err_line = 'unknown error' unless defined($first_err_line) && length($first_err_line);
+        $first_err_line = _pp_sanitize($first_err_line);
+        if ($frc == SELECT_SESSION_FORK_FAILED_EXIT && $retries_left > 0) {
+            my $msg = "WARNING: could not duplicate the host session ($first_err_line); returning to the picker.";
+            _emit_err("$msg\n");
+            return _pick_session_via_screen($sessions_dir, $retries_left - 1, $msg);
+        }
+        $PICK_ERROR = "ERROR: could not duplicate the host session ($first_err_line); cancelling.";
+        return ('cancel', undef);
+    }
+
     return ('resume', $id);
 }
 
@@ -1813,10 +1932,7 @@ sub ensure_ccpraxis_data_dir {
                 chomp $st if defined $st;
                 $st = '' unless defined $st;
                 if ($st eq 'running') {
-                    print STDERR "ERROR: a sandbox container ($name) is running and still bind-mounts\n";
-                    print STDERR "       the old .claude-data, which blocks the one-time migration to\n";
-                    print STDERR "       .ccpraxis-local-data/claude-home. Close its dashboard / session\n";
-                    print STDERR "       first, then re-run.\n";
+                    print STDERR "ERROR: a sandbox container ($name) is running and still bind-mounts the old .claude-data, which blocks the one-time migration to .ccpraxis-local-data/claude-home. Close its dashboard / session first, then re-run.\n";
                     reset_terminal();
                     exit 1;
                 }
@@ -1835,11 +1951,7 @@ sub ensure_ccpraxis_data_dir {
             log_ev('migrate_claude_data', { from => $old, to => $CLAUDE_DATA });
         } else {
             print STDERR "ERROR: could not migrate $old -> $CLAUDE_DATA: $!\n";
-            print STDERR "       Something holds a handle on the old .claude-data so it can't be\n";
-            print STDERR "       moved. The usual culprit is another editor or Claude Code session\n";
-            print STDERR "       open on THIS project folder — its recursive file-watcher keeps a\n";
-            print STDERR "       handle on the directory (a running sandbox, a shell whose cwd is\n";
-            print STDERR "       inside it, or a file indexer do the same). Close it, then re-run.\n";
+            print STDERR "       Something holds a handle on the old .claude-data so it can't be moved. The usual culprit is another editor or Claude Code session open on THIS project folder — its recursive file-watcher keeps a handle on the directory (a running sandbox, a shell whose cwd is inside it, or a file indexer do the same). Close it, then re-run.\n";
             print STDERR "       (Or move it by hand once nothing holds it:\n";
             print STDERR "         mv '$old' '$CLAUDE_DATA')\n";
             reset_terminal();
@@ -1952,8 +2064,29 @@ sub _rmtree {
 # every signal path -- alt-screen off, cursor shown, title popped, ReadMode
 # restored -- before the STDERR restore and before reset_terminal(). Its
 # once-guard is what makes a second Ctrl-C during teardown safe.
-$SIG{INT}  = sub { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; _stderr_capture_drain(); log_ev('signal', { sig => 'INT' });  _keepawake_release_global(); _resources_sampler_release_global(); _spend_sampler_release_global(); _container_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 130 };
-$SIG{TERM} = sub { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; _stderr_capture_drain(); log_ev('signal', { sig => 'TERM' }); _keepawake_release_global(); _resources_sampler_release_global(); _spend_sampler_release_global(); _container_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 143 };
+# _teardown_and_exit -- the one full, correct teardown chain, extracted so
+# "the same path" is a source fact rather than a claim to trust
+# (sandbox-launcher-lifecycle package 01, spec sec 2.4). Called identically by
+# $SIG{INT}/$SIG{TERM} below and by the console-liveness poll (see the gather
+# closure) when the owning console host is confirmed gone without a signal
+# ever being delivered.
+sub _teardown_and_exit {
+    my ($sig_label, $code) = @_;
+    tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST;
+    _stderr_capture_drain();
+    log_ev('signal', { sig => $sig_label });
+    _keepawake_release_global();
+    _resources_sampler_release_global();
+    _spend_sampler_release_global();
+    _container_sampler_release_global();
+    LaunchLog::close_log($LAUNCH_LOG);
+    _close_transcript();
+    SandboxLock::release_all();
+    reset_terminal();
+    exit $code;
+}
+$SIG{INT}  = sub { _teardown_and_exit('INT', 130) };
+$SIG{TERM} = sub { _teardown_and_exit('TERM', 143) };
 # 03-resources-reader-model fix-batch (red-team L15): closing the terminal
 # window -- the single most common way a user ends a dashboard -- sends HUP,
 # not INT/TERM, and perl does not run END blocks on an uncaught terminating
@@ -2498,8 +2631,7 @@ my $CONTAINER_NAME;
         # Connector requires a manager/dashboard to already be up.
         if ($state ne 'running') {
             _emit_err(_c_err("ERROR:"), " no running sandbox to connect to for this project.\n");
-            _emit_err("       Run `claude-sandbox` (no flags) to start the sandbox + dashboard first,\n");
-            _emit_err("       then launch a claude session from the dashboard.\n");
+            _emit_err("       Run `claude-sandbox` (no flags) to start the sandbox + dashboard first, then launch a claude session from the dashboard.\n");
             SandboxLock::release($LOCK_DIR);
             reset_terminal();
             exit 1;
@@ -2522,11 +2654,7 @@ my $CONTAINER_NAME;
                 : undef;
             if (my $skew = decide_forced_rebuild(1, $rv, $HOST_VERSION)) {
                 _emit_err(_c_warn("WARNING:"), " $skew\n");
-                _emit_err("       Connecting anyway -- this container is running and rebuilding it\n",
-                          "       would end the session inside it. Session files under claude-home\n",
-                          "       are shared through the bind mount and assume one version wrote\n",
-                          "       them, so close this sandbox and run `claude-sandbox` with no flags\n",
-                          "       to rebuild it when convenient.\n");
+                _emit_err("       Connecting anyway -- this container is running and rebuilding it would end the session inside it. Session files under claude-home are shared through the bind mount and assume one version wrote them, so close this sandbox and run `claude-sandbox` with no flags to rebuild it when convenient.\n");
                 log_ev('connector_version_skew', { recorded => $rv, host => $HOST_VERSION });
             }
         }
@@ -2553,6 +2681,13 @@ my $CONTAINER_NAME;
                 # Leave FIRST: an emit into a live frame is a byte the
                 # alt-screen restore is about to throw away.
                 tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST;
+                # Decision 34 (review M1): a bounded fork-retry exhaustion
+                # sets $PICK_ERROR before returning 'cancel' -- show it here,
+                # after the frame is gone, so "Cancelled." is not the only
+                # thing the operator sees for a fork that kept failing.
+                if (defined($PICK_ERROR) && length($PICK_ERROR)) {
+                    _emit_out("$PICK_ERROR\n");
+                }
                 _emit_out("Cancelled.\n");
                 reset_terminal();
                 exit 0;
@@ -2574,12 +2709,26 @@ my $CONTAINER_NAME;
         # and the plain path tear down exactly as before.
         kill_orphan_claudes_if_user_confirms(
             sub { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST });
+        # sandbox-session-ux/01 (Decision 8): the host zone is re-derived at
+        # EVERY session launch, never cached and never baked in at `podman
+        # create` -- see HostTz.pm for the full detection algorithm. The probe
+        # is a single `podman exec ... test -f /usr/share/zoneinfo/<iana>`
+        # against the ALREADY-RUNNING container, so it only fires when an IANA
+        # candidate exists.
+        my $HOST_TZ = HostTz::detect(probe_iana => sub {
+            my ($iana) = @_;
+            local $ENV{MSYS2_ARG_CONV_EXCL} = '*' if $WINDOWS_FAMILY;
+            my ($rc, undef, undef) = _capture_out_err($PODMAN, 'exec', $CONTAINER_NAME,
+                'test', '-f', "/usr/share/zoneinfo/$iana");
+            return $rc == 0;
+        });
+        eval { log_ev(HostTz::log_event($HOST_TZ)); 1 };
         # Everything from here on owns the REAL terminal directly: `podman exec
         # -it claude` takes the tty outright and hold_for_keypress drives its
         # own cbreak loop. Nothing may paint into a buffer about to be
         # discarded, and the read mode they assume must be the one they get.
         tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST;
-        my @cmd = ($PODMAN, 'exec', '-it', $CONTAINER_NAME,
+        my @cmd = ($PODMAN, 'exec', '-it', HostTz::exec_env_args($HOST_TZ), $CONTAINER_NAME,
                    'claude', '--dangerously-skip-permissions',
                    @SESSION_FLAGS);
         my $rc = run_claude(@cmd);
@@ -2831,6 +2980,43 @@ if (_container_exists($CONTAINER_NAME)) {
     if (defined $div && length $div) {
         push @STALE_REASONS, "  - Skills changed since container was created: $div";
     }
+
+    # Decision 19 (review M2): a plugin newly enabled by ANY settings layer is
+    # newly masked (Decision 10), but masks only ever reach `podman create`'s
+    # argv -- an already-created container keeps the OLD mask set forever, the
+    # exact bug this package closes, one layer up. NO SAVED SIGNATURE IS NOT
+    # DRIFT, same rule as the Containerfile/launcher-hash checks above.
+    my $mask_sig = _host_only_mask_signature();
+    if (defined $mask_sig) {
+        my $saved_mask_sig = _read_file($HOST_ONLY_MASKS_SIGNATURE_FILE);
+        chomp $saved_mask_sig if defined $saved_mask_sig;
+        if (defined $saved_mask_sig && length $saved_mask_sig && $saved_mask_sig ne $mask_sig) {
+            push @STALE_REASONS, "  - Host-only mask set changed since container was created";
+        }
+    }
+}
+
+# _host_only_mask_signature() -> sorted, comma-joined container_paths of every
+# host-only-masks entry, or undef if the subcommand fails (fail-open: undef
+# means "cannot tell", never "assume drift"). Independent of @PLUGIN_MOUNTS
+# (not built yet at this point in the script) -- it shells out to skills.pl
+# itself, same as _skill_divergence_msg does for skill drift.
+sub _host_only_mask_signature {
+    my $seed_settings = -f $CONTAINER_SETTINGS_JSON
+        ? $CONTAINER_SETTINGS_JSON
+        : "$CONTAINER_CONFIG/settings.json";
+    my ($rc, $out, $err) = _capture_out_err($^X, $SANDBOX_SKILLS_PL,
+        'host-only-masks',
+        '--selection-file', $SELECTION_FILE,
+        '--project-path',   $PROJECT_PATH,
+        '--user-settings',  "$CLAUDE_DATA/settings.json",
+        '--seed-settings',  $seed_settings,
+        '--plugins-snapshot', $PLUGINS_SNAPSHOT_FILE);
+    return undef if $rc != 0;
+    my $masks = eval { require JSON::PP; JSON::PP::decode_json($out) };
+    return undef unless ref $masks eq 'ARRAY';
+    return join(',', sort map { $_->{container_path} }
+        grep { ref $_ eq 'HASH' && defined $_->{container_path} } @$masks);
 }
 
 # Silent podman-inspect for existence check (avoids dumping the
@@ -2917,15 +3103,7 @@ sub enforce_container_config_shape {
         # Leave the frame first: this refusal is the ONLY thing the operator
         # gets, and an alt screen discards whatever was painted into it.
         tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST;
-        _emit_err(_c_err("ERROR:"), " sandbox container ($name) still has the old\n");
-        _emit_err("       claude.json mount shape (@{[join(', ', @codes)]}) and its\n");
-        _emit_err("       running state could not be positively confirmed as safe to\n");
-        _emit_err("       remove (status: '@{[$st_ok ? ($st eq '' ? '(empty)' : $st) : 'inspect failed']}'). Continuing risks silent config\n");
-        _emit_err("       loss (an atomic rename() over the shared host config would\n");
-        _emit_err("       leave a still-attached container following a stale, unlinked\n");
-        _emit_err("       inode) or killing a live session. Close its dashboard /\n");
-        _emit_err("       session first (or re-run once the container engine responds\n");
-        _emit_err("       normally), then re-run.\n");
+        _emit_err(_c_err("ERROR:"), " sandbox container ($name) still has the old claude.json mount shape (@{[join(', ', @codes)]}) and its running state could not be positively confirmed as safe to remove (status: '@{[$st_ok ? ($st eq '' ? '(empty)' : $st) : 'inspect failed']}'). Continuing risks silent config loss (an atomic rename() over the shared host config would leave a still-attached container following a stale, unlinked inode) or killing a live session. Close its dashboard / session first (or re-run once the container engine responds normally), then re-run.\n");
         log_ev('config_shape_blocked', { container => $name, violations => \@codes, state => $st, state_ok => $st_ok });
         # H1: this sub is now also called from the early-dispatch block,
         # above enter_dashboard()'s fast path, where $LOCK_DIR (the setup
@@ -3035,6 +3213,7 @@ sub _skill_divergence_msg {
     $fmt->('plugin-path drift', $d->{plugin_path_changed});
     $fmt->('plugin added',      $d->{plugins_added});
     $fmt->('plugin removed',    $d->{plugins_removed});
+    $fmt->('plugin now host-only', $d->{plugins_host_only});
     $fmt->('plugin path drift', $d->{plugins_path_changed});
     return join('; ', @parts);
 }
@@ -3078,11 +3257,10 @@ my %plan_state = (
 my $answer;
 if (defined $FORCE_REBUILD_REASON) {
     # Non-declinable. Stated, not asked.
+    # >>> forced-rebuild-notice:BEGIN
     _emit_err(_c_warn("REBUILD REQUIRED:"), " $FORCE_REBUILD_REASON\n");
-    _emit_err("       A container and host on different Claude Code versions is not a\n",
-              "       supported configuration -- session files under claude-home are\n",
-              "       shared through the bind mount and assume one version wrote them.\n",
-              "       Rebuilding the image and recreating the container.\n");
+    _emit_err("       A container and host on different Claude Code versions is not a supported configuration -- session files under claude-home are shared through the bind mount and assume one version wrote them. Rebuilding the image and recreating the container.\n");
+    # <<< forced-rebuild-notice:END
     log_ev('forced_rebuild', { reason => $FORCE_REBUILD_REASON });
 }
 elsif (plan_wants_prompt(%plan_state)) {
@@ -3684,10 +3862,13 @@ sync_copy_plan($prior_skills_plan, _read_copy_plan($SKILLS_COPY_MANIFEST), "$CLA
 # selection + launcher control metadata stay RO in .launcher/. Each launch the
 # host-tier is RECONCILED to exactly the current selection (refresh selected,
 # remove what was placed before that isn't selected/present now -> no zombies),
-# while plugins installed INSIDE the sandbox are PRESERVED. installed_plugins.json
+# while plugins installed INSIDE the sandbox are PRESERVED, refreshed to the
+# host's version when the host has it too (host wins; the container's own
+# plugin auto-updater is off). installed_plugins.json
 # and known_marketplaces.json are real RW files in claude-home, merge-materialized
-# (selection authoritative + sandbox installs preserved). ccpraxis (and any other
-# directory-source marketplace) stays a LIVE read-only bind below.
+# (selection authoritative + sandbox installs preserved or host-refreshed).
+# ccpraxis (and any other directory-source marketplace) stays a LIVE
+# read-only bind below.
 
 make_path("$CLAUDE_DATA/plugins") unless -d "$CLAUDE_DATA/plugins";
 
@@ -3764,6 +3945,75 @@ if (-f "$HOST_PLUGINS_DIR/known_marketplaces.json") {
                 unless -d "$CLAUDE_DATA/plugins/marketplaces/$name";
             my $container_path = "/root/.claude/plugins/marketplaces/$name";
             push @PLUGIN_MOUNTS, '-v', "${host_path}:${container_path}:ro";
+        }
+    }
+}
+
+# Mask the host-only skills of any plugin -- selected in the picker OR enabled
+# in any settings layer the container can see (Decision 10) -- that is served
+# by one of the live binds above.
+#
+# `host-only: true` was enforced on only one of the two paths into a container.
+# discover_skills drops a host-only STANDALONE skill; plugin-shipped skills came
+# in through plugin selection, which never opened a SKILL.md. Resolution here
+# goes straight through plugin_directory_source + plugin_skill_census, so a
+# plugin whose skills are ALL host-only (sandbox, todo) is masked whole even
+# though discover_plugins would drop it from the picker, and a MIXED plugin --
+# steward ships /steward:setup-project and /steward:audit, which belong in a
+# container, next to four skills that do not -- keeps its container-safe skills.
+#
+# A directory-source marketplace is bind-mounted LIVE and read-only, so there is
+# no copy to leave a skill out of. Bind an empty directory over the skill dir
+# instead: what remains is a directory with no SKILL.md, which is not a skill.
+# Measured against podman first -- a nested bind over a subtree of a read-only
+# bind mounts fine and leaves its siblings intact.
+#
+# Ordering matters: every mask must come AFTER the marketplace bind it nests
+# inside, which is why this block sits below the loop above rather than beside it.
+#
+# host-only mask discovery -- FAILS OPEN (review M1). A mask error must never
+# abort the launch, so this calls _capture_out_err directly rather than the
+# die-on-nonzero-exit helper used elsewhere for perl-to-file writes. A
+# non-zero exit here is warned and the launch proceeds with no masks -- a
+# host-only skill left visible, no worse than before this package existed.
+if (@PLUGIN_MOUNTS) {
+    my $seed_settings = -f $CONTAINER_SETTINGS_JSON
+        ? $CONTAINER_SETTINGS_JSON
+        : "$CONTAINER_CONFIG/settings.json";
+    my ($mask_rc, $mask_out, $mask_err) = _capture_out_err($^X, $SANDBOX_SKILLS_PL,
+        'host-only-masks',
+        '--selection-file', $SELECTION_FILE,
+        '--project-path',   $PROJECT_PATH,
+        '--user-settings',  "$CLAUDE_DATA/settings.json",
+        '--seed-settings',  $seed_settings,
+        '--plugins-snapshot', $PLUGINS_SNAPSHOT_FILE);
+
+    my $masks;
+    if ($mask_rc != 0) {
+        _emit_err($mask_err) if defined $mask_err && length $mask_err;
+        _emit_err("Warning: host-only mask discovery failed (perl exit @{[$mask_rc >> 8]}); host-only plugin skills will be visible in the container.\n");
+    } else {
+        _write_file($HOST_ONLY_MASKS_FILE, $mask_out);
+        $masks = eval { require JSON::PP; JSON::PP::decode_json($mask_out) };
+    }
+    if (ref $masks eq 'ARRAY' && @$masks) {
+        # One shared empty directory serves every mask: it is mounted read-only
+        # and never written, so there is nothing to keep separate per skill.
+        make_path($EMPTY_SKILL_DIR) unless -d $EMPTY_SKILL_DIR;
+        my $empty_src = winify_path($EMPTY_SKILL_DIR);
+        if (-d $EMPTY_SKILL_DIR) {
+            for my $m (@$masks) {
+                next unless ref $m eq 'HASH';
+                my $target = $m->{container_path};
+                next unless defined $target && $target =~ m{^/root/\.claude/plugins/};
+                push @PLUGIN_MOUNTS, '-v', "${empty_src}:${target}:ro";
+            }
+        } else {
+            # Fail SOFT. A mask that cannot be created is a host-only skill left
+            # visible in the container -- the bug this closes, no worse than
+            # before it was closed. Refusing to launch the sandbox over it would
+            # be a far bigger regression than the defect.
+            _emit_err("Warning: could not create $EMPTY_SKILL_DIR; host-only plugin skills will be visible in the container.\n");
         }
     }
 }
@@ -3938,6 +4188,8 @@ ensure_claude_json_onboarded();
 # The decision token comes back through a temp file under .launcher/ so
 # we don't need to fight the terminal to read it.
 sub pick_session_action {
+    my ($retries_left) = @_;
+    $retries_left = 3 unless defined $retries_left;
     my $sessions_dir = "$CLAUDE_DATA/projects/-project";
     # TUI path: the pick happens in-process from a --list-json snapshot, so
     # there is no --output round-trip and no child owning the terminal.
@@ -3947,15 +4199,42 @@ sub pick_session_action {
     unlink $out_file;
     my $rc = system($^X, $SELECT_SESSION_PL,
         '--sessions-dir',  $sessions_dir,
+        '--host-sessions-dir', $HOST_SESSIONS_DIR,
         '--project-label', $PROJECT_NAME,
         '--output',        $out_file);
     my $exit = $rc >> 8;
     if ($exit == 2) {
         return ('cancel', undef);
     }
+    if ($exit == SELECT_SESSION_FORK_FAILED_EXIT) {
+        # Decision 32/33/34: a failed host-session fork (picked inside
+        # select-session.pl's own loop, per S2.2) is reported and sent back
+        # to the picker -- it must never fall through to a new session
+        # silently. Bounded to at most 3 retries: a picker that fails on
+        # EVERY run must never loop the launcher forever. Once exhausted,
+        # Decision 34 CANCELS (never 'new' -- the operator picked a specific
+        # host conversation, possibly 4 times running; a silent blank
+        # session is exactly the surprise Decision 32 rules out).
+        #
+        # Review M2: select-session.pl already printed its own error to
+        # this same terminal, but by the time the picker respawns and
+        # re-enters the alt screen, that text is gone with no chance for
+        # the operator to read it. Print it again and wait for Enter before
+        # the picker redraws -- the smallest fix that makes it visible.
+        if ($retries_left > 0) {
+            _emit_err("WARNING: host-session fork failed; returning to the picker.\n");
+            _emit_err("Press Enter to continue...");
+            my $ignored = <STDIN>;
+            return pick_session_action($retries_left - 1);
+        }
+        _emit_err("ERROR: host-session fork kept failing after 3 retries; cancelling.\n");
+        return ('cancel', undef);
+    }
     if ($exit != 0) {
-        # Selector failed for some other reason. Don't block the user —
-        # fall through to a fresh session, which is the safest default.
+        # Any other non-zero exit (a usage error against a script we invoke
+        # correctly) is exceedingly rare, and is NOT the dedicated fork-fail
+        # code -- no retry (a picker that crashes every time must never loop
+        # the launcher).
         _emit_err("WARNING: session selector exited $exit; starting a new session.\n");
         return ('new', undef);
     }
@@ -3968,7 +4247,11 @@ sub pick_session_action {
     if ($token =~ /^RESUME\s+([0-9a-fA-F-]+)\s*$/) {
         return ('resume', $1);
     }
-    _emit_err("WARNING: session selector returned unrecognized token '$token'; starting a new session.\n");
+    # red-team N2: $token round-trips through --output, so it can carry any
+    # bytes a container-controlled sandbox sessionId put into a RESUME line
+    # (the regex above only accepted the well-formed case). Strip control
+    # bytes before it reaches this terminal.
+    _emit_err("WARNING: session selector returned unrecognized token '" . _pp_sanitize($token) . "'; starting a new session.\n");
     return ('new', undef);
 }
 
@@ -4443,9 +4726,7 @@ sub kill_orphan_claudes_if_user_confirms {
         "Found " . scalar(@orphans) . " orphan claude process(es) in the container:",
         (map { "  PID $_" } @orphans),
         '',
-        'Left over from a previous session — usually a Ctrl+C from PowerShell, which',
-        'kills the local client but does not always propagate into the container. They',
-        'hold lockfiles in /root/.claude/ that will block any new claude session.',
+        'Left over from a previous session — usually a Ctrl+C from PowerShell, which kills the local client but does not always propagate into the container. They hold lockfiles in /root/.claude/ that will block any new claude session.',
     );
 
     my $kill;
@@ -4790,6 +5071,8 @@ if (! _container_exists($CONTAINER_NAME)) {
             claude_data  => $CLAUDE_DATA,
             launcher_dir => $LAUNCHER_DIR,
             statusline   => "${CLAUDE_HOST_CONFIG}/ccpraxis/scripts/statusline.pl",
+            (defined &MountSpec::ensure_global_counts_file
+                ? (global_counts => "${CLAUDE_HOST_CONFIG}/almanac-global-counts.json") : ()),
         );
         push @args, @SKILL_MOUNTS;
         push @args, @PLUGIN_MOUNTS;
@@ -4848,15 +5131,9 @@ if (! _container_exists($CONTAINER_NAME)) {
             _emit_err("       Found $n stray `;C`-suffixed bind-mount target(s):\n");
             _emit_err("         - $_\n") for @stray;
             _emit_err("\n");
-            _emit_err("       Cause: the MSYS2_ARG_CONV_EXCL=* guard didn't apply when\n");
-            _emit_err("       podman.exe was invoked. Likely someone edited launcher.pl\n");
-            _emit_err("       or the .sh/.ps1 shim and removed the env-var setup, OR you\n");
-            _emit_err("       invoked launcher.pl directly without the shim.\n");
-            _emit_err("       See global-config/CLAUDE.md \"MSYS2 path-conversion\" for the\n");
-            _emit_err("       full failure mode.\n");
+            _emit_err("       Cause: the MSYS2_ARG_CONV_EXCL=* guard didn't apply when podman.exe was invoked. Likely someone edited launcher.pl or the .sh/.ps1 shim and removed the env-var setup, OR you invoked launcher.pl directly without the shim. See global-config/CLAUDE.md \"MSYS2 path-conversion\" for the full failure mode.\n");
             _emit_err("\n");
-            _emit_err("       Auto-recovering: removing the stray dirs and the broken\n");
-            _emit_err("       container so the next run can rebuild cleanly.\n");
+            _emit_err("       Auto-recovering: removing the stray dirs and the broken container so the next run can rebuild cleanly.\n");
             _launch_fail('create', 'MSYS2 path corruption detected after podman create', undef);
             for my $path (@stray) {
                 _rmtree($path);
@@ -4875,6 +5152,14 @@ if (! _container_exists($CONTAINER_NAME)) {
     _write_file("$LAUNCHER_DIR/container-created",
         strftime("%Y-%m-%dT%H:%M:%S", gmtime(time)));
     _write_file("$LAUNCHER_DIR/launcher-hash",    launcher_hash());
+    {
+        # Decision 19 (review M2): record the mask signature this container
+        # was actually created with, so the drift check above has something
+        # to compare a future launch's signature against.
+        my $mask_sig_now = _host_only_mask_signature();
+        _write_file($HOST_ONLY_MASKS_SIGNATURE_FILE, $mask_sig_now)
+            if defined $mask_sig_now;
+    }
     run_perl_or_die('record-mount failed', 'record-mount',
         '--selection-file',     $SELECTION_FILE,
         '--discovery-snapshot', $SNAPSHOT_FILE);
@@ -5207,7 +5492,7 @@ sub reap_notice_lines {
     # The sentence heartbeat.sh composed. It is authored next to the decision
     # it describes, so it cannot drift from it -- prefer it to anything
     # reconstructed here.
-    push @out, _reap_wrap($f->{why}) if defined $f->{why} && length $f->{why};
+    push @out, $f->{why} if defined $f->{why} && length $f->{why};
 
     # The facts, compactly, for a reader who wants to check the sentence.
     my @facts;
@@ -5228,28 +5513,12 @@ sub reap_notice_lines {
     # A suspend-shaped reap has a specific, actionable cause, and the operator
     # cannot infer it from the numbers alone. Say what to do about it.
     if (($f->{host_suspends_detected} || 0) > 0) {
-        push @out, _reap_wrap(
+        push @out,
             'The machine slept while the container was up. keep-awake.ps1 holds it '
           . 'out of connected standby, but it only runs while a butler run is active '
-          . '-- so an idle sandbox is still exposed to a long suspend.');
+          . '-- so an idle sandbox is still exposed to a long suspend.';
     }
     return @out;
-}
-
-# _reap_wrap TEXT -> one wrapped string. PURE. Greedy word wrap at 76 columns;
-# a word longer than the limit is emitted whole rather than broken, since
-# breaking a path or an identifier makes it uncopyable.
-sub _reap_wrap {
-    my ($text) = @_;
-    my @lines; my $cur = '';
-    for my $w (split /\s+/, ($text // '')) {
-        next unless length $w;
-        if (!length $cur)              { $cur = $w }
-        elsif (length($cur) + 1 + length($w) <= 76) { $cur .= " $w" }
-        else                           { push @lines, $cur; $cur = $w }
-    }
-    push @lines, $cur if length $cur;
-    return join("\n", @lines);
 }
 # >>> s-reap-notice:END
 
@@ -5456,9 +5725,8 @@ if ($start_rc != 0 && $port_in_use->($start_rc)) {
         _emit_err(_c_err("ERROR:"),
             " another sandbox took this container's host ports"
             . (defined $PORT_BASE ? " (block $PORT_BASE-@{[$PORT_BASE + 19]})" : '') . ".\n");
-        _emit_err("       This container's port mapping is fixed for its lifetime.\n");
-        _emit_err("       Rebuild ([r] at the next prompt) to recreate it with a fresh,\n");
-        _emit_err("       free port block.\n\n");
+        _emit_err("       This container's port mapping is fixed for its lifetime. Rebuild ([r] at the next prompt) to recreate it with a fresh, free port block.\n");
+        _emit_err("\n");
         reset_terminal();
         exit ($start_rc >> 8 || 1);   # never exit 0 on a failed/ signal-killed start
     }
@@ -5662,13 +5930,15 @@ sub enter_dashboard {
     # are effectively immutable for this dashboard's lifetime, and an opendir + up to
     # five file reads per frame would be a real regression in the hot path. Reading it
     # once also keeps the boundary marker's position stable (no flicker).
-    my ($hist_groups_ref, $hist_last_epoch) = _history_events("$CLAUDE_DATA/sandbox-logs", "launch-$LAUNCH_ID.log");
+    my ($hist_groups_ref, $hist_epochs_ref) = _history_events("$CLAUDE_DATA/sandbox-logs", "launch-$LAUNCH_ID.log");
     my @hist_groups = @{ $hist_groups_ref || [] };
+    my @hist_epochs = @{ $hist_epochs_ref || [] };
     my $cached_status           = 'unknown';
     my $cached_machine_state    = 'unknown';   # s12: _machine_state, refreshed on the 10s inspect round
     my $cached_busy_age         = undef;   # B5: age (s) of /tmp/.butler-busy in CONTAINER time, or undef
     my $cached_busy_stamp       = 0;       # host time() when $cached_busy_age was measured
     my $cached_probe_result     = { state => 'lease-absent' };   # s21: KeepAwake's pinned probe struct
+    my $last_keepawake_log      = 0;       # when the periodic keep-awake decision was last written
     my $cached_needs_you        = 0;       # B3: escalations only the OPERATOR can clear
     my $cached_triage_queued    = 0;       # ...and those queued for the escalation resolver
     my $cached_backpack         = undef;   # B4: backpack items + per-item approval
@@ -5677,6 +5947,7 @@ sub enter_dashboard {
     my $cached_resources        = undef;   # s09/03: the reader's return value. undef means the detached sampler has not written a snapshot yet (or fork() failed) -- the panel is deliberately absent, never undef-as-a-bug.
     my $cached_runs             = [];      # s10: RunState::summarize struct, initialised to [] so the "runs" key is never undef
     my $last_inspect            = 0;
+    my $last_console_check      = 0;       # sandbox-launcher-lifecycle 01: stamp for the console-liveness throttle
     my $last_resources          = 0;       # s09: stamp for the throttled probe cadence
     my $bp_host_file      = "$CLAUDE_DATA/backpack.json";
     my $bp_appr_file      = "$LAUNCHER_DIR/backpack-approvals.json";
@@ -5691,7 +5962,7 @@ sub enter_dashboard {
     my $BUSY_STALE   = ($ENV{BUSY_STALE_SECS} && $ENV{BUSY_STALE_SECS} =~ /^\d+$/)
                        ? $ENV{BUSY_STALE_SECS} : 600;
     my $ka_helper    = "$SANDBOX_PLUGIN/scripts/keep-awake.ps1";
-    my $ka_pidfile   = "$LAUNCHER_DIR/keepawake.pid";
+    my $ka_pidfile   = "$SAMPLER_TMPDIR/keepawake.pid";
     _keepawake_reap_orphan($ka_pidfile);
     $KEEPAWAKE = KeepAwake->new(
         start => sub { _keepawake_start($ka_helper, $ka_pidfile) },
@@ -5754,6 +6025,35 @@ sub enter_dashboard {
     # ...and launcher.pl's own mtime, for the same reason and with the opposite
     # remedy: it can never be reloaded, so a change to it means RELAUNCH.
     { my @st = stat($SELF_PL); $LAUNCHER_MTIME_AT_START = $st[9] if @st; }
+
+    # sandbox-launcher-lifecycle package 01-launcher-and-its-terminal (spec
+    # sec 2.3): once, before Dashboard::run, learn the WINPID of the console
+    # host that owns this launcher's terminal window, so the gather-round poll
+    # below can notice when that window is destroyed without a signal ever
+    # being delivered. undef => mechanism disarmed; the poll is then a
+    # permanent no-op (never falls back to a guess).
+    my $CONSOLE_HOST_WINPID;
+    if ($WINDOWS_FAMILY) {
+        my ($self_wp, $r1) = self_winpid(
+            ps_w     => sub { my $r = `ps -W 2>/dev/null`; return (defined $r && $? != -1) ? $r : undef },
+            self_pid => sub { $$ },
+        );
+        if (defined $self_wp) {
+            my ($host_wp, $r2) = console_host_winpid($self_wp,
+                cim_ancestry => sub {
+                    my $ps = q{powershell.exe -NoProfile -NonInteractive -Command }
+                           . q{"Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Select-Object ProcessId,ParentProcessId,Name | ConvertTo-Json -Compress -Depth 3"};
+                    my $r = `$ps 2>/dev/null`;
+                    return (defined $r && $? != -1) ? $r : undef;
+                },
+            );
+            $CONSOLE_HOST_WINPID = $host_wp;
+            log_ev('console_liveness_armed', { self_winpid => $self_wp, console_host_winpid => $host_wp, reason => $r2 });
+        } else {
+            log_ev('console_liveness_disarmed', { reason => $r1 });
+        }
+    }
+
     my $rc = Dashboard::run(
         color     => 1,
         # The two t11 seams. Dashboard.pm contains no system/exec/fork and
@@ -5999,6 +6299,51 @@ sub enter_dashboard {
                 $last_inspect  = $now;
                 $probed_now    = 1;
             }
+            # sandbox-launcher-lifecycle package 01 (spec sec 2.3): a second,
+            # independent throttle -- did our owning console host disappear
+            # without ever delivering a signal? $CONSOLE_HOST_WINPID is undef
+            # whenever the mechanism is disarmed (non-Windows, ps -W
+            # unavailable, or no console host found in the ancestry chain), in
+            # which case this whole block is a permanent no-op.
+            if ($CONSOLE_HOST_WINPID && $now - $last_console_check >= $CONSOLE_LIVENESS_POLL_SECONDS) {
+                $last_console_check = $now;
+                # simplify pass, 2026-09-19 (efficiency finding): this fires
+                # every CONSOLE_LIVENESS_POLL_SECONDS on the SAME loop that
+                # renders and handles input -- a synchronous powershell.exe
+                # spawn here cost ~400ms measured on this host (CLR/host
+                # startup dominates a single-filter CIM query), directly
+                # against the idle-CPU goal package 02 just fixed. `tasklist`
+                # via cmd.exe answers the identical "does this WINPID still
+                # exist" question with no CLR to start, measured ~100ms here
+                # -- still a real cost every 5s, but a ~4x cut, and it stays
+                # native rather than moving the probe to a detached sampler
+                # (a bigger redesign this finding did not ask for). Local
+                # MSYS2_ARG_CONV_EXCL scope per CLAUDE.md's documented
+                # pattern -- nothing here is a path, so nothing needs
+                # hand-translation, only the exclusion itself.
+                my $verdict = winpid_alive($CONSOLE_HOST_WINPID,
+                    cim_probe => sub {
+                        local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
+                        my $r = `tasklist /FI "PID eq $CONSOLE_HOST_WINPID" /NH /FO CSV 2>/dev/null`;
+                        my $exec_ok = ($? != -1);
+                        return (undef, 0) unless $exec_ok;
+                        # tasklist prints one CSV row per match, or an
+                        # "INFO: No tasks..." line for zero matches -- adapt
+                        # both into the minimal JSON shape winpid_alive
+                        # already knows how to decode, so that function's
+                        # own contract and test coverage stay untouched.
+                        my $found = ($r =~ /^"[^"]*","(\d+)"/m) ? $1 : undef;
+                        my $json = (defined $found && $found == $CONSOLE_HOST_WINPID)
+                                 ? qq([{"ProcessId":$found}])
+                                 : '[]';
+                        return ($json, 1);
+                    },
+                );
+                if ($verdict eq 'gone') {
+                    _teardown_and_exit('CONSOLE-GONE', 143);
+                }
+                # 'alive' or 'unknown': no action. 'unknown' is not evidence of death.
+            }
             # 03-resources-reader-model: the probe round no longer runs here at
             # all. A detached sampler (forked in enter_dashboard, see
             # _resources_sampler_start/_resources_sampler_round) does the
@@ -6079,6 +6424,12 @@ sub enter_dashboard {
             $cur = LaunchLog::merge_by_key([ $cur, $orch_ev ],
                        key => \&_row_time_key, max => $ACTIVITY_EVENT_MAX)
                 if ref $orch_ev eq 'ARRAY' && @$orch_ev;
+            # spec 03-activity-feed-ordering S2c: one divider PER prior
+            # session, embedded into a flat list before handing it to the
+            # unchanged, 2-source/single-outer-marker merge_sessions below --
+            # not a change to that function's signature or semantics.
+            my $hist_flat       = Dashboard::stitch_history_dividers(\@hist_groups, \@hist_epochs, undef);
+            my $hist_last_epoch = @hist_epochs ? $hist_epochs[-1] : undef;
             return {
                 project_name    => $PROJECT_NAME,
                 container       => $CONTAINER_NAME,
@@ -6091,13 +6442,27 @@ sub enter_dashboard {
                 # skipped off a reading that may be up to 10s out of date.
                 status_stale    => ($probed_now ? 0 : 1),
                 events          => LaunchLog::merge_sessions(
-                                        [ @hist_groups, $cur ],
+                                        [ $hist_flat, $cur ],
                                         max    => $ACTIVITY_EVENT_MAX,
                                         marker => Dashboard::session_boundary_row($hist_last_epoch),
                                     ),
                 install_warning => $INSTALL_WARNING,
                 busy_age        => $busy_age,
                 stay_awake      => $stay,
+                # THE READING, NOT JUST THE NUMBER DERIVED FROM IT. busy_age is
+                # undef for two completely different reasons -- "there is no
+                # lease" and "we could not read one" -- and the panel used to
+                # render both as "none (no active run)". The operator then saw
+                # a definite negative for a lease that was being refreshed
+                # every few seconds (20260915-230820-d33e). Pass the probe
+                # state through so the view can tell those apart.
+                lease_probe     => { state  => $cached_probe_result->{state},
+                                     detail => $cached_probe_result->{detail} },
+                # What the wake-lock is ACTUALLY doing, as opposed to what this
+                # gather would like it to do. They diverge exactly when a probe
+                # failure is being held through, which is the case worth
+                # rendering honestly.
+                keepawake_held  => ($KEEPAWAKE && $KEEPAWAKE->running) ? 1 : 0,
                 needs_you        => $cached_needs_you,
                 triage_queued    => $cached_triage_queued,
                 backpack         => $cached_backpack,
@@ -6127,9 +6492,47 @@ sub enter_dashboard {
         },
         keepawake => sub {
             my ($st) = @_;
-            my $act = $KEEPAWAKE->sync($st->{stay_awake} ? 1 : 0);
-            log_ev('keepawake', { want => ($st->{stay_awake} ? 1 : 0), action => $act,
-                                  busy_age => $st->{busy_age} }) if $act ne 'noop';
+            # THE PROBE OWNS THIS DECISION; THIS SEAM ONLY CONVERGES TO IT.
+            #
+            # This runs on every state refresh, while the probe behind it is
+            # throttled to one round per $CONTAINER_POLL_SECONDS. During a
+            # probe failure the cached age is deliberately FROZEN and its
+            # timestamp is not advanced, so the extrapolated $busy_age above
+            # grows without bound -- and this seam, re-deriving staleness from
+            # it, would eventually cross $BUSY_STALE and release the very lock
+            # on_probe was holding on purpose. Two decision sites, one of them
+            # ignorant of the probe state, is how the tolerance got defeated.
+            #
+            # So: when the last reading was 'probe-failed', leave the lock
+            # exactly as on_probe left it.
+            my $probe_state = ref $st->{lease_probe} eq 'HASH'
+                            ? ($st->{lease_probe}{state} // '') : '';
+            my $act = 'noop';
+            if ($probe_state ne 'probe-failed') {
+                $act = $KEEPAWAKE->sync($st->{stay_awake} ? 1 : 0);
+                log_ev('keepawake', { want => ($st->{stay_awake} ? 1 : 0), action => $act,
+                                      busy_age => $st->{busy_age} }) if $act ne 'noop';
+            }
+            # AND THE STEADY STATE GETS WRITTEN DOWN. Logging only transitions
+            # meant the state that actually matters -- held, hour after hour --
+            # wrote nothing at all: `busy_age` appeared zero times across every
+            # launch log on the reporting host, so "is the keep-awake working?"
+            # had no answer available to either side (20260911-224616-e8e0).
+            # Throttled to the heartbeat's own cadence, so it costs one line
+            # every two minutes.
+            my $now_ka = time;
+            if ($now_ka - $last_keepawake_log >= $KEEPAWAKE_LOG_SECONDS) {
+                $last_keepawake_log = $now_ka;
+                log_ev('keepawake_decision', {
+                    want       => ($st->{stay_awake} ? 1 : 0),
+                    held       => ($KEEPAWAKE->running ? 1 : 0),
+                    busy_age   => $st->{busy_age},
+                    stale      => $BUSY_STALE,
+                    probe      => ($probe_state ne '' ? $probe_state : undef),
+                    detail     => (ref $st->{lease_probe} eq 'HASH' ? $st->{lease_probe}{detail} : undef),
+                    action     => $act,
+                });
+            }
         },
         spawn         => \&_spawn_session,
         stop_runs     => sub { my ($st, $prog) = @_; _lifecycle_run('stop-runs',     $st, $prog) },
@@ -6150,8 +6553,9 @@ sub enter_dashboard {
             # $cached_status and re-deciding the wake-lock off a stale busy_age.
             # They are `my` lexicals of enter_dashboard (:2842-2843), reachable
             # only from a closure -- hence this shape.
-            $last_inspect   = 0;
-            $last_resources = 0;
+            $last_inspect       = 0;
+            $last_console_check = 0;
+            $last_resources     = 0;
             return $r;
         },
         # 07-backpack-screen S2.3/E-A: the three persistence seams the [b]
@@ -6326,8 +6730,8 @@ sub _lifecycle_run {
             }
             # Bounded (:5s each) -- a wedged podman must not hang await_quiet's
             # poll loop indefinitely and freeze the TUI (see _run_timed above).
-            my $bm = _run_timed(qq{$PODMAN exec "$CONTAINER_NAME" stat -c %Y /tmp/.butler-busy 2>/dev/null}, 5);
-            my $cn = _run_timed(qq{$PODMAN exec "$CONTAINER_NAME" date +%s 2>/dev/null}, 5);
+            my $bm = _run_timed(qq{$PODMAN exec "$CONTAINER_NAME" sh -c 'stat -c %Y $BUSY_LEASE_PATH' 2>/dev/null}, 5);
+            my $cn = _run_timed(qq{$PODMAN exec "$CONTAINER_NAME" sh -c 'date +%s' 2>/dev/null}, 5);
             my ($lmt)  = ($bm && $bm =~ /^(\d+)/) ? ($1) : ();
             my ($cnow) = ($cn && $cn =~ /^(\d+)/) ? ($1) : ();
             my $busy_age;
@@ -6446,7 +6850,7 @@ sub recover_container {
             # is kept because touching early is unconditionally correct and free,
             # NOT because of a ten-second cliff that never existed.
             if ($code == 0) {
-                my $touch_out = `$PODMAN exec "$CONTAINER_NAME" touch /tmp/.launcher-alive 2>&1`;
+                my $touch_out = `$PODMAN exec "$CONTAINER_NAME" sh -c 'touch $LAUNCHER_ALIVE_PATH' 2>&1`;
             }
             my $err = _trim_err($out);
             # MINOR-4: a container removed while the machine was down classifies
@@ -6500,7 +6904,7 @@ sub _heartbeat_once {
     # across the live frame (the corruption André saw). Backticks + 2>&1 keep it
     # off-screen (MSYS2_ARG_CONV_EXCL=* is set, so the /tmp path passes through),
     # and the captured reason is surfaced in the launch log instead.
-    my $out = `$PODMAN exec "$CONTAINER_NAME" touch /tmp/.launcher-alive 2>&1`;
+    my $out = `$PODMAN exec "$CONTAINER_NAME" sh -c 'touch $LAUNCHER_ALIVE_PATH' 2>&1`;
     my $rc  = $?;
     if ($rc != 0) {
         my $state = `$PODMAN inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null`;
@@ -6543,16 +6947,38 @@ sub _heartbeat_once {
 # tell "container gone" apart from "merely could not be asked right now".
 sub _busy_lease_probe {
     my ($container) = @_;
+
+    # THE PATH GOES INSIDE `sh -c`, AND THAT IS LOAD-BEARING ON WINDOWS.
+    #
+    # `podman exec <ctr> stat -c %Y /tmp/.butler-busy` hands podman.exe -- a
+    # NATIVE Windows binary -- an argv element that starts with a slash. MSYS2
+    # rewrites those into Windows paths on the way past, so what the container
+    # actually received was
+    #
+    #     stat: cannot statx 'C:/Users/ANDR~1/AppData/Local/Temp/.butler-busy'
+    #
+    # and the "No such file" below read it as lease-absent: a definite fact
+    # about the CONTAINER, which releases the wake-lock at once. The machine
+    # then slept under a live fleet. Measured on this host 2026-09-16; the
+    # probe had been blind since efdd028 (2026-08-25).
+    #
+    # Wrapping the whole command in `sh -c '...'` makes the argv element start
+    # with `stat`, not `/`, so there is nothing for MSYS2 to convert. This is
+    # the project's stated preference (CLAUDE.md, "Windows landmines"): a shape
+    # that is correct under EITHER conversion state beats one that depends on
+    # MSYS2_ARG_CONV_EXCL being set, because it cannot be broken by a caller's
+    # environment. The sampler that calls this used to clear that variable.
+    #
     # Read mtime first, then the container's own clock, so the inter-exec gap
     # can't read negative (matches the prior host/container-clock-skew fix).
-    my $bm = `$PODMAN exec "$container" stat -c %Y /tmp/.butler-busy 2>&1`;
+    my $bm = `$PODMAN exec "$container" sh -c 'stat -c %Y $BUSY_LEASE_PATH' 2>&1`;
     my $rc = $?;
     if ($rc == 0) {
         my ($lmt) = ($bm =~ /^(\d+)/);
         unless (defined $lmt) {
             return { state => 'probe-failed', detail => 'unparsable stat output: ' . _trim_err($bm) };
         }
-        my $cn = `$PODMAN exec "$container" date +%s 2>/dev/null`;
+        my $cn = `$PODMAN exec "$container" sh -c 'date +%s' 2>/dev/null`;
         my ($cnow) = ($cn && $cn =~ /^(\d+)/) ? ($1) : ();
         unless (defined $cnow) {
             return { state => 'probe-failed', detail => 'could not read container clock' };
@@ -6562,13 +6988,37 @@ sub _busy_lease_probe {
     }
     # Non-zero: is this "the lease file genuinely doesn't exist" (exec itself
     # succeeded, `stat` just failed) or "could not even run the exec"?
-    if ($bm =~ /no such file or directory/i) {
-        return { state => 'lease-absent' };
+    # ...but only if the file it could not find is the one we ASKED for. The
+    # rule itself is pure and lives in KeepAwake so it can be exercised against
+    # the real measured strings; see classify_lease_stat_failure for why a
+    # rewritten path is a fact about us rather than about the container.
+    if (my $verdict = KeepAwake::classify_lease_stat_failure($bm, $BUSY_LEASE_PATH)) {
+        return { state => 'lease-absent' } if $verdict eq 'lease-absent';
+        return { state => 'probe-failed',
+                 detail => "lease path was rewritten before podman saw it (asked for $BUSY_LEASE_PATH): "
+                           . _trim_err($bm) };
     }
+    # WHETHER THE CONTAINER IS GONE IS ITSELF A QUESTION THAT CAN GO UNANSWERED.
+    #
+    # `podman inspect` prints nothing when the podman CLIENT cannot reach the
+    # machine at all -- the host suspending the WSL2 VM does exactly this. The
+    # old code took the resulting empty string, compared it to 'running', and
+    # returned container-gone: a definite negative, released with no tolerance.
+    # The launch logs carry 267 of these as `container_gone state=` with an
+    # empty state and "Cannot connect to Podman" as the reason, which is the
+    # signature of a client that could not ask rather than a container that
+    # died. An unanswerable inspect is probe-failed, which on_probe holds
+    # through $KEEPAWAKE_PROBE_TOLERANCE before giving up.
     my $state = `$PODMAN inspect --format '{{.State.Status}}' "$container" 2>/dev/null`;
+    my $inspect_rc = $?;
     chomp $state if defined $state;
     $state //= '';
     my $reason = _trim_err($bm);
+    if ($inspect_rc != 0 || $state eq '') {
+        return { state => 'probe-failed',
+                 detail => ($reason ne '' ? "could not reach podman to confirm container state; $reason"
+                                          : 'could not reach podman to confirm container state') };
+    }
     if ($state ne 'running') {
         return { state => 'container-gone', detail => ($reason ne '' ? "state=$state; $reason" : "state=$state") };
     }
@@ -6608,6 +7058,14 @@ sub _keepawake_start {
     }
     my $win_ps1 = winify_path($ps1);
     my $win_pid = winify_path($pidfile);
+    # The helper's owner is THIS launcher, named by its WINDOWS pid so the helper
+    # can tell a quiet owner from a gone one (keep-awake.ps1 -OwnerWinPid,
+    # Decision 16). Read in the parent, before fork: $$ is an MSYS pid, a
+    # different namespace that keep-awake.ps1 must never be handed. When it
+    # cannot be read, omit the flag -- the helper then runs on its bounded
+    # fallback lease rather than trusting a wrong identity.
+    my $owner_winpid = _keepawake_owner_winpid();
+    my @owner_args = defined $owner_winpid ? ('-OwnerWinPid', $owner_winpid) : ();
     my $pid = fork();
     if (!defined $pid) {
         log_ev('keepawake_start_failed', { reason => "fork: $!" });
@@ -6621,11 +7079,28 @@ sub _keepawake_start {
         open(STDERR, '>', '/dev/null');
         local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
         exec('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
-             '-WindowStyle', 'Hidden', '-File', $win_ps1, '-PidFile', $win_pid)
+             '-WindowStyle', 'Hidden', '-File', $win_ps1, '-PidFile', $win_pid,
+             @owner_args)
             or do { POSIX::_exit(127); };
     }
-    log_ev('keepawake_started', { pid => $pid });
+    log_ev('keepawake_started', { pid => $pid,
+        owner_winpid => (defined $owner_winpid ? $owner_winpid : 'none') });
     return $pid;
+}
+
+# _keepawake_owner_winpid() -> positive WINDOWS pid of this process | undef.
+# Cygwin/MSYS exposes the native pid at /proc/<msys-pid>/winpid (measured on
+# this host: MSYS 1183523 -> WINPID 99496). Anything that is not a positive
+# integer -- no /proc, unreadable, garbage -- is undef, never a guess.
+sub _keepawake_owner_winpid {
+    my $f = "/proc/$$/winpid";
+    return undef unless -r $f;
+    open(my $fh, '<', $f) or return undef;
+    my $v = <$fh>;
+    close $fh;
+    return undef unless defined $v;
+    $v =~ s/\s+//g;
+    return ($v =~ /^\d+$/ && $v > 0) ? $v : undef;
 }
 
 # _keepawake_stop($child_pid, $pidfile) — kill our helper child (releases the
@@ -6975,9 +7450,9 @@ sub _gnu_timeout_bin {
 # _probe_err_path($key) -> where THIS probe's stderr goes for this round.
 #
 # Per-probe, so a reason can be attributed to the probe that produced it. The
-# files live beside the sampler's own .err and are overwritten each round, so
-# they never grow.
-sub _probe_err_path { my ($k) = @_; return "$LAUNCHER_DIR/probe-$k.err" }
+# files live beside the sampler's own .err (in $SAMPLER_TMPDIR, off host NTFS
+# inside the project tree) and are overwritten each round, so they never grow.
+sub _probe_err_path { my ($k) = @_; return "$SAMPLER_TMPDIR/probe-$k.err" }
 
 # _probe_reason($key) -> the first meaningful stderr line from this probe's last
 # run, or undef. Read only when a probe produced nothing, so a healthy round
@@ -7706,6 +8181,13 @@ sub _container_sampler_round {
 
     my $probe   = _busy_lease_probe($container);
     my $machine = _machine_state();
+    # The container's own PID namespace, so the host can answer liveness for
+    # PIDs a sandboxed run wrote from inside it. `ls /proc` is the cheapest
+    # census available and needs no extra tooling in the image; wrapped in
+    # `sh -c` for the same conversion reason as every other exec here.
+    my $pidlist = `$PODMAN exec "$container" sh -c 'ls /proc' 2>/dev/null`;
+    my @container_pids = ($? == 0 && defined $pidlist)
+        ? (grep { /^\d+$/ } split /\s+/, $pidlist) : ();
 
     my $snap = {
         v            => 1,
@@ -7724,6 +8206,12 @@ sub _container_sampler_round {
         # probe_errors came to ship inert two commits ago.
         status_why   => $status_why,
         machine      => $machine,
+        # EMPTY AND ABSENT MEAN DIFFERENT THINGS HERE. An exec that failed
+        # leaves this absent, and _container_pids_fresh then declines to
+        # answer at all -- which is what preserves _pid_alive's UNKNOWN. A
+        # successful exec always yields at least pid 1, so an empty list
+        # cannot arise from a healthy container and is not special-cased.
+        (@container_pids ? (container_pids => \@container_pids) : ()),
         probe        => (ref $probe eq 'HASH' ? $probe : { state => 'probe-failed',
                                                            detail => 'probe returned no result' }),
     };
@@ -7735,10 +8223,25 @@ sub _container_sampler_round {
 # _container_sampler_main($container, $owner_pid) -> exit code.
 sub _container_sampler_main {
     my ($container, $owner_pid) = @_;
-    # Same reason the other two samplers clear it: the parent `local`s it
-    # immediately before exec, which leaves it set for this process's entire
-    # life and its whole subtree.
-    delete $ENV{MSYS2_ARG_CONV_EXCL};
+    # THIS SAMPLER KEEPS MSYS2_ARG_CONV_EXCL, AND IT IS THE ONE THAT MUST.
+    #
+    # The resources and spend samplers clear it because they go on to run MSYS
+    # tools that WANT POSIX->Windows translation. This one does not: every
+    # subprocess it spawns is podman.exe, a native Windows binary, and the
+    # arguments it hands over are container-side POSIX paths that must arrive
+    # verbatim. Clearing the variable here -- copied from the other two when
+    # this sampler was split out in efdd028 -- put MSYS2 back in the path of
+    # `stat /tmp/.butler-busy`, which was rewritten to the host's Windows TEMP
+    # directory. stat then failed "No such file", _busy_lease_probe read that
+    # as lease-absent, and the wake-lock was never taken out at all: zero
+    # keepawake events across every launch log on the reporting host, while a
+    # fleet ran for sixteen hours and the machine slept under it.
+    #
+    # The call sites are now wrapped in `sh -c` and so are correct under either
+    # conversion state -- belt as well as braces, per CLAUDE.md's rule that the
+    # opt-out and the translation are one technique. This line is the braces.
+    # Do not "restore symmetry" with the other two samplers by deleting it.
+    $ENV{MSYS2_ARG_CONV_EXCL} = '*' if $WINDOWS_FAMILY;
     while (1) {
         last unless kill(0, $owner_pid);
         eval { _write_file_atomic($CONTAINER_SAMPLER_PID, "$$ $owner_pid " . time . "\n"); 1 };
@@ -8240,7 +8743,7 @@ sub _tail_lines {
 sub _history_events {
     my ($dir, $exclude) = @_;
     my @groups;
-    my $newest_hist_epoch;
+    my @group_epochs;
     eval {
         my @paths = LaunchLog::recent_logs($dir, $HISTORY_LOG_FILES, $exclude);  # newest-first
         for my $p (reverse @paths) {                                # -> oldest-first
@@ -8268,23 +8771,24 @@ sub _history_events {
             }
             if (ref $ev eq 'ARRAY' && @$ev) {
                 push @groups, $ev;
-                # The newest timestamp in this group. Only the LAST group's
-                # value survives the loop, which is the one wanted: it dates the
-                # "previous session" divider that sits directly above the
-                # current session's events. Needed because activity rows show a
-                # wall clock now instead of an age, and a bare "23:41" on the
-                # far side of a session boundary says nothing about WHICH day.
+                # The newest timestamp in THIS group -- one entry per group now
+                # (spec 03-activity-feed-ordering S2c), rather than collapsed
+                # across the whole loop, so Dashboard::stitch_history_dividers
+                # can date a divider per prior session instead of just one
+                # divider for the whole history.
+                my $group_newest;
                 for my $ln (@lines) {
                     my $e = Dashboard::_event_epoch_of_line($ln);
                     next unless defined $e;
-                    $newest_hist_epoch = $e
-                        if !defined($newest_hist_epoch) || $e > $newest_hist_epoch;
+                    $group_newest = $e
+                        if !defined($group_newest) || $e > $group_newest;
                 }
+                push @group_epochs, $group_newest;
             }
         }
         1;
-    } or do { @groups = (); $newest_hist_epoch = undef };   # any failure -> no history, dashboard behaves exactly as today
-    return (\@groups, $newest_hist_epoch);
+    } or do { @groups = (); @group_epochs = () };   # any failure -> no history, dashboard behaves exactly as today
+    return (\@groups, \@group_epochs);
 }
 
 # _gather_orchestrator_events($runs) -> ARRAYREF of span-rows -- spec S2
@@ -8385,16 +8889,23 @@ sub _gather_spend {
 }
 
 # _row_time_key($row) -> seconds-since-local-midnight | undef (private helper
-# for the s16 cross-source interleave). recent_events rows don't carry a raw
-# epoch, only the already-rendered "HH:MM:SS  " muted span (Dashboard.pm's
-# _event_time), so that is the best-effort comparable key LaunchLog::merge_by_key
-# needs. Unparseable -> undef, which merge_by_key treats as "keep this source's
-# own append order" rather than as an error.
-# _row_time_key($row) -> seconds-since-midnight, or undef.
+# for the s16 cross-source interleave). The caller-supplied key extractor for
+# LaunchLog::merge_by_key (s16 spec S1.1). Best-effort by construction:
+# rendered rows carry no raw epoch, only the muted timestamp span, so this
+# recovers what is there. Unparseable -> undef, which merge_by_key treats as
+# "keep this source's own append order" rather than as an error.
 #
-# The caller-supplied key extractor for LaunchLog::merge_by_key (s16 spec S1.1).
-# Best-effort by construction: rendered rows carry no raw epoch, only the muted
-# HH:MM:SS span, so this recovers what is there.
+# almanac 20260919-000106-2bdd: Limitation 2 below warned that a rendering
+# change would silently degrade this to always-undef with nothing failing
+# loudly -- and that is exactly what had already happened. The regex required
+# "HH:MM:SS" (seconds included), but the wall-clock renderer this key reads
+# from (Dashboard.pm's activity_time_text(_local_hhmm(...))) emits only
+# "HH:MM" -- it never had a seconds field to begin with. Every row this
+# function was asked to key returned undef, so the cross-source interleave
+# below silently fell back to source-order for every pair, always. Fixed by
+# making the seconds group optional and defaulting it to 0; a merge key that
+# is only ever minute-precision is still strictly better than a merge key
+# that never existed.
 #
 # TWO KNOWN LIMITATIONS, recorded rather than left for the next reader to
 # rediscover. Both are bounded by the spec's ordering ruling (S1): within a
@@ -8414,17 +8925,235 @@ sub _gather_spend {
 #      deliberate escalation, not a silent widening.
 #
 #   2. COUPLING TO RENDERED TEXT. This parses display output to recover a sort
-#      key. s17 is next on this same panel; if it changes the leading timestamp
-#      span, this returns undef, the merge degrades to source-order fallback,
-#      and NOTHING FAILS LOUDLY. Whoever touches that rendering must re-check
-#      here.
+#      key. If the leading timestamp span's shape changes again, this returns
+#      undef, the merge degrades to source-order fallback, and NOTHING FAILS
+#      LOUDLY -- exactly the failure mode that produced this bug. Whoever
+#      touches that rendering must re-check here, and ideally add an assertion
+#      that pins the format this function expects.
+# >>> s-rowtimekey:BEGIN
 sub _row_time_key {
     my ($row) = @_;
     return undef unless ref $row eq 'ARRAY' && @$row && ref $row->[0] eq 'HASH';
     my $t = $row->[0]{text};
-    return undef unless defined $t && $t =~ /^(\d\d):(\d\d):(\d\d)/;
-    return $1 * 3600 + $2 * 60 + $3;
+    return undef unless defined $t && $t =~ /^(\d\d):(\d\d)(?::(\d\d))?/;
+    return $1 * 3600 + $2 * 60 + (defined $3 ? $3 : 0);
 }
+# <<< s-rowtimekey:END
+
+# >>> wt-profile:BEGIN
+# wt_profile_plan(%seams) -> { profile => $name_or_undef, event => $event_or_undef }
+#
+# Pure, seam-driven decision for the [c] launch-claude hotkey: should the new
+# window open under the ccpraxis Windows Terminal profile, and if not, what
+# reason should the launch log carry? This function performs no I/O of its
+# own — every side effect happens through the three caller-supplied seams
+# (resolve_root, ensure, profile_name) — so it can be extracted and eval'd
+# into a fresh package by a test without ever touching a real filesystem.
+#
+# Contract (see specs/02-launch-claude-uses-profile-spec.md sec 2.2, amended by
+# sandbox-session-ux/01-container-timezone-spec.md sec 2.3 point 3, Decision
+# 17):
+#   - success: { profile => $name, event => undef }, UNLESS the ensure seam's
+#     result carries appearance => 'fallback', in which case success is
+#     { profile => $name, event => { type => 'launch_profile_appearance_fallback',
+#                                     fields => { reason => R } } } -- R is
+#     appearance_reason when it is a non-ref string matching
+#     /\A[a-z][a-z_]{0,63}\z/, otherwise 'unknown'.
+#   - failure: { profile => undef, event => { type => 'launch_profile_degraded',
+#                                              fields => { reason => $code } } }
+#   profile and event are mutually exclusive ONLY on failure -- on success, an
+#   event means the profile opened with fallback appearance. Every seam call
+#   is fenced so this function itself never raises and never emits a warning.
+sub wt_profile_plan {
+    my (%seams) = @_;
+
+    my $make_degrade = sub {
+        my ($reason) = @_;
+        $reason = 'bad_result' if defined($reason) && ref($reason);
+        $reason = 'unknown' unless defined($reason) && $reason =~ /\S/;
+        return {
+            profile => undef,
+            event   => { type => 'launch_profile_degraded', fields => { reason => $reason } },
+        };
+    };
+
+    # Step 1: resolve the fragment root.
+    my $root_result;
+    my $root_ok = eval {
+        local $SIG{__WARN__} = sub { };
+        $root_result = $seams{resolve_root}->();
+        1;
+    };
+    return $make_degrade->('ensure_threw') unless $root_ok;
+    return $make_degrade->('bad_result')   unless ref($root_result) eq 'HASH';
+    return $make_degrade->($root_result->{reason}) unless $root_result->{ok};
+
+    # Step 2: ensure the fragment file is written/current.
+    my $ensure_result;
+    my $ensure_ok = eval {
+        local $SIG{__WARN__} = sub { };
+        $ensure_result = $seams{ensure}->($root_result->{root});
+        1;
+    };
+    return $make_degrade->('ensure_threw') unless $ensure_ok;
+    return $make_degrade->('bad_result')   unless ref($ensure_result) eq 'HASH';
+    return $make_degrade->($ensure_result->{reason}) unless $ensure_result->{ok};
+
+    # Step 3: the profile name to hand to spawn_argv.
+    my $name;
+    my $name_ok = eval {
+        local $SIG{__WARN__} = sub { };
+        $name = $seams{profile_name}->();
+        1;
+    };
+    return $make_degrade->('ensure_threw')   unless $name_ok;
+    return $make_degrade->('no_profile_name') unless defined($name) && length($name);
+
+    # Decision 17 hand-off: surface a fallback appearance as a log event
+    # instead of discarding it.
+    if (defined($ensure_result->{appearance}) && $ensure_result->{appearance} eq 'fallback') {
+        my $reason = $ensure_result->{appearance_reason};
+        $reason = 'unknown'
+            unless defined($reason) && !ref($reason) && $reason =~ /\A[a-z][a-z_]{0,63}\z/;
+        return {
+            profile => $name,
+            event   => { type => 'launch_profile_appearance_fallback', fields => { reason => $reason } },
+        };
+    }
+
+    return { profile => $name, event => undef };
+}
+# <<< wt-profile:END
+
+# >>> console-liveness:BEGIN
+# sandbox-launcher-lifecycle package 01-launcher-and-its-terminal
+# (specs/01-launcher-and-its-terminal-spec.md sec 2.1). Three pure,
+# seam-driven functions -- no I/O of their own -- so they can be extracted
+# and eval'd into a fresh package by a test without ever touching a real
+# subprocess or WMI. Real I/O closures are wired at the call sites, outside
+# this region, in launcher.pl proper.
+
+# self_winpid(%seams) -> ($winpid_or_undef, $reason)
+#   seams (both required): ps_w => sub { returns raw "ps -W" stdout text, or
+#                           undef on exec failure }
+#                           self_pid => sub { returns the MSYS pid to match,
+#                           i.e. $$ }
+sub self_winpid {
+    my (%seams) = @_;
+    my $raw = $seams{ps_w}->();
+    return (undef, 'ps-w-unavailable') unless defined $raw && $raw =~ /\S/;
+    my $pid = $seams{self_pid}->();
+    my @lines = split /\r?\n/, $raw;
+
+    # Locate PID/WINPID by parsing the header row's own field names rather
+    # than trusting a pinned column index -- ps -W's layout varies by build
+    # (this host's real Cygwin/Git-for-Windows ps has 8 columns: PID PPID
+    # PGID WINPID TTY UID STIME COMMAND, not the 4-column PID PPID WINPID
+    # COMMAND some other ps builds use). Self-correcting against future
+    # column-order drift; fails safe (undef), never guesses a wrong index.
+    # Column-name discovery is confined to the header row (line 0) only --
+    # scanning into data rows risks a literal 'WINPID'/'PID' token
+    # coincidentally appearing in a process's COMMAND field and silently
+    # producing a wrong index.
+    my ($pid_idx, $winpid_idx);
+    my @header_cols = @lines ? split(' ', $lines[0]) : ();
+    for my $i (0 .. $#header_cols) {
+        $pid_idx = $i if !defined($pid_idx) && $header_cols[$i] eq 'PID';
+        $winpid_idx = $i if $header_cols[$i] eq 'WINPID';
+    }
+    return (undef, 'winpid-column-not-found') unless defined $winpid_idx;
+    return (undef, 'pid-column-not-found') unless defined $pid_idx;
+
+    for my $line (@lines) {
+        my @cols = split ' ', $line;
+        next unless @cols > $pid_idx && @cols > $winpid_idx;
+        next unless $cols[$pid_idx] =~ /^\d+$/;
+        next unless $cols[$pid_idx] == $pid;
+        return (undef, 'winpid-not-numeric') unless $cols[$winpid_idx] =~ /^\d+$/;
+        return ($cols[$winpid_idx], 'ok');
+    }
+    return (undef, 'no-matching-row');
+}
+
+# console_host_winpid($self_winpid, %seams) -> ($winpid_or_undef, $reason)
+#   seams (required): cim_ancestry => sub { returns raw JSON text of
+#     Get-CimInstance Win32_Process | Select ProcessId,ParentProcessId,Name
+#     | ConvertTo-Json -Compress -Depth 3 (see spec sec 2.2 for the pinned
+#     command), or undef on exec failure }
+#   Walks ParentProcessId upward from $self_winpid, bounded to 64 hops
+#   (mirrors reap-orphans.pl's own-ancestry guard), and returns the WINPID of
+#   the NEAREST ancestor whose Name matches, case-insensitively, one of:
+#   conhost.exe, OpenConsole.exe, WindowsTerminal.exe. Returns
+#   (undef, 'cim-query-failed') if the seam returns undef, (undef,
+#   'cim-parse-failed') on malformed JSON, (undef, 'no-console-host-in-chain')
+#   if the walk exhausts (chain end or hop bound) without a match. NEVER
+#   guesses: an inconclusive walk watches nothing.
+sub console_host_winpid {
+    my ($self_winpid, %seams) = @_;
+
+    my $raw = $seams{cim_ancestry}->();
+    return (undef, 'cim-query-failed') unless defined $raw && $raw =~ /\S/;
+
+    my $data = eval { JSON::PP->new->utf8(0)->decode($raw) };
+    return (undef, 'cim-parse-failed') unless ref $data;
+    $data = [$data] if ref $data eq 'HASH';
+    return (undef, 'cim-parse-failed') unless ref $data eq 'ARRAY';
+
+    my %by_pid;
+    for my $p (@$data) {
+        next unless ref $p eq 'HASH';
+        next unless defined $p->{ProcessId};
+        $by_pid{ $p->{ProcessId} } = $p;
+    }
+
+    my $console_re = qr/^(?:conhost\.exe|OpenConsole\.exe|WindowsTerminal\.exe)$/i;
+    my $current = $self_winpid;
+    my $guard   = 0;
+    while ($guard++ < 64) {
+        my $row = $by_pid{$current};
+        return (undef, 'no-console-host-in-chain') unless ref $row eq 'HASH';
+        my $parent = $row->{ParentProcessId};
+        return (undef, 'no-console-host-in-chain') unless defined $parent;
+        my $parent_row = $by_pid{$parent};
+        if (ref $parent_row eq 'HASH' && defined $parent_row->{Name} && $parent_row->{Name} =~ $console_re) {
+            return ($parent, 'ok');
+        }
+        $current = $parent;
+    }
+    return (undef, 'no-console-host-in-chain');
+}
+
+# winpid_alive($winpid, %seams) -> 'alive' | 'gone' | 'unknown'
+#   seams (required): cim_probe => sub { returns ($raw_json_text_or_undef,
+#     $exec_ok_boolean) for Get-CimInstance Win32_Process -Filter
+#     "ProcessId=$winpid" (see spec sec 2.2 for the pinned command) }
+#   'unknown' whenever the query could not be trusted (exec_ok false, raw
+#   undef, or malformed JSON) -- NEVER collapsed into 'gone'. 'gone' only
+#   when the query executed cleanly (exec_ok true, raw defined) and decoded
+#   to zero matching processes. 'alive' when it decoded to exactly one
+#   process bearing that ProcessId. This asymmetry is what makes criterion 3
+#   (never falsely reap) hold: every failure mode degrades toward "do
+#   nothing", never toward "gone".
+sub winpid_alive {
+    my ($winpid, %seams) = @_;
+
+    my ($raw, $exec_ok) = $seams{cim_probe}->();
+    return 'unknown' unless $exec_ok;
+    return 'unknown' unless defined $raw;
+
+    unless ($raw =~ /\S/) {
+        return 'gone';
+    }
+
+    my $data = eval { JSON::PP->new->utf8(0)->decode($raw) };
+    return 'unknown' unless ref $data;
+    $data = [$data] if ref $data eq 'HASH';
+    return 'unknown' unless ref $data eq 'ARRAY';
+
+    my @matches = grep { ref $_ eq 'HASH' && defined $_->{ProcessId} && $_->{ProcessId} == $winpid } @$data;
+    return @matches ? 'alive' : 'gone';
+}
+# <<< console-liveness:END
 
 # _spawn_session — the dashboard's launch-claude hotkey: open a NEW Windows
 # Terminal window running the internal connector entry
@@ -8461,7 +9190,14 @@ sub _spawn_session {
         return 'redraw';
     }
 
-    my $argv = Dashboard::spawn_argv('wt', { cmd => \@inner });   # ['wt.exe','-w','new',…]
+    my $plan = wt_profile_plan(
+        resolve_root => sub { WtProfile::fragment_root() },
+        ensure       => sub { WtProfile::ensure_fragment($_[0]) },
+        profile_name => sub { WtProfile::profile_name() },
+    );
+    eval { log_ev($plan->{event}{type}, $plan->{event}{fields}); 1 } if $plan->{event};
+
+    my $argv = Dashboard::spawn_argv('wt', { cmd => \@inner, profile => $plan->{profile} });   # ['wt.exe','-w','new', -p <profile>?, …]
     log_ev('launch_session', { mode => 'wt' });
     my $rc = system(@$argv);   # returns immediately (detached window)
     log_ev('launch_session_done', { mode => 'wt', exit => ($rc >> 8) });
@@ -8476,9 +9212,7 @@ sub plain_heartbeat_loop {
     print "=" x 60 . "\n";
     print "Sandbox ready: $CONTAINER_NAME\n";
     print "=" x 60 . "\n";
-    print "This terminal is the manager — keep it open. Closing it stops\n";
-    print "the sandbox (~5 minutes after the last heartbeat).\n";
-    print "Press Ctrl+C to stop now.\n";
+    print "This terminal is the manager — keep it open. Closing it stops the sandbox (~5 minutes after the last heartbeat). Press Ctrl+C to stop now.\n";
     print "\n";
 
     my $BEAT_INTERVAL = 120;  # Container's HB is 300 (5 min); 120s gives 2.5x margin.

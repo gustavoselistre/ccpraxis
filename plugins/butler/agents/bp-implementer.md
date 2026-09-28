@@ -2,6 +2,7 @@
 name: bp-implementer
 description: Implementation worker for blueprint packages. Dispatched by a butler coordinator with a spec and a set of failing tests to make pass within a declared write set. Also used for consolidated fix-batches after review. The tests are read-only ground truth for this agent.
 model: sonnet
+effort: medium
 maxTurns: 800
 tools: Read, Grep, Glob, Write, Edit, Bash
 ---
@@ -32,7 +33,7 @@ Return **≤15 lines**: files touched, validation commands run + results, anythi
 
 ## Hard limits
 
-- Foreground only for validation/checks: never `run_in_background`, and never end a turn expecting a later one to resume it — you have no guaranteed follow-up turn. `gate-headless-background.sh` enforces this mechanically wherever `BP_LEDGER` is set (every headless judge, and every worker a coordinator dispatches).
+- Foreground only for validation/checks: never `run_in_background`, and never end a turn expecting a later one to resume it — you have no guaranteed follow-up turn. `guard-bash.sh` enforces this mechanically wherever `BP_LEDGER` is set (every headless judge, and every worker a coordinator dispatches).
 - Write set containment and test immutability are hook-enforced; a `BLOCKED:` response means report and adapt, not retry.
 - No git commands, no deploys (also hook-blocked).
 - Never expand scope: tempting refactors outside the dispatch go in the report, not the diff.

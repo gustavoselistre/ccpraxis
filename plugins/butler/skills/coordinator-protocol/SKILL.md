@@ -21,23 +21,23 @@ Your process carries (exported by the launcher — if these are missing you were
 
 Hooks enforce: write-set containment, implementer/test-writer role separation, one write-capable worker in flight, git/deploy safety, the stop gate, and the **graceful-stop gate** (see "Graceful stop" below). **A `BLOCKED:` message is protocol feedback. Comply, record it in the ledger, escalate via `status: blocked` if it reveals a scope problem. Never route around a hook.**
 
-#### …but only inside a butler-LAUNCHED coordinator
+#### Write-guard reach
 
-That sentence is true of *this* session — a coordinator started by `bp-launch.sh` — and false
-almost everywhere else. Every butler hook but one begins with `bp_hook_gate` (`hooks/lib.sh:9`),
-which **exits 0 (allow) unless `BP_LEDGER`, `BP_DIR` and `BP_PROJECT_ROOT` are all set**. Those are
-exported by `bp-launch.sh` only. So in a `/butler:drive-solo` run, in a manually-dispatched
-`Task`/Agent subagent, and in any ordinary interactive session, write-set containment, role
-separation and the one-write-capable-worker lock are **convention, not enforcement** — nothing will
-stop a violation, and nothing will report one.
-
-The single exception is **`guard-git-mutations.sh`**, which deliberately carries no `bp_hook_gate`
-and applies everywhere (see its header). It exists because the gate opening in a manual drive is
-not hypothetical: a prohibited `git stash` swept away a completed, uncommitted fix-batch that the
-ledger had already recorded as done.
+- In a coordinator (`BP_LEDGER` set), write-set containment, role separation and the
+  one-write-capable-worker lock all apply, hook-enforced, exactly as this protocol describes.
+- In an armed drive-solo session the write-set and ledger guards apply to the driver and its
+  subagents (the one-writer lock does not; see `drive-solo/SKILL.md`): a subagent may write only
+  its bound package's write set (test paths only as the test-writer), its own ledger, and its
+  own blueprint dir except a sibling package's ledger, and temp; with two or more packages in
+  flight, an unbound subagent's edits are refused.
+- In any other session (a manually-dispatched subagent, an ordinary interactive session), no
+  butler write guard applies, except `guard-git-mutations.sh` and `guard-blueprint-write.sh`,
+  which apply everywhere. `guard-git-mutations.sh` exists because an unguarded manual drive is
+  not hypothetical: a prohibited `git stash` swept away a completed, uncommitted fix-batch that
+  the ledger had already recorded as done.
 
 **What this means for you:** never infer "a hook would have caught it" from the list above. If you
-are driving without the `BP_*` contract, `git status` after every write-capable worker is the only
+are outside a guarded session, `git status` after every write-capable worker is the only
 containment check you actually have.
 
 ### `BP_REPORT_DIR` — derive capture output paths, never hardcode one
@@ -106,10 +106,8 @@ already asks; (2) it is not fixable inside your own write set — matches
 that guidance's default applies instead: fix it, file nothing.
 
 A worked example of the quality bar a filed report needs (bug-report's "What makes a report worth
-reading" transfers almost verbatim): the registry-path `$PWD` guess still live at
-`plugins/butler/hooks/lib.sh:380`, `plugins/butler/hooks/mark-wakeup.sh:214`, and two sites inside
-the reporter's own drive-loop gate script — file:line, verified from disk, evidence stated plainly,
-exactly the bar this filing needs.
+reading" transfers almost verbatim): the registry-path `$PWD` guess — file:line, verified from
+disk, evidence stated plainly, exactly the bar this filing needs.
 
 ### Context budget — your ledger has one, and a fix when it's blown
 
@@ -186,8 +184,9 @@ script, anything you'd otherwise be tempted to sit and watch — launch it with
 its output, do not watch it grow. The completion notification comes back to you on its own, in a
 later turn, and that is when you resume. You are notified when it completes — you never have to
 go looking. This is a multi-turn pattern only: a headless one-shot process (a judge, a
-Task-dispatched worker) has no later turn, so `gate-headless-background.sh` denies
-`run_in_background` mechanically whenever `BP_LEDGER` is set.
+Task-dispatched worker) has no later turn, so `guard-bash.sh` denies `run_in_background`
+mechanically whenever `BP_LEDGER` is set, except the continuity holder (see "Waiting on a
+background subagent").
 
 **Foreground is the documented default for validation.** Anything that finishes in a couple of
 minutes or less — your test suite, `bp-ledger.pl` calls, a lint pass — belongs in the
@@ -217,6 +216,103 @@ on something **already complete** — a sentinel file that had existed for over 
 already sitting on disk, a suite that was already green — the whole time it polled. So: read the
 result **once**. If it's there, proceed. If it isn't yet, end the turn and resume on the
 completion notification; never check again in the same turn, and never in a loop.
+
+### Every wait names its subject and its liveness proof
+
+A butler-launched coordinator has no completion-notification resumption available for an ordinary
+background Bash job (`guard-bash.sh` denies `run_in_background` whenever `BP_LEDGER` is set,
+except the continuity holder, as this same file states above), so the "Check the sentinel once"
+paragraph's notification branch does not apply to a background Bash job. Only a background
+subagent, held by the continuity holder, resumes a coordinator. Name a subject and a liveness
+proof instead.
+
+Three coordinators in about twenty minutes each blocked or parked on work that had already died or
+finished (`20260917-003158-949e`), and each queued a human decision that did not need one.
+
+**A wait is legal only if you can name two things: the SUBJECT and the LIVENESS PROOF.** The
+subject is the exact process, file or ledger you are waiting on. The liveness proof is a check that
+asks a live process, not one that reads bookkeeping. **A pid you recorded, a sentinel path and a
+report filename are bookkeeping; none of them is evidence that anything is still running.**
+
+**If you cannot name a liveness proof, the wait is not legal.** Do one of these instead, in order:
+(1) run the work in the FOREGROUND and read its result in this turn; (2) re-dispatch the subject so
+the wait has a live subject again; (3) write a concrete `## Next action` and stop. **Never park, and
+never queue a human decision, on a wait whose subject you never checked.**
+
+The `liveness proof` cell below draws only from this closed vocabulary:
+
+| token | means |
+|---|---|
+| `Task return` | the Task tool returned; the dispatch is over by construction |
+| `completion notification` | the completion notification of a `run_in_background` Bash job (interactive drivers) or of a held background subagent (coordinators and drivers) |
+| `foreground exit code` | you ran it inline and read `$?` in the same turn |
+| `pid_alive` | `BpResumption::pid_alive`, called directly |
+| `NONE` | no liveness proof exists for this shape — legal **only** on a `BANNED` row |
+
+The wait-shape table's columns are fixed:
+
+```
+| wait shape | subject | liveness proof | ruling |
+```
+
+The sanctioned and banned shapes:
+
+| wait shape | subject | liveness proof | ruling |
+|---|---|---|---|
+| Task worker dispatch, synchronous | the dispatched subagent | `Task return` | SANCTIONED |
+| backgrounded Bash job resumed on notification (interactive drivers only) | the backgrounded job | `completion notification` | SANCTIONED |
+| a background subagent dispatch held by the holder (coordinators and drivers) | the dispatched subagent | `completion notification` | SANCTIONED |
+| foreground validation run | the command you ran | `foreground exit code` | SANCTIONED |
+| a recorded pid, checked live | the process that pid names | `pid_alive` | SANCTIONED |
+| naked existence read as completion — test -f on a dispatch report | the worker you dispatched | `NONE` | BANNED |
+| naked sentinel wait — an absent sentinel read as "still running" | the process that must write the sentinel | `NONE` | BANNED |
+| naked pid-file read — a recorded pid read as a live process | the process that pid named | `NONE` | BANNED |
+
+The three `BANNED` rows come from real cases: the report-stub row is `06-l1-reaudit`, the sentinel
+row is `03-scorer-rich`, and the pid-file row is `02-rich-extraction`.
+
+#### Waiting on a background subagent
+
+<!-- continuity:begin -->
+You are armed by construction. You stop only on a terminal, fresh ledger with a concrete
+`## Next action` when blocked or parked, or while a hold covers a running background subagent.
+To wait: dispatch the worker in the background, run `butler-hold <agent id>` with
+`run_in_background: true` only when `butler-continuity status` shows `holder: none` (otherwise
+run it in the foreground, which extends the holder), and end the turn; its completion wakes you.
+A hold on anything that is not a running background subagent counts for nothing.
+`butler-continuity off` and `silence` refuse in a coordinator.
+A denied stop prints a stop token for the holder line above; use it as printed.
+<!-- continuity:end -->
+
+#### Existence is not completion
+
+The worker dispatch contract itself mandates the report file be **created before the investigation
+and appended to as it goes** (`SKILL.md`, "CREATE THIS FILE EARLY, BEFORE THE INVESTIGATION, AND
+APPEND AS YOU GO"). So at dispatch start **every** report file already exists. `test -f <report>`
+therefore proves only that the dispatch *started*.
+
+A wait on a dispatch report ends only when the worker has returned and the report has advanced
+past its stub — never on bare existence. This extends, and does not replace, the existing
+"Confirm the artifact exists on disk before accepting any worker's conclusion … If the file is
+absent or stub-sized, the work did not happen" rule (`SKILL.md`, the worker dispatch contract's
+rules): that one governs *accepting a conclusion*; this one governs *ending a wait*.
+
+**A sentinel is the same rule with the polarity flipped:** a *missing* sentinel is not evidence that
+work is still running. Pair every sentinel wait with the writer's pid.
+
+#### Fail OPEN means the wait CONTINUES
+
+**A wait is not a gate, and it is bounded by the holder's 50 minutes**, so continuing one cannot
+wedge anything: the worst case is that the hold runs out and you make a recorded decision then.
+The `pid_alive` row is a single check, not a loop: one call, then decide. The two errors are
+therefore not symmetric:
+
+- Treating an **unverifiable** subject as **dead** ends the wait and triggers a re-dispatch of work
+  that may still be running — two write-capable workers in one write set, and a live worker
+  abandoned moments before it would have written its report.
+- Treating it as **alive** costs at most the remainder of one hold.
+
+So: **an undeterminable subject is ALIVE, and the wait continues.** Unknown is never dead.
 
 ## Fast test I/O — heavy artifacts on container-native storage
 
@@ -333,7 +429,7 @@ Once that judgement is made and a report is filed, the `TOOLING-BUG-FILED:` mark
 **defined and mechanically checkable**: `id=` must resolve to a real, existing report file whose own
 frontmatter `id:` matches, and `why=` must be non-empty — the same shape as the deviation marker
 documented in "Mandated means & deviations" above. **Say exactly what that buys you today, not
-more:** this grammar is proven by an exercised test (`t/152-tooling-bug-filing.t`), and any reader can
+more:** this grammar is proven by an exercised test (`t/tooling-bug-filing.t`), and any reader can
 apply it by hand — but, unlike that deviation marker, it is **not yet wired into any live hook or into
 the remediation engine** that acts on it automatically. A forged or missing `id=` today produces no
 automatic finding and blocks nothing — nobody acts on it until a human, or a future package, wires
@@ -386,7 +482,22 @@ Check off pipeline steps in the ledger as you go. Steps may be skipped only with
 same per-dispatch budget/elapsed-time mechanism `drive-solo/SKILL.md`'s "Arm the
 watcher" section documents for the interactive driver; both surfaces share the same
 blind spot — a dispatched worker has no elapsed-time signal independent of its own
-self-report, regardless of which one dispatched it):
+self-report, regardless of which one dispatched it). **This manual bracket is what
+gives you `--budget-seconds`/`elapsed`/the over-budget-interrupt-loop signal below —
+`track-dispatch.sh`'s automatic hook tracking (see "Checking what is outstanding"
+further down) does NOT provide that; it gives you `outstanding` instead, a
+different, weaker check.** If you bracket a dispatch manually here, do not also
+assume the hook leaves it alone: `track-dispatch.sh`'s `PostToolUse` half tries to
+resolve a matching `running` record automatically the moment the `Task` call
+returns, which fires **before** your own next turn's `finish` call ever runs — so
+by the time you call `finish`, the hook has typically already closed the record to
+`done`. `finish` does not check that a record is still `running` before closing
+it, so it re-closes the already-`done` record anyway: `ended_at`/`duration_seconds`
+get overwritten with a second, near-identical measurement, and a second
+`history.jsonl` line gets appended for the same dispatch. This is not a correctness
+problem for the record's final `done` state, but it IS a duplicate history entry —
+know that this double-bracketing is what produces it, rather than treating it as a
+bug in either mechanism.
 
 ```bash
 perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-dispatch-log.pl start \
@@ -400,14 +511,15 @@ perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-dispatch-log.pl finish --id <id> --statu
 elapsed --id <id>` shows `over_budget: true`, "interrupt" always means "send the
 dispatch a message asking it to stop iterating and report," never a process kill,
 whether the caller is an interactive driver or a semi-autonomous coordinator. The
-canonical prompt is documented once, in `drive-solo/SKILL.md`'s "Arm the watcher"
-section (step 4) — read it there rather than duplicating it here, so there is one
+canonical prompt is documented once, in `drive-solo/SKILL.md`'s "Wedged workers"
+section — read it there rather than duplicating it here, so there is one
 canonical wording and one place it can drift out of sync.
 
 Every dispatch prompt contains, explicitly:
 
 ```
 Scope: <what, precisely>
+Ledger: .ccpraxis-local-data/blueprints/<blueprint>/packages/<package>.md
 Files: <paths, file:line where known>
 Do NOT: <out-of-scope list, incl. anything tempting nearby>
 Acceptance: <how the worker knows it's done>
@@ -417,11 +529,16 @@ Report to: $BP_DIR/reports/$BP_PACKAGE/<worker>-<step>.md
 Return: ≤15 lines — outcome, validation run + result, report path, anything off-spec.
 ```
 
+drive-solo needs the `Ledger:` line to bind the dispatch; in a fleet coordinator it is
+informational.
+
 Rules:
 
-- **One write-capable worker in flight** (implementer / test-writer / ui-prober) — hook-enforced *inside a `bp-launch.sh` coordinator only* (see "…but only inside a butler-LAUNCHED coordinator" above); elsewhere it is your discipline. Read-only workers may run in parallel.
+- **One write-capable worker in flight** (implementer / test-writer / ui-prober) — hook-enforced *inside a `bp-launch.sh` coordinator only* (see "Write-guard reach" above); elsewhere it is your discipline. Read-only workers may run in parallel.
 - A worker that returns garbage or dies: redispatch once with a sharpened prompt. Twice: log the attempt, then either change approach or block — don't loop.
 - You may make small glue edits inside your write set yourself (wiring an export, a one-line fix during validation). Anything resembling a step belongs to a worker.
+- **Never dispatch with `subagent_type: fork`; launch a fresh subagent with a self-contained
+  prompt instead.**
 
 ### Turn caps — two fields, one concept, and they are NOT the same field
 
@@ -433,14 +550,14 @@ This has already cost one whole review pass: **eleven of eleven** dispatched wor
 | `maxTurns:` | **agent** frontmatter, `plugins/*/agents/<name>.md` | **Task subagents** — the workers you dispatch |
 | `steps:` | **OpenCode twin**, `plugins/butler/opencode/<name>.md` | the same worker under `worker_backend: opencode` |
 
-There are **three** of them, and the third is easy to miss entirely. `t/157-opencode-worker-runtime.t` keeps `steps:` derived from its Claude twin's `maxTurns:`, so changing a cap without syncing the twin turns that file red — deliberately.
+There are **three** of them, and the third is easy to miss entirely. `t/opencode-worker-runtime.t` keeps `steps:` derived from its Claude twin's `maxTurns:`, so changing a cap without syncing the twin turns that file red — deliberately.
 
 The first two differ only in case and separator. Raising one does **nothing** for the other, and that is not hypothetical: `b23` raised the ledger default 80 → 150 and wrote "`bp-scout` … default 40" into the authoring protocol while `bp-scout.md` kept `maxTurns: 15` — the very number that same paragraph calls known-starving — for another two months.
 
 - **Task exposes no per-dispatch turn override.** You cannot raise a cap from the dispatch call; the agent's own frontmatter is the only control point. So either the cap fits the scope, or the scope must fit the cap.
 - **A cap is a runaway backstop, NOT a budget.** This is the whole principle, and getting it wrong is what starved eleven workers. A cap only binds when the agent would otherwise still be working: an agent that finishes in 12 turns costs 12 turns whether its cap is 40 or 800. So a low cap buys you **nothing** on the runs that behave, and costs you the **entire dispatch** on the runs that don't — an asymmetry that always argues upward. Size the cap to stop a pathological loop, not to ration a healthy worker.
 - **Spend is controlled elsewhere**, and confusing the two is the trap: scope the worker narrowly, pick the cheapest model that can do the job, set `effort:` deliberately, and bound the run with the token budget. Those throttle cost continuously. A turn cap throttles nothing until it decapitates.
-- **Floor: no agent definition may declare `maxTurns:` below `400`.** Enforced by `t/91-agent-worker-doctrine.t`, which reads this number from this sentence and checks every `plugins/*/agents/*.md` — so prose and mechanism cannot drift apart again.
+- **Floor: no agent definition may declare `maxTurns:` below `400`.** Enforced by `t/agent-worker-doctrine.t`, which reads this number from this sentence and checks every `plugins/*/agents/*.md` — so prose and mechanism cannot drift apart again.
 - Caps above the floor are **sized to the role**: bounded read-and-write-one-artifact roles sit at the floor (400); multi-file roles that must *execute* things at 600; convergence loops (implementer, resolve-judge) at 800. For calibration, the ledger `max_turns:` default for a **coordinator** is 150 — a worker auditing a whole subsystem has no business being capped below the thing that dispatches it.
 - **If you are tempted to lower one of these, you are reading it as a budget again.** Lower the scope instead.
 
@@ -488,12 +605,50 @@ What does **not** change, and why it matters:
 - **The same one-write-capable-worker lock applies.** `bp-worker.pl` takes the *same* marker file `track-dispatch.sh` uses for Task workers, so the implementer/test-writer role split holds identically across both paths. A second write-capable dispatch while one is in flight exits **3** and writes nothing. You cannot evade the rule by switching backends.
 - **Read-only workers still run concurrently.** Scout, architect, reviewer and redteam take no marker on either path.
 - **The ≤15-line return contract still applies.** stdout is capped regardless of how much the worker emitted; the full text lands under `$BP_DIR/reports/$BP_PACKAGE/`, and the printed `report:` line names it.
-- **The dispatch log still gets its entry**, in the same format `log-dispatch.sh` writes for Task.
+- **The dispatch log still gets its entry**, in the same format `track-dispatch.sh` writes for Task.
 - **A fleet stop is still honoured.** `bp-worker.pl` checks the stop signals itself and refuses (exit 5), because a subprocess bypasses the `PreToolUse` graceful-stop gate entirely. A stopped fleet does not keep spawning workers through this path.
 
 Exit codes: `0` ok · `2` usage · `3` a write-capable worker is already in flight · `4` unrecognised backend · `5` refused, fleet stop in force · `6` env contract not satisfied · `7` the backend itself exited non-zero · `8` backend binary not found.
 
 **Judges never port.** Harvest, conformance and resolve judges stay on Claude regardless of `worker_backend:`.
+
+### Checking what is outstanding, without asserting the answer
+
+`track-dispatch.sh`'s `PostToolUse` half resolves a worker's dispatch record automatically the
+moment its `Task` call returns — for a `Task` dispatch tracked only through the hook (i.e. not also
+manually bracketed per the "Worker dispatch contract" section above), you do not need to call
+`finish`/`resolve` yourself. The START half's `dispatch_key` correlation is what lets the completion
+half find the right record; see `track-dispatch.sh`'s own header comment (in this repo, not the
+blueprint's gitignored spec, which does not travel to a fresh clone) if you need the mechanism. What
+you get for free is a check, not a guarantee:
+
+```bash
+perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-dispatch-log.pl outstanding \
+     --root "$BP_PROJECT_ROOT" --blueprint "$BP_BLUEPRINT" --package "$BP_PACKAGE"
+```
+
+**Always scope with `--blueprint`/`--package` like this when the answer feeds an automated
+decision** (a stop, a gate, anything beyond an operator-facing report) — both env vars are already
+exported into your process. The unfiltered, whole-store form (omitting both flags) reports every
+outstanding record across every blueprint and package ever run against this store, including
+pre-existing keyless records this mechanism can never resolve; an unscoped automated stop condition
+built on it is permanently true. The unfiltered form stays useful for an operator-facing audit — just
+never as the input to an automatic decision.
+
+Read `outstanding_count:` from its stdout. If the line is absent or reads `unknown`, the answer is
+**unknown** — never treat that as zero. Every `summary:` line this verb can print is hedged
+deliberately: a dispatch **appears** to be outstanding, or none was detected — it is never asserted
+as settled, because the check only reflects what is recorded on disk, not whether a process is
+actually still alive. A crashed dispatch whose `PostToolUse` never fired stays outstanding forever;
+`outstanding` has no timeout that clears it. Use this to catch a false "nothing left to do" before
+you park or checkpoint — not to prove a negative on its own.
+
+**What this signal cannot claim (L1):** two dispatches identical in `subagent_type`, package and
+`dispatch_key` within 120 seconds of each other collapse to ONE record (the start half's own
+pre-existing dedup window, which cannot tell a double-stamped single dispatch from two genuinely
+concurrent same-key ones). `outstanding` can therefore read zero while a second, genuinely-running
+dispatch of that exact shape still exists — narrow, but real. See the "Worker dispatch contract"
+section above for the manual-bracket alternative this signal does not replace.
 
 ## Resumption
 
@@ -512,3 +667,59 @@ The deterministic orchestrator can stop the fleet mid-package without killing yo
 - **Per-package force-stop** (`runs/<pkg>.force-stop`) — this package is being stopped individually. Record a concrete `## Next action`, then stop.
 
 In all three, `## Next action` must be concrete enough for a fresh coordinator (or your warm-resumed self) to pick up — the Stop gate enforces it. **Don't fight the gate**: keep trying denied work and you just burn the budget the pause exists to protect.
+
+## Context-growth checkpoint
+
+This is now a **two-tier, mostly mechanical** ritual (coordinator-context-discipline/02), not
+something you compute by hand. The canonical numbers live in exactly one place in code —
+`bp-orchestrator.pl`'s `%CTX_CEILING_DEFAULT` — and this section is a restatement of it, not a
+second source of truth: **soft = 250,000 tokens**, **hard = 350,000 tokens**. An operator overrides
+either independently via `BP_CONTEXT_CEILING_SOFT_TOKENS` / `BP_CONTEXT_CEILING_HARD_TOKENS` (the
+old single-ceiling variable this superseded no longer exists — superseded, not aliased).
+
+You no longer measure your own context by hand — the old line-count-plus-tail recipe is gone. Two
+hooks do the measurement for you, from the same bounded tail-read of `runs/<pkg>.jsonl` the
+orchestrator itself uses:
+
+- **`context-ceiling.sh`** (`PostToolUse` on `Task`/`Bash`) — at or above the **soft**
+  ceiling, this attaches a short **guidance** reminder to a tool result you were already going to
+  receive. It is purely informational and blocks nothing: no new tool call is made on your behalf,
+  and the reminder rides on an existing turn rather than manufacturing one. It re-injects at most
+  once every 15 minutes while you stay at/above soft (so a single mention doesn't read as
+  "resolved"), and resets the moment you drop back below soft. The reminder's own dispatch-status
+  line quotes `bp-dispatch-log.pl outstanding` (scoped to your blueprint and package) verbatim — it
+  is not your own guess about what's still running.
+- **`context-ceiling.sh`** (`PreToolUse` on `Task`/`Bash`) — at or above the **hard** ceiling,
+  this is the mandatory **flush**: it denies `Task` dispatch outright and denies any `Bash` command
+  that isn't exactly flush work. The allow-list is `bp-ledger.pl set-status|set-next-action|
+  tick-step|append-attempt|add-output|validate` and `bp-dispatch-log.pl outstanding` — `Read`,
+  `Edit`, `Grep` and `Write` are never gated by this hook at all, so you can still write the
+  `## Escalation` prose and re-read your ledger freely. The flush is capped at **5 turns**: use them
+  to run the scoped `bp-dispatch-log.pl outstanding` check, write a concrete `## Next action` with
+  `bp-ledger.pl set-next-action`, leave `status:` non-terminal, and stop — exactly the same stop
+  shape as the usage/telemetry pause above (`## Graceful stop (orchestrator-initiated)`, "Usage /
+  telemetry pause" bullet). If you cannot finish within 5 turns, the overrun is recorded to disk and
+  becomes visible to the orchestrator; at that point set `status: blocked` with a filled
+  `## Escalation` naming what is preventing completion, then stop — the established stuck-coordinator
+  path, not a new one.
+
+You write no signal file at either tier: a soft-tier checkpoint exits cleanly (structurally identical
+to an ordinary turn-end), exactly as the old ritual did. The orchestrator independently re-derives
+the **soft** check from your own transcript at relaunch time — if your last coordinator-owned usage
+record was at or above the soft ceiling, it forces a **COLD** relaunch regardless of how fresh the
+cache looks, exactly like its existing `max_turns` override (`bp-orchestrator.pl`, the
+`watchdog_relaunch` site). Checking soft (not just hard) here is deliberate: soft subsumes hard (any
+usage at/above hard is also at/above soft), so a flushed coordinator relaunching cold holds by
+construction — without that, a same-session, seconds-old checkpoint could resume WARM, `--resume`d
+back into the exact context you just tried to discard.
+
+**If a worker turn itself grows context past a ceiling before returning**: the guidance/flush check
+happens only after that worker returns, on its next `Task`/`Bash` call — you cannot interrupt an
+in-flight worker (matching the usage-pause ritual's own "in-flight workers can't be cancelled"
+stance). You may therefore be noticeably above a ceiling for one tool call before either hook fires;
+that's expected, not a defect (the figure the guidance hook reports may lag your true current context
+by up to one turn for the same reason).
+
+**If this trigger and the usage/telemetry pause condition are both true at the same boundary**: no
+ordering is prescribed — either one produces the identical stop mechanics, so firing "both" collapses
+to firing the ritual once. Don't try to satisfy two separate stop procedures.

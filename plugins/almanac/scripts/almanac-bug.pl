@@ -41,6 +41,27 @@ use Digest::SHA qw(sha256_hex);
 use File::Basename qw(dirname);
 use Cwd ();
 
+# Almanac::Lock sits beside this script, and it is found from THIS FILE's own
+# path rather than from $0 or FindBin. Both of those are the invoking program,
+# which is not the same thing: the tests load this script in-process with
+# `do $A`, where $0 is the .t file and FindBin would resolve to the tests
+# directory. __FILE__ is this file wherever it was loaded from, so `perl -c`
+# from the repo root, `perl -c` from plugins/almanac/tests/, a CLI run and a
+# `do` all resolve the same module.
+BEGIN {
+    my $dir = __FILE__;
+    $dir =~ s{\\}{/}g;
+    $dir =~ s{/[^/]+\z}{};
+    $dir = '.' unless length $dir;
+    unshift @INC, $dir;
+}
+use Almanac::Lock ();
+
+# Set by _write_atomic on every failure, cleared at its entry. cas_write
+# reports it rather than a bare "write failed", so a rename that exhausted its
+# retry deadline is named as that.
+our $LAST_ERROR = '';
+
 our @STATES = qw(open reviewing taken resolved declined);
 
 # Closed vocabulary for `severity`. `unknown` is IN it — it is the script's own
@@ -84,11 +105,22 @@ sub registry_path {
 }
 
 # known_projects() -> list of absolute project roots on THIS machine.
+#
+# FIX (defect 2, 20260911-225720-4c57): the file is read via `<:raw>` (raw,
+# UN-decoded bytes), so it MUST be decoded with `->utf8` -- that tells
+# JSON::PP the input is UTF-8-encoded bytes rather than already-decoded
+# characters. Without it, a registry path containing a real multi-byte
+# character (job-search: "/c/Users/André/Personal Files/Job search")
+# decodes to MOJIBAKE: the two raw bytes of 'é' (0xC3 0xA9) each become their
+# own bogus codepoint (U+00C3, U+00A9) instead of collapsing to one (U+00E9).
+# opendir() on that corrupted string then fails, silently, and a project's
+# entire bug-report store vanishes from `collect` with no diagnostic --
+# verified: job-search's 6 reports (all open) were invisible before this fix.
 sub known_projects {
     my $p = registry_path();
     open my $fh, '<:raw', $p or return ();
     local $/;
-    my $j = eval { JSON::PP->new->decode(<$fh>) };
+    my $j = eval { JSON::PP->new->utf8->decode(<$fh>) };
     close $fh;
     return () unless ref $j eq 'HASH' && ref $j->{projects} eq 'HASH';
     my @out;
@@ -100,6 +132,60 @@ sub known_projects {
     return @out;
 }
 sub reports_dir { my ($root) = @_; return "$root/.ccpraxis-local-data/bug-reports" }
+
+# _almanac_type_dirs($almanac_root) -> @dirs -- directory DISCOVERY, not a
+# type list (package 09, S2.3): every subdirectory of $almanac_root whose
+# name matches the store-type grammar ^[a-z][a-z0-9-]*$. A missing root is
+# silently skipped -- the container case for the global root. Never dies.
+sub _almanac_type_dirs {
+    my ($almanac_root) = @_;
+    return () unless defined $almanac_root && -d $almanac_root;
+    opendir(my $dh, $almanac_root) or return ();
+    my @out;
+    for my $e (readdir($dh)) {
+        next unless $e =~ /\A[a-z][a-z0-9-]*\z/;
+        my $full = "$almanac_root/$e";
+        push @out, $full if -d $full;
+    }
+    closedir $dh;
+    return sort @out;
+}
+
+# canonical_root(path) -> a value two SPELLINGS of one directory converge on,
+# so a dedupe keyed on it treats them as the same root.
+#
+# FIX (defect 1, 20260911-225720-4c57): the caller's own root arrives as
+# `C:/Development/ccpraxis` (from $CLAUDE_PROJECT_DIR / Cwd::abs_path), while
+# the steward registry stores the POSIX spelling `/c/Development/ccpraxis`.
+# `all_report_paths` used to dedupe on the RAW string, so both spellings
+# survived into @roots, both got walked, and every report under that one
+# directory was yielded twice -- measured: 88 reports where the project held
+# 43 (43*2 + 2 from another project).
+#
+# Cwd::abs_path is the real answer whenever the directory exists: it
+# resolves case, "..", backslashes and symlinks to one canonical form, which
+# is exactly why both `C:/Development/ccpraxis` and `/c/Development/ccpraxis`
+# collapse to `/c/Development/ccpraxis` on this host (verified). It returns
+# undef for a path that does not currently resolve -- a registered project
+# whose directory has moved or been deleted -- so this falls back to a
+# lightweight textual normalisation for exactly that case (backslashes to
+# forward slashes, `/x/` <-> `X:/` drive form, uppercased drive letter, no
+# trailing slash). The fallback cannot resolve symlinks or on-disk case, but
+# a root that fails even abs_path is already unreadable to list_reports_in,
+# so it contributes nothing either way -- this only stops it being walked
+# under BOTH of its spellings.
+sub canonical_root {
+    my ($p) = @_;
+    return '' unless defined $p && length $p;
+    my $abs = Cwd::abs_path($p);
+    return $abs if defined $abs;
+    my $norm = $p;
+    $norm =~ s{\\}{/}g;
+    $norm =~ s{^/([a-zA-Z])(?=/|\z)}{uc($1) . ':'}e;
+    $norm =~ s{^([a-zA-Z]):}{uc($1) . ':'}e;
+    $norm =~ s{/+\z}{};
+    return $norm;
+}
 
 sub _mkpath {
     my ($d) = @_;
@@ -160,14 +246,51 @@ sub _render {
     return "---\n" . join("\n", @lines) . "\n---\n" . $body;
 }
 sub _read_file { my ($p)=@_; open my $fh,'<:raw',$p or return undef; local $/; my $c=<$fh>; close $fh; return $c }
+# Returns 1/0 in scalar context, as three call sites depend on, and sets
+# $LAST_ERROR to a specific reason on failure.
+#
+# THE rename IS RETRIED, against a bounded deadline. On Windows a rename over a
+# path another process holds open FAILS — an on-access virus scanner, an
+# editor, or Claude Code's own node process reading the file is enough — and
+# reporting that as "write failed" turns a transient sharing violation into a
+# lost write. Almanac::Lock::rename_with_retry polls for up to 2s against an
+# allowlist of transient errnos and fails fast on anything else.
+#
+# The temp file stays this function's own business (Almanac::Lock removes
+# nothing, ever — see its header), so the only removal in this script is of
+# $tmp, and never of a lock file.
 sub _write_atomic {
     my ($p, $bytes) = @_;
-    _mkpath(dirname($p)) or return 0;
+    $LAST_ERROR = '';
+    unless (_mkpath(dirname($p))) {
+        $LAST_ERROR = "could not create the directory for $p";
+        return 0;
+    }
     my $tmp = "$p.tmp.$$";
-    open my $fh, '>:raw', $tmp or return 0;
-    print {$fh} $bytes or do { close $fh; unlink $tmp; return 0 };
-    close $fh or do { unlink $tmp; return 0 };
-    rename($tmp, $p) or do { unlink $tmp; return 0 };
+    my $fh;
+    unless (open $fh, '>:raw', $tmp) {
+        $LAST_ERROR = "could not open $tmp for writing: $!";
+        return 0;
+    }
+    unless (print {$fh} $bytes) {
+        my $why = "$!";
+        close $fh;
+        unlink $tmp;
+        $LAST_ERROR = "could not write $tmp: $why";
+        return 0;
+    }
+    unless (close $fh) {
+        my $why = "$!";
+        unlink $tmp;
+        $LAST_ERROR = "could not close $tmp: $why";
+        return 0;
+    }
+    my ($renamed, $err) = Almanac::Lock::rename_with_retry($tmp, $p);
+    unless ($renamed) {
+        $LAST_ERROR = $err->{message};
+        unlink $tmp;
+        return 0;
+    }
     return 1;
 }
 
@@ -190,26 +313,42 @@ sub load {
 # refusal message two lines above it promises. `verify` would then say "not
 # frozen" rather than TAMPERED, so nothing would even report the problem.
 #
-# There is no portable, trustworthy OS-level lock to reach for here. This
-# repo runs on Git-for-Windows, where flock() semantics on Windows perl
-# builds are not something else in this codebase relies on (see this
-# script's own header on Windows landmines, and CLAUDE.md), and mtime
-# granularity is too coarse to reliably distinguish two writes inside the
-# same second. So this re-reads the file's actual on-disk BYTES immediately
-# before the write and compares them to the bytes `load()` captured — a
-# compare-and-swap over the load-modify-write window. It cannot close the
-# window entirely (there is a residual gap between this read and the
-# following rename, same as any userspace CAS without a kernel-level lock),
-# but it narrows "anywhere between load and write" down to "between this
-# read and the next few instructions", and it turns the race from silent
-# data loss into a loud, specific refusal instead of ever writing.
+# THIS IS LAYER TWO, AND THE COMMENT THAT USED TO BE HERE WAS WRONG.
+#
+# It claimed there was no portable OS-level lock worth reaching for on this
+# platform, and built the whole design on that claim. The claim was false.
+# bp-blueprint.pl:425 has taken flock(LOCK_EX) on a sidecar lock file for
+# every blueprint mutation in this repo since it was written, and a direct
+# measurement on 2026-09-11 — two concurrent processes, one sidecar lock
+# file, both host perls — showed the waiter blocking for the holder's full
+# remaining hold and then acquiring. flock works here.
+#
+# So the three read-modify-write verbs now take a real exclusive lock across
+# the WHOLE load-modify-write (Almanac::Lock, on `<report>.md.lock`), and two
+# concurrent writers QUEUE rather than collide. A refusal is not
+# serialization: the requirement is that two agents editing one record both
+# get their change, in some order, not that one of them is told to retry.
+#
+# cas_write is not deleted and not weakened — it is DEMOTED. Three layers,
+# each catching what the one above it cannot:
+#
+#   1. the lock            — two sanctioned writers racing
+#   2. this byte CAS       — a writer that BYPASSED the lock entirely
+#   3. content_sha256      — an out-of-band write that routed around 1 and 2
+#
+# LAYER TWO is therefore about a writer that took no lock at all: it re-reads
+# the file's actual on-disk BYTES immediately before the write and compares
+# them to the bytes `load()` captured. It refuses instead of ever writing, so
+# an unsanctioned concurrent write becomes a loud, specific refusal rather
+# than silent data loss. It takes no lock and releases none — its caller
+# holds one.
 sub cas_write {
     my ($rep, $bytes) = @_;
     my $current = _read_file($rep->{path});
     return (0, 'the report no longer exists on disk') unless defined $current;
     return (0, 'the report changed on disk since it was loaded (a concurrent '
              . 'set-status or update landed in between)') unless $current eq $rep->{raw};
-    return (0, 'write failed') unless _write_atomic($rep->{path}, $bytes);
+    return (0, "write failed: $LAST_ERROR") unless _write_atomic($rep->{path}, $bytes);
     return (1, '');
 }
 
@@ -327,15 +466,28 @@ sub verify {
     return (0, "TAMPERED: body digest $now != recorded $f->{content_sha256}");
 }
 
-# all_report_paths(\@extra_roots) -> sorted absolute paths of every report on
-# this machine. Disk is the truth; there is nothing to keep in sync.
+# all_report_paths(\@extra_roots, $warn) -> sorted absolute paths of every
+# report on this machine. Disk is the truth; there is nothing to keep in
+# sync. $warn, if given, is a coderef called with one string for every root
+# that could not be read at all (see list_reports_in) -- optional so
+# internal callers (the cross-project `$find` in `main`, `verify`) that do
+# not want CLI noise can omit it; `collect` passes one that prints to STDERR.
+#
+# Roots are deduped on canonical_root(), NOT the raw string -- see that sub's
+# header for why the raw-string dedupe this replaced double-counted every
+# report in a project reachable under two spellings.
 sub all_report_paths {
-    my ($extra) = @_;
+    my ($extra, $warn) = @_;
     my %seen;
-    my @roots = grep { !$seen{$_}++ } (@{ $extra // [] }, known_projects());
+    my @roots;
+    for my $r (@{ $extra // [] }, known_projects()) {
+        my $c = canonical_root($r);
+        next if $seen{$c}++;
+        push @roots, $r;
+    }
     my @paths;
     for my $r (@roots) {
-        push @paths, list_reports_in($r);
+        push @paths, list_reports_in($r, $warn);
     }
     my %u; return sort grep { !$u{$_}++ } @paths;
 }
@@ -345,20 +497,82 @@ sub all_report_paths {
 # and the real directory was never read — silently missing every report in any
 # project whose path contains a space. Two of this machine's registered
 # projects do. opendir has no quoting semantics at all.
+#
+# $warn (optional coderef) is called with one message when the ROOT ITSELF is
+# not a readable directory (registered, but gone/inaccessible on this
+# machine) -- NOT when the root exists but simply has no bug-reports/ yet,
+# which is the overwhelmingly common and entirely normal case for a project
+# that has never filed a ccpraxis bug. FIX (defect 2, 20260911-225720-4c57):
+# a root that failed to open its reports dir used to vanish with no
+# diagnostic at all -- that is what hid job-search's 6 open reports (a
+# SEPARATE cause, since fixed: see known_projects()'s header).
 sub list_reports_in {
-    my ($root) = @_;
+    my ($root, $warn) = @_;
     my $dir = reports_dir($root);
-    opendir(my $dh, $dir) or return ();
-    my @f = sort grep { /\.md\z/ && -f "$dir/$_" } readdir($dh);
-    closedir $dh;
-    return map { "$dir/$_" } @f;
+    if (opendir(my $dh, $dir)) {
+        my @f = sort grep { /\.md\z/ && -f "$dir/$_" } readdir($dh);
+        closedir $dh;
+        return map { "$dir/$_" } @f;
+    }
+    if ($warn && !-d $root) {
+        $warn->("project root '$root' does not exist or is not a readable "
+              . "directory on this machine -- skipped");
+    }
+    return ();
 }
 
+# PACKAGE 09 (report 20260917-040452-f500): the original new_id keyed only on
+# the clock to the second plus $$ & 0xffff -- 10,000 generations inside one
+# process-second yielded ONE distinct id, not "occasionally collides". That
+# never bit hand-paced bug filing, but package 09 writes records
+# programmatically, which removes the pacing that hid it.
+#
+# ID_BASE is minted once (mixing pid and a random draw, so two concurrent
+# processes still diverge) and ID_SEQ increments on every call, so up to
+# 65,536 ids within one process in one second are distinct. The SHAPE is
+# unchanged (YYYYMMDD-HHMMSS-<4 hex>) -- 61 live reports, commit messages and
+# cross-report citations already depend on it, and new ids are additive: an
+# existing legacy id is never rewritten or reparsed by this function.
+#
+# TWO GENERATORS, DELIBERATELY (ledger item 3, parity decision). Almanac::Record
+# has its own new_id with an 8-hex tail (pid4hex + seq4hex) -- a different
+# shape. They are NOT unified: bug ids stay 4-hex because
+# plugins/butler/tests/t/tooling-bug-filing.t:457 pins
+# ^\d{8}-\d{6}-[0-9a-f]{4}$ for a report filed through almanac-bug.pl, and
+# nothing reads a bug id and a store id through one shared grammar -- verify
+# treats both as opaque file names, and bug reports and store records never
+# share a directory. Kept as two generators, not merged into one.
+our $ID_BASE = ($$ ^ int(rand(0x10000))) & 0xffff;
+our $ID_SEQ  = 0;
 sub new_id {
     my ($now) = @_;
     my @t = gmtime($now // time);
+    my $tail = ($ID_BASE + $ID_SEQ++) & 0xffff;
     return sprintf('%04d%02d%02d-%02d%02d%02d-%04x',
-                   $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0], ($$ & 0xffff));
+                   $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0], $tail);
+}
+
+# claim_report_path($dir, $now) -> ($path, $lock) | (undef, $err)
+#
+# Mints a fresh id, takes its per-record lock, and confirms no file already
+# sits at that path -- up to 64 attempts -- so `file` can never rename over
+# an existing report. Creates $dir before the loop. The caller releases the
+# returned lock once it has written the report (or on any early exit).
+sub claim_report_path {
+    my ($dir, $now) = @_;
+    _mkpath($dir) or return (undef, { message => "could not create the directory $dir" });
+    for (1 .. 64) {
+        my $id   = new_id($now);
+        my $path = "$dir/$id.md";
+        my ($lock, $err) = Almanac::Lock->acquire($path, verb => 'file');
+        return (undef, $err) unless $lock;
+        if (-e $path) {
+            $lock->release;
+            next;
+        }
+        return ($path, $lock);
+    }
+    return (undef, { message => 'no free report id' });
 }
 
 sub can_transition {
@@ -416,11 +630,47 @@ sub _reject_untrimmed {
 # deterministically land a concurrent write inside the load-modify-write
 # window instead of racing real threads against real wall-clock timing.
 # Nothing in normal operation ever sets this env var; only
-# plugins/almanac/tests/t/04-*.t does, and the hook script it points at
+# plugins/almanac/tests/t/load-modify-write-race.t does, and the hook script it points at
 # never sets it itself (so there is no recursive self-invocation).
+#
+# THE SEAM MUST NOW SUSPEND THE LOCK, and that is the correct semantics rather
+# than a dodge. Once the lock wraps load->write, the window this hook lands in
+# is closed to any writer that RESPECTS the lock — the hook's child would block
+# on its own deadline and never land its write. With serialization in place the
+# only writer that can still land there is one that BYPASSED the lock, and
+# catching exactly that is what layer two now exists for. So the seam simulates
+# such a writer: the lock is dropped for the hook's duration and re-acquired
+# afterwards. This is the ONLY sanctioned caller of suspend/resume in this
+# script, and a test asserts that by grep.
 sub _race_test_hook {
+    my ($lock) = @_;                # undef for any caller that holds no lock
     return unless defined $ENV{ALMANAC_RACE_TEST_HOOK} && length $ENV{ALMANAC_RACE_TEST_HOOK};
+    $lock->suspend if $lock;
     system($^X, $ENV{ALMANAC_RACE_TEST_HOOK});
+    if ($lock) {
+        my ($ok, $err) = $lock->resume;
+        unless ($ok) {
+            print STDERR "almanac-bug: could not re-acquire the lock after the test hook: "
+                       . "$err->{message}";
+            exit 2;
+        }
+    }
+    return;
+}
+
+# The three read-modify-write verbs take the lock BEFORE they load, and hold it
+# across the mutation and the cas_write. This is what turns two concurrent
+# writers into a queue instead of a collision. `file` deliberately does NOT
+# lock: its path carries a UTC timestamp to the second plus the low 16 bits of
+# the pid (new_id), so no other process is writing that path, and there is no
+# read-modify-write to serialize.
+sub _refuse_unlocked {
+    my ($verb, $id, $err) = @_;
+    print STDERR "almanac-bug $verb: refused — could not take the write lock on '$id' "
+               . "within $err->{timeout_ms}ms.\n"
+               . $err->{message}
+               . "Retry the command; nothing was written.\n";
+    exit 2;
 }
 
 sub _slurp_arg {
@@ -475,9 +725,6 @@ unless (caller) {
         die "almanac-bug file: --body or --body-file is required (a report with no body is noise)\n"
             unless defined $body && $body =~ /\S/;
         my $now = time;
-        my $id  = AlmanacBug::new_id($now);
-        my $dir = AlmanacBug::reports_dir($root);
-        my $path = "$dir/$id.md";
         my $severity = $o{severity} // 'unknown';
         # Order matters (spec §2.3): the one-line check fires before the enum
         # check, so a multi-line payload dies "must be one line", not "must be
@@ -486,6 +733,14 @@ unless (caller) {
         _reject_untrimmed('file', 'severity', $severity) unless ref $severity;
         die "almanac-bug file: --severity must be one of: " . join(', ', @AlmanacBug::SEVERITIES) . "\n"
             unless !ref $severity && AlmanacBug::valid_severity($severity);
+
+        my $dir = AlmanacBug::reports_dir($root);
+        my ($path, $lock) = AlmanacBug::claim_report_path($dir, $now);
+        unless (defined $path) {
+            print STDERR "almanac-bug file: could not claim a report id: $lock->{message}\n";
+            exit 2;
+        }
+        (my $id = $path) =~ s{.*/}{}; $id =~ s{\.md$}{};
         my %f = (
             id => $id, title => $title, status => 'open',
             severity => $severity,
@@ -493,8 +748,9 @@ unless (caller) {
             project  => $root,
             created_at => AlmanacBug::_iso($now), updated_at => AlmanacBug::_iso($now),
         );
-        AlmanacBug::_write_atomic($path, AlmanacBug::_render(\%f, $body))
-            or die "almanac-bug file: could not write $path\n";
+        my $wrote = AlmanacBug::_write_atomic($path, AlmanacBug::_render(\%f, $body));
+        $lock->release;
+        die "almanac-bug file: could not write $path\n" unless $wrote;
 
         print "$path\n";
         exit 0;
@@ -513,19 +769,33 @@ unless (caller) {
         return undef;
     };
 
+    # The read-only verbs (`list`, `collect`, `verify`) load through this one
+    # reference, and take NO lock. They only read, and a reader that queued
+    # behind a writer would make `list` stall on whatever record some other
+    # agent happens to be holding. Keeping their loader visibly distinct from
+    # the acquire-then-load path the three mutating verbs use is the point.
+    my $read_only_load = \&AlmanacBug::load;
+
     if ($cmd eq 'update') {
         my $id = $pos[0] or die "almanac-bug update: <id> required\n";
         my $path = $find->($id) or die "almanac-bug update: no report '$id'\n";
+        # LAYER ONE, and it must be taken BEFORE the load: the window this
+        # closes is load-to-write, so a lock taken after the load would leave
+        # exactly the gap it exists to remove. Released on every exit below,
+        # refusals included.
+        my ($lock, $lock_err) = Almanac::Lock->acquire($path, verb => 'update');
+        _refuse_unlocked('update', $id, $lock_err) unless $lock;
         my $rep  = AlmanacBug::load($path) or die "almanac-bug update: $path is unreadable or malformed\n";
         die "almanac-bug update: '$id' has MALFORMED: duplicate frontmatter key "
           . "'$rep->{duplicate_key}' — refusing to operate on a possibly-forged report\n"
             if $rep->{duplicate_key};
-        _race_test_hook();
+        _race_test_hook($lock);
         my $st   = $rep->{fields}{status} // 'open';
         unless ($AlmanacBug::MUTABLE{$st}) {
             print STDERR "almanac-bug update: refused — '$id' is $st, and content is frozen from "
                        . "'reviewing' onward so a reviewer cannot have the report rewritten "
                        . "underneath them. Add a follow-up report instead.\n";
+            $lock->release;
             exit 2;
         }
         my $body = _slurp_arg(%o);
@@ -573,6 +843,7 @@ unless (caller) {
               . "($ol lines replaced by $nl), and there is no undo: reports are gitignored.\n"
               . "  To add to the report:      almanac-bug.pl append $id --body-file <file>\n"
               . "  To genuinely rewrite it:   almanac-bug.pl update $id --body-file <file> --replace\n";
+            $lock->release;
             exit 2;
         }
 
@@ -584,9 +855,11 @@ unless (caller) {
         unless ($cas_ok) {
             print STDERR "almanac-bug update: refused — '$id' $cas_why. "
                        . "Retry the command; do not assume it partially applied.\n";
+            $lock->release;
             exit 2;
         }
 
+        $lock->release;
         print "$path\n";
         exit 0;
     }
@@ -604,15 +877,19 @@ unless (caller) {
     if ($cmd eq 'append') {
         my $id = $pos[0] or die "almanac-bug append: <id> required\n";
         my $path = $find->($id) or die "almanac-bug append: no report '$id'\n";
+        # Before the load, for the same reason as `update` above.
+        my ($lock, $lock_err) = Almanac::Lock->acquire($path, verb => 'append');
+        _refuse_unlocked('append', $id, $lock_err) unless $lock;
         my $rep  = AlmanacBug::load($path) or die "almanac-bug append: $path is unreadable or malformed\n";
         die "almanac-bug append: '$id' has MALFORMED: duplicate frontmatter key "
           . "'$rep->{duplicate_key}' — refusing to operate on a possibly-forged report\n"
             if $rep->{duplicate_key};
-        _race_test_hook();
+        _race_test_hook($lock);
         my $st = $rep->{fields}{status} // 'open';
         unless ($AlmanacBug::MUTABLE{$st}) {
             print STDERR "almanac-bug append: refused — '$id' is $st, and content is frozen from "
                        . "'reviewing' onward. Add a follow-up report instead.\n";
+            $lock->release;
             exit 2;
         }
         my $add = _slurp_arg(%o);
@@ -629,8 +906,10 @@ unless (caller) {
         unless ($cas_ok) {
             print STDERR "almanac-bug append: refused — '$id' $cas_why. "
                        . "Retry the command; do not assume it partially applied.\n";
+            $lock->release;
             exit 2;
         }
+        $lock->release;
         print "$path\n";
         exit 0;
     }
@@ -639,11 +918,14 @@ unless (caller) {
         my $id = $pos[0] or die "almanac-bug set-status: <id> required\n";
         my $to = $o{to} or die "almanac-bug set-status: --to <state> required\n";
         my $path = $find->($id) or die "almanac-bug set-status: no report '$id'\n";
+        # Before the load, for the same reason as `update` above.
+        my ($lock, $lock_err) = Almanac::Lock->acquire($path, verb => 'set-status');
+        _refuse_unlocked('set-status', $id, $lock_err) unless $lock;
         my $rep  = AlmanacBug::load($path) or die "almanac-bug set-status: $path unreadable\n";
         die "almanac-bug set-status: '$id' has MALFORMED: duplicate frontmatter key "
           . "'$rep->{duplicate_key}' — refusing to operate on a possibly-forged report\n"
             if $rep->{duplicate_key};
-        _race_test_hook();
+        _race_test_hook($lock);
         _reject_multiline('set-status', 'note', $o{note}) if defined $o{note} && !ref $o{note};
         _reject_untrimmed('set-status', 'note', $o{note}) if defined $o{note} && !ref $o{note};
         my $from = $rep->{fields}{status} // 'open';
@@ -681,7 +963,7 @@ unless (caller) {
                   . "reach it. Re-run with --repair to place it in a valid state."
                 if !$ok && !$from_known;
         }
-        unless ($ok) { print STDERR "almanac-bug set-status: $why\n"; exit 2 }
+        unless ($ok) { print STDERR "almanac-bug set-status: $why\n"; $lock->release; exit 2 }
 
         my %f = %{ $rep->{fields} };
         my $now = AlmanacBug::_iso(time);
@@ -699,9 +981,11 @@ unless (caller) {
         unless ($cas_ok) {
             print STDERR "almanac-bug set-status: refused — '$id' $cas_why. "
                        . "Retry the command; do not assume it partially applied.\n";
+            $lock->release;
             exit 2;
         }
 
+        $lock->release;
         print "$id: $from -> $to" . (($from_known ? '' : '  (repaired: previous status was outside the state machine)')) . "\n";
         exit 0;
     }
@@ -713,12 +997,16 @@ unless (caller) {
         if ($cmd eq 'list') {
             @paths = AlmanacBug::list_reports_in($root);   # opendir, not glob — see list_reports_in
         } else {
-            @paths = AlmanacBug::all_report_paths([$root]);
+            # A skipped root must be LOUD (defect 2) -- silence is what hid six
+            # open job-search reports with no clue anything had gone wrong.
+            @paths = AlmanacBug::all_report_paths([$root], sub {
+                print STDERR "almanac-bug collect: $_[0]\n";
+            });
         }
         my @out;
         for my $p (@paths) {
             next unless -f $p;
-            my $rep = AlmanacBug::load($p) or next;
+            my $rep = $read_only_load->($p) or next;
             my $f = $rep->{fields};
             next if defined $o{status} && !ref $o{status} && ($f->{status}//'') ne $o{status};
             my $integrity;
@@ -736,7 +1024,18 @@ unless (caller) {
                          created_at=>$f->{created_at}, path=>$p,
                          (defined $integrity ? (integrity=>$integrity) : ()) };
         }
-        if ($o{json}) { print JSON::PP->new->canonical->pretty->encode(\@out) }
+        # ->utf8 ON THE ENCODE SIDE TOO, and it is not optional. known_projects
+        # decodes the registry with ->utf8 (see :123), so project paths arrive
+        # here as CHARACTER strings. Encoding without ->utf8 emits those
+        # characters raw, and a path containing `André` goes out as a lone 0xE9
+        # byte -- malformed UTF-8 that every JSON consumer rejects. Measured on
+        # this machine: `collect --json` died with "malformed UTF-8 character in
+        # JSON string ... before \x{e9}/.claude/ccpra...".
+        #
+        # Decode and encode must be symmetric. This is the same hazard the
+        # user-global CLAUDE.md records for registry values ("never re-encode
+        # something already decoded"), arriving from the opposite direction.
+        if ($o{json}) { print JSON::PP->new->utf8->canonical->pretty->encode(\@out) }
         else {
             printf "%-22s %-10s %-9s %s\n", 'ID', 'STATUS', 'SEVERITY', 'TITLE';
             for my $r (@out) {
@@ -745,7 +1044,23 @@ unless (caller) {
                 print  "  !! $r->{integrity}\n" if $r->{integrity};
                 print  "  $r->{project}\n" if $cmd eq 'collect';
             }
-            print "\n" . scalar(@out) . " report(s)\n";
+            # FIX (defect 4, 20260911-225720-4c57): `list` used to print a
+            # bare "N report(s)" with no hint the answer was scoped to one
+            # project. Asked to "fetch all bug reports", an agent reached for
+            # `list`, got a confident total, and reported a number that was
+            # never the whole picture -- and `collect` itself never said its
+            # own project set comes from steward's backup registry, so an
+            # unregistered project (filing a bug is unrelated to registering
+            # for backup) was excluded with no indication that had happened.
+            if ($cmd eq 'list') {
+                print "\n" . scalar(@out) . " report(s) IN THIS PROJECT ($root) only -- "
+                    . "run 'almanac-bug.pl collect' for every project on this machine.\n";
+            } else {
+                print "\n" . scalar(@out) . " report(s) across every project REGISTERED in "
+                    . "steward's backup registry -- a project that files ccpraxis bugs but is "
+                    . "not registered for backup is excluded from this count (see any "
+                    . "'skipped' warnings above for a registered root that could not be read).\n";
+            }
         }
         exit 0;
     }
@@ -755,7 +1070,7 @@ unless (caller) {
         my $n = 0;
         my @skipped;
         for my $p (AlmanacBug::all_report_paths([$root])) {
-            my $rep = AlmanacBug::load($p);
+            my $rep = $read_only_load->($p);
             # A .md in this directory that has no almanac frontmatter is not a
             # report — typically a hand-written file that predates the state
             # machine, or one imported from it. Calling that "malformed" buries
@@ -770,11 +1085,110 @@ unless (caller) {
             my ($ok, $note) = AlmanacBug::verify($rep);
             push @bad, ($rep->{fields}{id} . ": $note") unless $ok;
         }
+
+        # Package 09 (S2.3): the same three-layer doctrine, widened to every
+        # almanac record store. require()d here only -- almanac-bug.pl has no
+        # other reason to load Almanac::Store, and this keeps that load out
+        # of every other verb's startup cost.
+        require Almanac::Store;
+
+        # Roots: the caller's own root plus every project known_projects()
+        # reports, deduped by canonical_root -- exactly all_report_paths'
+        # own root set (S2.3).
+        my %seen_root;
+        my @project_roots;
+        for my $r ($root, AlmanacBug::known_projects()) {
+            my $c = AlmanacBug::canonical_root($r);
+            next if $seen_root{$c}++;
+            push @project_roots, $r;
+        }
+
+        my $home = $ENV{ALMANAC_HOME} // $ENV{HOME} // $ENV{USERPROFILE} // '.';
+        $home =~ s{\\}{/}g; $home =~ s{/+$}{};
+
+        my @store_dirs;
+        for my $r (@project_roots) {
+            (my $base = $r) =~ s{\\}{/}g; $base =~ s{/+$}{};
+            push @store_dirs, AlmanacBug::_almanac_type_dirs("$base/.ccpraxis-local-data/almanac");
+        }
+        push @store_dirs, AlmanacBug::_almanac_type_dirs("$home/.claude/claude-code-vault/almanac");
+
+        my %seen_record;
+        my @records;
+        for my $d (@store_dirs) {
+            for my $rp (Almanac::Store::record_files_in($d)) {
+                next if $seen_record{$rp}++;
+                push @records, $rp;
+            }
+        }
+
+        my $m = 0;
+        my $unsealed_count = 0;
+        my @almanac_bad;
+        for my $rp (sort @records) {
+            (my $type_dir = $rp) =~ s{/[^/]+\z}{};
+            my $type = $type_dir; $type =~ s{.*/}{};
+            (my $rid = $rp) =~ s{.*/}{}; $rid =~ s{\.md\z}{};
+
+            my $result = Almanac::Store::check_seal($rp);
+            my $state  = $result->{state};
+
+            if ($state eq 'tampered' || $state eq 'unreadable') {
+                # Locked re-check (S2.3, edge cases): an unlocked read can pair
+                # a seal and a record from different moments. The final state
+                # comes from the re-check, taken under the record's own lock.
+                # Also covers a concurrent DELETE: check_seal's first pass can
+                # observe the record mid-removal and report unreadable for a
+                # record that is not tampered at all, just gone -- the same
+                # false-positive class the re-check already exists to remove.
+                my ($lock, $lock_err) = Almanac::Lock->acquire($rp, verb => 'verify', timeout_ms => 2000);
+                if ($lock) {
+                    $result = Almanac::Store::check_seal($rp);
+                    $state  = $result->{state};
+                    $lock->release;
+                } else {
+                    $state = 'busy';
+                }
+            }
+
+            # Still unreadable after the locked re-check, and the file is
+            # simply gone: a sanctioned delete landed between the directory
+            # listing and this check. Not tampering -- skip it, uncounted.
+            if ($state eq 'unreadable' && !-e $rp) {
+                next;
+            }
+
+            $m++;
+            if ($state eq 'unsealed') {
+                $unsealed_count++;
+            }
+            elsif ($state eq 'tampered') {
+                push @almanac_bad,
+                    "$type/$rid: TAMPERED: digest $result->{digest} matches no sealed digest -- $rp";
+            }
+            elsif ($state eq 'bad_seal') {
+                push @almanac_bad,
+                    "$type/$rid: BAD SEAL: " . Almanac::Store::seal_path_for($rp) . " is not one or two sha256 lines -- $rp";
+            }
+            elsif ($state eq 'unreadable') {
+                push @almanac_bad, "$type/$rid: UNREADABLE -- $rp";
+            }
+            elsif ($state eq 'busy') {
+                push @almanac_bad,
+                    "$type/$rid: UNVERIFIED: record is locked by another writer; re-run verify -- $rp";
+            }
+        }
+
         printf "skipped %d non-report file(s) in bug-reports/ (no almanac frontmatter)\n",
                scalar @skipped if @skipped;
-        print "checked $n report(s)\n";
+        print "checked $n report(s)\nchecked $m almanac record(s)\n";
+        if ($unsealed_count) {
+            print "unsealed $unsealed_count almanac record(s) -- written before sealing existed, or their "
+                . "seal was removed; not verifiable until their next sanctioned write\n";
+        }
         print "  $_\n" for @bad;
-        exit(@bad ? 2 : 0);
+        print "  $_\n" for @almanac_bad;
+        exit((@bad || @almanac_bad) ? 2 : 0);
     }
 
     print STDERR <<'USAGE';
@@ -783,24 +1197,18 @@ almanac-bug.pl — ccpraxis bug reports, one file per report.
   file --title T (--body - | --body-file F) [--severity S] [--area A] [--project ROOT]
         Create a report in the current project. Prints its path.
   append <id> (--body - | --body-file F)
-        Add to the end of a report's body. Allowed ONLY while status is `open`.
-        Use this to record progress — it cannot lose what is already there.
+        Add to the end of a report's body. Allowed ONLY while status is `open`. Use this to record progress — it cannot lose what is already there.
   update <id> (--body - | --body-file F) [--title T] [--severity S] [--replace]
-        REPLACE a report's body. Allowed ONLY while status is `open`.
-        Refuses when the existing body would be discarded unless --replace is
-        given; there is no undo, as reports are gitignored.
+        REPLACE a report's body. Allowed ONLY while status is `open`. Refuses when the existing body would be discarded unless --replace is given; there is no undo, as reports are gitignored.
   set-status <id> --to <state> [--note N] [--repair]
         open -> reviewing -> taken -> resolved|declined  (reviewing -> open to hand back)
-        --repair: ONLY for a report whose current status is not a known state
-        (hand-written, or from before this machine existed). It cannot skip a
-        legal transition between valid states. Put it last on the line.
+        --repair: ONLY for a report whose current status is not a known state (hand-written, or from before this machine existed). It cannot skip a legal transition between valid states. Put it last on the line.
         Leaving `open` FREEZES the body and records its sha256.
-  list [--status S] [--json]        reports in this project
-  collect [--status S] [--json]     reports across every project (via the index)
+  list [--status S] [--json]        reports in THIS PROJECT only
+  collect [--status S] [--json]     reports across every project REGISTERED in steward's backup registry -- filing a bug and registering for backup are unrelated decisions, so an unregistered project is excluded, not scanned for
   verify                            re-check every frozen body against its digest
 
-One report per file. Write only through this script — a PreToolUse hook denies
-direct edits to the reports directory.
+One report per file. Write only through this script — a PreToolUse hook denies direct edits to the reports directory.
 USAGE
     exit 3;
 }

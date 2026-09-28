@@ -28,6 +28,7 @@ Recurring preferences that surfaced in multiple project memories — promoted he
 - **Don't chain `cd` in git/shell commands.** Never write `cd /path && git ...` — chaining forces a fresh approval prompt every time. Run commands from the working directory directly (or use `git -C <dir>`); if a different directory is genuinely needed, `cd` once in its own call, then run subsequent commands separately.
 - **Delegate heavy mechanical work to cheaper-model subagents.** When a task will burn lots of tokens in the main context (large WebFetches, full-site mirrors, reading big downloaded files, long-output commands, batch reconnaissance), spawn a subagent overridden to a cheaper, faster model rather than running it inline on the session's large model. Only the subagent's summary returns, so the heavy raw content never lands in the expensive context. Keep synthesis, judgement, edits, and final go/no-go calls on the large model; don't subagent trivial work (the overhead beats the saving).
 - **Dependency & runtime versions are a deliberate choice.** Default to the latest LTS/stable of every runtime, tool, and library; never a random pin and never an **EOL** version (e.g. Node 20 is EOL). Not bleeding-edge either — the selected version must be **≥7 days old** (supply-chain safety + maturity) and mutually compatible with the rest of the stack and the task. Reviewed, not improvised.
+- **A ccpraxis tooling defect goes to `almanac-bug.pl`, not to Anthropic.** When butler/blueprint/sandbox/backpack/almanac scripts, hooks, templates or skills do the wrong thing, that is a ccpraxis bug: `perl <ccpraxis>/plugins/almanac/scripts/almanac-bug.pl file --title "..." --severity <low|medium|high|blocker> --area <plugin> --body -` (exact shape documented by the `bug-report` skill).
 
 ## ⚠️⚠️⚠️ NEVER RUN DEV TOOLING ON THE HOST ⚠️⚠️⚠️
 
@@ -52,3 +53,9 @@ This includes but is not limited to:
 ## ⚠️ Path-scoped `Bash(...)` permissions do not work in skill frontmatter
 
 `permissions.allow` entries like `Bash(perl ~/.claude/scripts/*)` match correctly in `settings.json`, but silently fail to match when written into a skill's `allowed-tools:` frontmatter — only the broadest form (`Bash(perl *)`) takes effect there, which is too permissive to want. To pre-approve a specific command a skill invokes, add it to `settings.json` (use the `update-config` skill) and leave the frontmatter as bare `Bash, Read, Write, …`.
+
+## Durable facts go in almanac notes
+
+Claude Code memory is disabled; record a durable cross-project fact as a global almanac note (`perl ~/.claude/ccpraxis/plugins/almanac/scripts/almanac-note.pl create --global --title "..." --content -`, the fact on stdin), never as a memory. Your notes index is imported on the next line from `~/.claude/almanac-notes.md`, which `almanac-migrate-memories.pl render-index` generates from your own vault; every `target` in it is relative to `~/.claude/claude-code-vault/`.
+
+@~/.claude/almanac-notes.md

@@ -62,8 +62,7 @@ usage: bp-spend-auth.pl --provider NAME [--path PATH]
        bp-spend-auth.pl --provider NAME --from-firefox [--path PATH]
            host-side Firefox cookie extraction (Windows-only, see spec 3.1).
        bp-spend-auth.pl --status [--provider NAME] [--path PATH]
-           report presence/mode/parseability of the credential file. NEVER
-           prints the cookie value.
+           report presence/mode/parseability of the credential file. NEVER prints the cookie value.
 USAGE
 
 sub _fail_usage {
@@ -166,8 +165,7 @@ Manual fallback (see plugins/butler/docs/spend-credentials.md):
   1. Open https://opencode.ai in Firefox and sign in.
   2. DevTools (F12) -> Application -> Cookies -> https://opencode.ai
   3. Copy the session cookie's value.
-  4. Run: bp-spend-auth.pl --provider $provider
-     and paste the value on STDIN when prompted.
+  4. Run: bp-spend-auth.pl --provider $provider and paste the value on STDIN when prompted.
 MANUAL
 
     if ($^O ne 'MSWin32') {

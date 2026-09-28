@@ -5,11 +5,16 @@
       "commit" : "",
       "pr" : ""
    },
+   "autoMemoryEnabled" : false,
    "autoScrollEnabled" : false,
    "cleanupPeriodDays" : 180,
+   "disableAgentView" : true,
+   "disableWorkflows" : true,
    "editorMode" : "vim",
    "effortLevel" : "high",
    "enabledPlugins" : {
+      "agents-md@builtin" : false,
+      "almanac@ccpraxis-local" : true,
       "backpack@ccpraxis-local" : true,
       "blueprint@ccpraxis-local" : true,
       "butler@ccpraxis-local" : true,
@@ -17,19 +22,21 @@
       "frontend-design@claude-plugins-official" : true,
       "sandbox@ccpraxis-local" : true,
       "steward@ccpraxis-local" : true,
-      "todo@ccpraxis-local" : true
+      "telemetry@builtin" : false
    },
    "env" : {
       "CLAUDE_AUTO_BACKGROUND_TASKS" : "1",
       "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR" : "0",
       "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY" : "1",
       "CLAUDE_CODE_ENABLE_AWAY_SUMMARY" : "1",
-      "CLAUDE_CODE_ENABLE_TODO_TOOLS" : "1",
       "CLAUDE_CODE_IDE_SKIP_AUTO_INSTALL" : "true",
       "CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION" : "100000",
       "CLAUDE_CODE_NEW_INIT" : "1",
       "CLAUDE_CODE_NO_FLICKER" : "1",
       "CLAUDE_CODE_SCROLL_SPEED" : "3",
+      "CLAUDE_CODE_SEND_FEEDBACK" : "0",
+      "CLAUDE_CODE_TICKLISH_WHISPER" : "1",
+      "CLAUDE_CODE_TODO_REMINDER_MODE" : "off",
       "DISABLE_AUTOUPDATER" : "1",
       "DISABLE_INSTALL_GITHUB_APP_COMMAND" : "1",
       "DISABLE_UPGRADE_COMMAND" : "1",
@@ -50,12 +57,13 @@
          }
       }
    },
+   "feedbackDrafts" : "off",
    "hooks" : {
       "SessionStart" : [
          {
             "hooks" : [
                {
-                  "command" : "perl \"$HOME/.claude/ccpraxis/scripts/hooks/reap-orphans-hook.pl\"",
+                  "command" : "f=\"$HOME/.claude/ccpraxis/scripts/hooks/reap-orphans-hook.pl\"; [ -f \"$f\" ] || exit 0; exec perl \"$f\"",
                   "type" : "command"
                }
             ]
@@ -63,6 +71,14 @@
       ]
    },
    "inputNeededNotifEnabled" : true,
+   "modelSettings" : {
+      "claude-opus-5-5" : {
+         "effortLevel" : "medium"
+      },
+      "claude-sonnet-5" : {
+         "effortLevel" : "medium"
+      }
+   },
    "permissions" : {
       "allow" : [
          "Read",
@@ -79,9 +95,6 @@
          "Skill(steward:setup-project)",
          "Skill(steward:update)",
          "Skill(steward:usage-audit)",
-         "Skill(todo:create)",
-         "Skill(todo:manage)",
-         "Skill(todo:resume)",
          "Bash(find *)",
          "Bash(grep *)",
          "Bash(wc *)",
@@ -96,12 +109,28 @@
          "Bash(perl ~/.claude/ccpraxis/scripts/*)",
          "Bash(perl ~/.claude/ccpraxis/plugins/steward/scripts/*)",
          "Bash(bash ~/.claude/ccpraxis/plugins/steward/scripts/*)",
+         "Bash(perl scripts/run-tests.pl *)",
+         "Bash(perl -c *)",
+         "Bash(git diff *)",
+         "Bash(git log *)",
+         "Bash(git show *)",
+         "Bash(git status *)",
+         "Bash(git ls-files *)",
+         "Bash(ls *)",
+         "Bash(cat *)",
+         "Bash(head *)",
+         "Bash(tail *)",
+         "Bash(sed -n *)",
+         "Bash(sha256sum *)",
          "WebFetch",
          "WebSearch"
       ],
       "ask" : [],
       "defaultMode" : "default",
-      "deny" : [],
+      "deny" : [
+         "Read(~/.claude/projects/**/memory/**)",
+         "SendFeedback"
+      ],
       "disableBypassPermissionsMode" : "disable"
    },
    "promptSuggestionEnabled" : false,
@@ -110,9 +139,11 @@
    "showThinkingSummaries" : true,
    "skipAutoPermissionPrompt" : true,
    "statusLine" : {
-      "command" : "perl \"$HOME/.claude/ccpraxis/scripts/statusline.pl\"",
+      "command" : "f=\"$HOME/.claude/ccpraxis/scripts/statusline.pl\"; [ -f \"$f\" ] || exit 0; exec perl \"$f\"",
       "type" : "command"
    },
+   "timeFormat" : "24-hour",
+   "tui" : "fullscreen",
    "useAutoModeDuringPlan" : true,
    "worktree" : {
       "baseRef" : "fresh"

@@ -129,7 +129,7 @@ sub prune {
 # (a corrupt store degrades to "nothing approved", i.e. re-review — fail safe).
 #
 # \%err is an OPTIONAL second argument, backward compatible: existing one-argument
-# callers (t/26-backpack-approval.t, BackpackReview.pm) are unaffected. When
+# callers (t/backpack-approval.t, BackpackReview.pm) are unaffected. When
 # supplied as a hashref it is cleared at entry and, on failure, filled in with
 # { op, broken, errno, path, message } so the caller can tell *absent* (broken=>0)
 # from *broken* (broken=>1) — the distinction criterion 5 needs.

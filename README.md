@@ -22,6 +22,7 @@ Each project gets its own container, with its own toolchain, dependencies and co
   - [Finishing without being watched](#finishing-without-being-watched)
   - [Hooks for the mistakes that are not worth repeating](#hooks-for-the-mistakes-that-are-not-worth-repeating)
   - [Your setup, synced across machines](#your-setup-synced-across-machines)
+  - [Records that outlive a session](#records-that-outlive-a-session)
   - [A statusline worth the two lines it costs](#a-statusline-worth-the-two-lines-it-costs)
   - [Choosing when Claude Code updates](#choosing-when-claude-code-updates)
   - [No dependency tree of its own](#no-dependency-tree-of-its-own)
@@ -93,7 +94,7 @@ Installed for every project you open:
 Scoped to where they apply:
 
 - `git stash`, `reset`, `checkout` and `clean`, refused outright, matched even inside quoted or nested commands. Registered in this repo's own `.claude/settings.json`, so it covers work on ccpraxis; add the same registration to another project to get it there
-- direct edits to bug reports and blueprints, which must go through an API that validates them
+- direct edits to almanac records, bug reports and blueprints, which must go through an API that validates them
 - inside a blueprint run: write-set containment, ledger freshness, single-writer
 
 This is a fixed list of known failures, not a mechanism for enforcing rules you write.
@@ -104,16 +105,42 @@ This is a fixed list of known failures, not a mechanism for enforcing rules you 
 
 Most of what accumulates around a project should not ship with it. Blueprints, todos, session notes and project-specific instructions are yours, not the codebase's, and committing them to a repo other people pull is the wrong answer. They go to a **vault** instead: a private git repository you create and control, synced with three-way merge and a pre-push secret scan, which never deletes a local file it has never held.
 
-`/todo:create` writes a note without derailing what you are doing, and `/todo:resume` picks one back up later. They ride along in the vault, so the note you left on one machine is there on the next. `/steward:setup-project` is what enrols a project: it finds the Claude files worth keeping, proposes a name, and either registers them fresh or links the project back to a slug an earlier machine already pushed, which is how a clone on new hardware gets its notes back.
+`/steward:setup-project` is what enrols a project: it finds the Claude files worth keeping, proposes a name, and either registers them fresh or links the project back to a slug an earlier machine already pushed, which is how a clone on new hardware gets its notes back.
 
-Two more of steward's commands are worth knowing about. `/steward:usage-audit` reads every transcript on the machine — the host plus each project's sandbox home, nested subagent transcripts included — separates what you spent talking to Claude from what unattended runs spent on your behalf, and prices the total against Anthropic's list rates and several cheaper providers. If a week disappeared, that report says where. And `/steward:ccpraxis-extend` is the single door for changing ccpraxis itself: it works out whether you're asking for something new or a change to something that exists, does the work, and then wires it in — the plugin registration, the settings entry, the skill link. That wiring is the part that's easy to skip by hand, and skipping it leaves a skill sitting on disk that nothing ever loads.
+Two more of steward's commands are worth knowing about. `/steward:usage-audit` reads every transcript on the machine — the host plus each project's sandbox home, nested subagent transcripts included — separates what you spent talking to Claude from what unattended runs spent on your behalf, and prices the total against Anthropic's list rates and several cheaper providers. If a week disappeared, that report says where. And `/steward:ccpraxis-extend` is the single door for changing ccpraxis itself: it works out whether you're asking for something new or a change to something that exists, does the work inside your clone, and wires it in there: the marketplace registration, the settings entry. It stops there and says so, because the change is inert until you promote it, and a new skill or plugin still needs `install.pl` and `/steward:backup` on the host afterward before it actually loads. Skipping that leaves a skill sitting on disk that nothing ever loads.
+
+### Records that outlive a session
+
+**almanac** keeps five kinds of record, each one file per record: project and global todos
+(`/almanac:todo`), notes that point at a fact instead of copying it (`/almanac:note`), the
+project's ordered tasklist (`/almanac:task`), pending product decisions for the operator
+(`/almanac:decision`), and ccpraxis bug reports (`/almanac:bug-report`, `/almanac:bug-triage`).
+
+Storage is plain files on disk. A project record lives at
+`<project>/.ccpraxis-local-data/almanac/<type>/<id>.md`; a global one (todos and notes only) at
+`~/.claude/claude-code-vault/almanac/<type>/<id>.md`; a bug report at
+`<project>/.ccpraxis-local-data/bug-reports/<id>.md`. Inside a sandbox only project records are
+reachable; the store itself refuses a `--global` call there.
+
+A record stays trustworthy through three layers. Each record type's script is the only writer,
+and refuses a change that does not make sense, such as editing a frozen bug report. A
+`PreToolUse` hook, `plugins/almanac/hooks/guard-almanac-write.sh`, denies `Edit` and `Write` under
+either almanac root and on bug reports, so nothing bypasses the script by editing the file
+directly. And every write to an almanac record leaves a hash beside it, while a bug report records
+its digest only once it freezes; `almanac bug verify`
+(`perl plugins/almanac/scripts/almanac.pl bug verify`) and `almanac doctor`
+(`perl plugins/almanac/scripts/almanac.pl doctor`) both report a record whose bytes no longer
+match that hash, which is what a write that got around the first two layers looks like.
+
+`almanac doctor` is the one read-only diagnostic across every store: it names a repair and changes
+nothing itself.
 
 ### A statusline worth the two lines it costs
 
 Claude Code gives you a couple of rows at the bottom of the terminal. This puts everything you would otherwise interrupt yourself to check into them:
 
 ```text
-○ HOST ｜ ccpraxis ｜ ⌥ main ↑3 ↓22 ｜ ⧉ 2  ⋮ 14
+○ HOST ｜ ccpraxis ｜ ⌥ main ↑3 ↓22 ｜ ⧉ 2  ❏ 14
 Opus 5 200k 59% 118k 82k ｜ 5h 34% 3h 35m｜7d 12% 4d 4h
 /c/Development/ccpraxis
 ```
@@ -211,20 +238,25 @@ plan described above), then restart Claude Code.
 | `/backpack:add` | Record a tool so container rebuilds restore it |
 | `/steward:usage-audit` | Price what you actually consumed, here and in every sandbox |
 | `/steward:ccpraxis-extend` | Add to or change ccpraxis, wired in properly |
+| `/almanac:todo` | Record a todo that outlives this session |
+| `/almanac:note` | Keep a durable fact, in place of Claude Code auto-memory |
+| `/almanac:task` | Work the project's ordered tasklist |
+| `/almanac:decision` | File a product decision only the operator can make |
 
-The rest, including `/todo` and `/almanac`, are listed with every other surface in [`docs/reference.md`](docs/reference.md).
+The rest are listed with every other surface in [`docs/reference.md`](docs/reference.md).
 
 ---
 
 ## Layout and documentation
 
-Plugins live under `plugins/<name>/` (`sandbox`, `backpack`, `blueprint`, `butler`, `steward`, `todo`, `almanac`); skills under `skills/`; the `CLAUDE.md` and `settings.json` this installs to `~/.claude/` under `global-config/`.
+Plugins live under `plugins/<name>/` (`sandbox`, `backpack`, `blueprint`, `butler`, `steward`, `almanac`); skills under `skills/`; the `CLAUDE.md` and `settings.json` this installs to `~/.claude/` under `global-config/`.
 
 | Page | For |
 |---|---|
 | [Reference](docs/reference.md) | How each surface works: install contract, commands, statusline, backup, vault sync, sandbox, backpack |
 | [Repo layout](docs/repo-layout.md) | Every file, annotated and generated from disk |
 | [Design conventions](docs/design-conventions.md) | Packaging, approval flows, and what gets enforced in code |
+| [Disabling a Claude Code feature](docs/disabling-claude-code-features.md) | Which lever removes a tool/MCP server/subagent/skill from context vs only gates calls |
 
 ## Platforms
 

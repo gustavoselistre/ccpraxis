@@ -24,11 +24,8 @@ usage() {                     # printf only: reachable with an empty PATH (2.2)
   printf '%s\n' \
 'usage: bp-fast-store.sh [--project DIR] [--native-root DIR] [--store DIR] [--virtual-store DIR]' \
 '' \
-"Point pnpm's storeDir + virtualStoreDir at container-native storage (the overlay" \
-'FS) instead of the slow 9p/WSL2 bind mount, via a gitignored project pnpm-workspace.yaml.' \
-'NOTE: pnpm 10+ silently IGNORES kebab-case store-dir/virtual-store-dir written to' \
-'.npmrc (confirmed broken, spec b38-node-pnpm-toolchain 1.3) -- the camelCase keys must' \
-'live in pnpm-workspace.yaml, which pnpm actually honours.' \
+"Point pnpm's storeDir + virtualStoreDir at container-native storage (the overlay FS) instead of the slow 9p/WSL2 bind mount, via a gitignored project pnpm-workspace.yaml." \
+"NOTE: pnpm 10+ silently IGNORES kebab-case store-dir/virtual-store-dir written to .npmrc (confirmed broken, spec b38-node-pnpm-toolchain 1.3) -- the camelCase keys must live in pnpm-workspace.yaml, which pnpm actually honours." \
 '' \
 '  --project DIR          project dir to configure               (default: the current directory)' \
 '  --native-root DIR      parent of the derived native dirs      (default: /root)' \
@@ -36,9 +33,7 @@ usage() {                     # printf only: reachable with an empty PATH (2.2)
 '  --virtual-store DIR    pnpm virtualStoreDir, per project       (default: <native-root>/<slug>-vstore)' \
 '  -h, --help             this help' \
 '' \
-'Writes <project>/pnpm-workspace.yaml, ensures the .gitignore entries, creates the native' \
-'dirs, and prints ONE /backpack:add line on stdout (all progress goes to stderr). It never' \
-"runs pnpm install -- that is the backpack item's job on the next container rebuild."
+"Writes <project>/pnpm-workspace.yaml, ensures the .gitignore entries, creates the native dirs, and prints ONE /backpack:add line on stdout (all progress goes to stderr). It never runs pnpm install -- that is the backpack item's job on the next container rebuild."
 }
 
 say() { printf 'bp-fast-store: %s\n' "$1" >&2; }

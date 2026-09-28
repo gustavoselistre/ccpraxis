@@ -31,7 +31,7 @@ Each package ledger's frontmatter (`status`, `model`, `max_turns`, `write_set`, 
 ### 1. Create (`/blueprint:create`)
 
 1. Run `bp-init.sh`. Gather the objective from the user/conversation.
-2. **Interrogate before decomposing.** Identify every architectural fork, every "ALWAYS confirm" surface, every ambiguity — and batch them into ONE `AskUserQuestion` pass. The user's mental model: *"I answer questions for 2–3 minutes at the start, then the agents work for hours."* Mid-flight questions are a defect; batch any later blockers with the next user-attention checkpoint unless truly urgent. **This pass always includes the quality-profile question (below) — there is no default, so it must ask every time, not only when the objective seems ambiguous.**
+2. **Interrogate before decomposing.** Identify every architectural fork, every "ALWAYS confirm" surface, every ambiguity — and batch them into ONE `AskUserQuestion` pass. The user's mental model: *"I answer questions for 2–3 minutes at the start, then the agents work for hours."* Mid-flight questions are a defect; batch any later blockers with the next user-attention checkpoint unless truly urgent. **`model`/`effort` are never part of this pass** — see the Decomposition rules below.
 3. Decompose into packages (rules below). Create `blueprint.md` with **`bp-blueprint.pl init`**, then fill it with **`set-section`** (prose) and the typed verbs **`add-decision`/`add-package`** — never `Write`/`Edit`, which `guard-blueprint-write.sh` denies for any `blueprint.md` path including a new one. Write one ledger per package from the package-ledger template (ledgers are unguarded ordinary files), copying scope, done criteria, inputs, `write_set`, `test_paths`, `checks`, `model` into the ledger frontmatter.
 4. **Auditor gate.** Dispatch `blueprint:bp-auditor` (Task) pointed ONLY at the blueprint dir. Its fresh context is the point: you and the user share session context that never made it into the file; an agent reading only the file finds exactly those gaps. Batch its findings into a second (final) `AskUserQuestion` pass, fix the blueprint, set `status: audited`.
 5. Tell the user the blueprint is authored + audited and which packages form wave 1. Execution is `/butler:dispatch-fleet` inside the sandbox (or `/butler:drive-solo` for a host-safe single session) — never automatic.
@@ -41,9 +41,9 @@ Each package ledger's frontmatter (`status`, `model`, `max_turns`, `write_set`, 
 - A package is **independently shippable**: its done criteria are testable without sibling packages, sized roughly 0.5–2 focused dev-days.
 - `write_set` is mandatory and exact (colon-separated patterns; trailing `/` = prefix; `*` crosses `/`). An unscoped package will be refused at launch by butler.
 - `depends_on` forms an explicit DAG. **Parallel-safe = disjoint write sets AND no unmet dependencies.** Overlapping write sets are serialized; only if overlap is unavoidable and serialization too slow, consider worktree isolation — an escalation, not a default.
-- Assign `model` per package: `sonnet` default; `opus` for packages with gnarly design surface or security weight. `max_turns` is butler's per-coordinator backstop — an **authoring-time** default only (runtime turn budgeting is `b11`'s).
+- Assign `model`/`effort` per package: **`sonnet` + `effort: medium`, always.** Raise either only with a package-specific reason, recorded as a one-line Decision. This is the coordinator's own model — a SEPARATE, fixed axis governs what model each WORKER a coordinator dispatches runs on (`plugins/butler/agents/*.md`, `plugins/blueprint/agents/bp-auditor.md`), not set here: `bp-scout`, `bp-test-writer`, `bp-implementer`, `bp-harvest-judge` and `bp-ui-prober` run `sonnet` (`bp-scout` on `haiku`); every other role — `bp-architect`, `bp-reviewer`, `bp-redteam`, `bp-auditor`, `bp-feedback-verifier`, `bp-conformance-judge`, `bp-escalation-resolver`, `bp-resolve-judge` — runs `opus`. `max_turns` is butler's per-coordinator backstop — an **authoring-time** default only (runtime turn budgeting is `b11`'s).
 
-**Do not write a number here.** The canonical value lives in `plugins/butler/turn-caps.json` (`coordinator_default`), the ledger template is generated from it, and `bp-turn-caps.pl check` / `t/93` fail on drift. This paragraph previously carried its own literal, and that is exactly how the divergence happened: `b23` raised the prose 80 → 150 and never touched `templates/package-ledger.md` (still at the original `80`) or `agents/bp-scout.md` (still at `15`, the value this same paragraph called known-starving). Prose that restates a number becomes another copy to drift.
+**Do not write a number here.** The canonical value lives in `plugins/butler/turn-caps.json` (`coordinator_default`); the ledger template is generated from it, and `bp-turn-caps.pl check` / `t/93` fail on drift. A restated literal is exactly how this drifted before (`b23` raised the prose to 150 but left `templates/package-ledger.md` at `80` and `agents/bp-scout.md` at `15`) — point at the source, don't copy the number.
 
 - Give each package a **`checks:`** list — the *kinds* of verification its write set can break. This is a different question from `test_paths:`, which only limits *which tests run*; a package can be perfectly compliant on `test_paths` and never compile, lint, or load its own output. That gap is where escapes live: one initiative shipped five defects to its closing gate, each because the check that would have caught it was in no package's criteria.
 
@@ -52,22 +52,14 @@ Each package ledger's frontmatter (`status`, `model`, `max_turns`, `write_set`, 
   This does **not** cover the visual class — `bp-ui-prober`'s human-read pass is not replaced by any of it.
 
 A cap is a **runaway backstop, not a budget** — it only binds when the coordinator would otherwise still be working, so a healthy one costs the same at 80 as at 800 while a starved one loses the package. Raise per package when its scope needs more; if you are tempted to lower one, lower the scope instead.
-- Assign `effort` per package (opt-in; omit the key entirely for "no flag, inherit `effortLevel` from settings.json" — butler never invents a default here). Under the **higher** quality profile, most packages get no explicit `effort` (i.e. inherit the settings-payload default, today `high`), with `xhigh` reserved for the hardest packages. Under the **normal** profile, prefer `sonnet` more broadly, reserve `opus` for genuinely gnarly packages, and set `effort: medium` on most packages.
-
-### Quality profile — always asked, never defaulted (operator ruling R-03)
-
-Before decomposing, the author **must ask the user** to choose a quality profile for the whole blueprint — **normal** or **higher** — as part of the batched `AskUserQuestion` interrogation pass above. This question has **no default**: the author never silently picks one, never falls back to either option when the user doesn't answer, and never infers a profile from the objective's wording. If the answer is unclear, ask again; do not proceed to decomposition without an explicit choice.
-
-- **higher** — approximately today's behavior: default effort (no explicit `effort:` key, so `effortLevel` from settings.json applies) on most packages, with `xhigh` on the packages judged hardest.
-- **normal** — more `sonnet`, `opus` used sparingly, and `effort: medium` on most packages.
-
-The chosen profile governs the `model`/`effort` assignment guidance above for every package in the blueprint.
 - Every package block carries `inputs` (file:line where known) and `out_of_scope` (explicit DO-NOT list) — coordinators must not re-discover what you already know.
 - **Record runtime/version choices up front.** For every runtime or toolchain a package needs (node, python, pnpm, …), name the version *and the reason* in the package block: latest LTS/stable, **≥7 days old**, mutually compatible, **never EOL**, and **declared in the backpack** so a container rebuild restores it. Version selection is a deliberate, reviewed choice — an undeclared runtime that vanishes on rebuild stalls an unattended fleet. A coordinator that must guess a version at 3am has already lost; `bp-deps-check.pl` enforces the mechanical half of this at execution time.
 
 ### 3. Manage (`/blueprint:manage`)
 
 `list` / `view` read files only. `audit` re-runs `blueprint:bp-auditor`. `archive` / `delete` are lifecycle ops on the files. This plugin never touches running coordinator processes — those live in the sandbox and are butler's to stop. A user decision that implies substantial new work becomes a **new blueprint**, not scope creep on an existing one.
+
+**Work that moved to another blueprint is dropped, not parked.** Mark that package's ledger dropped and put a pointer to where the work went (<blueprint>/<package>) in its Next action; parked means waiting on a decision, and a finished blueprint holding a parked package is never archived.
 
 ## Soft ordering vs a hard dependency edge
 

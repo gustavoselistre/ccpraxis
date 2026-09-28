@@ -2,6 +2,7 @@
    "disabledMcpjsonServers" : [],
    "enabledMcpjsonServers" : [],
    "enabledPlugins" : {
+      "almanac@ccpraxis-local" : true,
       "backpack@ccpraxis-local" : true,
       "blueprint@ccpraxis-local" : true,
       "butler@ccpraxis-local" : true,
@@ -10,36 +11,16 @@
       "sandbox@ccpraxis-local" : true
    },
    "hooks" : {
-      "PostToolUse" : [
-         {
-            "hooks" : [
-               {
-                  "command" : "\"$CLAUDE_PROJECT_DIR\"/plugins/butler/hooks/guard-subagent-stall.sh",
-                  "type" : "command"
-               }
-            ],
-            "matcher" : "Task|Bash"
-         }
-      ],
       "PreToolUse" : [
          {
             "hooks" : [
                {
-                  "command" : "\"$CLAUDE_PROJECT_DIR\"/plugins/butler/hooks/guard-git-mutations.sh",
+                  "command" : "unset BASH_ENV ; f=\"$CLAUDE_PROJECT_DIR/plugins/butler/hooks/guard-git-mutations.sh\" ; w=\"$CLAUDE_PROJECT_DIR/plugins/butler/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "timeout" : 15,
                   "type" : "command"
                }
             ],
             "matcher" : "Bash"
-         }
-      ],
-      "Stop" : [
-         {
-            "hooks" : [
-               {
-                  "command" : "\"$CLAUDE_PROJECT_DIR\"/plugins/butler/hooks/guard-subagent-stall.sh",
-                  "type" : "command"
-               }
-            ]
          }
       ]
    }

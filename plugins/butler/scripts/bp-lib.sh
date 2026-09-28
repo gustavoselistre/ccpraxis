@@ -13,15 +13,28 @@
 # ---------------------------------------------------------------- roots ----
 
 bp_project_root() {
-  # Priority: explicit env > git toplevel > walk-up for data dir > cwd.
+  # Priority: explicit env > git toplevel > bounded walk-up (bp-data-root.pl,
+  # package 03/Decision 3 -- never ascend out of temp, never adopt home unless
+  # the cwd IS home) > cwd. The bounded rules live once in BpDataRoot.pm; a
+  # bash mirror of the 8.3/drive-form/Cygwin tolerance they need would be a
+  # third copy of the hardest part, in the language least able to express it,
+  # so this shells out to the small perl helper instead.
   if [ -n "${BP_PROJECT_ROOT:-}" ]; then printf '%s\n' "$BP_PROJECT_ROOT"; return 0; fi
   local r
   if r=$(git rev-parse --show-toplevel 2>/dev/null); then printf '%s\n' "$r"; return 0; fi
-  local d="$PWD"
-  while [ "$d" != "/" ]; do
-    if [ -d "$d/.ccpraxis-local-data" ]; then printf '%s\n' "$d"; return 0; fi
-    d=$(dirname "$d")
-  done
+  local h
+  h="$(dirname "${BASH_SOURCE[0]}")/../../butler/scripts/bp-data-root.pl"
+  # Decision 24 item 5 (red-team S3): accept the helper's stdout only if it is
+  # a single line naming an EXISTING directory -- a noisy/multi-line answer
+  # (a stray PATH-first "perl" that prints extra output) must fall to $PWD,
+  # never be exported as-is.
+  if [ -f "$h" ]; then
+    r=$(perl "$h" --cwd "$PWD" 2>/dev/null)
+    case "$r" in *$'\n'*) r='' ;; esac
+    if [ -n "$r" ] && [ -d "$r" ]; then
+      printf '%s\n' "$r"; return 0
+    fi
+  fi
   printf '%s\n' "$PWD"
 }
 
@@ -178,10 +191,8 @@ bp_require_sandbox() {
   [ "${BP_ALLOW_HOST:-}" = "1" ] && return 0
   if [ "${IS_SANDBOX:-}" != "1" ]; then
     echo "butler: refusing to launch outside the sandbox." >&2
-    echo "  Butler runs detached headless coordinators (setsid/nohup/flock + 'claude -p')," >&2
-    echo "  which only work inside the rootless-Podman sandbox container." >&2
-    echo "  Author blueprints on the host with the 'blueprint' plugin (/blueprint:create)," >&2
-    echo "  then run them from inside 'claude-sandbox'. (Set BP_ALLOW_HOST=1 to override.)" >&2
+    echo "  Butler runs detached headless coordinators (setsid/nohup/flock + 'claude -p'), which only work inside the rootless-Podman sandbox container." >&2
+    echo "  Author blueprints on the host with the 'blueprint' plugin (/blueprint:create), then run them from inside 'claude-sandbox'. (Set BP_ALLOW_HOST=1 to override.)" >&2
     exit 4
   fi
 }
@@ -196,20 +207,20 @@ bp_require_sandbox() {
 # comment, or heredoc body.
 #
 # fixbatch step7 / w03 F2. BYTE-IDENTICAL algorithm to the one
-# mark-wakeup.sh authored first (fixbatch step7 / g03 F1, verified live
+# arm-on-entry.sh authored first (fixbatch step7 / g03 F1, verified live
 # against three independent bypass techniques: a bash comment, a
 # single-quoted string, a heredoc body). Lifted here so a THIRD copy of this
-# logic is never written: hooks/guard-validation-interlock.sh is the second
+# logic is never written: hooks/guard-bash.sh is the second
 # consumer of this one implementation.
 #
 # 2026-08-19 d03-one-shell-noise-stripper (almanac report 20260814-093113-34a0):
-# mark-wakeup.sh's own inline copy is GONE. This sentence used to claim it was
+# arm-on-entry.sh's own inline copy is GONE. This sentence used to claim it was
 # "deliberately left as-is rather than refactored to call this" because "only
 # a genuinely NEW caller needs to reuse rather than reinvent" -- that claim is
 # now FALSE and would contradict the code next to it if left standing. Both of
-# mark-wakeup.sh's arms (the reporter-arm block and the driver-arm block) now
+# arm-on-entry.sh's arms (the reporter-arm block and the driver-arm block) now
 # call this function via a conditional source of this file, mirroring
-# guard-validation-interlock.sh:70-74. This is the third and last treatment of
+# guard-bash.sh:70-74. This is the third and last treatment of
 # one problem collapsing to one implementation, not two independent copies
 # plus a shared one.
 #
@@ -223,7 +234,7 @@ bp_require_sandbox() {
 # that executes their contents regardless of surrounding quotes or the outer
 # command, and this function's own $(...)/backtick handling (below, inside
 # the dquote branch) and its callers' segment-boundary treatment of them
-# (mark-wakeup.sh's bp_wakeup_arm_check) exist specifically so that content
+# (arm-on-entry.sh's bp_wakeup_arm_check) exist specifically so that content
 # is NOT treated as inert the way a genuinely-inert residual would be.
 #
 # Returns EMPTY (not the original text) if perl is unavailable or the input

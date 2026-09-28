@@ -14,16 +14,24 @@
 #
 # This module is split into a PURE core (layout / frame composition / render
 # diff / key dispatch / spawn-argv / signal-path derivation — all unit-tested in
-# tests/t/25-dashboard.t with no terminal) and a thin seam-injected loop
+# tests/t/dashboard-framework.t with no terminal) and a thin seam-injected loop
 # (`run`). Every side effect the loop performs — heartbeat touch, container
 # inspect, state gather, key read, terminal size, spawn, signal write, raw-mode
 # enter/leave, output — is an injected coderef, so the loop itself is driven by
 # the test harness with a fake clock and a scripted key queue.
 #
-# RENDER MODEL (the B0 carry-forward / flicker fix, extended by s04): never
-# `\e[2J` per frame. Clear once on a full redraw (first frame or a resize), then
-# update only the rows whose text changed via `\e[<row>;1H` + text + `\e[K`, with
-# the whole burst wrapped in synchronized-output `\e[?2026h` … `\e[?2026l`.
+# RENDER MODEL (the B0 carry-forward / flicker fix, extended by s04, then by
+# the span-diff change): never `\e[2J` per frame. Clear once on a full redraw
+# (first frame or a resize), then update only the rows whose SIGNATURE
+# changed (`_cell_sig`). A changed row is no longer always re-emitted whole:
+# `_row_diff_ansi` diffs the row's spans against the previous frame's (common
+# prefix / common suffix by role+text) and, when the changed middle is the
+# same DISPLAY WIDTH on both sides (so nothing after it would shift), emits
+# ONLY that middle at its column -- no `\e[K`. This is what stops the
+# top-row spinner from visibly blanking-then-refilling every tick. Anything
+# that changes the middle's width falls back to the old whole-tail repaint
+# (`\e[<row>;<col>H` + text-to-end-of-row + `\e[K`). The whole burst is
+# wrapped in synchronized-output `\e[?2026h` … `\e[?2026l`.
 #
 # Composed rows are a STYLED-SPAN model (s04): a row is an ordered list of
 # `{ text, role }` spans; a composed cell carries both the spans and their plain
@@ -521,6 +529,15 @@ my %BUTLER_KIND_STYLE = (
     review            => [ 'warn',   'warn' ],
     acquire           => [ 'good',   'ok' ],
     release           => [ 'muted',  'idle' ],
+    # host-wake-and-suspend package 03: suspend_gap is the un-synthesizable
+    # fallback style (a real suspend/resume pair never reaches it); suspend/
+    # resume are the row-synthesis styles consumed by recent_events below;
+    # busy_lease_tick is a per-tick forensic record, deliberately 'muted' so
+    # it never floods the operator-facing panel.
+    suspend_gap       => [ 'warn',   'warn' ],
+    suspend           => [ 'warn',   'warn' ],
+    resume            => [ 'good',   'ok' ],
+    busy_lease_tick   => [ 'muted',  'idle' ],
 );
 
 # @SPINNER DELETED (2026-08-25). It listed the ten spinner glyphs in order so
@@ -813,6 +830,33 @@ sub session_boundary_row {
                                       : '-- previous session --'), role => 'muted' } ];
 }
 
+# stitch_history_dividers(\@hist_groups, \@hist_epochs, $localtime_fn) -> \@flat
+# spec S2b (03-activity-feed-ordering). PURE, TOTAL -- never dies/warns.
+# Embeds one session_boundary_row() per prior-session group BEFORE handing a
+# flat list off to the unchanged LaunchLog::merge_sessions. \@hist_groups is
+# oldest-first, one element per prior launch-log file (exactly the shape
+# _history_events already produces); \@hist_epochs is the parallel per-group
+# newest-member epoch. The very first non-empty group gets no divider (nothing
+# older sits beneath it); every subsequent non-empty group is preceded by
+# exactly one divider dated from that group's own epoch. Empty groups
+# contribute nothing and consume no divider slot. Non-ARRAY inputs degrade to
+# the best-effort usable pairs -- never dies.
+sub stitch_history_dividers {
+    my ($hist_groups, $hist_epochs, $localtime_fn) = @_;
+    my @g = (ref $hist_groups eq 'ARRAY') ? @$hist_groups : ();
+    my @e = (ref $hist_epochs eq 'ARRAY') ? @$hist_epochs : ();
+    my @out;
+    my $seen = 0;
+    for my $i (0 .. $#g) {
+        my $grp = (ref $g[$i] eq 'ARRAY') ? $g[$i] : [];
+        next unless @$grp;
+        push @out, session_boundary_row($e[$i], $localtime_fn) if $seen;
+        push @out, @$grp;
+        $seen = 1;
+    }
+    return \@out;
+}
+
 # _local_parts($epoch, $localtime_fn) -> (hh, mm, ymd, "Www DD Mon") | ()
 # The one place an epoch becomes local wall-clock text. $localtime_fn is
 # injectable so every caller stays testable without touching the machine clock.
@@ -907,7 +951,16 @@ use constant HOT_RELOAD_REPORT_SECS => 20;
 # painting in full. Sized to cover a terminal that reflows AFTER reporting its
 # new size (a maximize does this; a drag-resize hides it by reporting many
 # times). Long enough to outlast that reflow, short enough that the extra full
-# repaints are invisible: at the production tick five ticks is about a second.
+# repaints are invisible. COUNTED IN TICKS, NOT SECONDS (deliberately -- see
+# below), so this scales with $tick_int: at the production default (1.0s,
+# was 0.2s) five ticks is now ~5s of wall clock, not ~1s. Left at 5 rather
+# than reduced: the settle window exists to survive a reflow that keeps
+# re-reporting geometry for some real, tick_int-independent stretch of wall
+# time, and the poll granularity is now 5x coarser, so shrinking the tick
+# count would shrink the safety margin against exactly the reflow lag this
+# was sized for. The cost of leaving it at 5 is bounded and cosmetic (a few
+# extra full repaints, all during/just after an active resize -- see
+# Dashboard.pm:3145-3150 below for why ticks and not seconds).
 use constant RESIZE_SETTLE_TICKS       => 5;
 use constant SPINNER_PERIOD_SECS       => 0.5;
 # Was 2.0, on the reasoning that a title is glanced at rather than watched and
@@ -1118,20 +1171,18 @@ sub _cell_sig {
     return join('', map { length($_) . ':' . $_ } @fields);
 }
 
-# _row_ansi($row, \%cell, $color) -> the ANSI to (re)draw one 1-based row.
-# The line is cleared (\e[K) BEFORE the text, never after: every composed row is
-# exactly $cols display columns wide, so writing it parks the cursor in the last
-# cell (deferred auto-wrap). A trailing \e[K would then erase that last cell —
-# invisibly on a dash separator, but visibly chopping the title's closing "]"
-# (the "[running" bug). Clearing first wipes any stale tail (a width-shrink
-# diff) and leaves the final character intact. With color, each span is
+# _spans_ansi(\@spans, $color) -> the ANSI text for a list of spans, with NO
+# cursor-position/clear prefix and no trailing reset. With color, each span is
 # SELF-CLOSING (SGR . text . \e[0m; a ''-role span emits bare text) -- no
 # row-level trailing reset, so style never bleeds within a row or across rows.
-# PRIVATE, extended (F9: s04 fix-batch doc-tag pass).
-sub _row_ansi {
-    my ($row, $cell, $color) = @_;
-    my $s = "\e[${row};1H\e[K";
-    for my $raw_sp (@{ _cell_spans($cell) }) {
+# Guards a non-hashref span element via _span_hash (F1: never die). Factored
+# out of _row_ansi (span-diff change) so the partial-row emit path
+# (_row_diff_ansi) can reuse the exact same span-to-ANSI mapping instead of a
+# second, silently divergent copy. PRIVATE.
+sub _spans_ansi {
+    my ($spans, $color) = @_;
+    my $s = '';
+    for my $raw_sp (@$spans) {
         my $sp   = _span_hash($raw_sp);   # F1: never die on a malformed span element
         my $text = defined $sp->{text} ? $sp->{text} : '';
         if (!$color) {
@@ -1142,6 +1193,97 @@ sub _row_ansi {
         $s .= $sgr eq '' ? $text : ($sgr . $text . "\e[0m");
     }
     return $s;
+}
+
+# _row_ansi($row, \%cell, $color) -> the ANSI to (re)draw one 1-based row IN
+# FULL (full repaint / resize / first frame). The line is cleared (\e[K)
+# BEFORE the text, never after: every composed row is exactly $cols display
+# columns wide, so writing it parks the cursor in the last cell (deferred
+# auto-wrap). A trailing \e[K would then erase that last cell — invisibly on
+# a dash separator, but visibly chopping the title's closing "]" (the
+# "[running" bug). Clearing first wipes any stale tail (a width-shrink diff)
+# and leaves the final character intact. PRIVATE, extended (F9: s04
+# fix-batch doc-tag pass).
+sub _row_ansi {
+    my ($row, $cell, $color) = @_;
+    return "\e[${row};1H\e[K" . _spans_ansi(_cell_spans($cell), $color);
+}
+
+# _span_eq($a, $b) -> true iff two spans (any shape accepted by _span_hash)
+# have the SAME role and the SAME text. Used by _row_diff_ansi's prefix/
+# suffix scan; comparing role+text (not just text) means a role-only change
+# (e.g. a status glyph recoloring with identical text) still counts as a
+# difference, matching _cell_sig's own role-sensitivity. PRIVATE.
+sub _span_eq {
+    my ($a, $b) = @_;
+    my $sa = _span_hash($a);
+    my $sb = _span_hash($b);
+    my $ra = defined $sa->{role} ? $sa->{role} : '';
+    my $rb = defined $sb->{role} ? $sb->{role} : '';
+    my $ta = defined $sa->{text} ? $sa->{text} : '';
+    my $tb = defined $sb->{text} ? $sb->{text} : '';
+    return $ra eq $rb && $ta eq $tb;
+}
+
+# _row_diff_ansi($row, \%prev_cell, \%new_cell, $color) -> the ANSI to bring
+# row $row from $prev_cell's painted state to $new_cell's, WITHOUT
+# re-emitting the whole row when only a middle span (or two) actually
+# changed (the top-row spinner-flash fix). Caller guarantees the two cells'
+# _cell_sig differ (a no-op diff is filtered out by render_frame before this
+# is called).
+#
+# Algorithm: find the longest common PREFIX of spans (role+text equal,
+# scanned left to right) and the longest common SUFFIX (scanned right to
+# left, never overlapping the prefix). The spans strictly between them on
+# each side are the "middle". If the middle's DISPLAY WIDTH is unchanged,
+# nothing to the right of it shifts on screen, so only the middle needs to
+# be repainted: position the cursor at column `spans_width(prefix)+1` and
+# emit ONLY the new middle spans -- no \e[K, because nothing after the
+# middle needs erasing (it's already correct on screen and untouched).
+# Otherwise the suffix (and everything after the middle) would visually
+# shift, so fall back to repainting from the start of the middle through
+# end-of-row (middle + suffix), ending in \e[K to clear any stale tail left
+# by a row that got narrower in aggregate.
+#
+# Column arithmetic uses spans_width (-> display_width), never length/byte
+# count: a status dot / spinner / gauge glyph can be 1-2 display columns
+# across several UTF-8 bytes, so byte length would misposition the cursor
+# whenever the unchanged prefix contains one. PRIVATE.
+sub _row_diff_ansi {
+    my ($row, $prev_cell, $new_cell, $color) = @_;
+    my $prev_spans = _cell_spans($prev_cell);
+    my $new_spans  = _cell_spans($new_cell);
+    my $pn = scalar @$prev_spans;
+    my $nn = scalar @$new_spans;
+
+    my $prefix = 0;
+    while ($prefix < $pn && $prefix < $nn
+           && _span_eq($prev_spans->[$prefix], $new_spans->[$prefix])) {
+        $prefix++;
+    }
+
+    my $suffix = 0;
+    while ($suffix < ($pn - $prefix) && $suffix < ($nn - $prefix)
+           && _span_eq($prev_spans->[$pn - 1 - $suffix], $new_spans->[$nn - 1 - $suffix])) {
+        $suffix++;
+    }
+
+    my @prefix_spans = @{$new_spans}[0 .. $prefix - 1];
+    my @mid_old      = @{$prev_spans}[$prefix .. $pn - 1 - $suffix];
+    my @mid_new      = @{$new_spans}[$prefix .. $nn - 1 - $suffix];
+    my @suffix_spans = @{$new_spans}[$nn - $suffix .. $nn - 1];
+
+    my $col = spans_width(\@prefix_spans) + 1;
+
+    if (spans_width(\@mid_old) == spans_width(\@mid_new)) {
+        # Equal-width middle: nothing after it shifts. No \e[K -- the spinner case.
+        return "\e[${row};${col}H" . _spans_ansi(\@mid_new, $color);
+    }
+
+    # Width changed: the suffix (and anything past the middle) would shift on
+    # screen, so repaint from the middle through end-of-row and clear any tail.
+    return "\e[${row};${col}H" . _spans_ansi(\@mid_new, $color)
+         . _spans_ansi(\@suffix_spans, $color) . "\e[K";
 }
 
 # render_frame($prev_frame, $new_frame, \%opts) -> the ANSI string to apply.
@@ -1175,10 +1317,15 @@ sub render_frame {
     my $out = "\e[?2026h";   # begin synchronized output
     $out .= "\e[2J\e[H" if $full;
     for my $i (0 .. $#$new) {
-        unless ($repaint) {
-            next if _cell_sig($prev->[$i]) eq _cell_sig($new->[$i]);
+        if ($repaint) {
+            $out .= _row_ansi($i + 1, $new->[$i], $color);
+            next;
         }
-        $out .= _row_ansi($i + 1, $new->[$i], $color);
+        next if _cell_sig($prev->[$i]) eq _cell_sig($new->[$i]);
+        # Span-level diff (the flicker fix): emit only the changed middle of
+        # the row when it's safe to (see _row_diff_ansi), instead of always
+        # re-emitting the whole row via _row_ansi's \e[K + full text.
+        $out .= _row_diff_ansi($i + 1, $prev->[$i], $new->[$i], $color);
     }
     $out .= "\e[?2026l";     # end synchronized output
     return $out;
@@ -1300,12 +1447,24 @@ sub find_wt {
 # command opaque means the wrapping logic stays pure/testable while the launcher
 # owns the platform-correct invocation (a native wt.exe/`start` can't exec the
 # .ps1 by bare name, so the launcher passes a `powershell.exe -File …` cmd).
-# ctx: { cmd => [...], comspec }.
+# ctx: { cmd => [...], comspec, profile }.
+# ctx.profile is an optional Windows Terminal profile NAME (never a GUID; see
+# WtProfile::profile_name()), honoured only in the 'wt' mode. When defined and
+# non-empty it is inserted as two separate argv elements, '-p' and the name,
+# between 'new' and @cmd -- never joined into one shell-quoted string, since
+# system(@argv) here is always the list form. With no profile the output is
+# byte-identical to before this key existed.
 sub spawn_argv {
     my ($mode, $ctx) = @_;
     $ctx ||= {};
     my @cmd = @{ $ctx->{cmd} || [] };
-    return ['wt.exe', '-w', 'new', @cmd]                            if $mode eq 'wt';
+    if ($mode eq 'wt') {
+        my $profile = $ctx->{profile};
+        if (defined $profile && length $profile) {
+            return ['wt.exe', '-w', 'new', '-p', $profile, @cmd];
+        }
+        return ['wt.exe', '-w', 'new', @cmd];
+    }
     return [($ctx->{comspec} || 'cmd.exe'), '/c', 'start', '', @cmd] if $mode eq 'start';
     return undef;   # inline: caller runs the connector in-process
 }
@@ -1390,6 +1549,30 @@ sub recent_events {
         # kind's, generically -- the field isn't pause-specific) must reach
         # the rendered row, same as exit/state already do.
         my $reason = _ev_scalar($rec->{reason});
+
+        # host-wake-and-suspend package 03: synthesize a suspend row and a
+        # resume row from ONE suspend_gap event, rather than rendering the
+        # raw event unstyled. See spec 03-suspend-reaches-the-operator 2a.
+        if ($type eq 'suspend_gap' && defined $epoch) {
+            my $gap = _ev_scalar($rec->{gap_secs});
+            if (defined $gap && $gap =~ /^\d+(?:\.\d+)?$/ && $gap > 0) {
+                my $overshoot = _ev_scalar($rec->{overshoot_secs});
+                my $sr_extra = " gap_secs=$gap";
+                $sr_extra .= " overshoot_secs=$overshoot" if defined $overshoot;
+
+                my ($srole, $sglyph) = event_style('suspend', undef, undef);
+                my $sbody = "suspend$sr_extra";
+                $sbody = substr($sbody, 0, $EVENT_FIELD_MAX_LEN) if length($sbody) > $EVENT_FIELD_MAX_LEN;
+                push @records, { epoch => $epoch - $gap, body => $sbody, role => $srole, glyph => $sglyph };
+
+                my ($rrole, $rglyph) = event_style('resume', undef, undef);
+                my $rbody = "resume$sr_extra";
+                $rbody = substr($rbody, 0, $EVENT_FIELD_MAX_LEN) if length($rbody) > $EVENT_FIELD_MAX_LEN;
+                push @records, { epoch => $epoch, body => $rbody, role => $rrole, glyph => $rglyph };
+                next;   # do NOT also push the raw suspend_gap record below
+            }
+        }
+
         $extra .= " exit=$exit"     if defined $exit;
         $extra .= " state=$state"   if defined $state;
         $extra .= " reason=$reason" if defined $reason;
@@ -1543,8 +1726,8 @@ sub _alert_msgs {
 # take. $rows is now an OPTIONAL third parameter -- callers that supply it
 # (activity_capacity, below) get the capped/reserve-aware total that agrees
 # with compose_frame at realistic terminal sizes (verified:
-# t/77-wrap-width-regressions.t, rows=30 cols=90/120). Callers that omit it
-# (t/25, t/40, t/41's direct 2-arg AC16 calls -- pre-existing, untouched
+# t/wrap-width-regressions.t, rows=30 cols=90/120). Callers that omit it
+# (t/dashboard-framework.t, t/layout-responsive.t, t/panel-semantics.t's direct 2-arg AC16 calls -- pre-existing, untouched
 # tests) fall back to the OLD natural/uncapped total, exactly as before this
 # fix-batch: not because the cap doesn't apply to them, but because without
 # $rows there is no $body_height to cap against, and guessing one would risk
@@ -2807,7 +2990,7 @@ sub run {
     my $color      = exists $o{color} ? $o{color} : 1;
     my $beat_int   = defined $o{beat_interval}  ? $o{beat_interval}  : 120;
     my $state_int  = defined $o{state_interval} ? $o{state_interval} : 2;
-    my $tick_int   = defined $o{tick_interval}  ? $o{tick_interval}  : 0.2;
+    my $tick_int   = defined $o{tick_interval}  ? $o{tick_interval}  : 1.0;
     # MINOR-1 (red-team step 6): a wall-clock cooldown on the recover ACTION.
     # "ly" is one of the commonest digraphs in English (only/really/finally), so
     # pasting an ordinary paragraph into the dashboard otherwise fires one full
@@ -2847,7 +3030,7 @@ sub run {
     # $INSTALL_WARNING assignment in launcher.pl executes before this loop is
     # ever entered (_launch_stage_begin('dashboard')) -- so no NEW/different
     # warning can ever arise while this flag is live to swallow it. That
-    # invariant is enforced by plugins/sandbox/tests/t/87-banner-dismiss.t
+    # invariant is enforced by plugins/sandbox/tests/t/banner-dismiss.t
     # PART 7 (a source-structure scan of launcher.pl); if a future change adds
     # or moves an $INSTALL_WARNING assignment to after the dashboard stage
     # begins, that test goes red -- read it before "fixing" this flag to be
@@ -2984,7 +3167,8 @@ sub run {
                 # frame signature, so it forced the recompose the resize should
                 # have forced. Reading the terminal size is an ioctl, not a
                 # subprocess; there is no reason for it to ride a throttle meant
-                # for probes. At $tick_int it is now noticed within ~200ms.
+                # for probes. It is noticed and repainted within at most one
+                # tick -- $tick_int now defaults to 1.0s (was 0.2s).
                 #
                 # $rows/$cols are in the frame-cache signature, so updating them
                 # here is by itself enough to force a recompose on the same tick.

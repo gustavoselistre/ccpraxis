@@ -535,7 +535,7 @@ sub _resolve_clone_dir {
     eval {
         # Normalise separators BEFORE deriving the directory: abs_path can return
         # a backslashed path on Windows and dirname does not split on backslashes.
-        # Enforced by plugins/butler/tests/t/93-turn-cap-consistency.t (C9).
+        # Enforced by plugins/butler/tests/t/turn-cap-consistency.t (C9).
         (my $self = __FILE__) =~ s{\\}{/}g;
         my $abs = abs_path($self) // $self;
         $abs =~ s{\\}{/}g;
@@ -1223,7 +1223,6 @@ sub _native_path {
 
 sub _run_capture {
     my (@cmd) = @_;
-    local $ENV{MSYS2_ARG_CONV_EXCL} = '*' if $^O =~ /^(MSWin32|cygwin|msys)$/;
 
     my ($efh, $ename) = File::Temp::tempfile(UNLINK => 1);
     close $efh;
@@ -1302,6 +1301,17 @@ sub _run_with_stdin {
 sub _git_capture {
     my ($root, @args) = @_;
     local $ENV{GIT_TERMINAL_PROMPT} = '0';
+    # Scoped here, not in the generic _run_capture: this call hands a
+    # hand-translated Windows-style path (_native_path) straight to the
+    # native git.exe, so disabling MSYS's own POSIX->Windows argv rewrite
+    # is correct and paired, per CLAUDE.md's MSYS2 landmine writeup.
+    # _run_capture's OTHER callers spawn $^X (a perl SCRIPT), which may
+    # itself shell out to git with an unqualified POSIX path relying on
+    # that same rewrite (gen-readme-tree.pl's `git -C $REPO_ROOT`, e.g.) --
+    # setting the exclusion there too would leak into that grandchild spawn
+    # and break it (verified: reproduces the exact "fatal: cannot change to
+    # '/c/...': No such file or directory" from bug report 20260922-211319).
+    local $ENV{MSYS2_ARG_CONV_EXCL} = '*' if $^O =~ /^(MSWin32|cygwin|msys)$/;
     return _run_capture('git', '-C', _native_path($root), @args);
 }
 

@@ -2,6 +2,7 @@
 name: setup
 description: Onboard the current project to the ccpraxis system — create the local data dir + self-gitignore, migrate any legacy .claude-plans into blueprints, and register the project for vault backup (detect trackables, pick a slug, initial sync; or link/restore an existing vault slug from another machine). Manual, idempotent, host-side. Use when starting to use blueprints or backup in a project, or when the user says "set up this project", "onboard this project", "steward setup", "register for backup", "back up this project", "link to vault", "restore from vault", or "migrate my plans here".
 argument-hint: (none)
+host-only: true
 allowed-tools: Bash, Read, AskUserQuestion
 ---
 

@@ -155,8 +155,6 @@ for my $m (@missing) {
     printf STDERR "      (not found)\n\n";
 }
 
-print STDERR "Fix: either correct the path in README.md, or — if it's an\n";
-print STDERR "intentional placeholder/example — wrap it with <...> markers\n";
-print STDERR "so the linter skips it.\n";
+print STDERR "Fix: either correct the path in README.md, or — if it's an intentional placeholder/example — wrap it with <...> markers so the linter skips it.\n";
 
 exit 1;

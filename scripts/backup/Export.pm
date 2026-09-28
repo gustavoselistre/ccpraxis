@@ -403,8 +403,17 @@ sub _do_file_conflicts {
             # is ever emitted.
         }
         elsif ($status eq 'not_linked' || $status eq 'conflict') {
+            # Pair by the item's own identity, never by basename alone.
+            # sync-export.pl's repo_file tells us the repo-relative path
+            # this live $file is actually mapped to (they diverge for
+            # CLAUDE.md: live ~/.claude/CLAUDE.md pairs with repo
+            # global-config/CLAUDE.md, NOT a same-named file at the repo
+            # root -- see bug report 20260922-211416-1b92). Fall back to
+            # $file only for older sync-export.pl output that predates the
+            # repo_file field.
+            my $repo_file = $item->{repo_file} // $file;
             my $live_path = "$home_n/.claude/$file";
-            my $repo_path = "$root/$file";
+            my $repo_path = "$root/$repo_file";
             if (-d $live_path) {
                 $ctx->{note}->('file_status_directory', { file => $file, note => $item->{note} });
                 next;

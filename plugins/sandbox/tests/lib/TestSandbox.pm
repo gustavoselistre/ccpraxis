@@ -20,9 +20,25 @@ use warnings;
 use FindBin qw($Bin);
 use lib "$Bin/../../scripts";
 use MountSpec qw(winify_path convert_v_to_mount);
-use Exporter qw(import);
+use Exporter ();
+our @ISA = ('Exporter');
 use File::Temp qw(tempdir);
 use File::Path qw(remove_tree);
+use File::Basename qw(dirname);
+use Cwd qw(abs_path);
+
+# HostCaps.pm: the sole owner of scratch_root() (blueprint test-platform-
+# split, package 04-scratch-root). __FILE__-derived, never FindBin/$Bin --
+# $Bin above is the INVOKING SCRIPT's directory (a process-wide singleton),
+# not this module's own directory, so it is only correct when THIS file is
+# the one doing the requiring of its OWN siblings (MountSpec, above); a
+# sibling-lookup for HostCaps needs this module's own path regardless of who
+# required it. Bareword `require HostCaps;` (not a string-path require) so
+# every caller lands on the identical %INC key and the file loads exactly
+# once no matter which of HostCaps.pm / StewardTest.pm / TestSandbox.pm is
+# required first.
+use lib dirname(abs_path(__FILE__)) . "/../../../butler/tests/lib";
+require HostCaps;
 
 our @EXPORT_OK = qw(
     podman_bin
@@ -38,6 +54,8 @@ our @EXPORT_OK = qw(
     sweep_orphan_containers
     test_container_prefix
     orphan_container_names
+    container_runtime_reachable
+    container_unreachable_reason
 );
 
 our $WINDOWS_FAMILY = $^O =~ /^(MSWin32|cygwin|msys)$/;
@@ -67,6 +85,104 @@ my $COUNTER = 0;
 sub podman_bin { $PODMAN }
 sub probe_image { $PROBE_IMAGE }
 
+# ---------------------------------------------------------------------------
+# Reachability probe (Decision 120(a), blueprint hook-continuity-remake
+# package 36) -- `<cli> --version` above only proves the CLI binary is on
+# PATH; it says nothing about whether the daemon/VM behind it is actually
+# reachable. The distinguishing host state this exists for is podman on
+# PATH with the machine STOPPED (this host's normal idle state): `--version`
+# succeeds instantly regardless, so callers that only gate on
+# _detect_container_cli() go on to run real container operations that then
+# fail hard with a raw podman connection error, rather than skipping.
+#
+# `podman info` is used as the probe because, empirically on this host with
+# the machine stopped, it fails FAST (~0.17s, exit 125, "unable to connect
+# to Podman socket") rather than hanging -- so the alarm() bound below is a
+# safety net for a wedged daemon, not the primary defense. Same documented,
+# accepted best-effort gap as launcher.pl's _run_timed(): SIGALRM interrupts
+# a pending backtick on this POSIX-ish perl; on a perl/platform where it
+# doesn't, this degrades to a no-op bound rather than a hard guarantee.
+#
+# Memoized: the reachability of the runtime does not change within a single
+# test process's lifetime for any test in this suite, and repeating the
+# probe would multiply this cost across every caller.
+my ($REACHABLE, $REACHABLE_REASON);
+sub container_runtime_reachable {
+    return $REACHABLE if defined $REACHABLE;
+    my $quoted_podman = _arg_quote($PODMAN);
+    my $cmd = "$quoted_podman info " . _arg_quote('--format') . ' ' . _arg_quote('{{.Host.Arch}}') . ' 2>&1';
+    my $out;
+    my $died = 0;
+    eval {
+        local $SIG{ALRM} = sub { die "TestSandbox: podman info timeout\n" };
+        alarm(15);
+        $out = `$cmd`;
+    };
+    alarm(0);
+    if ($@) {
+        $died = 1;
+    }
+    my $rc = $died ? -1 : ($? >> 8);
+    if ($died) {
+        $REACHABLE = 0;
+        $REACHABLE_REASON = "$PODMAN info did not return within 15s -- container runtime unreachable (or wedged)";
+    } elsif ($rc != 0) {
+        $REACHABLE = 0;
+        (my $reason = $out // '') =~ s/\s+\z//;
+        $reason =~ s/\s+/ /g;
+        $REACHABLE_REASON = "$PODMAN is on PATH but its runtime is unreachable (rc=$rc): $reason";
+    } else {
+        $REACHABLE = 1;
+        $REACHABLE_REASON = undef;
+    }
+    return $REACHABLE;
+}
+
+# The clear skip reason to hand to Test::More's skip()/plan(skip_all=>...)
+# after a false container_runtime_reachable(). Runs the probe if it has not
+# already run in this process.
+sub container_unreachable_reason {
+    container_runtime_reachable() unless defined $REACHABLE;
+    return $REACHABLE_REASON;
+}
+
+# Symbols whose import means the caller intends to actually TALK to the
+# runtime (spawn/exec against a real daemon), as opposed to catalog-style
+# helpers (podman_bin, probe_image, new_temp_dir, new_container_name,
+# register_cleanup_*, cleanup_all, sweep_orphan_containers,
+# orphan_container_names, test_container_prefix, winify_path,
+# container_runtime_reachable/container_unreachable_reason themselves) that
+# work, and were already exercised in this suite, whether or not the daemon
+# is reachable. Gating the auto-skip below on this set specifically -- not
+# on every import -- matters: a caller that requires TestSandbox late, after
+# other assertions already ran, and only ever imports catalog-style helpers
+# (e.g. scratch-root-single.t's per-row child processes, which import only
+# new_temp_dir) must keep running unaffected by machine state, exactly as it
+# did before this probe existed.
+my %NEEDS_REACHABLE_RUNTIME = (podman_run_capture => 1, create_probe_container => 1);
+
+# Custom import (Decision 120(a), package 36): still exports symbols exactly
+# as Exporter's default import would, THEN -- only when the CLI exists (the
+# pre-existing die above already covers "no CLI at all", unchanged) but
+# container_runtime_reachable() is false, and only when the caller actually
+# asked for a runtime-talking symbol -- calls Test::More's plan(skip_all),
+# which prints "1..0 # skip <reason>" and exits 0. That is only safe to do
+# at `use`/`require+import` time, before the caller's own test assertions
+# have run (exactly the six `use TestSandbox qw(...)` files this covers);
+# it is why the gate above matters just as much as the reachability check
+# itself for any caller that imports these symbols LATER, mid-file.
+sub import {
+    my $class = shift;
+    my @syms = @_;
+    $class->export_to_level(1, $class, @syms);
+    if (grep { exists $NEEDS_REACHABLE_RUNTIME{$_} } @syms) {
+        unless (container_runtime_reachable()) {
+            require Test::More;
+            Test::More::plan(skip_all => container_unreachable_reason());
+        }
+    }
+}
+
 sub _tag {
     $COUNTER++;
     return "claude-sandbox-test-$$-$COUNTER";
@@ -76,18 +192,46 @@ sub new_container_name { return _tag() . '-c' }
 
 # winify_path comes from MountSpec.pm (imported above).
 
-# Anchor temp dirs under $HOME (or $USERPROFILE on Windows). On WSL2-backed
-# Docker/Podman, $HOME is reachable via /mnt/c automounts; same on Linux
-# native; same on macOS via virtiofs. Git-Bash /tmp is in a 9p namespace
-# the VM may not see (historical Hyper-V bug — kept the anchor for
-# portability across backends).
+# Anchor temp dirs under HostCaps::scratch_root()."/sandbox" (blueprint
+# test-platform-split, package 04-scratch-root) when defined -- i.e. on
+# Windows, or under any platform where CCPRAXIS_SCRATCH_ROOT is set.
+# HostCaps::scratch_root() dying on a bad override propagates uncaught here,
+# deliberately -- see HostCaps.pm.
+#
+# When scratch_root() is undef (non-Windows, no override), fall back to
+# EXACTLY today's pre-existing behavior: $HOME (or $USERPROFILE) is where
+# WSL2-backed Docker/Podman, Linux-native and macOS-virtiofs backends all
+# reach a bind-mounted host path from inside a container (Git-Bash /tmp is
+# in a 9p namespace the VM may not see -- historical Hyper-V bug). The
+# HOME/USERPROFILE lookup, and its die-if-missing, only happen on this
+# branch now -- on this Windows host scratch_root() is always defined, so
+# requiring HOME/USERPROFILE to be set when nothing downstream needs either
+# would be a new, avoidable failure mode with no compensating benefit.
 sub new_temp_dir {
-    my $home = $ENV{HOME} // $ENV{USERPROFILE};
-    die "neither HOME nor USERPROFILE set" unless defined $home;
-    my $base = "$home/.cache/sandbox-tests";
+    my $scratch = HostCaps::scratch_root();
+    my $base;
+    if (defined $scratch) {
+        $base = "$scratch/sandbox";
+    } else {
+        my $home = $ENV{HOME} // $ENV{USERPROFILE};
+        die "neither HOME nor USERPROFILE set" unless defined $home;
+        $base = "$home/.cache/sandbox-tests";
+    }
     require File::Path;
     File::Path::make_path($base) unless -d $base;
-    my $d = tempdir(DIR => $base, CLEANUP => 0);
+    # CLEANUP => 1, not 0: this used to opt out of File::Temp's own cleanup
+    # and rely solely on register_cleanup_dir() below plus this file's END
+    # block / SIG{INT,TERM,HUP} handlers to drain @CLEANUP_DIRS at exit. That
+    # registry DOES drain reliably for every exit path Perl can act on (normal
+    # exit, die, INT/TERM/HUP) -- exactly the same two paths the container
+    # reaping above documents. CLEANUP => 0 bought nothing on top of that: it
+    # doesn't survive a SIGKILL/hard-crash any better than CLEANUP => 1 would
+    # (File::Temp's own cleanup is itself an END-time hook, no more signal-safe
+    # than ours), so the only thing it was doing was DISABLING a second,
+    # independent safety net for the paths that already work, which is a pure
+    # loss. Leaving it at 1 costs nothing (both mechanisms check -d before
+    # acting) and covers a caller that forgets to invoke cleanup_all().
+    my $d = tempdir(DIR => $base, CLEANUP => 1);
     $d = winify_path($d);
     register_cleanup_dir($d);
     return $d;

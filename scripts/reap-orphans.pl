@@ -53,7 +53,7 @@
 # If they ever do need bounding, bound them by age with the same report-first
 # discipline as the process path -- do not fold it into this script's --kill.
 # SHAPE: a pure selection library plus a thin CLI, the convention this repo
-# already uses (bp-dispatch-log.pl, bp-runstate.pl). The point is testability
+# already uses (bp-dispatch-log.pl). The point is testability
 # WITHOUT SPAWNING ANYTHING: select_orphans takes a process list as data, so the
 # oracle feeds it synthetic processes instead of creating real orphans and real
 # kills inside the suite. A test for a process reaper that reaps is a test that
@@ -269,18 +269,55 @@ sub human_age {
     return sprintf('%dm', int($s / 60));
 }
 
+# terminate_pid($pid) -- send the kill IN THE NAMESPACE THE PID CAME FROM.
+#
+# THE BUG THIS REPLACES (20260917-033101-c455). This block used to try
+# `kill('TERM', $pid)` first, fall back to `taskkill` when that failed, and then
+# verify with `kill(0, $pid)`. Every one of those perl calls asks MSYS about a
+# pid that `enumerate_windows` collected from `Get-CimInstance Win32_Process`.
+#
+# Git-for-Windows perl runs under MSYS2, which keeps its OWN pid numbering.
+# `ps -W` prints both and they are different numbers for the same process:
+#
+#     PID    PPID    WINPID   COMMAND
+#  832282       1    159020   /usr/bin/perl        <- one process, two ids
+#
+# perl's $$, getppid() and kill() use PID. CIM, Get-Process, Stop-Process and
+# taskkill use WINPID. Crossing them DOES NOT ERROR -- it answers "no such
+# process", which reads as a real answer.
+#
+# So the old first attempt could never land (hence the taskkill workaround, whose
+# comment recorded the symptom without the cause), and worse, the VERIFICATION
+# `kill(0, $winpid)` returned false for every live process, setting $ok = 1
+# unconditionally. THE TOOL REPORTED EVERY KILL AS SUCCESSFUL and @failed could
+# not be populated. A reaper that cannot say what it failed to reap is exactly
+# the tool you cannot trust when something leaks -- which is how it was found,
+# after two launchers survived 37 hours on this host.
+sub terminate_pid {
+    my ($pid) = @_;
+    return unless defined $pid && $pid =~ /^\d+$/;
+    if ($^O =~ /^(MSWin32|cygwin|msys)$/) {
+        system("taskkill /PID $pid /F >/dev/null 2>&1");
+        return;
+    }
+    kill('TERM', $pid);
+}
+
 my @killed;
 my @failed;
 if ($opt{kill}) {
+    terminate_pid($_->{pid}) for @candidates;
+
+    # VERIFY BY RE-ENUMERATING, not by asking about one pid. enumerate() is the
+    # same source every candidate came from, so it cannot disagree with itself
+    # about which namespace these numbers live in -- which is precisely the
+    # disagreement that made the old check meaningless. One query for the whole
+    # batch, rather than one per pid.
+    select(undef, undef, undef, 0.5);   # brief settle; a forced kill is not instant
+    my %still = map { $_->{pid} => 1 } enumerate();
+
     for my $c (@candidates) {
-        my $ok = kill('TERM', $c->{pid}) ? 1 : 0;
-        # Windows perl's kill(TERM) does not always land on a native process;
-        # fall back to taskkill, which does. Verified against a real orphan.
-        if (!$ok && $^O =~ /^(MSWin32|cygwin|msys)$/) {
-            system("taskkill /PID $c->{pid} /F >/dev/null 2>&1");
-            $ok = (kill(0, $c->{pid}) ? 0 : 1);
-        }
-        push @{ $ok ? \@killed : \@failed }, $c;
+        push @{ $still{ $c->{pid} } ? \@failed : \@killed }, $c;
     }
 }
 

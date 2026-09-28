@@ -1,6 +1,6 @@
 ---
 name: backup
-description: Syncs everything personal between the live host and your private repos — ccpraxis config (global + container) AND every project registered for vault backup (CLAUDE.md, skills, plans, memory). Scans for secrets before pushing. Resolves vault sync conflicts interactively. If you're in a project that has trackable Claude files but isn't registered for backup, offers to register it. Also surfaces Claude Code binary snapshots taken by /update and supports manual revert. Use when the user wants to sync config, back up settings, push config changes, sync vault projects, list/revert Claude Code snapshots, or says "backup", "sync config", "push config", "sync everything", "back up my work", "revert claude code", "list claude snapshots", "rollback claude".
+description: Syncs everything personal between the live host and your private repos — ccpraxis config (global + container) AND every project registered for vault backup (CLAUDE.md, skills, plans, memory, almanac records — global and project). Scans for secrets before pushing. Resolves vault sync conflicts interactively. If you're in a project that has trackable Claude files but isn't registered for backup, offers to register it. Also surfaces Claude Code binary snapshots taken by /update and supports manual revert. Use when the user wants to sync config, back up settings, push config changes, sync vault projects, list/revert Claude Code snapshots, or says "backup", "sync config", "push config", "sync everything", "back up my work", "revert claude code", "list claude snapshots", "rollback claude".
 user-invocable: true
 host-only: true
 allowed-tools: Bash, AskUserQuestion, Skill
@@ -63,6 +63,19 @@ the paused run):
 ```
 perl ~/.claude/ccpraxis/scripts/backup.pl run --json --restart
 ```
+
+**A `--resume` call that hangs or times out with no output.** Do not retry the same token:
+the run may already have consumed it, and a replayed token is terminal (`token_replayed`).
+Instead, re-invoke with no token at all, `perl ~/.claude/ccpraxis/scripts/backup.pl run --json`.
+It reports the true state:
+- **exit 3 `token_missing`**: the run is still paused, so the hung call never took effect and
+  the original token is still valid. Retry the same `--resume` call with the same answers.
+- **any other result**: the hung call had already consumed the token, and this call carries
+  the run on from where it got to. Handle its exit as usual.
+
+One case needs the operator first. If the hung call was answering the run's LAST decisions, it
+may have finished the whole backup, and a token-less call on a finished run starts a fresh one.
+Say so and ask before re-invoking.
 
 Repeat the exit-10 branch until a terminal exit. Bound the loop at **20 driver
 invocations**; if that bound is hit, stop, say plainly that the backup is **incomplete**
@@ -150,6 +163,8 @@ Surface, from the report's fields:
   sync. The revert mode is entered by intent (see **Modes**), never from a report.
 - `sources` — a phase that never ran is reported as "never ran", never as "found
   nothing".
+- `almanac_store_skipped` notes (relay each `message` verbatim) and `global_almanac_failed`
+  (treat the run as problematic); mention `global_almanac.committed` / `.pushed` too.
 
 ## Follow-up actions
 

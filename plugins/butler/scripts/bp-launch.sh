@@ -19,7 +19,7 @@ PLUGIN_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 # shellcheck source=bp-lib.sh
 source "$SCRIPT_DIR/bp-lib.sh"
 bp_require_sandbox
-require_cmd jq flock claude setsid realpath
+require_cmd jq flock claude setsid realpath perl
 
 BP_NAME="${1:?usage: bp-launch.sh <blueprint> <package> [opts]}"
 PKG="${2:?usage: bp-launch.sh <blueprint> <package> [opts]}"
@@ -104,9 +104,19 @@ fi
 
 LOG="$BPDIR/runs/$PKG.jsonl"
 PIDFILE="$BPDIR/runs/$PKG.pid"
+STATUSFILE="$BPDIR/runs/$PKG.exit-status"
 rm -f "$BPDIR/runs/$PKG.force-stop" "$BPDIR/runs/$PKG.active-worker"
+rm -f "$PIDFILE" "$STATUSFILE"
 
 # -------- launch detached
+# 03-deaths-are-diagnosable: bp-watch-child.pl becomes the true parent of
+# `claude` (fork+setsid+exec+waitpid) so the coordinator's real OS exit status
+# can be observed -- bp-launch.sh's own subshell is reparented away long
+# before `claude` exits, so nothing here could ever waitpid() on it directly.
+# The pid recorded below is bp-watch-child.pl's CHILD's own pid (the same
+# process that execs into claude), never the watcher's own pid -- see
+# specs/03-deaths-are-diagnosable-spec.md §2.2 for the invariant this
+# preserves.
 ATTEMPT=$(registry_get "$BP_NAME" "$PKG" attempt); ATTEMPT=$(( ${ATTEMPT:-0} + 1 ))
 (
   cd "$PROJECT_ROOT"
@@ -116,20 +126,35 @@ ATTEMPT=$(registry_get "$BP_NAME" "$PKG" attempt); ATTEMPT=$(( ${ATTEMPT:-0} + 1
   export BP_WRITE_SET="$WRITE_SET" BP_TEST_PATHS="$TEST_PATHS"
   export BP_REPORT_DIR="$BPDIR/reports/$PKG"
   export BP_ROLE="coordinator"
+  # Batch C (spec 16-cutover 2.8): the old concurrency-switch condition is
+  # gone -- bin/ is always on PATH, and the missing-butler-hold warning
+  # always fires when the file is missing or not executable. That switch's
+  # env var is no longer exported.
+  [ -x "$PLUGIN_ROOT/bin/butler-hold" ] || echo "bp-launch: $PLUGIN_ROOT/bin/butler-hold is missing or not executable; the coordinator can only stop on its ledger" >&2
+  export PATH="$PLUGIN_ROOT/bin:$PATH"
   if [ -n "$RESUME_SID" ]; then
-    setsid nohup claude -p "$PROMPT" --resume "$RESUME_SID" \
+    setsid nohup perl "$SCRIPT_DIR/bp-watch-child.pl" "$PIDFILE" "$STATUSFILE" "$ATTEMPT" -- \
+      claude -p "$PROMPT" --resume "$RESUME_SID" \
       --output-format stream-json --verbose \
       --model "$MODEL" --max-turns "$MAXT" \
       --dangerously-skip-permissions "${EFFORT_ARGS[@]}" >> "$LOG" 2>&1 &
   else
-    setsid nohup claude -p "$PROMPT" \
+    setsid nohup perl "$SCRIPT_DIR/bp-watch-child.pl" "$PIDFILE" "$STATUSFILE" "$ATTEMPT" -- \
+      claude -p "$PROMPT" \
       --output-format stream-json --verbose \
       --model "$MODEL" --max-turns "$MAXT" \
       --dangerously-skip-permissions "${EFFORT_ARGS[@]}" > "$LOG" 2>&1 &
   fi
-  echo $! > "$PIDFILE"
 )
-PID=$(cat "$PIDFILE")
+# PID used to be available synchronously ($! from the subshell). It is now
+# written by a process that starts asynchronously (fork+setsid+exec, sub-
+# second in practice) -- poll instead of reading it back immediately.
+PID=""
+for _ in $(seq 1 100); do
+  [ -s "$PIDFILE" ] && PID=$(cat "$PIDFILE" 2>/dev/null) && [ -n "$PID" ] && break
+  sleep 0.1
+done
+[ -n "$PID" ] || { echo "bp-launch: watcher did not report a coordinator pid within 10s -- inspect $LOG" >&2; exit 1; }
 
 # -------- capture session id from the stream (init event), up to 60s
 SID="$RESUME_SID"

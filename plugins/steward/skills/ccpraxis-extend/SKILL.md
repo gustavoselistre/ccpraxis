@@ -1,9 +1,8 @@
 ---
 name: ccpraxis-extend
-description: THE single entrypoint for changing ccpraxis or adding new functionality to it. Decides whether the request is NEW (scaffold a skill, plugin, or plugin-skill — applying the packaging rule) or a CHANGE (locate the existing skill/plugin/script and edit it), then does the work and wires it in (related links, settings perms, marketplace, README, live mirror). Use proactively whenever the user wants to add, build, create, scaffold, or design a new skill / plugin / slash command / capability for ccpraxis, OR change, fix, improve, refactor, rename, or extend an existing ccpraxis skill, plugin, or script. Use when the user says "add a skill", "make a plugin", "new slash command", "extend ccpraxis", "change the X skill", "update the Y plugin", or describes a capability they want ccpraxis to have. Host-only.
+description: THE single entrypoint for changing ccpraxis or adding new functionality to it. Decides whether the request is NEW (scaffold a skill, plugin, or plugin-skill — applying the packaging rule) or a CHANGE (locate the existing skill/plugin/script and edit it), then does the work and wires it in (related links, settings perms, marketplace, README). Use proactively whenever the user wants to add, build, create, scaffold, or design a new skill / plugin / slash command / capability for ccpraxis, OR change, fix, improve, refactor, rename, or extend an existing ccpraxis skill, plugin, or script. Use when the user says "add a skill", "make a plugin", "new slash command", "extend ccpraxis", "change the X skill", "update the Y plugin", or describes a capability they want ccpraxis to have.
 argument-hint: [what you want to add or change]
 user-invocable: true
-host-only: true
 allowed-tools: Bash, Read, Write, Edit, AskUserQuestion, Glob, Grep, Skill
 ---
 
@@ -11,9 +10,39 @@ allowed-tools: Bash, Read, Write, Edit, AskUserQuestion, Glob, Grep, Skill
 
 The one tool for evolving ccpraxis. The user does **not** pick "create vs update" or "skill vs plugin" — they describe what they want in their own words and this skill figures out the shape. It absorbs what used to be `/create-skill` and `/update-skill`, generalized beyond a single skill to **skills, plugins, plugin-skills, and scripts**.
 
-Repo root is `~/.claude/ccpraxis` (this is a host-only skill that edits the repo, then refreshes the live install). The request: `$ARGUMENTS` — if empty, ask the user what they want to add or change.
+This skill operates on a **checked-out ccpraxis clone**: read, edit, and validate the clone, then stop. It never touches the machinery a session is running from.
+
+The request: `$ARGUMENTS`. If empty, ask the user what they want to add or change.
 
 **Take your time.** Extending ccpraxis is a design task. Read the references, understand the request, propose the shape, and confirm before writing anything. Don't rush to deliver.
+
+## Before anything: confirm this is a ccpraxis clone
+
+Find the repo toplevel and confirm it is a tracked ccpraxis checkout, never the install a session runs from:
+
+```bash
+top="$(git rev-parse --show-toplevel 2>/dev/null)"
+[ -n "$top" ] && grep -q '"name": *"ccpraxis-local"' "$top/plugins/.claude-plugin/marketplace.json"
+```
+
+If there is no git toplevel, or `$top/plugins/.claude-plugin/marketplace.json` is missing or its `name` field isn't `ccpraxis-local`, stop with exactly one line and write nothing:
+
+> Not a ccpraxis clone: /steward:ccpraxis-extend only works inside a checkout of the ccpraxis repository.
+
+Otherwise, guard against the live install with a resolved, case-folded, trailing-slash-anchored compare. This catches both an `ANDR~1`-style short name and a case variant, neither of which a plain string compare would.
+
+```bash
+hc=$(cd "$HOME/.claude" 2>/dev/null && pwd -P | tr 'A-Z' 'a-z')
+real=$(cd "$top" && pwd -P | tr 'A-Z' 'a-z')
+[ -n "$hc" ] && case "$real/" in "$hc"/*) echo LIVE ;; esac
+echo "$top"
+```
+
+If that prints `LIVE`, stop with exactly one line and write nothing (a missing `$HOME/.claude` never matches, so an empty `$hc` never triggers this):
+
+> Refusing: this checkout is under $HOME/.claude, the live install, not a development clone. Work in your clone.
+
+Otherwise the last line printed is the repo's absolute path. Bash calls do not share shell variables, so `$top` will not survive into a later call. Take that printed absolute path and use it literally, in place of every `<repo>` below, in every later command, including `Read`/`Edit`/`Write` targets, which no shell re-derivation covers anyway. Never re-run `git rev-parse --show-toplevel` later in this task: if a later step changes the working directory, re-deriving from the cwd would silently point at the wrong tree and skip the guard above.
 
 ## Step 0 — Load the references (always)
 
@@ -23,8 +52,8 @@ Two docs are load-bearing. Read both before scaffolding or editing:
 - **`references/skill-writing-guide.md`** — frontmatter fields, progressive disclosure, description-writing, string substitutions, and style for the SKILL.md body itself.
 
 ```bash
-cat ~/.claude/ccpraxis/references/extending-ccpraxis.md
-cat ~/.claude/ccpraxis/references/skill-writing-guide.md
+cat "<repo>/references/extending-ccpraxis.md"
+cat "<repo>/references/skill-writing-guide.md"
 ```
 
 Everything below assumes you've internalized them — this skill is the *process*; those docs are the *conventions*. Don't duplicate their detail here; defer to them.
@@ -66,7 +95,7 @@ For each skill being created, settle: name (kebab-case, no "claude"/"anthropic")
 
 ### 2d. Scaffold
 
-Write the files into the **repo** (never directly into `~/.claude/skills` or a live plugin):
+Write the files into the **repo** (never into a live install):
 
 - **Standalone skill:** `skills/<name>/SKILL.md` (+ any one-level-deep supporting files / `scripts/`).
 - **New plugin:** `plugins/<name>/.claude-plugin/plugin.json` (no `displayName` — the validator rejects it), `skills/<verb>/SKILL.md` per verb, optional `scripts/`, `bin/` (+ `ccpraxis-install.pl` only if it ships a CLI that must land on PATH — delegate to `scripts/_install-bin-helper.pl`). Reference bundled scripts from a skill body via `${CLAUDE_PLUGIN_ROOT}/scripts/...` in bash blocks (the env var bash expands at runtime), matching the other steward skills.
@@ -81,8 +110,8 @@ Then go to Step 4 (wiring).
 Find what the user named and classify it, because the edit + rewiring differ:
 
 ```bash
-ls -d ~/.claude/ccpraxis/skills/<name> ~/.claude/ccpraxis/plugins/<name> \
-      ~/.claude/ccpraxis/plugins/*/skills/<name> 2>/dev/null
+ls -d "<repo>/skills/<name>" "<repo>/plugins/<name>" \
+      "<repo>"/plugins/*/skills/<name> 2>/dev/null
 ```
 
 - **bare skill** → `skills/<name>/`
@@ -102,7 +131,7 @@ Read the full SKILL.md / script of every target + sibling and the guide, so you 
 
 ### 3d. Edit surgically
 
-Use `Edit` for targeted changes (preserve everything the user didn't ask to change); reserve `Write`/full-rewrite for when a rewrite is genuinely cleaner. Keep the existing style, numbering, and frontmatter field order. If the change is a **rename or removal**, treat it as a change plus the reverse of the relevant wiring in Step 4 (move/delete the dir, drop the `Skill(...)` perm, drop the marketplace/`enabledPlugins` entry for a removed plugin, remove the live mirror), then regen the README.
+Use `Edit` for targeted changes (preserve everything the user didn't ask to change); reserve `Write`/full-rewrite for when a rewrite is genuinely cleaner. Keep the existing style, numbering, and frontmatter field order. If the change is a **rename or removal**, treat it as a change plus the reverse of the relevant wiring in Step 4 (move/delete the dir, drop the `Skill(...)` perm, drop the marketplace/`enabledPlugins` entry for a removed plugin), then regen the README.
 
 Then go to Step 4 (wiring).
 
@@ -112,19 +141,15 @@ Only the steps that apply to what you touched:
 
 1. **`related` frontmatter.** Skills created together link to each other; a new skill that pairs with an existing one is added to both `related` lists. Keep links symmetric.
 
-2. **Settings permission.** For a user-invocable skill, add an allow entry so it doesn't prompt — `Skill(<name>)` for a bare skill, `Skill(<plugin>:<verb>)` for a plugin skill — to the repo source `global-config/settings.json` (and the live `~/.claude/settings.json` so it takes effect now). Keep the list alphabetical.
+2. **Settings permission.** For a user-invocable skill, add an allow entry so it doesn't prompt — `Skill(<name>)` for a bare skill, `Skill(<plugin>:<verb>)` for a plugin skill — to the repo source `global-config/settings.json`. Keep the list alphabetical.
 
-3. **New plugin only:** register it in `plugins/.claude-plugin/marketplace.json` (`{"name","source":"./<name>","description"}`) and enable it — add `"<name>@ccpraxis-local": true` to `enabledPlugins` in **both** `global-config/settings.json` and `~/.claude/settings.json`. Then **install it yourself** so it's cached and recorded in `installed_plugins.json` like the other ccpraxis plugins — don't leave the user a manual `/plugin install`:
-   ```bash
-   claude plugin install <name>@ccpraxis-local
-   ```
-   (`claude` is the host CLI; run it from Bash. It copies the plugin into `~/.claude/plugins/cache/` and records it, so the plugin persists across restarts. Enabling in `enabledPlugins` alone is not enough — without the install record a fresh session may not load it.) If you instead added a skill to an **existing** plugin, skip the install and just update that plugin's `plugin.json` description so it stays accurate.
+3. **New plugin only:** register it in `plugins/.claude-plugin/marketplace.json` (`{"name","source":"./<name>","description"}`) and enable it — add `"<name>@ccpraxis-local": true` to `enabledPlugins` in `global-config/settings.json`. If you instead added a skill to an **existing** plugin, just update that plugin's `plugin.json` description so it stays accurate.
 
-4. **Docs.** The file tree is generated and lives in **`docs/repo-layout.md`**, not the README — never hand-edit it. Run, in order:
+4. **Docs.** The file tree is generated and lives in **`docs/repo-layout.md`**, not the README — never hand-edit it. Run the clone's own scripts, in order:
    ```bash
-   perl ~/.claude/ccpraxis/scripts/gen-readme-tree.pl --write
-   perl ~/.claude/ccpraxis/scripts/gen-readme-tree.pl --check
-   perl ~/.claude/ccpraxis/scripts/lint-readme-paths.pl
+   perl "<repo>"/scripts/gen-readme-tree.pl --write
+   perl "<repo>"/scripts/gen-readme-tree.pl --check
+   perl "<repo>"/scripts/lint-readme-paths.pl
    ```
    The tree comment comes from a `.about` sidecar if present, else `plugin.json`, else the SKILL.md `description` — so a good frontmatter description is usually enough; add a `<name>.about` one-liner only to override.
 
@@ -140,23 +165,19 @@ Only the steps that apply to what you touched:
 
    Re-run `--check` + lint until clean.
 
-5. **Live mirror.** Bare skills are mirrored to `~/.claude/skills/`; refresh after any create/edit/delete:
-   ```bash
-   perl ${CLAUDE_PLUGIN_ROOT}/scripts/ccpraxis-helpers.pl sync-skills
-   ```
-   Plugins load live from the repo via the marketplace — no mirror. A **new plugin** (already installed in step 3, so it persists) becomes active in the *current* session only after `/reload-plugins` or a restart; tell the user to run `/reload-plugins`.
-
 ## Step 5 — Validate + self-review
 
-- **Plugin manifest** (if you created/changed a plugin): validate in a throwaway container —
+- **Plugin manifest** (if you created/changed a plugin): validate against the repo toplevel.
   ```bash
-  export MSYS2_ARG_CONV_EXCL='*'
-  podman run --rm --entrypoint claude \
-    -v "$(cygpath -m ~/.claude/ccpraxis/plugins/<name>):/work/p:ro" \
-    localhost/claude-sandbox:latest plugin validate /work/p
+  claude plugin validate "<repo>/plugins/<name>"
   ```
+  If you touched `plugins/.claude-plugin/marketplace.json`, also validate `"<repo>/plugins"` so the marketplace manifest itself is checked. This works the same on the host and inside a sandbox, since both carry the `claude` CLI.
 - **Read back** every file you wrote or edited and self-review against the guide: third-person description with triggers, steps unambiguous, under 500 lines, supporting files one level deep, `related` symmetric, cross-references correct, works on Windows + Unix.
 
 ## Step 6 — Report
 
-Tell the user: what was created/changed and its shape; the slash command(s) now available (and whether a `/reload-plugins`/restart is needed for a new plugin); how `related`/settings/marketplace were wired; that the README regenerated clean; and that changes sync to their private repos on the next **`/steward:backup`** (which also relinks bare skills on other machines after pulling).
+Tell the user: what was created/changed and its shape; the slash command(s) it adds once promoted; how `related`/settings/marketplace were wired; and that the README regenerated clean.
+
+If the change added a bare skill or a new plugin, the report must also give the host-side follow-up, since nothing sits behind that slash command until it runs. Promotion (`perl scripts/promote.pl`, host-side, from the clone) merges the code and settings but does not mirror skills or record a plugin install. After promoting, run the live install's `install.pl --confirm`, then `/steward:backup`. Between them they link any new bare skill into the live install's skills directory and flag a new plugin that still needs installing. Skipping this leaves the change present on disk and invisible to Claude.
+
+**Changed in the clone; inert until promoted by merge.**

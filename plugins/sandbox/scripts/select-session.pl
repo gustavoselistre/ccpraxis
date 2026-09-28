@@ -16,27 +16,59 @@
 #   RESUME <uuid>         — resume the session with this UUID
 #
 # Exit codes:
-#   0   chose NEW or RESUME (written to --output)
+#   0   chose NEW or RESUME (written to --output, or printed as "RESUME
+#       <uuid>" on stdout in --fork mode)
 #   2   cancelled (Esc / q / Ctrl-C) — --output is removed/empty
-#   1   usage error or unreadable inputs
+#   3   host-session fork failed: --fork mode could not produce a resumable
+#       session (no such host session, or SessionFork::fork_session itself
+#       failed), or the plain/TUI picker's own fork-before-resume path hit
+#       the same failure after a HOST row was picked. Nothing is written to
+#       --output/stdout on this exit. Callers use this dedicated code (never
+#       plain 1) to decide whether returning to the picker makes sense.
+#   1   usage error or unreadable inputs (any other failure)
 #
 # Why an output file instead of stdout: the launcher invokes this via
 # system() (not backticks) so stdin/stdout/stderr stay attached to the
 # user's TTY — required for cbreak input + cursor-positioned redraws.
 # Writing the decision to a file is the clean way to return data without
 # fighting the terminal.
+#
+# blueprint sandbox-session-ux, package 03-picker-cards: both this script's
+# plain loop and the launcher dashboard's 'c' screen render SessionIndex
+# results as CARDS through the one shared renderer in tui::LaunchScreens
+# (session_card_lines / session_new_lines / card_window). See
+# specs/03-picker-cards-spec.md.
 
 use strict;
 use warnings;
 use File::Basename qw(basename dirname);
 use Cwd ();
 use POSIX qw(strftime);
-use JSON::PP ();   # 08-launcher-screens: --list-json's one output object
+use JSON::PP ();
+use Encode ();
+
+# Dedicated exit code for a failed host-session fork -- see the "Exit codes"
+# block in the header comment above. Kept as a named constant rather than a
+# bare 3 at each call site.
+use constant FORK_FAILED_EXIT => 3;
 
 binmode STDOUT, ':raw';
 binmode STDERR, ':raw';
 
 my $WINDOWS_FAMILY = $^O =~ /^(MSWin32|cygwin|msys)$/;
+
+# =====================================================================
+# @INC / tui::LaunchScreens
+# =====================================================================
+# The script's own directory (backslashes normalised) goes on @INC so
+# `use tui::LaunchScreens` resolves the same way launcher.pl's does — that
+# module brings in Theme and tui::Frame, which is everything the card
+# renderer and the colour tokens need.
+BEGIN {
+    my $dir = File::Basename::dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
+    unshift @INC, $dir unless grep { $_ eq $dir } @INC;
+}
+use tui::LaunchScreens ();
 
 # =====================================================================
 # Args
@@ -48,6 +80,10 @@ my $OUTPUT_FILE   = '';
 my $BLUEPRINTS_DIR     = '';
 my $BLUEPRINTS_DIR_SET = 0;   # 1 iff --blueprints-dir was supplied (even if empty)
 my $LIST_JSON          = 0;   # 08-launcher-screens: data mode, no terminal at all
+my $HOST_SESSIONS_DIR     = '';
+my $HOST_SESSIONS_DIR_SET = 0;   # 1 iff --host-sessions-dir was supplied -- "origin mode" (07)
+my $FORK_UUID             = '';
+my $FORK_UUID_SET         = 0;   # 1 iff --fork was supplied -- non-interactive fork mode (07)
 
 # Parse @ARGV into the globals above. Split out from the entry point so
 # the `unless (caller)` guard at the bottom can run it only when the script is
@@ -74,6 +110,14 @@ sub parse_args {
             $BLUEPRINTS_DIR = $1;         $BLUEPRINTS_DIR_SET = 1;
         } elsif ($a eq '--list-json') {
             $LIST_JSON = 1;
+        } elsif ($a eq '--host-sessions-dir' && @argv) {
+            $HOST_SESSIONS_DIR = shift @argv; $HOST_SESSIONS_DIR_SET = 1;
+        } elsif ($a =~ /^--host-sessions-dir=(.*)$/) {
+            $HOST_SESSIONS_DIR = $1;         $HOST_SESSIONS_DIR_SET = 1;
+        } elsif ($a eq '--fork' && @argv) {
+            $FORK_UUID = shift @argv; $FORK_UUID_SET = 1;
+        } elsif ($a =~ /^--fork=(.*)$/) {
+            $FORK_UUID = $1;         $FORK_UUID_SET = 1;
         } else {
             print STDERR "select-session.pl: unknown arg: $a\n";
             exit 1;
@@ -83,16 +127,28 @@ sub parse_args {
         print STDERR "select-session.pl: --sessions-dir is required\n";
         exit 1;
     }
+    # --fork is a non-interactive mode: requires --sessions-dir and
+    # --host-sessions-dir, never --output, and cannot be combined with
+    # --list-json (usage error).
+    if ($FORK_UUID_SET) {
+        if ($LIST_JSON) {
+            print STDERR "select-session.pl: --fork cannot be combined with --list-json\n";
+            exit 1;
+        }
+        if (!$HOST_SESSIONS_DIR_SET || !length $HOST_SESSIONS_DIR) {
+            print STDERR "select-session.pl: --fork requires --host-sessions-dir\n";
+            exit 1;
+        }
+    }
     # --list-json is a DATA mode: it prints the session list and touches no
     # terminal and no --output file, so that flag is not required for it.
-    if (!length $OUTPUT_FILE && !$LIST_JSON) {
+    if (!length $OUTPUT_FILE && !$LIST_JSON && !$FORK_UUID_SET) {
         print STDERR "select-session.pl: --output is required\n";
         exit 1;
     }
     # The project label is rendered into the TUI title and the line-prompt
     # header; strip any terminal-control bytes at this input seam so a crafted
-    # label can't beep/overwrite/spoof the menu (the TUI path is also guarded
-    # by clip_visible, but the line-prompt header prints it raw).
+    # label can't beep/overwrite/spoof the menu.
     $PROJECT_LABEL = sanitize_cell($PROJECT_LABEL);
 
     # --blueprints-dir is OPTIONAL (the s14-session-filter test/override seam,
@@ -110,8 +166,7 @@ sub parse_args {
 # bp-lib.sh scan. Accepts / or \ as the separator (the launcher runs
 # host-side, where $PROJECT_PATH may be a Windows path). Requires the
 # .ccpraxis-local-data component to be a strict ancestor (a trailing
-# separator must follow it). Any other shape -> ''. Never dies. Does NOT
-# check existence — collect_butler_sids handles a non-existent root.
+# separator must follow it). Any other shape -> ''. Never dies.
 sub derive_blueprints_dir {
     my ($sd) = @_;
     return '' unless defined $sd && length $sd;
@@ -120,8 +175,25 @@ sub derive_blueprints_dir {
 }
 
 # =====================================================================
-# SessionFilter integration (fail-open — D4)
+# SessionFilter / SessionIndex integration
 # =====================================================================
+
+my $HAVE_SESSION_FORK;   # undef = not tried yet
+
+# load_session_fork() -- lazy require, same idiom as load_session_index()/
+# load_session_filter() below: a test that `require`s this script to unit-
+# test its pure helpers never runs main() (the `unless (caller)` guard), so
+# an eager `use SessionFork ()` at compile time would double-load the module
+# under a second %INC key whenever the test also required SessionFork.pm
+# directly by its own absolute path (harmless, but noisy "subroutine
+# redefined" warnings). Loading on demand, from the same dir tui::LaunchScreens
+# and SessionIndex already resolve against, avoids that entirely.
+sub load_session_fork {
+    return $HAVE_SESSION_FORK if defined $HAVE_SESSION_FORK;
+    my $dir = File::Basename::dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
+    $HAVE_SESSION_FORK = eval { require "$dir/SessionFork.pm"; 1 } ? 1 : 0;
+    return $HAVE_SESSION_FORK;
+}
 
 my $HAVE_SESSION_FILTER;   # undef = not tried yet
 
@@ -140,6 +212,17 @@ sub butler_sids {
     return (ref $s eq 'HASH') ? $s : {};
 }
 
+my $HAVE_SESSION_INDEX;   # undef = not tried yet
+my $SESSION_INDEX_ERR = '';
+
+sub load_session_index {
+    return $HAVE_SESSION_INDEX if defined $HAVE_SESSION_INDEX;
+    my $dir = File::Basename::dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
+    $HAVE_SESSION_INDEX = eval { require "$dir/SessionIndex.pm"; 1 } ? 1 : 0;
+    $SESSION_INDEX_ERR = $@ unless $HAVE_SESSION_INDEX;
+    return $HAVE_SESSION_INDEX;
+}
+
 sub write_action {
     my $action = shift;
     open my $fh, '>:raw', $OUTPUT_FILE or do {
@@ -151,156 +234,123 @@ sub write_action {
 }
 
 # =====================================================================
-# Scan + parse sessions
+# Scan sessions (SessionIndex-backed — package 02)
 # =====================================================================
+
+# list_sessions($dir) -> @sessions. Each element:
+#   { uuid, mtime, kind, started_at, last_active_at, first_typed, last_typed,
+#     same_message }
 #
-# Each Claude Code session is one *.jsonl file directly under the project's
-# encoded-cwd directory. We extract a UUID (filename or first JSON line),
-# mtime (most-recent-activity), and a short preview taken from the first
-# user message that isn't isMeta:true (which would surface a caveat banner
-# instead of the user's real first prompt).
-
+# Listing goes straight through SessionIndex::index_dir() -- package 02's
+# one index -- rather than a second directory scan here. Entries the index
+# marks `empty` (Decision 4: no typed message at all) are dropped by this
+# consumer and never reach any view; index_dir() itself still returns them
+# (its own contract leaves that filtering to callers). Order otherwise
+# matches index_dir()'s own (last_active_at desc, id asc) unchanged.
 sub list_sessions {
-    return () unless -d $SESSIONS_DIR;
-    opendir(my $dh, $SESSIONS_DIR) or return ();
-    my @files = grep { /\.jsonl$/i } readdir $dh;
-    closedir $dh;
+    my ($dir) = @_;
+    $dir = $SESSIONS_DIR unless defined $dir;
+    return () unless load_session_index();
+    my $entries = eval { SessionIndex::index_dir($dir) };
+    return () unless ref $entries eq 'ARRAY';
 
-    my @sessions;
-    for my $f (@files) {
-        my $path = "$SESSIONS_DIR/$f";
-        next unless -f $path;
-        my @st = stat($path);
-        next unless @st;
-        my $mtime = $st[9];
-        my $size  = $st[7];
-        my $info  = parse_session_head($path);
-        my ($uuid) = $f =~ /^([0-9a-fA-F-]+)\.jsonl$/;
-        $uuid = $info->{session_id} unless defined $uuid && length $uuid;
-        next unless defined $uuid && length $uuid;
-        push @sessions, {
-            uuid    => $uuid,
-            mtime   => $mtime,
-            size    => $size,
-            preview => $info->{preview} // '',
-            # cwd isn't rendered today, but sanitize at the store seam so it's
-            # never a latent injection vector if a future panel displays it.
-            cwd     => sanitize_cell($info->{cwd} // ''),
+    my @out;
+    for my $e (@$entries) {
+        next unless ref $e eq 'HASH';
+        next if $e->{empty};
+        next unless defined $e->{id};
+        push @out, {
+            uuid           => $e->{id},
+            path           => $e->{path},
+            mtime          => $e->{mtime},
+            kind           => $e->{kind},
+            started_at     => $e->{started_at},
+            last_active_at => $e->{last_active_at},
+            first_typed    => $e->{first_typed},
+            last_typed     => $e->{last_typed},
+            same_message   => $e->{same_message},
         };
     }
-    # Most recent first.
-    @sessions = sort { $b->{mtime} <=> $a->{mtime} } @sessions;
+    return @out;
+}
+
+# origin_sessions($dir, $forced_origin) -> @sessions -- list_sessions($dir),
+# each row tagged with an `origin`. When $forced_origin is given (host
+# rows), every row gets that origin. Otherwise (sandbox rows) a row is
+# `fork` (+ `source_session_id`) when SessionFork::read_provenance finds a
+# sidecar, else `sandbox`.
+#
+# red-team S1 (MUST-FIX, promoted by Decision 34): a listed row's `id` is
+# SessionIndex's filename stem ONLY when the stem is uuid-shaped -- when it
+# is not, index_file() falls back to the first record's `sessionId`, which
+# for a file the CONTAINER wrote (any file under the sandbox sessions dir)
+# is content the container controls. A crafted `"sessionId":"host:<real
+# host uuid>"` would otherwise be listed as an id identical in shape to a
+# genuine host row's item id, and picking it forks the named HOST session.
+# Closed two ways, both applied here:
+#   - every row whose id is not uuid_shaped is dropped outright (closes the
+#     sandbox-row spoof: "host:<uuid>" is never uuid-shaped);
+#   - a HOST row's id must equal ITS OWN file's stem -- never a
+#     content-derived id -- so host-ness/identity for a host row never
+#     comes from anything the container wrote.
+sub origin_sessions {
+    my ($dir, $forced_origin) = @_;
+    my @candidates = list_sessions($dir);
+    my $is_host = defined($forced_origin) && $forced_origin eq 'host';
+    my @out;
+    for my $s (@candidates) {
+        next unless load_session_fork() && SessionFork::is_uuid_shaped($s->{uuid});
+        if ($is_host) {
+            my $stem = defined($s->{path}) ? $s->{path} : '';
+            $stem =~ s{.*[/\\]}{};
+            $stem =~ s/\.jsonl\z//i;
+            next unless length($stem) && lc($stem) eq lc($s->{uuid});
+        }
+        push @out, $s;
+    }
+    for my $s (@out) {
+        if (defined $forced_origin) {
+            $s->{origin} = $forced_origin;
+            next;
+        }
+        my $prov = eval { SessionFork::read_provenance($dir, $s->{uuid}) };
+        if (ref $prov eq 'HASH') {
+            $s->{origin}            = 'fork';
+            $s->{source_session_id} = $prov->{source_session_id};
+        } else {
+            $s->{origin} = 'sandbox';
+        }
+    }
+    return @out;
+}
+
+# merged_sessions() -> @sessions -- sandbox rows (list_sessions($SESSIONS_DIR),
+# origin-tagged sandbox/fork) plus, in origin mode, host rows from
+# $HOST_SESSIONS_DIR (origin host). Sort: last_active_at desc, then uuid
+# asc, then origin (sandbox < fork < host) as the final tie-break.
+sub merged_sessions {
+    my @sessions = origin_sessions($SESSIONS_DIR);
+    if ($HOST_SESSIONS_DIR_SET && length $HOST_SESSIONS_DIR) {
+        push @sessions, origin_sessions($HOST_SESSIONS_DIR, 'host');
+    }
+    my %rank = (sandbox => 0, fork => 1, host => 2);
+    @sessions = sort {
+        (defined($b->{last_active_at}) ? $b->{last_active_at} : -1)
+            <=> (defined($a->{last_active_at}) ? $a->{last_active_at} : -1)
+            or $a->{uuid} cmp $b->{uuid}
+            or ($rank{$a->{origin} // ''} // 9) <=> ($rank{$b->{origin} // ''} // 9)
+    } @sessions;
     return @sessions;
 }
 
-sub parse_session_head {
-    my $path = shift;
-    my %out;
-    my $fallback_preview;
-    open my $fh, '<:raw', $path or return \%out;
-    my $line_count = 0;
-    while (defined(my $line = <$fh>)) {
-        $line_count++;
-        # Cap how far we scan: a corrupt or multi-MB session shouldn't make
-        # the picker hang during enumeration. 500 lines is enough to find
-        # the first prose prompt in any normal session opening.
-        last if $line_count > 500;
-        next unless length $line;
-        if (!defined $out{session_id} && $line =~ /"sessionId"\s*:\s*"([0-9a-fA-F-]+)"/) {
-            $out{session_id} = $1;
-        }
-        if (!defined $out{cwd} && $line =~ /"cwd"\s*:\s*"([^"]+)"/) {
-            $out{cwd} = $1;
-        }
-        if (!defined $out{preview}) {
-            my $is_user_msg    = $line =~ /"type"\s*:\s*"user"/;
-            my $is_meta        = $line =~ /"isMeta"\s*:\s*true/;
-            # tool_result user messages carry the tool's stdout as
-            # "content": [...] — their first "text":"..." field is the
-            # tool output, not anything the user typed. Skip them.
-            my $is_tool_result = $line =~ /"type"\s*:\s*"tool_result"/;
-            if ($is_user_msg && !$is_meta && !$is_tool_result) {
-                my $content = extract_user_content($line);
-                if (defined $content && length $content) {
-                    # Skip system-injected boilerplate: <local-command-*>
-                    # tags wrap a caveat (every session) or slash-command
-                    # stdout — neither is the user's actual prompt.
-                    next if $content =~ /^<local-command-/;
-                    # Strip <command-message>/<command-args>/<command-stdout>
-                    # bodies entirely — their contents duplicate what's in
-                    # <command-name> and would render as noise like
-                    # "manage-plans /manage-plans". Keep <command-name>
-                    # bodies (just strip the tags) so slash-command sessions
-                    # show as "/manage-plans".
-                    $content =~ s{<command-(?:message|args|stdout)>.*?</command-(?:message|args|stdout)>}{ }gs;
-                    $content =~ s{</?command-name>}{ }g;
-                    $content =~ s/\s+/ /g;
-                    $content =~ s/^\s+|\s+$//g;
-                    next unless length $content;
-                    # Hold the first non-meta message as a fallback in case
-                    # we never find prose — but keep scanning for something
-                    # more informative than a bare slash-command invocation.
-                    $fallback_preview //= substr($content, 0, 100);
-                    next if $content =~ m{^/[a-zA-Z]};
-                    $out{preview} = substr($content, 0, 100);
-                }
-            }
-        }
-        last if defined $out{session_id} && defined $out{cwd} && defined $out{preview};
-    }
-    close $fh;
-    $out{preview} //= $fallback_preview;
-    return \%out;
-}
-
-# Extract the user message's text content from a JSONL line without a full
-# decoder. content can be a string ("...") or an array of typed blocks. We
-# match the string form (most common for user input) and fall back to
-# pulling the first {"type":"text","text":"..."} block.
-sub extract_user_content {
-    my $line = shift;
-    if ($line =~ /"content"\s*:\s*"((?:[^"\\]|\\.)*)"/) {
-        return json_unescape($1);
-    }
-    if ($line =~ /"text"\s*:\s*"((?:[^"\\]|\\.)*)"/) {
-        return json_unescape($1);
-    }
-    return undef;
-}
-
-sub json_unescape {
-    my $s = shift;
-    # Decode \uXXXX (BMP) to UTF-8 bytes first, so real text renders instead of
-    # literal backslash-u noise; a JSON-encoded control character (an ESC, for
-    # example) then becomes a real byte that sanitize_cell strips downstream,
-    # rather than slipping through as harmless-but-ugly literal text.
-    $s =~ s/\\u([0-9a-fA-F]{4})/_decode_u($1)/ge;
-    $s =~ s/\\n/ /g;
-    $s =~ s/\\t/ /g;
-    $s =~ s/\\r//g;
-    $s =~ s/\\"/"/g;
-    $s =~ s/\\\\/\\/g;
-    return $s;
-}
-
-# _decode_u('001b') -> the UTF-8 byte encoding of code point U+001B. BMP only;
-# surrogate halves are encoded best-effort (a lone-surrogate preview is rare and
-# purely cosmetic). Returns bytes so the rest of the byte-oriented pipeline is
-# unaffected.
-sub _decode_u {
-    my $hex = shift;
-    my $c = chr(hex($hex));
-    utf8::encode($c);
-    return $c;
-}
-
 # =====================================================================
-# Time formatting (relative)
+# Time formatting
 # =====================================================================
 
 sub relative_time {
-    my $t = shift;
-    my $delta = time - $t;
+    my ($t, $now) = @_;
+    $now = time unless defined $now;
+    my $delta = $now - $t;
     return 'just now'           if $delta < 60;
     return int($delta/60) . 'm ago'   if $delta < 3600;
     return int($delta/3600) . 'h ago' if $delta < 86400;
@@ -308,42 +358,127 @@ sub relative_time {
     return "${d}d ago"                if $d < 30;
     my $mo = int($d/30);
     return "${mo}mo ago"              if $mo < 12;
-    my $y = int($d/365);
+    my $y = int($d/365) || 1;
     return "${y}y ago";
 }
 
+sub _fmt_when {
+    my ($t) = @_;
+    return '-' unless defined $t && !ref $t && $t =~ /^-?\d+(?:\.\d+)?$/;
+    return strftime('%Y-%m-%d %H:%M', localtime($t));
+}
+
+# card_fields(\%session, $now) -> \%card — the tui::LaunchScreens card
+# contract (S2.1). Missing/malformed input never dies.
+sub card_fields {
+    my ($s, $now) = @_;
+    $s = {} unless ref $s eq 'HASH';
+    $now = time unless defined $now;
+
+    my $started_src = defined($s->{started_at}) ? $s->{started_at} : $s->{mtime};
+    my $active_src  = defined($s->{last_active_at}) ? $s->{last_active_at} : $s->{mtime};
+
+    my $ago = '-';
+    if (defined($active_src) && !ref($active_src) && $active_src =~ /^-?\d+(?:\.\d+)?$/) {
+        $ago = relative_time($active_src, $now);
+    }
+
+    my $kind_label;
+    if ($s->{is_butler}) {
+        my $kind = defined($s->{kind}) ? $s->{kind} : 'human';
+        $kind_label = $kind eq 'coordinator' ? 'coordinator'
+                    : $kind eq 'headless'    ? 'headless'
+                    : $kind eq 'sidechain'   ? 'subagent'
+                    : $kind eq 'human'       ? 'butler'
+                    :                          $kind;
+    }
+
+    return {
+        started    => _fmt_when($started_src),
+        active     => _fmt_when($active_src),
+        ago        => $ago,
+        first      => (defined($s->{first_typed}) ? $s->{first_typed} : $s->{last_typed}),
+        last       => ($s->{same_message} ? undef : $s->{last_typed}),
+        kind_label => $kind_label,
+        badges     => origin_badges($s),
+    };
+}
+
+# origin_badges(\%session) -> \@badges
+#
+# package 07-host-session-fork: an origin badge per S2.2's table, but ONLY
+# in "origin mode" (--host-sessions-dir was supplied) -- otherwise every
+# card.badges stays [] and today's output is byte-for-byte unchanged (D14,
+# AC-21).
+sub origin_badges {
+    my ($s) = @_;
+    return [] unless $HOST_SESSIONS_DIR_SET;
+    return [] unless ref $s eq 'HASH';
+    my $origin = $s->{origin};
+    return [] unless defined $origin && !ref $origin;
+    if ($origin eq 'host') {
+        return [ { text => 'host', role => 'accent' } ];
+    }
+    if ($origin eq 'sandbox') {
+        return [ { text => 'sandbox', role => 'text.muted' } ];
+    }
+    if ($origin eq 'fork') {
+        my $sid = $s->{source_session_id};
+        return [] unless defined $sid && length $sid;
+        return [ { text => 'duplicated from host ' . SessionFork::short_id($sid), role => 'state.ok' } ];
+    }
+    return [];
+}
+
 # =====================================================================
-# Render + read loop
+# Options (label + card, per session)
 # =====================================================================
 #
 # `options` is an arrayref of hashrefs:
-#   { label => '...', action => 'NEW'|'RESUME' UUID|'CANCEL' }
-# The first option is always "Start a new session"; the rest are the
-# parsed sessions in most-recent-first order.
+#   { label => '...', action => 'NEW'|'RESUME' UUID, is_butler => 0|1, card => \%card }
+# Option 0 is always "Start a new session" (no is_butler/card key); the rest
+# are list_sessions()'s entries in order.
+
+# _normalize_for_label($s) -> collapsed/trimmed text, control bytes removed.
+# N5: delegates to tui::LaunchScreens' own message normaliser (S2.1) rather
+# than duplicating its rule, so the plain line-prompt's label reads the same
+# way the card's message block would and a future rule change is made once.
+sub _normalize_for_label {
+    my ($s) = @_;
+    return '' unless defined $s && !ref $s;
+    my $t = tui::LaunchScreens::_normalize_msg("$s");
+    return defined($t) ? $t : '';
+}
 
 sub build_options {
     my @sessions = @_;
     my @opts;
     push @opts, {
-        label  => "\e[1;36m+ Start a new session\e[0m",
+        label  => '+ Start a new session',
         action => 'NEW',
     };
     for my $s (@sessions) {
-        my $when  = strftime('%Y-%m-%d %H:%M', localtime($s->{mtime}));
-        my $rel   = relative_time($s->{mtime});
-        # The preview is attacker-influenceable (it comes from arbitrary
-        # user/tool text in the session file), so strip terminal-control
-        # bytes before it reaches the screen — an embedded ESC could move the
-        # cursor, recolor the menu, or spoof which option looks selected.
-        my $prev  = sanitize_cell($s->{preview});
-        $prev = '(no preview)' unless length $prev;
-        # Single line: timestamp · relative · short uuid · preview.
-        my $short_uuid = substr($s->{uuid}, 0, 8);
-        my $label = sprintf("%s  (%s)  %s  %s", $when, $rel, $short_uuid, $prev);
+        my $card = card_fields($s, time);
+        my $msg = _normalize_for_label(
+            (defined($s->{first_typed}) && length($s->{first_typed})) ? $s->{first_typed}
+            : (defined($s->{last_typed}) && length($s->{last_typed})) ? $s->{last_typed}
+            : undef);
+        $msg = sanitize_cell($msg);
+        if (length($msg) > 100) { $msg = substr($msg, 0, 100) . '...'; }
+        $msg = '(no message)' unless length $msg;
+        my $label_txt = sprintf('%s  (%s)  %s', $card->{active}, $card->{ago}, $msg);
+        if ($HOST_SESSIONS_DIR_SET && ref($card->{badges}) eq 'ARRAY' && @{ $card->{badges} }) {
+            $label_txt .= ' [' . $card->{badges}[0]{text} . ']';
+        }
+        my $label = eval { Encode::encode('UTF-8', $label_txt) };
+        $label = $label_txt unless defined $label;
+        my $action = (defined($s->{origin}) && $s->{origin} eq 'host')
+            ? "HOST $s->{uuid}" : "RESUME $s->{uuid}";
         push @opts, {
             label     => $label,
-            action    => "RESUME $s->{uuid}",
+            action    => $action,
             is_butler => ($s->{is_butler} ? 1 : 0),
+            card      => $card,
         };
     }
     return @opts;
@@ -368,10 +503,6 @@ sub filter_options {
 }
 
 # footer_text($view, $short) -> $string
-#
-# The view indicator leads so it survives clip_visible truncation on a
-# narrow terminal. The short form keeps the current short footer's tail
-# verbatim.
 sub footer_text {
     my ($view, $short) = @_;
     my $label = (defined $view && $view eq 'butler') ? 'butler' : 'user';
@@ -382,9 +513,6 @@ sub footer_text {
 }
 
 # empty_view_note($view) -> $string
-#
-# Plain text only (no SGR, no indent) — $render wraps it, mirroring the
-# existing "(N more above/below)" hints.
 sub empty_view_note {
     my ($view) = @_;
     return (defined $view && $view eq 'butler')
@@ -392,9 +520,6 @@ sub empty_view_note {
 }
 
 # show_empty_note($n_view, $shown, $cap) -> 0|1
-#
-# The row-budget guard for the empty-view note, factored out so the
-# "frame never overflows" invariant stays unit-testable without a TTY.
 sub show_empty_note {
     my ($n_view, $shown, $cap) = @_;
     return 0 if !defined $n_view || !defined $shown || !defined $cap;
@@ -433,11 +558,10 @@ sub strip_ansi {
 }
 
 # sanitize_cell($s) -> $s with terminal-control bytes removed (C0 controls +
-# ESC, 0x00-0x1F, and DEL 0x7F). Session previews are attacker-influenceable
-# (arbitrary user/tool text), and this picker renders them; an unsanitized
-# preview could emit escape sequences that move the cursor, recolor the menu,
-# or spoof which option is highlighted. Printable multi-byte UTF-8 is kept as
-# raw bytes (its width is handled conservatively by clip_visible).
+# ESC, 0x00-0x1F, and DEL 0x7F). Session text is attacker-influenceable
+# (arbitrary user/tool content), and this picker renders it; an unsanitized
+# value could emit escape sequences that move the cursor, recolor the menu,
+# or spoof which option is highlighted.
 sub sanitize_cell {
     my ($s) = @_;
     return '' if !defined $s;
@@ -445,41 +569,11 @@ sub sanitize_cell {
     return $s;
 }
 
-# clip_visible($s, $width) -> $s truncated to at most $width visible columns.
-# This is also the render's display-seam control-character guard: our own SGR
-# color escapes (\e[...m) are preserved (zero columns), every other escape /
-# CSI sequence is dropped, and ALL C0 control bytes + DEL (0x00-0x1F, 0x7F) are
-# stripped — so even an un-sanitized source (e.g. $PROJECT_LABEL) can't smuggle
-# a BEL/CR/cursor-move to the terminal. A trailing \e[0m is always appended so
-# color never bleeds past the row end. Visible width is counted in BYTES, so a
-# multi-byte UTF-8 char counts as >1: truncation is *conservative* (may stop a
-# hair early) and a row can never WRAP — the invariant the bounded-height frame
-# relies on, since a wrapped logical row would occupy two physical rows and
-# desync the redraw.
-sub clip_visible {
-    my ($s, $width) = @_;
-    $s = '' if !defined $s;
-    $width = 0 if !defined $width || $width < 0;
-    my $out  = '';
-    my $cols = 0;
-    while (length $s) {
-        if ($s =~ s/^(\e\[[0-9;]*m)//)        { $out .= $1; next; }  # SGR: keep, 0 width
-        if ($s =~ s/^\e\[[0-9;]*[A-Za-z]//)   { next; }             # other CSI: drop
-        if ($s =~ s/^[\x00-\x1F\x7F]//)       { next; }             # C0/ESC/DEL: drop, 0 width
-        last if $cols >= $width;
-        $out .= substr($s, 0, 1, '');
-        $cols++;
-    }
-    return $out . "\e[0m";
-}
-
 # plan_frame($rows, $n) -> { head, foot, cap, hints } : the row budget for one
 # rendered frame given a terminal of $rows rows and $n options. Pure (no I/O)
 # so the "frame never exceeds the screen" invariant is unit-tested at every
 # size. Guarantees head + foot + (hints ? 2 : 0) + cap <= max($rows,1) and
-# cap >= 1, so the frame can never overflow and reintroduce scrolling — even on
-# a tiny terminal, where decorative chrome (rule, spacers, hints) is dropped
-# in priority order until the option window fits.
+# cap >= 1, so the frame can never overflow and reintroduce scrolling.
 #   head: number of header rows (3 = title+rule+blank, 1 = title, 0 = none)
 #   foot: number of footer rows (2 = blank+keys, 1 = short keys, 0 = none)
 #   cap : visible option rows
@@ -501,44 +595,188 @@ sub plan_frame {
     return { head => $head, foot => $foot, cap => $cap, hints => $hints };
 }
 
-# scroll_window($top, $sel, $cap, $n) -> the new viewport top index such that
-# the selection $sel stays inside the visible window [top, top+cap-1], scrolling
-# the minimum distance and clamping to valid bounds. Pure (no I/O) so the
-# scrolling behavior is unit-tested without a TTY. $cap = visible option rows,
-# $n = total options.
-sub scroll_window {
-    my ($top, $sel, $cap, $n) = @_;
-    $cap = 1 if !defined $cap || $cap < 1;
-    $n   = 0 if !defined $n   || $n < 0;
-    $top = 0 if !defined $top || $top < 0;
-    $sel = 0 if !defined $sel || $sel < 0;
-    $sel = $n - 1 if $n > 0 && $sel > $n - 1;
-    $top = $sel                 if $sel < $top;                  # selection above window
-    $top = $sel - $cap + 1      if $sel > $top + $cap - 1;       # selection below window
-    my $max_top = $n - $cap;
-    $max_top = 0 if $max_top < 0;
-    $top = $max_top if $top > $max_top;                          # never scroll past the end
-    $top = 0 if $top < 0;
-    return $top;
+# =====================================================================
+# The interactive loop — cards, colour tokens, idle resize polling.
+# =====================================================================
+#
+# run_picker_loop(\@opts, %seams) -> $action|'CANCEL'|undef
+#
+# Seams: read_key($timeout) (raw char or undef on timeout), term_size()
+# (($cols,$rows)), out($bytes), cap (default Theme::capability()), poll
+# (default 0.2, always 0 < poll <= 0.25). Pure aside from those seams: never
+# touches a real terminal, a clock beyond what term_size/read_key report, or
+# the filesystem.
+sub run_picker_loop {
+    my ($opts, %seams) = @_;
+    my @opts = (ref $opts eq 'ARRAY') ? @$opts : ();
+
+    my $read_key  = (ref $seams{read_key}  eq 'CODE') ? $seams{read_key}  : sub { undef };
+    my $term_size = (ref $seams{term_size} eq 'CODE') ? $seams{term_size} : sub { (80, 24) };
+    my $out       = (ref $seams{out}       eq 'CODE') ? $seams{out}       : sub { };
+    my $cap       = exists $seams{cap} ? $seams{cap} : Theme::capability();
+    my $poll      = (defined($seams{poll}) && $seams{poll} > 0 && $seams{poll} <= 0.25) ? $seams{poll} : 0.2;
+
+    my $view = 'user';
+    my @view_opts = filter_options(\@opts, $view);
+    my $sel  = 0;
+    my $top  = 0;
+    my $page = 1;
+
+    my ($last_cols, $last_rows);
+    my $settle = 0;
+    my $idle = 0;
+    my $idle_limit = tui::LaunchScreens::IDLE_POLL_LIMIT();
+
+    my $row = sub {
+        my ($line, $cols) = @_;
+        my $cell = tui::Frame::make_cell($line, undef, $cols);
+        return tui::Frame::paint_row($cell, $cap) . "\e[K";
+    };
+
+    my $render_frame = sub {
+        my ($full) = @_;
+        my ($cols, $rows) = $term_size->();
+        $cols = 80 if !$cols || $cols < 1;
+        $rows = 24 if !$rows || $rows < 1;
+        $last_cols = $cols;
+        $last_rows = $rows;
+
+        my @heights;
+        for my $o (@view_opts) {
+            if (($o->{action} // '') eq 'NEW') {
+                push @heights, 2;
+            } else {
+                my $h = tui::LaunchScreens::session_card_height($o->{card}, $cols);
+                push @heights, (defined $h && $h >= 1) ? $h : 3;
+            }
+        }
+        my $total_h = 0;
+        $total_h += $_ for @heights;
+        my $L = plan_frame($rows, $total_h);
+        my $cap_rows = $L->{cap};
+
+        $sel = 0 if $sel < 0;
+        $sel = $#view_opts if @view_opts && $sel > $#view_opts;
+        my $win = tui::LaunchScreens::card_window(\@heights, $sel, ($cap_rows > 0 ? $cap_rows : 1), $top);
+        $top = $win->{first};
+        $page = $win->{last} - $win->{first} + 1;
+        $page = 1 if $page < 1;
+
+        my @lines;
+        if (@view_opts && $win->{last} >= $win->{first}) {
+            for my $i ($win->{first} .. $win->{last}) {
+                my $o = $view_opts[$i];
+                my $is_sel = ($i == $sel) ? 1 : 0;
+                my $ln = (($o->{action} // '') eq 'NEW')
+                    ? tui::LaunchScreens::session_new_lines($cols, $is_sel)
+                    : tui::LaunchScreens::session_card_lines_cached($o->{card}, $cols, $is_sel);
+                push @lines, @$ln if ref $ln eq 'ARRAY';
+            }
+        }
+        @lines = @lines[0 .. $cap_rows - 1] if $cap_rows > 0 && @lines > $cap_rows;
+
+        my $title_txt = 'Resume a session' . (length($PROJECT_LABEL) ? " - $PROJECT_LABEL" : '');
+        my @rows;
+        push @rows, $row->([ { text => $title_txt, role => 'accent' } ], $cols) if $L->{head} >= 1;
+        if ($L->{head} >= 3) {
+            push @rows, $row->([ { text => ('-' x 60), role => 'rule' } ], $cols);
+            push @rows, $row->([], $cols);
+        }
+        push @rows, $row->([ { text => "    ($win->{above} more above)", role => 'text.faint' } ], $cols)
+            if $L->{hints} && $win->{above};
+        for my $ln (@lines) { push @rows, $row->($ln, $cols); }
+        my $shown = scalar @lines;
+        if (show_empty_note(scalar @view_opts, $shown, $cap_rows)) {
+            push @rows, $row->([ { text => '    ' . empty_view_note($view), role => 'text.muted' } ], $cols);
+        }
+        push @rows, $row->([ { text => "    ($win->{below} more below)", role => 'text.faint' } ], $cols)
+            if $L->{hints} && $win->{below};
+        if ($L->{foot} >= 2) {
+            push @rows, $row->([], $cols);
+            push @rows, $row->([ { text => footer_text($view, 0), role => 'text.faint' } ], $cols);
+        } elsif ($L->{foot} >= 1) {
+            push @rows, $row->([ { text => footer_text($view, 1), role => 'text.faint' } ], $cols);
+        }
+        my $bytes = $full ? "\e[H\e[2J" : "\e[H";
+        $bytes .= join("\r\n", @rows);
+        $bytes .= "\e[J";
+        $out->($bytes);
+    };
+
+    $render_frame->(1);
+
+    while (1) {
+        my $k = $read_key->($poll);
+        if (!defined $k) {
+            my ($cols, $rows) = $term_size->();
+            $cols = 80 if !$cols || $cols < 1;
+            $rows = 24 if !$rows || $rows < 1;
+            if (defined($last_cols) && ($cols != $last_cols || $rows != $last_rows)) {
+                $settle = tui::LaunchScreens::RESIZE_SETTLE_POLLS();
+                $render_frame->(1);
+            } elsif ($settle > 0) {
+                $settle--;
+                $render_frame->(1);
+            }
+            # Bounded so a read_key that cannot block (EOF on stdin) cannot
+            # spin here forever; any real key resets the run (M3, list_run's
+            # IDLE_POLL_LIMIT precedent).
+            return 'CANCEL' if ++$idle >= $idle_limit;
+            next;
+        }
+        $idle = 0;
+
+        if ($k eq "\e") {
+            my $k2 = $read_key->(0.05);
+            if (defined $k2 && ($k2 eq '[' || $k2 eq 'O')) {
+                my $k3 = $read_key->(0.05);
+                if (defined $k3) {
+                    if    ($k3 eq 'A') { $sel-- if $sel > 0;                 $render_frame->(0); next }
+                    elsif ($k3 eq 'B') { $sel++ if $sel < $#view_opts;       $render_frame->(0); next }
+                    elsif ($k3 eq 'H') { $sel = 0;                          $render_frame->(0); next }
+                    elsif ($k3 eq 'F') { $sel = $#view_opts;                $render_frame->(0); next }
+                    elsif ($k3 =~ /[0-9]/) {
+                        my $digits = $k3;
+                        while (defined(my $d = $read_key->(0.02))) {
+                            last if $d !~ /[0-9;]/;
+                            $digits .= $d;
+                        }
+                        if    ($digits eq '5') { $sel -= $page }
+                        elsif ($digits eq '6') { $sel += $page }
+                        $sel = 0          if $sel < 0;
+                        $sel = $#view_opts if $sel > $#view_opts;
+                        $render_frame->(0); next;
+                    }
+                }
+                next;
+            }
+            return 'CANCEL';
+        }
+        if ($k eq "\n" || $k eq "\r") {
+            return @view_opts ? $view_opts[$sel]{action} : 'CANCEL';
+        }
+        if (lc($k) eq 't') {
+            $view = ($view eq 'user') ? 'butler' : 'user';
+            @view_opts = filter_options(\@opts, $view);
+            $sel = 0;
+            $top = 0;
+            $render_frame->(0);
+            next;
+        }
+        if (lc($k) eq 'q') { return 'CANCEL' }
+        if ($k eq "\x03")  { return 'CANCEL' }
+        # any other key: ignore, no redraw needed
+    }
 }
 
 # Full TUI: a windowed, scrolling, arrow-key picker drawn on the ALTERNATE
-# screen buffer. Using the alt-screen (\e[?1049h) means nothing the picker
-# draws is committed to the terminal scrollback — on exit the user's original
-# screen is restored verbatim. This replaces the old in-place "\e[NA" redraw,
-# which scrolled the viewport once the list outgrew the screen and dumped a
-# fresh copy of the whole menu into scrollback on every keypress. Only a
-# screen-sized window of options is rendered; the selection scrolls the window
-# (with "(N more above/below)" hints), and every row is clipped to the terminal
-# width so nothing wraps. Restores the cursor + readmode + main screen on every
-# exit path.
+# screen buffer (\e[?1049h). run_picker_loop above holds the loop/keys/cards;
+# this wraps it with the real terminal (Term::ReadKey seams, alt-screen
+# enter/leave, signal cleanup) or falls back to the non-TTY line prompt.
 sub run_tui {
-    my @opts = @_;                                   # ALL options
-    my $view = 'user';                               # default view (Decision #10)
+    my @opts = @_;
+    my $view = 'user';
     my @view = filter_options(\@opts, $view);
-    my $sel  = 0;      # pre-select option 0 = "Start a new session"
-    my $top  = 0;      # index of the first option shown in the viewport
-    my $page = 1;      # PageUp/Down step; recomputed from the live window size
 
     my $have_readkey = eval { require Term::ReadKey; 1 };
     if (!$have_readkey || !-t STDIN || !-t STDERR) {
@@ -561,110 +799,22 @@ sub run_tui {
     $on_alt = 1;
     print STDERR "\e[?25l";                    # hide cursor
 
-    my $term_size = sub {
-        my @s = eval { Term::ReadKey::GetTerminalSize() };
-        my $cols = (@s && $s[0] && $s[0] > 0) ? $s[0] : 80;
-        my $rows = (@s && $s[1] && $s[1] > 0) ? $s[1] : 24;
-        return ($cols, $rows);
-    };
-
-    my $render = sub {
-        my ($cols, $rows) = $term_size->();
-        # plan_frame guarantees the whole frame fits in $rows at any size, and
-        # degrades the chrome (rule/spacers/hints) on tiny terminals so it can
-        # never overflow and reintroduce scrolling.
-        my $L   = plan_frame($rows, scalar @view);
-        my $cap = $L->{cap};
-        $page = $cap;
-        $top  = scroll_window($top, $sel, $cap, scalar @view);
-        my $last = $top + $cap - 1;
-        $last = $#view if $last > $#view;
-        my $below = $#view - $last;
-
-        my $row   = sub { clip_visible($_[0], $cols) . "\e[K\n" };  # clip + clear-to-EOL
-        my $title = "\e[1mResume a session"
-                    . (length $PROJECT_LABEL ? " - $PROJECT_LABEL" : "")
-                    . "\e[0m";
-
-        my $out = "\e[H";   # cursor home (top-left of the alt-screen)
-        $out .= $row->($title)                    if $L->{head} >= 1;
-        $out .= $row->("-" x 60) . $row->("")     if $L->{head} >= 3;
-        $out .= $row->(sprintf("\e[2m    (%d more above)\e[0m", $top))
-            if $L->{hints} && $top > 0;
-        for my $i ($top .. $last) {
-            my $label = $view[$i]{label};
-            $out .= $row->($i == $sel
-                ? "\e[1;36m  > \e[0m" . $label
-                : "    " . $label);
-        }
-        my $shown = ($last >= $top) ? ($last - $top + 1) : 0;
-        if (show_empty_note(scalar @view, $shown, $cap)) {
-            $out .= $row->("\e[2m    " . empty_view_note($view) . "\e[0m");
-        }
-        $out .= $row->(sprintf("\e[2m    (%d more below)\e[0m", $below))
-            if $L->{hints} && $below > 0;
-        if ($L->{foot} >= 2) {
-            $out .= $row->("");
-            $out .= $row->(footer_text($view, 0));
-        } elsif ($L->{foot} >= 1) {
-            $out .= $row->(footer_text($view, 1));
-        }
-        $out .= "\e[J";     # wipe any rows left over from a previous taller frame
-        print STDERR $out;
-    };
-
-    my $result;
-    $render->();
-    while (1) {
-        my $k = Term::ReadKey::ReadKey(0);
-        last unless defined $k;
-        if ($k eq "\e") {
-            my $k2 = Term::ReadKey::ReadKey(0.05);
-            if (defined $k2 && ($k2 eq '[' || $k2 eq 'O')) {
-                my $k3 = Term::ReadKey::ReadKey(0.05);
-                if (defined $k3) {
-                    if    ($k3 eq 'A') { $sel-- if $sel > 0;      $render->(); next }
-                    elsif ($k3 eq 'B') { $sel++ if $sel < $#view; $render->(); next }
-                    elsif ($k3 eq 'H') { $sel = 0;                $render->(); next }  # Home
-                    elsif ($k3 eq 'F') { $sel = $#view;           $render->(); next }  # End
-                    elsif ($k3 =~ /[0-9]/) {
-                        # CSI numeric sequences (e.g. PageUp = \e[5~, PageDown =
-                        # \e[6~); collect the digits up to the terminating '~'.
-                        my $digits = $k3;
-                        while (defined(my $d = Term::ReadKey::ReadKey(0.02))) {
-                            last if $d !~ /[0-9;]/;
-                            $digits .= $d;
-                        }
-                        if    ($digits eq '5') { $sel -= $page }   # PageUp
-                        elsif ($digits eq '6') { $sel += $page }   # PageDown
-                        $sel = 0      if $sel < 0;
-                        $sel = $#view if $sel > $#view;
-                        $render->(); next;
-                    }
-                    next;   # other escape: ignore
-                }
-            }
-            $result = 'CANCEL'; last;   # lone ESC cancels
-        }
-        if ($k eq "\n" || $k eq "\r") {
-            $result = @view ? $view[$sel]{action} : 'CANCEL';
-            last;
-        }
-        if (lc($k) eq 't') {
-            $view = ($view eq 'user') ? 'butler' : 'user';
-            @view = filter_options(\@opts, $view);
-            $sel  = 0;                       # D7
-            $top  = 0;
-            $render->();
-            next;
-        }
-        if (lc($k) eq 'q')            { $result = 'CANCEL';            last }
-        if ($k eq "\x03")             { $result = 'CANCEL';            last }
-        # any other key: ignore, no redraw needed
-    }
+    my $action = run_picker_loop(\@opts,
+        read_key  => sub {
+            my ($timeout) = @_;
+            return eval { Term::ReadKey::ReadKey(defined $timeout ? $timeout : 0.2) };
+        },
+        term_size => sub {
+            my @s = eval { Term::ReadKey::GetTerminalSize() };
+            my $cols = (@s && $s[0] && $s[0] > 0) ? $s[0] : 80;
+            my $rows = (@s && $s[1] && $s[1] > 0) ? $s[1] : 24;
+            return ($cols, $rows);
+        },
+        out => sub { print STDERR $_[0]; },
+    );
 
     $cleanup->();
-    return $result;
+    return $action;
 }
 
 # =====================================================================
@@ -672,58 +822,96 @@ sub run_tui {
 # =====================================================================
 #
 # Guarded by `unless (caller)` so a test can `require` this script to unit-test
-# the pure helpers (sanitize_cell / clip_visible / scroll_window / build_options)
-# without the main flow running and calling exit().
+# the pure helpers without the main flow running and calling exit().
 
 unless (caller) {
     parse_args(@ARGV);
 
-    my @sessions = list_sessions();
+    unless (load_session_index()) {
+        print STDERR "select-session.pl: cannot load SessionIndex.pm: $SESSION_INDEX_ERR\n";
+        exit 1;
+    }
+    unless (load_session_fork()) {
+        print STDERR "select-session.pl: cannot load SessionFork.pm\n";
+        exit 1;
+    }
+
+    # --fork <host uuid>: non-interactive mode (package 07-host-session-fork).
+    # Usage errors (malformed uuid also blocks path traversal, e.g. "../x")
+    # and "combined with --list-json" were already exited 1 in parse_args.
+    # Never touches a terminal, never writes --output. Decision 32/33: a
+    # fork failure here is reported to the caller (non-empty stderr,
+    # FORK_FAILED_EXIT, empty stdout) -- it is the caller's job to decide
+    # whether to return to the picker rather than silently starting a new
+    # session.
+    if ($FORK_UUID_SET) {
+        unless (load_session_fork() && SessionFork::is_uuid_shaped($FORK_UUID)) {
+            print STDERR "select-session.pl: --fork requires a well-formed uuid\n";
+            exit 1;
+        }
+        my $host_file = "$HOST_SESSIONS_DIR/$FORK_UUID.jsonl";
+        unless (-f $host_file) {
+            print STDERR "select-session.pl: --fork: no such host session: $FORK_UUID\n";
+            exit FORK_FAILED_EXIT;
+        }
+        my ($new, $err) = SessionFork::fork_session($host_file, $SESSIONS_DIR);
+        unless (defined $new) {
+            my $msg = sanitize_cell(defined($err) && length($err) ? $err : 'unknown error');
+            print STDERR "select-session.pl: fork failed: $msg\n";
+            exit FORK_FAILED_EXIT;
+        }
+        print "RESUME $new\n";
+        exit 0;
+    }
+
+    my @sessions = merged_sessions();
     my $sids     = butler_sids();                      # {} on any failure (D4)
     SessionFilter::mark_sessions(\@sessions, $sids) if load_session_filter();
-    $_->{is_butler} = ($_->{is_butler} ? 1 : 0) for @sessions;   # key always present
-
-    my @opts     = build_options(@sessions);
+    for my $s (@sessions) {
+        my $kind_hidden = defined($s->{kind}) && $s->{kind} ne 'human';
+        $s->{is_butler} = ($s->{is_butler} || $kind_hidden) ? 1 : 0;
+        # A fork inherits is_butler from its host source through provenance
+        # (Decision 12's "same human-only filter", extended -- AC-26): its
+        # OWN uuid is fresh and never matches $sids on its own.
+        if (!$s->{is_butler} && defined($s->{origin}) && $s->{origin} eq 'fork'
+                && defined($s->{source_session_id}) && load_session_filter()) {
+            $s->{is_butler} = 1 if SessionFilter::is_butler_session($s->{source_session_id}, $sids);
+        }
+    }
 
     # 08-launcher-screens: the DATA mode. One JSON object on stdout, exit 0.
-    # No ReadMode, no alt-screen escape, no --output round-trip.
-    #
-    # `error` is a DISTINCT field from an empty session list on purpose: "this
-    # project has no sessions yet" and "the sessions directory could not be
-    # read" are different facts, and rendering the second as the first would
-    # quietly offer a fresh session to someone whose history is simply
-    # unreadable.
+    # N3: skip build_options (and so a redundant card_fields pass) here --
+    # this mode calls card_fields itself, per row, below.
     if ($LIST_JSON) {
         my $error;
         if (length $SESSIONS_DIR) {
+            # Decode before interpolating into a ->utf8 JSON encoder: that
+            # encoder expects Perl-internal (decoded) text and re-encodes it
+            # to UTF-8 bytes. $SESSIONS_DIR is the raw argv byte string, so
+            # encoding it as-is double-encodes any non-ASCII path (N2).
+            my $dir_disp = eval { Encode::decode('UTF-8', $SESSIONS_DIR, Encode::FB_DEFAULT) };
+            $dir_disp = $SESSIONS_DIR unless defined $dir_disp;
             if (!-d $SESSIONS_DIR) {
-                $error = "sessions directory is not readable: $SESSIONS_DIR";
+                # package 07 S2.2: a fresh sandbox with no sessions yet is
+                # not an error -- it's exactly when forking a host session
+                # matters (a nonexistent dir is created on the first fork).
+                $error = undef;
             }
             elsif (opendir(my $probe, $SESSIONS_DIR)) {
                 closedir $probe;
             }
             else {
-                # PRESENT BUT UNREADABLE. list_sessions() returns () on an
-                # opendir failure exactly as it does for a project with no
-                # history, so without this probe a permission problem arrived
-                # at the launcher as `sessions => []` with error undef -- i.e.
-                # rendered as "no sessions yet" and answered with a cheerful
-                # offer of a fresh one, while the operator's real history sat
-                # there unread. Absent and broken are different facts.
-                $error = "sessions directory could not be read: $SESSIONS_DIR: $!";
+                $error = "sessions directory could not be read: $dir_disp: $!";
             }
         }
-        # build_options' rendered label is reused verbatim (minus its SGR), so
-        # the launch screen shows exactly what the interactive picker shows.
-        # @opts[0] is "Start a new session"; @opts[1..] are @sessions in order.
         my @rows;
-        for my $i (0 .. $#sessions) {
-            my $o = $opts[$i + 1];
+        for my $s (@sessions) {
             push @rows, {
-                uuid      => $sessions[$i]{uuid},
-                label     => sanitize_cell(strip_ansi(defined $o ? ($o->{label} // '') : '')),
-                mtime     => $sessions[$i]{mtime},
-                is_butler => ($sessions[$i]{is_butler} ? 1 : 0),
+                uuid      => $s->{uuid},
+                mtime     => $s->{mtime},
+                is_butler => ($s->{is_butler} ? 1 : 0),
+                origin    => $s->{origin},
+                card      => card_fields($s, time),
             };
         }
         print JSON::PP->new->utf8->canonical(1)->encode(
@@ -732,18 +920,41 @@ unless (caller) {
     }
 
     # Zero-session fast path: nothing to pick from, just emit NEW and exit.
-    # Skipping the TUI here avoids a confusing one-option menu on the very
-    # first launch of a fresh sandbox. D9: this counts ALL sessions, not just
-    # user-visible ones — if every session is butler, the TUI still opens so
-    # the [t] toggle stays reachable.
     if (@sessions == 0) {
         write_action('NEW');
         exit 0;
     }
 
+    my @opts = build_options(@sessions);
     my $action = run_tui(@opts);
     if (!defined $action || $action eq 'CANCEL') {
         exit 2;
+    }
+
+    # Picking a host row (Decision 14): fork before resuming. On failure,
+    # report the error and exit FORK_FAILED_EXIT without writing --output
+    # (Decision 32/33) -- the launcher's caller decides whether to return to
+    # the picker rather than silently starting a new session.
+    if ($action =~ /\AHOST\s+(\S+)\s*\z/) {
+        my $host_uuid = $1;
+        # red-team S2 (SHOULD-FIX): the plain picker's HOST id came straight
+        # from the option list -- validate it the same way --fork already
+        # does (is_uuid_shaped) BEFORE it is used to build a path. Without
+        # this, a content-derived host-row id (S1) that slipped past
+        # origin_sessions could still contain "/" or ".." and target a file
+        # outside $HOST_SESSIONS_DIR.
+        unless (load_session_fork() && SessionFork::is_uuid_shaped($host_uuid)) {
+            print STDERR "select-session.pl: fork failed: malformed host session id\n";
+            exit FORK_FAILED_EXIT;
+        }
+        my $host_file = "$HOST_SESSIONS_DIR/$host_uuid.jsonl";
+        my ($new, $err) = SessionFork::fork_session($host_file, $SESSIONS_DIR);
+        unless (defined $new) {
+            my $msg = sanitize_cell(defined($err) && length($err) ? $err : 'unknown error');
+            print STDERR "select-session.pl: fork failed: $msg\n";
+            exit FORK_FAILED_EXIT;
+        }
+        $action = "RESUME $new";
     }
 
     write_action($action);

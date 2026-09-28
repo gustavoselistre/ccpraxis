@@ -31,7 +31,12 @@
 #                                                      run ends. NOT a pause: a pause promises a
 #                                                      resume, and there is none until a human
 #                                                      re-authenticates.
-#   {"action":"blueprint-done","blueprint":B,"pending":[…]} B settled; pending = remaining bps to re-eval
+#   {"action":"blueprint-done","blueprint":B,"pending":[…],"archived":true|false,
+#    "archive_detail":"…"}                             B settled; pending = remaining bps to re-eval;
+#                                                      archived reports whether the director's own
+#                                                      single-blueprint archive attempt (reusing
+#                                                      bp-lifecycle.pl reconcile --archive) landed —
+#                                                      archive_detail names the outcome either way
 #   {"action":"in-flight","blueprint":B,"packages":[…],"running":[…]}
 #                                                      nothing dispatchable right now, but B still
 #                                                      holds non-terminal packages (typically owned by
@@ -55,6 +60,16 @@
 #   order.json      {"order":[…],"recorded_at":<epoch>}
 #   parks.json      [{"blueprint":…,"reason":…,"at":<epoch>}, …]
 #   announced.json  {"announced":[…]}   blueprints whose blueprint-done already fired
+#   inflight.json   {"packages":[{"blueprint":…,"package":…,"ledger":…,"since":<epoch>}],
+#                   "updated_at":<epoch>}   the project-level in-flight set
+#                   (package 11): a package is added on run-package, removed
+#                   once its ledger turns terminal. Batch C (spec 16-cutover):
+#                   concurrent hand-out (a further ready package whose write
+#                   set is disjoint from every in-flight one) is unconditional
+#                   now; current.json and the old concurrency-switch env var
+#                   no longer exist.
+#   inflight.lock   exclusive-lock file guarding one `next` call's read+prune
+#                   +write of inflight.json (never deleted; contents unused).
 #   keepawake.pid   PID of the wake-lock process (host only; sandbox = no file)
 #   run.md          append-only structured run log
 
@@ -65,6 +80,14 @@ use JSON::PP;
 use File::Path qw(make_path);
 use File::Basename qw(dirname basename);
 use Cwd qw(abs_path);
+use Fcntl qw(:flock);
+use Errno ();
+# Loaded WITHOUT importing `time`/`sleep` — this file's default `now` seam is
+# bare `time` (CORE, integer epoch, per spec "Integer epochs"); importing
+# Time::HiRes's floating-point time() would silently change that contract.
+# Called fully-qualified (Time::HiRes::time / ::sleep) at the one call site
+# that needs sub-second precision: the inflight.lock poll (package 11).
+use Time::HiRes ();
 
 # MSYS2 path-conversion guard (house rule — EC-7 / Landmine #1): this script may
 # spawn powershell / taskkill with ':'-bearing args on a Windows host.
@@ -72,6 +95,13 @@ BEGIN { $ENV{MSYS2_ARG_CONV_EXCL} = '*' if $^O =~ /^(MSWin32|cygwin|msys)$/; }
 
 # How many verdict attempts before degrading (spec §2.5, Decision #14).
 our $VERDICT_RETRY_MAX = 3;
+
+# How far ahead a usage pause may resume and still justify holding the machine
+# awake for it. Six hours: the FIVE-HOUR usage window can never reopen more than
+# five hours out, so this covers it with an hour of slack, while excluding the
+# seven-day window entirely. See the pause branch in run_next() for why that
+# distinction is the whole point.
+our $KEEPAWAKE_PAUSE_HORIZON_SECONDS = 6 * 3600;
 
 # Absolute script dir: lets tests `require` from any working dir.
 my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
@@ -81,7 +111,7 @@ my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
 # set). This is deliberately narrow — the other eight functions this file
 # mirrors from BpOrch (see the `# Mirrored from BpOrch::...` comments below)
 # are left as faithful copies on purpose (spec b44-execution-priority §3.1);
-# t/17-drive-next.t asserts BpDrive's own write_sets_overlap behaviour
+# t/drive-next.t asserts BpDrive's own write_sets_overlap behaviour
 # (including its deliberate empty-prefix landmine), so collapsing those
 # mirrors into requires would churn an immutable oracle for no gain here.
 # Measured safe to require: bp-orchestrator.pl is `package BpOrch;` ending
@@ -90,6 +120,7 @@ my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
 # does this same require).
 require "$DIR/bp-orchestrator.pl";
 require "$DIR/bp-keepawake.pl";    # the shared wake-lock (also used by the fleet)
+require "$DIR/BpDataRoot.pm";      # the single, bounded data-root resolution chain (package 04)
 
 # ===========================================================================
 # PURE DECISION FUNCTIONS (no I/O, no globals, no network — unit-tested in t/17)
@@ -98,6 +129,25 @@ require "$DIR/bp-keepawake.pl";    # the shared wake-lock (also used by the flee
 # --- terminal status: done|dropped|blocked|parked
 # Mirrored from BpOrch::_is_terminal (bp-orchestrator.pl line 66).
 sub _is_terminal { my $s = shift // ''; $s =~ /^(done|dropped|blocked|parked)$/ ? 1 : 0 }
+
+# --- inflight.json entry name validity (spec §2.2): the same regex parse_dag
+# already uses for a dependency name.
+sub _valid_name {
+    my ($s) = @_;
+    return (defined $s && !ref $s && $s =~ /^[A-Za-z0-9][A-Za-z0-9_.-]*$/) ? 1 : 0;
+}
+
+# --- inflight.json entry ledger string (spec §2.2): "<L>/blueprints/<bp>/
+# packages/<pkg>.md" where <L> is the basename of $data after turning '\'
+# into '/' and dropping trailing slashes. Informational only — the director
+# always derives the ledger FILE it reads from blueprint+package, never from
+# this string.
+sub _ledger_str {
+    my ($data, $bp, $pkg) = @_;
+    (my $d = $data) =~ s{\\}{/}g;
+    $d =~ s{/+$}{};
+    return basename($d) . "/blueprints/$bp/packages/$pkg.md";
+}
 
 # --- has any non-terminal package with no dead-ended dep?
 # Mirrored from BpOrch::has_progressable_work (bp-orchestrator.pl line 247-263).
@@ -136,6 +186,37 @@ sub resolve_scope {
         push @out, $name;
     }
     return @out;
+}
+
+# 1a. blueprint_lifecycle($bpdir) → 'drafting'|'audited'|'archived'|'' (unknown)
+# Reads blueprint.md's OWN `status:` -- the authoring lifecycle. That is a
+# different axis from package status (which lives in ledger frontmatter) and from
+# the run states this file computes; blueprint.md's own comment says so:
+# "drafting | audited | archived -- running/done are computed".
+# Bounded to the first 40 lines because it is frontmatter: a `status:` further
+# down is prose about a package, not the blueprint's declaration.
+sub blueprint_lifecycle {
+    my ($bpdir) = @_;
+    open my $fh, '<', "$bpdir/blueprint.md" or return '';
+    my $out = '';
+    while (my $l = <$fh>) {
+        last if $. > 40;
+        if ($l =~ /^status:\s*(\S+)/) { $out = lc $1; last }
+    }
+    close $fh;
+    return $out;
+}
+
+# 1b. blueprint_drivable($lifecycle) → 0|1
+# FAILS OPEN, deliberately: only a positively-read `drafting` or `archived`
+# excludes. A missing or unrecognised status stays drivable, because the two
+# errors are not symmetric -- wrongly refusing to drive stalls an unattended run
+# with nobody present to notice, while wrongly driving one costs a package that a
+# human can re-scope. Same asymmetry the run-finish guard is built on.
+sub blueprint_drivable {
+    my ($lc) = @_;
+    $lc = defined $lc ? lc $lc : '';
+    return ($lc eq 'drafting' || $lc eq 'archived') ? 0 : 1;
 }
 
 # 2. deps_met($deps, $status) → 0|1
@@ -304,6 +385,149 @@ sub _write_json_atomic {
     rename $tmp, $path or do { unlink $tmp; die "bp-drive-next: rename $tmp -> $path: $!"; };
 }
 
+# ===========================================================================
+# IN-FLIGHT SET (package 11, spec §2.2/2.5/2.6/2.7) — project-level, written
+# only by the director. Batch C (spec 16-cutover, 1.3 departure #9/#10):
+# current.json is gone. The director never creates, reads or removes it, and
+# seed_from_current is removed rather than kept as a migration path (the live
+# director already writes inflight.json before promotion).
+# ===========================================================================
+
+# load_inflight($data, $dsdir, $now) -> (\@entries, $dirty) (spec §2.5)
+sub load_inflight {
+    my ($data, $dsdir, $now) = @_;
+    my $existed = -e "$dsdir/inflight.json" ? 1 : 0;
+    my $raw = _read_json_file("$dsdir/inflight.json", $dsdir);
+    unless (ref $raw eq 'HASH' && ref $raw->{packages} eq 'ARRAY') {
+        return ([], $existed ? 1 : 0);
+    }
+    my @entries;
+    my %seen;
+    my $dirty = 0;
+    for my $e (@{ $raw->{packages} }) {
+        if (ref $e eq 'HASH'
+            && _valid_name($e->{blueprint}) && _valid_name($e->{package})
+            && defined $e->{ledger} && !ref $e->{ledger}
+            && defined $e->{since} && !ref $e->{since} && $e->{since} =~ /^-?\d+$/) {
+            my $key = "$e->{blueprint}\0$e->{package}";
+            if ($seen{$key}++) { $dirty = 1; next; }   # first of any duplicate pair wins
+            push @entries, {
+                blueprint => $e->{blueprint}, package => $e->{package},
+                ledger    => $e->{ledger},    since   => $e->{since} + 0,
+            };
+        } else {
+            $dirty = 1;
+        }
+    }
+    return (\@entries, $dirty);
+}
+
+# _prune_inflight($data, \@entries) -> $dirty (spec §2.6). Mutates @entries
+# in place (drops terminal-ledger, missing-ledger and parked-blueprint ones).
+sub _prune_inflight {
+    my ($data, $entries) = @_;
+    my $dsdir = "$data/.drive-solo";
+    my $parks_raw = _read_json_file("$dsdir/parks.json", $dsdir);
+    my @parks_list = (ref $parks_raw eq 'ARRAY') ? @$parks_raw : ();
+    my %parked = map { $_->{blueprint} => 1 } grep { ref $_ eq 'HASH' && $_->{blueprint} } @parks_list;
+
+    my @kept;
+    my $dirty = 0;
+    for my $e (@$entries) {
+        my ($bp, $pkg) = ($e->{blueprint}, $e->{package});
+        my $bpdir = "$data/blueprints/$bp";
+        # red-team M3: a set entry whose blueprint dir/blueprint.md is gone, or
+        # whose blueprint.md itself says `drafting`, can never be resumed by
+        # any driver -- prune it rather than let it block overlapping work
+        # forever. Same status read the director already uses for blueprints.
+        if (!-d $bpdir || !-f "$bpdir/blueprint.md") { $dirty = 1; next; }
+        if (blueprint_lifecycle($bpdir) eq 'drafting') { $dirty = 1; next; }
+        if (!-f "$bpdir/packages/$pkg.md") { $dirty = 1; next; }
+        if ($parked{$bp})                  { $dirty = 1; next; }
+        my $status = ledger_fm($bpdir, $pkg, 'status') // 'pending';
+        if (_is_terminal($status))         { $dirty = 1; next; }
+        push @kept, $e;
+    }
+    @$entries = @kept;
+    return $dirty;
+}
+
+# _write_inflight_set($dsdir, \@entries, $now) — atomic, NEVER FATAL (spec
+# §2.3): a failure (unwritable dir, inflight.json existing as a directory,
+# rename failure) is logged as one WARN line and changes nothing else.
+sub _write_inflight_set {
+    my ($dsdir, $entries, $now) = @_;
+    eval {
+        make_path($dsdir) unless -d $dsdir;
+        _write_json_atomic("$dsdir/inflight.json", { packages => $entries, updated_at => $now });
+    };
+    if ($@) {
+        _append_run_log($dsdir, "WARN inflight.json write failed: $@");
+    }
+    return;
+}
+
+# _acquire_inflight_lock($dsdir, $opts) -> $filehandle | undef (spec §2.4).
+# Exclusive, non-blocking, polled every 100ms up to
+# $opts->{inflight_lock_timeout} seconds (default 30). NEVER FATAL: any
+# failure (cannot open, flock error, timeout) logs one WARN line and returns
+# undef so the caller proceeds unlocked — a stalled `next` is worse than a
+# racy one. The lock is released implicitly when the returned filehandle goes
+# out of scope (held for the caller's whole lifetime, exactly the critical
+# section the spec names).
+sub _acquire_inflight_lock {
+    my ($dsdir, $opts) = @_;
+    my $timeout  = $opts->{inflight_lock_timeout} // 30;
+    my $lockfile = "$dsdir/inflight.lock";
+    my $fh;
+    unless (open $fh, '>>', $lockfile) {
+        _append_run_log($dsdir, "WARN inflight.lock: cannot open $lockfile: $!");
+        return undef;
+    }
+    my $deadline = Time::HiRes::time() + $timeout;
+    while (1) {
+        my $got = eval { flock($fh, LOCK_EX | LOCK_NB) };
+        return $fh if $got;
+        # review M3: only contention (EWOULDBLOCK/EAGAIN) is worth polling for.
+        # Any other flock failure (ENOLCK, EINVAL, ENOSYS, a die from $@, …) is
+        # not going to clear itself in 30s of retrying — log one WARN and
+        # proceed unlocked immediately, exactly like the timeout branch below.
+        unless (!$@ && ($!{EWOULDBLOCK} || $!{EAGAIN})) {
+            my $why = $@ ? do { (my $e = $@) =~ s/\s+\z//; $e } : $!;
+            _append_run_log($dsdir, "WARN inflight.lock: flock failed: $why — proceeding unlocked");
+            close $fh;
+            return undef;
+        }
+        if (Time::HiRes::time() >= $deadline) {
+            _append_run_log($dsdir,
+                "WARN inflight.lock: timed out after ${timeout}s waiting for the lock — proceeding unlocked");
+            close $fh;
+            return undef;
+        }
+        Time::HiRes::sleep(0.1);
+    }
+}
+
+# _acquire_archive_lock($dsdir) -> $filehandle | undef (review 01, M1).
+# Exclusive, non-blocking, single attempt -- no retry, no timeout. Busy or
+# any failure to acquire both return undef so the caller can defer
+# immediately rather than stall `next`. Released implicitly when the
+# returned filehandle goes out of scope (held for the caller's critical
+# section only).
+sub _acquire_archive_lock {
+    my ($dsdir) = @_;
+    make_path($dsdir) unless -d $dsdir;
+    my $lockfile = "$dsdir/archive.lock";
+    my $fh;
+    return undef unless open $fh, '>>', $lockfile;
+    my $got = eval { flock($fh, LOCK_EX | LOCK_NB) };
+    unless ($got) {
+        close $fh;
+        return undef;
+    }
+    return $fh;
+}
+
 sub _append_run_log {
     my ($dsdir, $line) = @_;
     return unless defined $dsdir;
@@ -344,11 +568,45 @@ sub parse_dag {
         my $deps_raw = $row{depends_on} // '';
         my @deps;
         for my $d (split /[,\s]+/, $deps_raw) {
-            push @deps, $d if $d =~ /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+            # package 30 (spec §2.2): a token containing '/' is kept VERBATIM,
+            # whether or not it is a well-formed cross-blueprint EXTREF -- the
+            # malformed shape is resolved (to state 'malformed') by
+            # external_dep_state, not filtered here. A token with no '/' keeps
+            # the original local-package whitelist unchanged.
+            if ($d =~ m{/}) {
+                push @deps, $d;
+            } elsif ($d =~ /^[A-Za-z0-9][A-Za-z0-9_.-]*$/) {
+                push @deps, $d;
+            }
         }
         $dag{$pkg} = \@deps;
     }
     return \%dag;
+}
+
+# parse_ext_ref($tok) -> ($bp, $pkg) for a well-formed EXTREF (spec §2.1:
+# NAME "/" NAME); empty list for anything else, including a local token.
+sub parse_ext_ref {
+    my ($tok) = @_;
+    return () unless defined $tok && !ref $tok;
+    return () unless $tok =~ m{^([A-Za-z0-9][A-Za-z0-9_.-]*)/([A-Za-z0-9][A-Za-z0-9_.-]*)$};
+    return ($1, $2);
+}
+
+# external_dep_state($data, $tok) -> $state (spec §2.2). Pure read: never
+# dies, never writes. Resolution order is the live blueprints/<bp> first,
+# then blueprints/_archive/<bp> (spec §2.2 / B7).
+sub external_dep_state {
+    my ($data, $tok) = @_;
+    my ($bp, $pkg) = parse_ext_ref($tok);
+    return 'malformed' unless defined $bp;
+    for my $root ("$data/blueprints/$bp", "$data/blueprints/_archive/$bp") {
+        next unless -f "$root/blueprint.md";
+        return 'missing-package' unless -f "$root/packages/$pkg.md";
+        my $st = ledger_fm($root, $pkg, 'status');
+        return (defined $st && length $st) ? $st : 'pending';
+    }
+    return 'missing-blueprint';
 }
 
 # ledger_fm($bpdir, $pkg, $key): read status/write_set from ledger frontmatter.
@@ -406,6 +664,19 @@ sub read_state {
                 priority  => ledger_fm($bpdir, $pkg, 'priority'),
             };
         }
+        # package 30 (spec §2.2): every cross-blueprint token ('<bp>/<pkg>')
+        # that appears anywhere in this blueprint's DAG becomes a key in the
+        # status view too, mapped to its external_dep_state. A package id can
+        # never contain '/', so this key can never collide with a package key
+        # (spec's invariant) -- deps_met/has_progressable_work/ready_packages
+        # need no changes at all: they already just look up $status->{$d}.
+        for my $pkg (keys %$dag) {
+            for my $d (@{ $dag->{$pkg} }) {
+                next unless $d =~ m{/};
+                next if exists $status{$d};
+                $status{$d} = external_dep_state($data, $d);
+            }
+        }
         $bp_meta{$bp}   = \%meta;
         $bp_status{$bp} = \%status;
     }
@@ -420,6 +691,44 @@ sub read_state {
     };
 }
 
+# _log_external_missing($dsdir, $bp, $meta, $status): for every non-terminal
+# package of $bp whose DAG holds a cross token whose resolved state is
+# missing-blueprint, missing-package or malformed, append exactly one
+# EXTERNAL-MISSING line (spec §2.3). No dedupe across calls -- matches the
+# existing ORDER-PRUNE/NOT-AUDITED convention.
+sub _log_external_missing {
+    my ($dsdir, $bp, $meta, $status) = @_;
+    for my $pkg (sort keys %$meta) {
+        next if _is_terminal($status->{$pkg} // 'pending');
+        for my $d (@{ $meta->{$pkg}{deps} || [] }) {
+            next unless $d =~ m{/};
+            my $st = $status->{$d};
+            next unless defined $st && $st =~ /^(?:missing-blueprint|missing-package|malformed)$/;
+            _append_run_log($dsdir, "EXTERNAL-MISSING $bp/$pkg waits on $d ($st)");
+        }
+    }
+}
+
+# _external_waits_for($meta, $status) -> \@waits (spec §2.3): one entry per
+# PENDING package with at least one unmet cross token, sorted by package;
+# each entry's deps lists only the unmet cross tokens, in cell order.
+sub _external_waits_for {
+    my ($meta, $status) = @_;
+    my @waits;
+    for my $pkg (sort keys %$meta) {
+        next unless ($status->{$pkg} // 'pending') eq 'pending';
+        my @unmet;
+        for my $d (@{ $meta->{$pkg}{deps} || [] }) {
+            next unless $d =~ m{/};
+            my $st = $status->{$d} // 'pending';
+            next if $st eq 'done';
+            push @unmet, { ref => $d, state => $st };
+        }
+        push @waits, { package => $pkg, deps => \@unmet } if @unmet;
+    }
+    return \@waits;
+}
+
 # mark_announced: add a blueprint to announced.json atomically.
 sub mark_announced {
     my ($dsdir, $bp) = @_;
@@ -432,8 +741,318 @@ sub mark_announced {
 }
 
 # ===========================================================================
+# SINGLE-BLUEPRINT ARCHIVE AT blueprint-done (director-archives-finished,
+# package 01, spec §2.3-2.6). Reuses bp-lifecycle.pl's own archive gate
+# (BpState::blueprint_lifecycle) and its `reconcile --archive` action as a
+# list-form subprocess -- never a second archive implementation. A failed or
+# deferred attempt never blocks the run; the caller retries on a later `next`
+# (the retry sweep in _cmd_next) or via the run-done `--all` backstop.
+# ===========================================================================
+
+# _archive_detail_clean($s): one line (every \r/\n run collapsed to a single
+# space), at most 400 characters, never empty (spec §2.1).
+sub _archive_detail_clean {
+    my ($s) = @_;
+    $s = defined $s ? $s : '';
+    $s =~ s/[\r\n]+/ /g;
+    $s = substr($s, 0, 400) if length($s) > 400;
+    return length($s) ? $s : 'archive failed: unknown';
+}
+
+# _archive_gate($data, $bp) -> ($ok, $detail) — pure read (spec §2.3).
+# Precedence: no ledgers -> not archivable; any non-done/dropped status ->
+# not all delivered; lifecycle ne 'done' -> not archivable; else (1, undef).
+sub _archive_gate {
+    my ($data, $bp) = @_;
+    require "$DIR/BpState.pm" unless defined &BpState::all_package_statuses;
+    my $bpdir = "$data/blueprints/$bp";
+    my $statuses = BpState::all_package_statuses($bpdir);
+    unless (%$statuses) {
+        return (0, 'not archivable: no package ledgers');
+    }
+    my @bad = grep { $statuses->{$_} ne 'done' && $statuses->{$_} ne 'dropped' } sort keys %$statuses;
+    if (@bad) {
+        return (0, 'not all delivered: ' . join(', ', map { "$_=$statuses->{$_}" } @bad));
+    }
+    my $lc = BpState::blueprint_lifecycle($bpdir, sub { kill(0, $_[0]) ? 1 : 0 });
+    if ($lc ne 'done') {
+        return (0, "not archivable: lifecycle is '$lc'");
+    }
+    return (1, undef);
+}
+
+# _archive_blockers($data, $dsdir, $bp, $now) -> \@parts (spec §2.4). Three
+# read-only deferral checks; empty list = not deferred. $now is the
+# director's own now seam for the dispatch-log staleness check ONLY -- the
+# worker-marker staleness check below uses the REAL clock deliberately
+# (mtime is real; see spec §2.4/2).
+sub _archive_blockers {
+    my ($data, $dsdir, $bp, $now) = @_;
+    my @parts;
+
+    # 1. in-flight set: NOT pruned (spec rationale — pruning would drop the
+    # very entry this check exists to see).
+    my ($entries) = load_inflight($data, $dsdir, $now);
+    my @inflight_pkgs = sort map { $_->{package} }
+                        grep { $_->{blueprint} eq $bp } @$entries;
+    push @parts, 'in-flight ' . join(',', @inflight_pkgs) if @inflight_pkgs;
+
+    # 2. live worker marker bound to one of this blueprint's ledgers.
+    my @live_tuids;
+    my $wdir = "$dsdir/workers";
+    my $bdir = "$dsdir/bindings";
+    if (-d $wdir) {
+        my $stale_min = 180;
+        if (defined $ENV{CCPRAXIS_VALIDATION_STALE_MIN}
+            && $ENV{CCPRAXIS_VALIDATION_STALE_MIN} =~ /^[0-9]+\z/
+            && $ENV{CCPRAXIS_VALIDATION_STALE_MIN} > 0) {
+            $stale_min = $ENV{CCPRAXIS_VALIDATION_STALE_MIN} + 0;
+        }
+        if (opendir(my $dh, $wdir)) {
+            for my $f (readdir $dh) {
+                next unless $f =~ /^[A-Za-z0-9_-]{1,128}\z/;
+                my $path = "$wdir/$f";
+                next unless -f $path;
+                my @st = stat($path);
+                next unless @st;
+                next unless (CORE::time() - $st[9]) < ($stale_min * 60);
+                my $binding = _read_json_file("$bdir/$f.json");
+                next unless ref $binding eq 'HASH' && (($binding->{blueprint} // '') eq $bp);
+                push @live_tuids, $f;
+            }
+            closedir $dh;
+        }
+    }
+    push @parts, 'live worker ' . join(',', sort @live_tuids) if @live_tuids;
+
+    # 3. open dispatch-log entry attributed to this blueprint.
+    my $dispatch_dir = "$data/.dispatch-log";
+    my @open_ids;
+    my $lib_ok = eval {
+        require "$DIR/bp-dispatch-log.pl" unless defined &BpDispatchLog::is_live;
+        1;
+    };
+    if (!$lib_ok) {
+        push @parts, 'dispatch-log unreadable';
+    } elsif (-d $dispatch_dir && opendir(my $dh, $dispatch_dir)) {
+        for my $f (readdir $dh) {
+            next unless $f =~ /^(.+)\.json\z/;
+            my $id  = $1;
+            my $rec = _read_json_file("$dispatch_dir/$f");
+            next unless ref $rec eq 'HASH';
+            next unless BpDispatchLog::is_live($rec, $now);
+            my $attr = BpDispatchLog::attribution($rec);
+            next unless (($attr->{blueprint} // '') eq $bp);
+            push @open_ids, $id;
+        }
+        closedir $dh;
+    }
+    push @parts, 'open dispatch ' . join(',', sort @open_ids) if @open_ids;
+
+    return \@parts;
+}
+
+# _run_archive($data, $dsdir, $bp, $opts) -> ($archived_bool_plain, $detail)
+# (spec §2.5). List-form subprocess, never a shell string; STDOUT/STDERR
+# captured through real temp files (never an in-memory scalar — Landmine #2).
+# Review 01 M1: takes a non-blocking $dsdir/archive.lock around the whole
+# attempt (busy -> deferred immediately, no retry) and, under that lock,
+# re-checks immediately before running bp-lifecycle.pl that the source still
+# exists and the destination does not -- closing the window a concurrent
+# `next` could have used to already file this same archive. Lock is released
+# on every return path via $lock_fh going out of scope.
+sub _run_archive {
+    my ($data, $dsdir, $bp, $opts) = @_;
+    my $script = $opts->{lifecycle_script} // "$DIR/bp-lifecycle.pl";
+
+    my $lock_fh = _acquire_archive_lock($dsdir);
+    return (0, 'deferred: archive in progress') unless $lock_fh;
+
+    my $bp_dir      = "$data/blueprints/$bp";
+    my $archive_dir = "$data/blueprints/_archive/$bp";
+    unless (-e $bp_dir) {
+        return (1, "already archived to _archive/$bp") if -d $archive_dir;
+        return (0, 'deferred: archive in progress');
+    }
+    # Decision 6: source and destination both present is a failure needing a
+    # human, never a deferral -- it does not clear by itself. Never runs
+    # bp-lifecycle.pl or touches _archive/<b> in this case.
+    return (0, "archive failed: _archive/$bp already exists (reconcile not run)") if -e $archive_dir;
+
+    require File::Temp;
+    my ($otfh, $opath) = File::Temp::tempfile(); close $otfh;
+    my ($etfh, $epath) = File::Temp::tempfile(); close $etfh;
+
+    open(my $saved_out, '>&', \*STDOUT) or return (0, "archive failed: could not run bp-lifecycle.pl (cannot dup STDOUT: $!)");
+    open(my $saved_err, '>&', \*STDERR) or do {
+        open(STDOUT, '>&', $saved_out); close $saved_out;
+        return (0, "archive failed: could not run bp-lifecycle.pl (cannot dup STDERR: $!)");
+    };
+    my $rc = -1;
+    my $fail_detail;
+    if (open(STDOUT, '>', $opath)) {
+        if (open(STDERR, '>', $epath)) {
+            $rc = system($^X, $script, 'reconcile', '--blueprint', $bp,
+                         '--data-dir', $data, '--archive', '--json');
+            $fail_detail = "could not run bp-lifecycle.pl ($!)" if $rc == -1;
+        } else {
+            $fail_detail = "cannot capture output: $!";
+        }
+    } else {
+        $fail_detail = "cannot capture output: $!";
+    }
+    open(STDOUT, '>&', $saved_out); close $saved_out;
+    open(STDERR, '>&', $saved_err); close $saved_err;
+
+    my $out = _read_file($opath) // '';
+    my $err = _read_file($epath) // '';
+    unlink $opath, $epath;
+
+    if ($rc == -1) {
+        return (0, "archive failed: $fail_detail");
+    }
+    my $exit = $rc >> 8;
+
+    my $parsed = eval { JSON::PP->new->decode($out) };
+    my $rec;
+    if (ref $parsed eq 'ARRAY') {
+        ($rec) = grep { ref $_ eq 'HASH' && (($_->{blueprint} // '') eq $bp) } @$parsed;
+    }
+
+    if ($exit != 0) {
+        my $detail;
+        if ($rec && ref $rec->{errors} eq 'ARRAY' && @{ $rec->{errors} }) {
+            $detail = $rec->{errors}[0];
+        }
+        unless (defined $detail) {
+            my @lines = grep { length } split /\r?\n/, $err;
+            $detail = $lines[0] if @lines;
+        }
+        $detail //= 'no output';
+        return (0, "archive failed: reconcile exit $exit: $detail");
+    }
+
+    # exit 0: disk state decides `archived`, never the JSON (spec §2.5).
+    if (-d "$data/blueprints/_archive/$bp" && !-e "$data/blueprints/$bp") {
+        my $detail;
+        if ($rec && ref $rec->{actions} eq 'ARRAY') {
+            my ($act) = grep { ref $_ eq 'HASH' && (($_->{kind} // '') eq 'archive') && $_->{applied} }
+                        @{ $rec->{actions} };
+            $detail = $act->{detail} if $act;
+        }
+        $detail //= "archived to _archive/$bp";
+        return (1, $detail);
+    }
+
+    # exit 0 but not archived: a reported `skipped` action names why and is
+    # NOT a failure (a live orchestrator raced the gate); anything else is.
+    if ($rec && ref $rec->{actions} eq 'ARRAY') {
+        my ($skip) = grep { ref $_ eq 'HASH' && (($_->{kind} // '') eq 'skipped') } @{ $rec->{actions} };
+        if ($skip) {
+            return (0, "not archivable: $skip->{detail}");
+        }
+    }
+    my $lc = $rec ? ($rec->{lifecycle} // '?') : '?';
+    return (0, "archive failed: reconcile exited 0 but did not archive (lifecycle '$lc')");
+}
+
+# _attempt_archive($data, $dsdir, $bp, $now, $opts) -> ($archived_bool_json,
+# $detail, $outcome) (spec §2.3). Gate -> blockers -> subprocess, first stop
+# wins. Never dies: the whole body is guarded so any exception becomes
+# (false, "archive failed: <msg>", 'failed'). Drops $bp from order.json on
+# 'archived' only.
+sub _attempt_archive {
+    my ($data, $dsdir, $bp, $now, $opts) = @_;
+    my ($archived, $detail, $outcome) = (0, undef, undef);
+    my $ok = eval {
+        my $inner = sub {
+            my ($gate_ok, $gate_detail) = _archive_gate($data, $bp);
+            return (0, $gate_detail, 'not-archivable') unless $gate_ok;
+
+            my $blockers = _archive_blockers($data, $dsdir, $bp, $now);
+            return (0, 'deferred: ' . join('; ', @$blockers), 'deferred') if @$blockers;
+
+            my ($ab, $rd) = _run_archive($data, $dsdir, $bp, $opts);
+            return (1, $rd, 'archived') if $ab;
+            return (0, $rd, 'not-archivable') if $rd =~ /^not archivable:/;
+            return (0, $rd, 'deferred') if $rd =~ /^deferred:/;
+            return (0, $rd, 'failed');
+        };
+        ($archived, $detail, $outcome) = $inner->();
+        1;
+    };
+    unless ($ok) {
+        (my $msg = $@) =~ s/\s+\z//;
+        ($archived, $detail, $outcome) = (0, "archive failed: $msg", 'failed');
+    }
+    if ($outcome eq 'archived') {
+        _drop_from_order($dsdir, $bp);
+    }
+    my $archived_json = $archived ? JSON::PP::true : JSON::PP::false;
+    return ($archived_json, _archive_detail_clean($detail), $outcome);
+}
+
+# _drop_from_order($dsdir, @names): re-reads order.json from disk and, if it
+# is a HASH whose `order` is an ARRAY containing any of @names, rewrites it
+# atomically with those names removed, preserving every other key. Never
+# writes when nothing is removed. A write failure logs one WARN line and is
+# otherwise ignored (spec §2.3).
+sub _drop_from_order {
+    my ($dsdir, @names) = @_;
+    return unless @names;
+    my $path = "$dsdir/order.json";
+    my $order_data = _read_json_file($path, $dsdir);
+    return unless ref $order_data eq 'HASH' && ref $order_data->{order} eq 'ARRAY';
+    my %drop = map { $_ => 1 } @names;
+    my @removed = grep { $drop{$_} } @{ $order_data->{order} };
+    return unless @removed;
+    my @kept = grep { !$drop{$_} } @{ $order_data->{order} };
+    my %new_data = %$order_data;
+    $new_data{order} = \@kept;
+    eval { _write_json_atomic($path, \%new_data); };
+    if ($@) {
+        (my $msg = $@) =~ s/\s+\z//;
+        _append_run_log($dsdir, "WARN order.json update failed: $msg");
+        return;
+    }
+    _append_run_log($dsdir, "ORDER-DROP-ARCHIVED $_") for @removed;
+}
+
+# ===========================================================================
 # KEEP-AWAKE ACTUATION (side effect; seam-injectable; never affects action/exit)
 # ===========================================================================
+
+# pause_keepawake_phase($reason, $until_epoch, $now) -> 'pause-pending'|'settled'
+#
+# HOLDING THE WAKE-LOCK ACROSS A PAUSE IS A PROMISE ABOUT RESUMING. A usage pause
+# auto-resumes, and the machine has to still be awake when the window reopens --
+# which is why 'pause-pending' is one of the two phases should_be_on() holds for.
+#
+# That reasoning is sound for the FIVE-HOUR usage window, which cannot reopen
+# more than five hours out. It is not sound for the SEVEN-DAY window. Measured on
+# this host 2026-09-18, the governor returned
+#   {"action":"pause","reason":"usage","until_epoch":1790013600}
+# with seven_day at 86%, resetting 2026-09-21T18:00Z -- 88 hours away.
+# 'pause-pending' would have held a laptop awake from Friday morning until Monday
+# evening waiting for it. Nobody expects that, and nobody would ask for it.
+#
+# Past the horizon the honest phase is 'settled': release the lock, let the
+# machine sleep, and let whoever comes back wake it. The pause ACTION is
+# byte-identical either way -- this decides only whether the machine is held
+# awake, never what any caller sees.
+#
+# An UNDEFINED until_epoch keeps the old behaviour and HOLDS. That is the
+# pre-existing semantics, it is the case no measurement covers, and a short pause
+# wrongly released is a broken auto-resume -- so the change stays scoped to the
+# case actually observed.
+#
+# Strictly greater-than, so a pause landing exactly ON the horizon still holds.
+sub pause_keepawake_phase {
+    my ($reason, $until, $now) = @_;
+    return 'settled' unless defined $reason && $reason eq 'usage';
+    return 'pause-pending' unless defined $until;
+    return (($until - $now) > $KEEPAWAKE_PAUSE_HORIZON_SECONDS) ? 'settled' : 'pause-pending';
+}
 
 sub keepawake_apply {
     my ($phase, $dsdir, $opts) = @_;
@@ -556,10 +1175,43 @@ sub _cmd_next {
         closedir $dh;
     }
 
-    my @candidates = resolve_scope($spec, \@all_bps);
+    # A blueprint that has not been AUDITED is not drivable, and this is the one
+    # place that enforces it. This file's own USAGE block documents `--scope all`
+    # as "all audited blueprints"; until 2026-09-18 the code simply listed every
+    # directory holding a blueprint.md and never read a lifecycle status at all,
+    # so a blueprint still at `status: drafting` was handed out as work.
+    #
+    # Measured on this host: the director returned run-package for
+    # butler-gate-ergonomics/01-live-watcher-probe while that blueprint was
+    # drafting. The expensive half is second-order -- `next` is called from the
+    # Stop hook on EVERY turn end, so keepawake_apply('active') kept re-spawning
+    # the wake-lock, and the machine was held awake for hours on a run whose
+    # runstate said `finished`. Killing the helper only bought one turn.
+    #
+    # NOT folded into @all_bps. That list answers "does this exist on disk", which
+    # is what the ORDER-PRUNE below keys on; pruning a drafting blueprint there
+    # would log it as "absent from disk -- archived, or not yet fully created",
+    # asserting something false about a blueprint that is present and healthy.
+    my %undrivable = map { $_ => 1 }
+                     grep { !blueprint_drivable(blueprint_lifecycle("$data/blueprints/$_")) }
+                     @all_bps;
+
+    my @candidates = grep { !$undrivable{$_} } resolve_scope($spec, \@all_bps);
 
     # Read all state from disk
     make_path($dsdir) unless -d $dsdir;
+
+    # In-flight set (package 11, spec §2.1/2.4-2.6, amended by the fix-batch;
+    # batch C: concurrent hand-out is unconditional): do NOT take the lock or
+    # load the set yet. Fix-batch red-team M2: the lock must never be held
+    # across network I/O (the usage/governor verdict fetch, token recovery,
+    # the `done` branch's `system()`), so it is acquired lazily, just before
+    # the load/prune/write/hand-out sequence that actually needs it -- see the
+    # "ok or degraded" branch below, which is reached only AFTER that bp's
+    # verdict has already been fetched. $inflight_entries is populated there
+    # (and reused for the in-flight action's `inflight` key), never here.
+    my $inflight_entries;
+
     my $state = read_state($data, $dsdir, \@candidates);
 
     my $order     = $state->{order};
@@ -567,6 +1219,20 @@ sub _cmd_next {
     my %announced = %{ $state->{announced} };
     my %bp_meta   = %{ $state->{bp_meta} };
     my %bp_status = %{ $state->{bp_status} };
+
+    # director-archives-finished / package 01, spec §2.6#3: whether order.json
+    # held an ARRAY that was EMPTY on disk, captured BEFORE the ORDER-PRUNE
+    # step below (which cannot change an already-empty array). Distinct from
+    # "no order.json at all" (undef) and from "pruned to empty in memory"
+    # (order-json-prune-stale-blueprint.t AC4/C, unaffected by this flag).
+    my $order_was_empty_array = (defined $order && ref $order eq 'ARRAY' && !@$order) ? 1 : 0;
+
+    # package 30 (spec §2.3): report every unresolvable cross token in scope,
+    # for every `next` call, regardless of which action this call ends up
+    # returning.
+    for my $bp (keys %bp_meta) {
+        _log_external_missing($dsdir, $bp, $bp_meta{$bp}, $bp_status{$bp});
+    }
 
     # e04 §2.4/AC4: prune, IN MEMORY, any order.json entry whose blueprint no
     # longer exists on disk -- before B2a's coverage check and the B3 walk see
@@ -602,7 +1268,7 @@ sub _cmd_next {
     # need-order with candidates:[] anyway. That prompt is UNANSWERABLE, and it
     # is a closed loop rather than a stall: record-order refuses an empty list,
     # so the session cannot answer it; `next` returns it again on every call;
-    # gate-drive-loop.sh treats any non-done/pause action as actionable work and
+    # stop-gate.sh treats any non-done/pause action as actionable work and
     # blocks the stop for it; and keepawake_apply('active') holds the machine
     # awake over a run containing no work at all.
     #
@@ -620,7 +1286,7 @@ sub _cmd_next {
     # Candidate discovery requires blueprint.md, so a directory under
     # blueprints/ that HAS packages but no blueprint.md is silently skipped and
     # lands here looking identical to "nothing is there". Reporting `done` over
-    # it is actively dangerous: bp-watchdog.pl branches on the action string and
+    # it is actively dangerous: the watchdog logic branches on the action string and
     # treats `done` as absolute ("The director reports no remaining work. Do not
     # re-arm."), so a package ledger sitting at status: running would be
     # declared settled and the dead-man's switch disarmed over a wedged run.
@@ -645,11 +1311,7 @@ sub _cmd_next {
                               . join(',', @malformed));
         print STDERR "bp-drive-next: blueprints/ holds directories with no blueprint.md:\n";
         print STDERR "  - $_\n" for @malformed;
-        print STDERR "Each is skipped by candidate discovery, so the scope resolves empty --\n"
-                   . "but 'empty' and 'malformed' are not the same thing, and reporting the run\n"
-                   . "settled over a half-created blueprint would disarm the watchdog on top of\n"
-                   . "a package that may still be running. Finish creating it (blueprint.md), or\n"
-                   . "move it aside, then retry.\n";
+        print STDERR "Each is skipped by candidate discovery, so the scope resolves empty -- but 'empty' and 'malformed' are not the same thing, and reporting the run settled over a half-created blueprint would disarm the watchdog on top of a package that may still be running. Finish creating it (blueprint.md), or move it aside, then retry.\n";
         return 2;
     }
 
@@ -660,12 +1322,23 @@ sub _cmd_next {
         return 0;
     }
 
-    # B2: no order recorded → need-order
+    # B2: no order recorded → need-order.
+    #
+    # director-archives-finished / package 01, spec §2.6#3: an order.json that
+    # held an ARRAY EMPTY ON DISK (captured above, before ORDER-PRUNE) is not
+    # "no order recorded" when every in-scope candidate is parked — every
+    # blueprint the archive removed from the order is exactly the case this
+    # exempts. Falling through here lets B2a (which already excludes parked
+    # names from `missing`) and the B3 walk (which iterates an empty @$order
+    # and finds nothing to do) settle it as `done`, never as a fresh
+    # need-order prompt for work that is either archived or parked.
     unless (defined $order && @$order) {
-        my $action = { action => 'need-order', candidates => \@candidates };
-        print _encode_action($action), "\n";
-        keepawake_apply('active', $dsdir, $opts);
-        return 0;
+        unless ($order_was_empty_array && !(grep { !$parked{$_} } @candidates)) {
+            my $action = { action => 'need-order', candidates => \@candidates };
+            print _encode_action($action), "\n";
+            keepawake_apply('active', $dsdir, $opts);
+            return 0;
+        }
     }
 
     # B2a: an order EXISTS but does not cover every in-scope candidate.
@@ -674,7 +1347,7 @@ sub _cmd_next {
     # looked at -- and the walk then falls through to 'done', which asserts
     # "every in-scope blueprint is done-or-parked". That assertion is false, and
     # it is believed by the two mechanisms named at the in-flight branch below:
-    # gate-drive-loop.sh allows the turn to end, and bp-watchdog.pl short-circuits
+    # stop-gate.sh allows the turn to end, and the watchdog logic short-circuits
     # to SETTLED. So the run reports finished having never considered the work.
     #
     # This is the same false-settled class as the in-flight bug documented there,
@@ -706,13 +1379,60 @@ sub _cmd_next {
         }
     }
 
+    # director-archives-finished / package 01, spec §2.6#2: the archive retry
+    # sweep. Every `next` (not only the call that first emits blueprint-done)
+    # retries the single-blueprint archive for any blueprint already
+    # announced, settled, unparked and drivable — so a deferral (in-flight /
+    # live worker / open dispatch) or a failure clears on a later call
+    # without a fresh blueprint-done. Silent when the gate itself still
+    # fails (the steady state for every fixture with no audited status);
+    # logged only for archived/deferred/failed, matching the emission-time
+    # ARCHIVE line's own vocabulary. This sweep changes which action THIS
+    # call returns only through an archived name's removal from `$order`.
+    for my $b (@$order) {
+        next if $undrivable{$b};
+        next if $parked{$b};
+        next unless $announced{$b};
+        my $b_meta   = $bp_meta{$b}   // {};
+        my $b_status = $bp_status{$b} // {};
+        next unless blueprint_settled($b_meta, $b_status, 0);
+
+        # S1 (review 01): no unguarded pre-check here -- _attempt_archive
+        # already runs _archive_gate inside its own eval (never dies) and
+        # the log filter below already suppresses its 'not-archivable'
+        # outcome, so calling it directly avoids a duplicate ledger read
+        # that could itself die outside any eval.
+        my ($archived_bool, $archive_detail, $outcome) = _attempt_archive($data, $dsdir, $b, $now, $opts);
+        if ($outcome eq 'archived' || $outcome eq 'deferred' || $outcome eq 'failed') {
+            _append_run_log($dsdir, "ARCHIVE $b $outcome -- $archive_detail");
+        }
+        if ($outcome eq 'archived') {
+            $order = [ grep { $_ ne $b } @$order ];
+        }
+    }
+
     # Blueprints that are NOT settled but have nothing dispatchable right now.
     # Collected rather than swallowed: emitting 'done' for these is the bug
     # documented at the in-flight branch below.
     my @in_flight;
 
+    # Filtering @candidates above is NOT sufficient on its own: this walk iterates
+    # @$order, not @candidates, so a blueprint already recorded in order.json is
+    # visited whatever the scope resolved to. That is exactly the observed case --
+    # order.json held ["almanac-records","butler-gate-ergonomics"] from when the
+    # second was expected to be audited shortly. Both filters are load-bearing.
+    if (my @nd = grep { $undrivable{$_} } @$order) {
+        _append_run_log($dsdir,
+            'NOT-AUDITED (skipped; blueprint.md status is not `audited`): ' . join(',', @nd));
+    }
+
     # B3: walk recorded order
     for my $bp (@$order) {
+        # Not audited: settled for drive purposes, and skipped exactly like a park
+        # -- never driven, and never ANNOUNCED, because blueprint-done asserts the
+        # blueprint FINISHED, which a drafting one emphatically has not.
+        next if $undrivable{$bp};
+
         my $is_parked   = $parked{$bp} ? 1 : 0;
         my $meta        = $bp_meta{$bp}   // {};
         my $status      = $bp_status{$bp} // {};
@@ -731,7 +1451,11 @@ sub _cmd_next {
                         my $b_meta    = $bp_meta{$b}   // {};
                         my $b_status  = $bp_status{$b} // {};
                         my $b_settled = blueprint_settled($b_meta, $b_status, $b_parked);
-                        $done_or_parked{$b} = 1 if $b_settled || $b_parked;
+                        # %done_or_parked is really "not pending work for this
+                        # run", and a non-audited blueprint is not pending work --
+                        # listing it would tell the session to re-evaluate a
+                        # blueprint it cannot legally drive.
+                        $done_or_parked{$b} = 1 if $b_settled || $b_parked || $undrivable{$b};
                     }
                 }
                 # collect blueprints strictly after $bp in the recorded order
@@ -745,9 +1469,21 @@ sub _cmd_next {
 
                 # Write to announced.json before returning (fire-once idempotence, B4)
                 mark_announced($dsdir, $bp);
-                _append_run_log($dsdir, "BLUEPRINT-DONE $bp pending=" . join(',', @pending_list));
 
-                my $action = { action => 'blueprint-done', blueprint => $bp, pending => \@pending_list };
+                # director-archives-finished / package 01, spec §2.6#1: the
+                # director's own single-blueprint archive attempt, reusing
+                # bp-lifecycle.pl's reconcile --archive. Never blocks the run
+                # -- archived/archive_detail report the outcome either way,
+                # and blueprint-done still fires exactly once via
+                # announced.json above regardless of it.
+                my ($archived_bool, $archive_detail, $archive_outcome) =
+                    _attempt_archive($data, $dsdir, $bp, $now, $opts);
+
+                _append_run_log($dsdir, "BLUEPRINT-DONE $bp pending=" . join(',', @pending_list));
+                _append_run_log($dsdir, "ARCHIVE $bp $archive_outcome -- $archive_detail");
+
+                my $action = { action => 'blueprint-done', blueprint => $bp, pending => \@pending_list,
+                               archived => $archived_bool, archive_detail => $archive_detail };
                 print _encode_action($action), "\n";
                 my $phase = @pending_list ? 'active' : 'settled';
                 keepawake_apply($phase, $dsdir, $opts);
@@ -783,22 +1519,126 @@ sub _cmd_next {
         if ($mapped->{action} && $mapped->{action} eq 'pause') {
             my $until = $mapped->{until_epoch};
             my $reason = $mapped->{reason};
-            my $phase  = ($reason eq 'usage') ? 'pause-pending' : 'settled';
+
+            my $phase = pause_keepawake_phase($reason, $until, $now);
+            if ($phase eq 'settled' && $reason eq 'usage' && defined $until) {
+                _append_run_log($dsdir, sprintf(
+                    'PAUSE-BEYOND-HORIZON (%.1fh away, horizon %.1fh) -- releasing the wake-lock; '
+                  . 'the run still resumes at %d, but the machine is free to sleep until then',
+                    ($until - $now) / 3600, $KEEPAWAKE_PAUSE_HORIZON_SECONDS / 3600, $until));
+            }
             my $action = { action => 'pause', reason => $reason, until_epoch => $until };
             print _encode_action($action), "\n";
             keepawake_apply($phase, $dsdir, $opts);
             return 0;
         }
 
-        # ok or degraded → find first ready package
-        my @ready = ready_packages($meta, $status, []);
-        if (@ready) {
-            my $pkg    = $ready[0];  # sorted by key (ready_packages uses sort keys)
-            my $action = { action => 'run-package', blueprint => $bp, package => $pkg };
-            _append_run_log($dsdir, "RUN $bp/$pkg");
-            print _encode_action($action), "\n";
-            keepawake_apply('active', $dsdir, $opts);
-            return 0;
+        # ok or degraded → find first ready package (spec §2.7, batch C: a
+        # SECOND disjoint ready package may always be handed out while others
+        # are in flight -- concurrent hand-out is unconditional now).
+        #
+        # Fix-batch red-team M2: the lock is acquired HERE, after this bp's own
+        # verdict fetch (above) has already completed -- never across it. The
+        # load, unconditional prune (review M1) and write of the set, and the
+        # hand-out decision, all stay inside this block's lock, which is
+        # released as soon as the block ends (whether by falling through to
+        # the in-flight collection below, or by the `return 0` inside it).
+        my $handed;
+        {
+            my $lock_fh = _acquire_inflight_lock($dsdir, $opts);
+            my $dirty;
+            ($inflight_entries, $dirty) = load_inflight($data, $dsdir, $now);
+            my $pruned = _prune_inflight($data, $inflight_entries);
+            $dirty = 1 if $pruned;
+            _write_inflight_set($dsdir, $inflight_entries, $now) if $dirty;
+
+            # Decision 65 / package 12 AC-20: reclaim a claimed-but-undriven
+            # in-flight entry. Carried from package 11's red-team M1/M4 (this
+            # ledger, 2026-09-24T12:50:48Z): an inflight.json entry can be
+            # claimed but never driven. Reclaiming means handing it out again
+            # -- a director act, done here rather than in the hook (spec sec
+            # 3.5).
+            my $bd_ok = eval {
+                require "$DIR/BpHook/BindDispatch.pm"
+                    unless defined &BpHook::BindDispatch::bound_since;
+                1;
+            };
+            if ($bd_ok) {
+                my $reclaim_after = $opts->{reclaim_after} // 1800;
+                my @reclaimable =
+                    sort { $a->{package} cmp $b->{package} }
+                    grep {
+                        $_->{blueprint} eq $bp
+                        && (($status->{ $_->{package} } // 'pending') eq 'pending')
+                        && (($now - $_->{since}) >= $reclaim_after)
+                        && !BpHook::BindDispatch::bound_since($data, $bp, $_->{package}, $_->{since})
+                        # package 30 / AC-12 (B11): never reclaim a pending
+                        # entry whose deps (local or external) are unmet.
+                        && deps_met($meta->{ $_->{package} }{deps}, $status)
+                    } @$inflight_entries;
+                if (@reclaimable) {
+                    my $entry = $reclaimable[0];
+                    my $pkg   = $entry->{package};
+                    my $action = { action => 'run-package', blueprint => $bp, package => $pkg };
+                    _append_run_log($dsdir, "RECLAIM $bp/$pkg (no dispatch bound since $entry->{since})");
+                    _append_run_log($dsdir, "RUN $bp/$pkg");
+                    $entry->{since}  = $now;
+                    $entry->{ledger} = _ledger_str($data, $bp, $pkg);
+                    _write_inflight_set($dsdir, $inflight_entries, $now);
+                    print _encode_action($action), "\n";
+                    keepawake_apply('active', $dsdir, $opts);
+                    return 0;
+                }
+            }
+
+            my @here = map { $_->{package} } grep { $_->{blueprint} eq $bp } @$inflight_entries;
+            # Driver decision (Decision 31 / red-team H1 / review M2): a
+            # package whose LEDGER status is `running` counts as in flight
+            # whether or not it is recorded in inflight.json.
+            push @here, grep { ($status->{$_} // '') eq 'running' } keys %$meta;
+            my %here_seen = map { $_ => 1 } @here;
+            my @ready = ready_packages($meta, $status, [ keys %here_seen ]);
+            @ready = grep { !$here_seen{$_} } @ready;   # in-flight-but-pending is never re-handed
+
+            my @other_ws;
+            for my $e (grep { $_->{blueprint} ne $bp } @$inflight_entries) {
+                push @other_ws, ledger_fm("$data/blueprints/$e->{blueprint}", $e->{package}, 'write_set') // '';
+            }
+            for my $obp (@$order) {
+                next if $obp eq $bp;
+                my $ometa   = $bp_meta{$obp}   // {};
+                my $ostatus = $bp_status{$obp} // {};
+                for my $opkg (keys %$ometa) {
+                    next unless ($ostatus->{$opkg} // '') eq 'running';
+                    push @other_ws, $ometa->{$opkg}{write_set};
+                }
+            }
+            @ready = grep {
+                my $ws = $meta->{$_}{write_set};
+                !grep { write_sets_overlap($ws, $_) } @other_ws
+            } @ready;
+            $handed = $ready[0] if @ready;
+
+            if (defined $handed) {
+                my $pkg    = $handed;
+                my $action = { action => 'run-package', blueprint => $bp, package => $pkg };
+                _append_run_log($dsdir, "RUN $bp/$pkg");
+
+                # §2.7 (batch C: always APPENDS to the set, keeping the old
+                # `since` if the same pair was already present).
+                my ($existing) = grep { $_->{blueprint} eq $bp && $_->{package} eq $pkg } @$inflight_entries;
+                my $since = $existing ? $existing->{since} : $now;
+                my $new_entry = { blueprint => $bp, package => $pkg, ledger => _ledger_str($data, $bp, $pkg), since => $since };
+                @$inflight_entries = (
+                    (grep { !($_->{blueprint} eq $bp && $_->{package} eq $pkg) } @$inflight_entries),
+                    $new_entry,
+                );
+                _write_inflight_set($dsdir, $inflight_entries, $now);
+
+                print _encode_action($action), "\n";
+                keepawake_apply('active', $dsdir, $opts);
+                return 0;
+            }
         }
 
         # No ready packages, but the blueprint is NOT settled. The comment here
@@ -815,12 +1655,12 @@ sub _cmd_next {
         # at the top of this file), which is simply false while work is in
         # flight -- and two safety mechanisms believe that assertion:
         #
-        #   * gate-drive-loop.sh, the Stop hook that keeps an unattended driver
+        #   * stop-gate.sh, the Stop hook that keeps an unattended driver
         #     from ending a turn with nothing scheduled to continue the run,
         #     treats 'done' as "run settled" and allows the stop. So the run
         #     dies silently mid-package, looking finished -- the exact failure
         #     that hook was written to prevent.
-        #   * bp-watchdog.pl short-circuits to VERDICT: SETTLED on 'done',
+        #   * the watchdog logic short-circuits to VERDICT: SETTLED on 'done',
         #     ahead of its own movement analysis, so an armed watchdog reports
         #     all-clear over a wedged run.
         #
@@ -846,12 +1686,36 @@ sub _cmd_next {
         _append_run_log($dsdir, "IN-FLIGHT $f->{blueprint}"
             . ' running=' . (join(',', @{ $f->{running} }) || '-')
             . ' nonterminal=' . join(',', @{ $f->{packages} }));
-        print _encode_action({
+        my $action = {
             action    => 'in-flight',
             blueprint => $f->{blueprint},
             packages  => $f->{packages},
             running   => $f->{running},
-        }), "\n";
+        };
+        # §2.8 (batch C: unconditional): gain an `inflight` key carrying the
+        # current set verbatim — never a re-issued run-package, which would
+        # tell the session to start a second pipeline over a ledger it is
+        # already driving.
+        # The set is loaded lazily inside the hand-out block; if this call
+        # never reached it, read (and prune, read-only) it here rather than
+        # letting @$inflight_entries autovivify into an empty list, which
+        # would tell a recovering session that nothing is in flight.
+        unless (ref $inflight_entries eq 'ARRAY') {
+            ($inflight_entries) = load_inflight($data, $dsdir, $now);
+            _prune_inflight($data, $inflight_entries);
+        }
+        $action->{inflight} = [ map {
+            { blueprint => $_->{blueprint}, package => $_->{package},
+              ledger    => $_->{ledger},    since   => $_->{since} }
+        } @$inflight_entries ];
+        # package 30 (spec §2.3): external_waits key only when non-empty, so
+        # a fixture with no cross tokens (AC-13/B12) produces a byte-identical
+        # action.
+        {
+            my $ew = _external_waits_for($bp_meta{ $f->{blueprint} } // {}, $bp_status{ $f->{blueprint} } // {});
+            $action->{external_waits} = $ew if @$ew;
+        }
+        print _encode_action($action), "\n";
         keepawake_apply('active', $dsdir, $opts);
         return 0;
     }
@@ -870,12 +1734,17 @@ sub _cmd_next {
     #   * a blueprint whose packages are ALL delivered is advanced to `done` and
     #     filed into blueprints/_archive/.
     #
-    # Archiving is enabled HERE and nowhere else in the automatic path. It is a
-    # directory move, so it must only run where nothing holds the directory —
-    # true at this point and not true inside the orchestrator (which lives in it)
-    # or during a status read (which may be observing a run about to relaunch).
-    # The director's own state lives in <data>/.drive-solo/, outside every
-    # blueprint, so moving one cannot disturb it.
+    # This --all sweep is the BACKSTOP for the director's own single-blueprint
+    # archive at blueprint-done (emission) and its retry sweep (B2a-B3):
+    # unlike those, it ignores the deferral records entirely (Decision 3(1))
+    # -- deliberately, since reaching B6 at all means nothing in scope can
+    # progress without a human, so nothing can still be writing into any
+    # blueprint's directory. It is a directory move, so it must only run
+    # where nothing holds the directory — true at this point and not true
+    # inside the orchestrator (which lives in it) or during a status read
+    # (which may be observing a run about to relaunch). The director's own
+    # state lives in <data>/.drive-solo/, outside every blueprint, so moving
+    # one cannot disturb it.
     #
     # A blueprint that is merely settled — parked or blocked awaiting a human —
     # is NOT all-delivered and is therefore left exactly where it is. bp-lifecycle
@@ -884,15 +1753,41 @@ sub _cmd_next {
     # Best-effort: the run is over and reported done either way. A reconciliation
     # failure must not manufacture a failed drive.
     {
-        my $lifecycle = "$DIR/bp-lifecycle.pl";
-        if (-f $lifecycle) {
-            my $rc = eval {
-                system($^X, $lifecycle, 'reconcile', '--all',
-                       '--data-dir', $data, '--archive', '--quiet');
-            };
-            _append_run_log($dsdir, 'LIFECYCLE-RECONCILE '
-                . ((!$@ && defined $rc && $rc == 0) ? 'ok' : 'failed (non-fatal)'));
+        # director-archives-finished / package 01, spec §2.6#4: snapshot the
+        # order BEFORE the sweep (its own archives happen inside the
+        # subprocess below, invisible to this process until it returns), so
+        # that "newly archived by THIS sweep" can be told apart from
+        # "already archived earlier this run".
+        my @snapshot_names = @$order
+            ? grep { -f "$data/blueprints/$_/blueprint.md" } @$order
+            : ();
+
+        # M1 (review 01): the same non-blocking archive.lock as the
+        # single-blueprint path, so this --all sweep can never race a
+        # concurrent `next`'s archive of the same blueprint. Busy -> skip
+        # the sweep this call, non-fatal, retried next time.
+        my $lock_fh = _acquire_archive_lock($dsdir);
+        if ($lock_fh) {
+            my $lifecycle = "$DIR/bp-lifecycle.pl";
+            if (-f $lifecycle) {
+                my $rc = eval {
+                    system($^X, $lifecycle, 'reconcile', '--all',
+                           '--data-dir', $data, '--archive', '--quiet');
+                };
+                _append_run_log($dsdir, 'LIFECYCLE-RECONCILE '
+                    . ((!$@ && defined $rc && $rc == 0) ? 'ok' : 'failed (non-fatal)'));
+            }
+        } else {
+            _append_run_log($dsdir, 'LIFECYCLE-RECONCILE deferred -- archive in progress');
         }
+
+        my @newly_archived = grep {
+            !-e "$data/blueprints/$_" && -d "$data/blueprints/_archive/$_"
+        } @snapshot_names;
+        for my $n (@newly_archived) {
+            _append_run_log($dsdir, "ARCHIVE $n archived -- by the run-done sweep");
+        }
+        _drop_from_order($dsdir, @newly_archived) if @newly_archived;
     }
 
     print _encode_action({ action => 'done' }), "\n";
@@ -938,10 +1833,7 @@ sub _cmd_record_order {
         if (@unknown) {
             print STDERR "bp-drive-next record-order: not a blueprint:\n";
             print STDERR "  - $_\n" for @unknown;
-            print STDERR "Each argument must be a blueprint directory name under\n"
-                       . "  $bpbase/\n"
-                       . "(record-order takes bare names, no flags -- a flag recorded as a\n"
-                       . "blueprint name reports itself settled and is never driven).\n";
+            print STDERR "Each argument must be a blueprint directory name under $bpbase/ (record-order takes bare names, no flags -- a flag recorded as a blueprint name reports itself settled and is never driven).\n";
             return 2;
         }
     }
@@ -977,10 +1869,7 @@ sub _cmd_record_order {
             }
         }
         if (@dropped) {
-            print STDERR "bp-drive-next record-order: refusing an order that omits blueprint(s)\n"
-                       . "still holding non-terminal packages -- the `next` walk iterates the\n"
-                       . "recorded order, so an omitted blueprint is never driven and the run\n"
-                       . "reports 'done' over work it never looked at:\n";
+            print STDERR "bp-drive-next record-order: refusing an order that omits blueprint(s) still holding non-terminal packages -- the `next` walk iterates the recorded order, so an omitted blueprint is never driven and the run reports 'done' over work it never looked at:\n";
             print STDERR "  - $_\n" for @dropped;
             print STDERR "Include them in the order, or exclude them deliberately with:\n"
                        . "  bp-drive-next.pl park <blueprint> <reason...>\n";
@@ -1048,50 +1937,36 @@ USAGE
 SUBCOMMANDS
   next --scope <spec>
       Print exactly ONE next-action JSON (below) to stdout, single line.
-      <spec> = one blueprint name | comma/space list of names | "all" (or empty)
-      = all audited blueprints. <spec> resolves mechanically to the candidate SET
-      and is used ONLY for need-order candidates; once order.json exists it is the
-      authoritative scope+order and --scope is ignored.
+      <spec> = one blueprint name | comma/space list of names | "all" (or empty) = all audited blueprints. <spec> resolves mechanically to the candidate SET and is used ONLY for need-order candidates; once order.json exists it is the authoritative scope+order and --scope is ignored.
   record-order <bp> [<bp> …]
-      Persist the SESSION-judged blueprint order to order.json. The director never
-      invents order — it only persists and serves it.
+      Persist the SESSION-judged blueprint order to order.json. The director never invents order — it only persists and serves it.
   park <blueprint> <reason…>
-      Record a blueprint-level park (idempotent) to parks.json and log it. A parked
-      blueprint is settled: never driven, excluded from every pending list.
+      Record a blueprint-level park (idempotent) to parks.json and log it. A parked blueprint is settled: never driven, excluded from every pending list.
 
 NEXT-ACTION JSON  (exactly one per `next`)
   {"action":"need-order","candidates":[…]}          no order yet; session must judge+record
   {"action":"run-package","blueprint":B,"package":P} drive this package next
   {"action":"pause","until_epoch":E,"reason":"usage"} timed auto-resume at epoch E
-  {"action":"stop","reason":"token-refresh-failed","detail":…} token could not be
-                                                     refreshed; the wake-lock is released and the
-                                                     run ends. NOT a pause: a pause promises a
-                                                     resume, and there is none until a human
-                                                     re-authenticates.
-  {"action":"blueprint-done","blueprint":B,"pending":[…]} B settled; pending = remaining bps to re-eval
-  {"action":"in-flight","blueprint":B,"packages":[…],"running":[…]}
-                                                     nothing dispatchable right now, but B still
-                                                     holds non-terminal packages (typically owned by
-                                                     a concurrent worker). NOT completion: stopping
-                                                     here kills the run mid-package.
+  {"action":"stop","reason":"token-refresh-failed","detail":…} token could not be refreshed; the wake-lock is released and the run ends. NOT a pause: a pause promises a resume, and there is none until a human re-authenticates.
+  {"action":"blueprint-done","blueprint":B,"pending":[…],"archived":true|false,"archive_detail":"…"} B settled; pending = remaining bps to re-eval; archived/archive_detail report the director's own single-blueprint archive attempt (reuses bp-lifecycle.pl reconcile --archive)
+  {"action":"in-flight","blueprint":B,"packages":[…],"running":[…]} nothing dispatchable right now, but B still holds non-terminal packages (typically owned by a concurrent worker). NOT completion: stopping here kills the run mid-package.
   {"action":"done"}                                  every in-scope blueprint is done-or-parked
 
-  Keep-awake is a director-managed SIDE EFFECT (started when work is runnable or a
-  timed auto-resume is pending; stopped when settled) — never an action.
+  Keep-awake is a director-managed SIDE EFFECT (started when work is runnable or a timed auto-resume is pending; stopped when settled) — never an action.
 
 GOVERNOR VERDICT CONSUMED  (from bp-usage-gate.pl verdict — pkg-02)
   {"action":"ok"|"pause-usage"|"pause-token"|"unavailable","until_epoch":E|null,"reason":…}
   ok           → proceed
   pause-usage  → pause reason=usage, until_epoch=E
-  pause-token  → attempt a refresh (bp-token-keeper). Recovered → proceed;
-                 failed → action=stop, wake-lock released, error logged.
-                 Solo NEVER pauses for token expiry — see _token_recover.
+  pause-token  → attempt a refresh (bp-token-keeper). Recovered → proceed; failed → action=stop, wake-lock released, error logged. Solo NEVER pauses for token expiry — see _token_recover.
   unavailable  → retry a few times, then degrade-and-proceed (log "governance degraded")
 
 STATE  (<data>/.drive-solo/, all director-owned)
   order.json      {"order":[…],"recorded_at":<epoch>}
   parks.json      [{"blueprint":…,"reason":…,"at":<epoch>}, …]
   announced.json  {"announced":[…]}   blueprints whose blueprint-done already fired
+  inflight.json   {"packages":[{"blueprint":…,"package":…,"ledger":…,"since":<epoch>}],
+                  "updated_at":<epoch>}   the project-level in-flight set: added on run-package, pruned once its ledger turns terminal. Concurrent hand-out (a further ready package disjoint from every in-flight write set) is unconditional.
   keepawake.pid   PID of the wake-lock process (host only; sandbox = no file)
   run.md          append-only structured run log
 END_HELP
@@ -1105,48 +1980,71 @@ END_HELP
 # "../../../.ccpraxis-local-data" guess resolves an unrelated root (the
 # marketplaces dir) that has no blueprints/. read_state then builds an empty DAG,
 # every blueprint looks settled, and `next` silently emits blueprint-done→done
-# despite pending work. This mirrors bp-lib.sh's bp_project_root()+bp_data_dir()
-# so the perl director and the bash helpers agree on exactly one root.
+# despite pending work. bp-lib.sh's bp_project_root()+bp_data_dir() is still
+# the unbounded walk-up this package replaces here (Decision 17 follow-up);
+# the two are not yet the same logic.
 #
-# Priority (identical to bp-lib.sh, plus the injected data_dir opt on top for tests):
-#   data_dir opt (--data-dir) > $CCPRAXIS_DATA_DIR
+# Priority (BpDataRoot.pm, package 04 — written once, shared with bp-lifecycle.pl):
+#   data_dir opt ($opts->{data_dir}, a PROGRAMMATIC seam -- there is no CLI
+#     --data-dir option on this director) > $CCPRAXIS_DATA_DIR
 #     > <project root>/.ccpraxis-local-data
 #   project root = $BP_PROJECT_ROOT > git toplevel
-#     > walk up from cwd for a dir containing .ccpraxis-local-data > cwd
+#     > BOUNDED walk-up from cwd for a dir containing .ccpraxis-local-data
+#       (stops at the OS temp dir and at the user's home dir; neither is
+#       adopted unless it IS the cwd -- bug 0f1e) > cwd
 
-sub _resolve_project_root {
-    return $ENV{BP_PROJECT_ROOT}
-        if defined $ENV{BP_PROJECT_ROOT} && length $ENV{BP_PROJECT_ROOT};
-
-    # git toplevel — trust only a clean exit and a real directory.
-    my $top = `git rev-parse --show-toplevel 2>/dev/null`;
-    if ($? == 0 && defined $top) {
-        chomp $top;
-        return $top if length $top && -d $top;
-    }
-
-    # Walk up from cwd for the first ancestor that already holds .ccpraxis-local-data.
-    my $d = Cwd::getcwd();
-    if (defined $d && length $d) {
-        my %seen;
-        while (!$seen{$d}++) {
-            return $d if -d "$d/.ccpraxis-local-data";
-            my $parent = dirname($d);
-            last if $parent eq $d;    # reached the filesystem / drive root
-            $d = $parent;
-        }
-    }
-
-    return Cwd::getcwd() // '.';
-}
+sub _resolve_project_root { BpDataRoot::project_root() }
 
 sub _resolve_data_dir {
     my ($opts) = @_;
-    return $opts->{data_dir}
-        if defined $opts->{data_dir} && length $opts->{data_dir};
-    return $ENV{CCPRAXIS_DATA_DIR}
-        if defined $ENV{CCPRAXIS_DATA_DIR} && length $ENV{CCPRAXIS_DATA_DIR};
-    return _resolve_project_root() . '/.ccpraxis-local-data';
+    return BpDataRoot::data_dir(data_dir => $opts->{data_dir});
+}
+
+# ===========================================================================
+# ARGUMENT VALIDATION (spec §2.4, Decision 7: "any argument starting with
+# '-' that the subcommand does not define" is rejected, exit 2, BEFORE any
+# root resolution -- so a bug-0f1e-shaped mistyped flag never gets a chance
+# to be silently ignored while the walk-up quietly adopts the wrong root).
+# ===========================================================================
+
+my $USAGE = <<'END_USAGE';
+usage: bp-drive-next.pl next --scope <spec>
+       bp-drive-next.pl record-order <bp> [<bp> ...]
+       bp-drive-next.pl park <blueprint> <reason...>
+       bp-drive-next.pl --help
+END_USAGE
+
+# Returns the FIRST offending dash-argument (in argv order), or undef if
+# every element is well-formed for $sub. `next` defines --scope <spec>: the
+# element right after --scope is consumed as its value only when it exists
+# and does not itself start with '-' (otherwise --scope's value is '' and
+# that next element is validated on its own, same as the old silent-ignore
+# parse used to leave for _cmd_next). `record-order` and `park` define no
+# options at all, so ANY element starting with '-' is rejected -- including
+# a `park` reason word typed unquoted with a leading dash (Q4).
+sub _reject_unknown_options {
+    my ($sub, $argv) = @_;
+    my @a = @$argv;
+
+    if ($sub eq 'next') {
+        my $i = 0;
+        while ($i <= $#a) {
+            my $o = $a[$i];
+            if ($o eq '--scope') {
+                $i++;
+                $i++ if $i <= $#a && $a[$i] !~ /^-/;
+                next;
+            }
+            return $o if $o =~ /^-/;
+            $i++;
+        }
+        return undef;
+    }
+
+    for my $o (@a) {
+        return $o if $o =~ /^-/;
+    }
+    return undef;
 }
 
 # ===========================================================================
@@ -1166,6 +2064,25 @@ sub run {
         return 0;
     }
 
+    # NEW (spec §2.4 step 2): an unrecognised subcommand -- including a
+    # leading flag such as `--data-dir X next` -- is rejected here, before
+    # any root resolution, rather than falling through to the old
+    # end-of-run() "unknown subcommand" branch.
+    unless ($sub eq 'next' || $sub eq 'record-order' || $sub eq 'park') {
+        print STDERR "bp-drive-next: unknown subcommand '$sub'\n";
+        print STDERR $USAGE;
+        return 2;
+    }
+
+    # NEW (spec §2.4 step 3): reject any dash-argument the subcommand does
+    # not define, BEFORE any resolution -- nothing is resolved, spawned, or
+    # written on rejection.
+    if (defined(my $bad = _reject_unknown_options($sub, \@argv))) {
+        print STDERR "bp-drive-next $sub: unknown option '$bad'\n";
+        print STDERR $USAGE;
+        return 2;
+    }
+
     # Inject production defaults for each seam. data_dir is PROJECT-anchored
     # (see _resolve_data_dir) — NEVER __FILE__/plugin-relative.
     my $data_dir = _resolve_data_dir($opts);
@@ -1183,9 +2100,9 @@ sub run {
         unless (-d "$data_dir/blueprints") {
             print STDERR "bp-drive-next: no blueprints/ under the resolved data dir:\n";
             print STDERR "    $data_dir\n";
-            print STDERR "  Resolution order: --data-dir opt > \$CCPRAXIS_DATA_DIR > \$BP_PROJECT_ROOT\n";
-            print STDERR "                    > git toplevel > walk-up for .ccpraxis-local-data > cwd.\n";
-            print STDERR "  Set CCPRAXIS_DATA_DIR=<project>/.ccpraxis-local-data (or pass --data-dir) and retry.\n";
+            print STDERR "  Resolution order: \$CCPRAXIS_DATA_DIR > \$BP_PROJECT_ROOT > git toplevel\n";
+            print STDERR "                    > walk-up for .ccpraxis-local-data (stops at the temp dir and at home) > cwd.\n";
+            print STDERR "  Set CCPRAXIS_DATA_DIR=<project>/.ccpraxis-local-data and retry.\n";
             return 2;
         }
     }
@@ -1195,7 +2112,7 @@ sub run {
         # TEST / DIAGNOSTIC SEAM, honoured only for well-formed JSON carrying an
         # 'action'. The production path below shells out to bp-usage-gate.pl,
         # which reads the host's REAL OAuth state -- so every consumer of the
-        # director inherits that state, including gate-drive-loop.sh and any
+        # director inherits that state, including stop-gate.sh and any
         # assertion about it. On 2026-08-08 t/94's stop-gate assertions went red
         # for exactly this reason: the host token aged under the relogin floor
         # mid-run, the director began answering pause/token, the gate correctly
@@ -1242,7 +2159,7 @@ sub run {
         return _cmd_next(\@argv, \%full_opts);
     } elsif ($sub eq 'record-order') {
         return _cmd_record_order(\@argv, \%full_opts);
-    } elsif ($sub eq 'park') {
+    } else {    # $sub eq 'park' — the only remaining option per the guard above
         my $bp     = shift @argv;
         my $reason = join(' ', @argv);
         unless (defined $bp && length $bp) {
@@ -1250,10 +2167,6 @@ sub run {
             return 2;
         }
         return _cmd_park($bp, $reason, \%full_opts);
-    } else {
-        print STDERR "bp-drive-next: unknown subcommand '$sub'\n";
-        print STDERR "usage: bp-drive-next.pl next|record-order|park|--help\n";
-        return 2;
     }
 }
 

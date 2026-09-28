@@ -4,8 +4,8 @@ package VaultNamespace;
 # WHY THIS IS SHARED RATHER THAN COPIED
 #
 # The vault holds several root-level namespaces owned by different scripts:
-# projects/ (vault-sync.pl), todos/ (todo-sync.pl), reports/ (usage-audit.pl),
-# research/ (update-research.pl). Two of those were writing files that NOTHING
+# projects/ (vault-sync.pl), todos/ (legacy, no writer since almanac-records 13),
+# reports/ (usage-audit.pl), research/ (update-research.pl). Two of those were writing files that NOTHING
 # EVER COMMITTED -- `git status` in the vault on 2026-09-06 showed `reports/`
 # and `bootstrap-archive/` as untracked, months of /steward:usage-audit output
 # that never reached the remote. The skill said "writes a dated report into the
