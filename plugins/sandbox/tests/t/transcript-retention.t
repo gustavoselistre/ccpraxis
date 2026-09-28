@@ -595,6 +595,13 @@ sub assert_baseline_preserved {
                                        # launcher's picker -- so unlike the two
                                        # env keys above this lands on one surface,
                                        # not three.
+        'timeFormat' => 1,             # 2026-09-28 -- the operator's 24-hour clock,
+                                       # on both surfaces. First added in 1b080f9
+                                       # without a line here; the red A4 it left
+                                       # was cleared by c04c1e6 rewriting both
+                                       # payloads from copies that lacked it, and
+                                       # the next promotion would then have deleted
+                                       # it from the live settings too.
     );
     my @unexpected = grep {
         !exists $baseline_flat->{$_} && !$permitted_additions{$_}
