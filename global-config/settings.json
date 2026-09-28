@@ -153,6 +153,7 @@
       "command" : "f=\"$HOME/.claude/ccpraxis/scripts/statusline.pl\"; [ -f \"$f\" ] || exit 0; exec perl \"$f\"",
       "type" : "command"
    },
+   "timeFormat" : "24-hour",
    "useAutoModeDuringPlan" : true,
    "worktree" : {
       "baseRef" : "fresh"
