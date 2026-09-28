@@ -5,7 +5,6 @@
       "commit" : "",
       "pr" : ""
    },
-   "autoMemoryEnabled" : false,
    "autoScrollEnabled" : false,
    "cleanupPeriodDays" : 180,
    "editorMode" : "vim",
@@ -31,7 +30,6 @@
       "CLAUDE_CODE_NEW_INIT" : "1",
       "CLAUDE_CODE_NO_FLICKER" : "1",
       "CLAUDE_CODE_SCROLL_SPEED" : "3",
-      "CLAUDE_CODE_USE_POWERSHELL_TOOL" : "1",
       "DISABLE_AUTOUPDATER" : "1",
       "DISABLE_INSTALL_GITHUB_APP_COMMAND" : "1",
       "DISABLE_UPGRADE_COMMAND" : "1",
@@ -41,7 +39,7 @@
    "extraKnownMarketplaces" : {
       "ccpraxis-local" : {
          "source" : {
-            "path" : "C:/Users/André/.claude/ccpraxis/plugins",
+            "path" : "/home/gustavo-selistre/.claude/ccpraxis/plugins",
             "source" : "directory"
          }
       },
@@ -53,26 +51,6 @@
       }
    },
    "hooks" : {
-      "PreToolUse" : [
-         {
-            "hooks" : [
-               {
-                  "command" : "perl \"$HOME/.claude/ccpraxis/scripts/hooks/block-nul-redirect.pl\"",
-                  "type" : "command"
-               }
-            ],
-            "matcher" : "Bash"
-         },
-         {
-            "hooks" : [
-               {
-                  "command" : "perl \"$HOME/.claude/ccpraxis/scripts/hooks/block-nonascii-ps1.pl\"",
-                  "type" : "command"
-               }
-            ],
-            "matcher" : "Edit|Write|MultiEdit|NotebookEdit"
-         }
-      ],
       "SessionStart" : [
          {
             "hooks" : [
@@ -123,9 +101,7 @@
       ],
       "ask" : [],
       "defaultMode" : "default",
-      "deny" : [
-         "Read(~/.claude/projects/**/memory/**)"
-      ],
+      "deny" : [],
       "disableBypassPermissionsMode" : "disable"
    },
    "promptSuggestionEnabled" : false,
