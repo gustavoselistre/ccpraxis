@@ -602,6 +602,24 @@ sub assert_baseline_preserved {
                                        # payloads from copies that lacked it, and
                                        # the next promotion would then have deleted
                                        # it from the live settings too.
+        # 2026-09-28 /steward:backup -- live-only keys the operator chose to
+        # export to the host payload and propagate to the container. The two
+        # builtin-plugin switches: agents-md@builtin (loading AGENTS.md as
+        # project instructions; off by default in 2.1.282, so pinned rather
+        # than changed) and telemetry@builtin (analytics from Claude Code's
+        # builtin plugins; on by default, so this is a real opt-out).
+        'enabledPlugins.agents-md@builtin'        => 1,
+        'enabledPlugins.telemetry@builtin'        => 1,
+        'modelSettings.claude-opus-5-5.effortLevel' => 1,
+        'modelSettings.claude-sonnet-5.effortLevel' => 1,
+        'tui'                                     => 1,
+        # Host-payload keys that reached the container in the same run.
+        # disableAgentView, disableWorkflows and CLAUDE_CODE_TICKLISH_WHISPER
+        # are declared in $HOST_BASELINE already; these entries admit them
+        # on the container side.
+        'disableAgentView'                        => 1,
+        'disableWorkflows'                        => 1,
+        'env.CLAUDE_CODE_TICKLISH_WHISPER'        => 1,
     );
     my @unexpected = grep {
         !exists $baseline_flat->{$_} && !$permitted_additions{$_}

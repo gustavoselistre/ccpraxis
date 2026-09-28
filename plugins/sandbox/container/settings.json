@@ -8,11 +8,15 @@
    "autoMemoryEnabled" : false,
    "autoScrollEnabled" : false,
    "cleanupPeriodDays" : 180,
+   "disableAgentView" : true,
+   "disableWorkflows" : true,
    "editorMode" : "vim",
    "effortLevel" : "high",
    "enabledPlugins" : {
+      "agents-md@builtin" : false,
       "feature-dev@claude-plugins-official" : true,
-      "frontend-design@claude-plugins-official" : true
+      "frontend-design@claude-plugins-official" : true,
+      "telemetry@builtin" : false
    },
    "env" : {
       "CCPRAXIS_SANDBOX" : "1",
@@ -26,6 +30,7 @@
       "CLAUDE_CODE_NO_FLICKER" : "1",
       "CLAUDE_CODE_SCROLL_SPEED" : "3",
       "CLAUDE_CODE_SEND_FEEDBACK" : "0",
+      "CLAUDE_CODE_TICKLISH_WHISPER" : "1",
       "CLAUDE_CODE_TODO_REMINDER_MODE" : "off",
       "DISABLE_AUTOUPDATER" : "1",
       "DISABLE_INSTALL_GITHUB_APP_COMMAND" : "1",
@@ -57,6 +62,14 @@
       ]
    },
    "inputNeededNotifEnabled" : true,
+   "modelSettings" : {
+      "claude-opus-5-5" : {
+         "effortLevel" : "medium"
+      },
+      "claude-sonnet-5" : {
+         "effortLevel" : "medium"
+      }
+   },
    "permissions" : {
       "deny" : [
          "Read(~/.claude/projects/**/memory/**)",
@@ -73,6 +86,7 @@
       "type" : "command"
    },
    "timeFormat" : "24-hour",
+   "tui" : "fullscreen",
    "worktree" : {
       "baseRef" : "fresh"
    }
